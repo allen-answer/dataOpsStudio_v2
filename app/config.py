@@ -101,7 +101,7 @@ class WorkerConfig(BaseSettings):
     worker_id: str = "worker-1"
     max_concurrent_jobs: int = 2
     heartbeat_interval_seconds: int = 15
-    heartbeat_timeout_seconds: int = 90  # 调度器超时阈值(设计稿 §4.6)
+    heartbeat_timeout_seconds: int = 600  # 慢首行 OLAP 查询优先避免误杀,见 ADR-0018
 
 
 class ResultStoreConfig(BaseSettings):

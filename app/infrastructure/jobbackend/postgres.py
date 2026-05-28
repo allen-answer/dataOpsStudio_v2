@@ -41,7 +41,6 @@ class PostgresJobBackend(JobBackend):
         self._bind = bind
         self._worker_id = worker_id
         self._job_default_max_retries = job_default_max_retries
-        self._claimed_worker_ids: dict[str, str] = {}
 
     def enqueue(self, job: Job) -> None:
         def op(conn: Connection) -> None:
@@ -99,16 +98,13 @@ class PostgresJobBackend(JobBackend):
             if row is None:
                 return None
             job = _job_from_row(row)
-            self._claimed_worker_ids[job.id] = worker_id
             self._write_event(conn, job.id, "claimed", f"worker={worker_id}")
             return job
 
         return self._write(op)
 
     def complete(self, job_id: str, result_ref: ResultRef) -> None:
-        worker_id = self._worker_id_for(job_id)
-        if worker_id is None:
-            return
+        worker_id = self._require_complete_fail_worker_id()
 
         def op(conn: Connection) -> None:
             result = conn.execute(
@@ -124,15 +120,12 @@ class PostgresJobBackend(JobBackend):
                 )
             )
             if result.rowcount:
-                self._claimed_worker_ids.pop(job_id, None)
                 self._write_event(conn, job_id, "completed", None)
 
         self._write(op)
 
     def fail(self, job_id: str, error: str) -> None:
-        worker_id = self._worker_id_for(job_id)
-        if worker_id is None:
-            return
+        worker_id = self._require_complete_fail_worker_id()
 
         def op(conn: Connection) -> None:
             result = conn.execute(
@@ -143,7 +136,6 @@ class PostgresJobBackend(JobBackend):
                 .values(status=JobStatus.FAILED.value, error=error, finished_at=text("now()"))
             )
             if result.rowcount:
-                self._claimed_worker_ids.pop(job_id, None)
                 self._write_event(conn, job_id, "failed", error)
 
         self._write(op)
@@ -172,9 +164,7 @@ class PostgresJobBackend(JobBackend):
         self._write(op)
 
     def mark_cancelled(self, job_id: str, reason: str = "cancelled") -> None:
-        worker_id = self._worker_id_for(job_id)
-        if worker_id is None:
-            return
+        worker_id = self._require_worker_id("mark_cancelled")
 
         def op(conn: Connection) -> None:
             result = conn.execute(
@@ -190,7 +180,6 @@ class PostgresJobBackend(JobBackend):
                 )
             )
             if result.rowcount:
-                self._claimed_worker_ids.pop(job_id, None)
                 self._write_event(conn, job_id, "cancelled", reason)
 
         self._write(op)
@@ -313,8 +302,15 @@ class PostgresJobBackend(JobBackend):
 
         return self._write(op)
 
-    def _worker_id_for(self, job_id: str) -> str | None:
-        return self._worker_id or self._claimed_worker_ids.get(job_id)
+    def _require_complete_fail_worker_id(self) -> str:
+        if self._worker_id is None:
+            raise RuntimeError("complete/fail requires worker_id")
+        return self._worker_id
+
+    def _require_worker_id(self, operation: str) -> str:
+        if self._worker_id is None:
+            raise RuntimeError(f"{operation} requires worker_id")
+        return self._worker_id
 
     def _write_event(
         self,

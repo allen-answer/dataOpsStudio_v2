@@ -251,8 +251,14 @@ class ThreadPoolJobBackend(JobBackend): ...  # dev / 极简 portable
 #### 2.2.3 Worker 心跳与故障恢复
 
 - worker 定期 `heartbeat` 更新 `jobs.last_heartbeat`
-- 调度器扫描:`status=running` 且 `last_heartbeat` 超时 → 标记 failed 或重新入队(按 retry_policy)
+- 调度器扫描:`status=running` 且 `last_heartbeat` 超时 → 标记 failed 或重新入队。2.0.0 使用全局 `job_default_max_retries`,per-job retry_policy 后置到 workflow 版本正式定义。
 - portable 单 worker:launcher 监控 worker 进程存活,崩溃则记录日志(2.0.0 不自动重启,见 §6)
+
+**已知限制 / Backlog**:
+
+- 2.0.0 不做独立 heartbeat 线程。慢首行 OLAP 查询期间可能长时间没有安全点心跳,因此默认 `worker_heartbeat_timeout` 设为 600 秒;产品取舍是"避免误杀合法慢查询"优先于"worker 死亡后更快恢复"。见 ADR-0018。
+- T4 前必修:worker 执行 SQL 时取消检查需改为每 N 行检查或按秒缓存(N 默认 5000),避免百万行结果触发百万次 PG `is_cancel_requested` 查询。
+- Backlog:将 worker 的 `UnsupportedJobKindError` 与 adapter 工厂的 unsupported db type 错误拆分为 `UnsupportedDbTypeError`。
 
 ### 2.3 横切层(必经路径)
 
@@ -896,7 +902,7 @@ timeouts:
   ai_assist_timeout: 60
   ai_copilot_timeout: 300
   worker_heartbeat_interval: 15
-  worker_heartbeat_timeout: 90   # 超时视为 worker 失联
+  worker_heartbeat_timeout: 600  # 超时视为 worker 失联;慢首行 OLAP 优先避免误杀
   job_history_retention_days: 30
   download_url_ttl_seconds: 300
   session_absolute_timeout_hours: 8
@@ -1785,8 +1791,9 @@ docs/adr/
 ├── 0013-lineage-reuse-v1-lineagereport.md          (v0.3.2 改:推翻 aspect 收敛)
 ├── 0014-api-worker-separation-pg-queue.md          (v0.3.1 新)
 ├── 0015-adapter-capabilities-and-tiers.md          (v0.3.1 新)
-└── 0016-ai-data-egress-policy.md                   (v0.3.1 新)
+├── 0016-ai-data-egress-policy.md                   (v0.3.1 新)
 ├── 0017-three-pronged-logging-runtime-audit-metrics.md  (v0.3.2 新)
+└── 0018-worker-heartbeat-timeout-slow-olap.md      (v0.3.2 新)
 (废弃) 0099-DEPRECATED-portable-sqlite-default.md
 ```
 

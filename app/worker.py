@@ -74,7 +74,7 @@ AdapterFactory = Callable[[DatasourceConnInfo, Callable[[], bool]], DatabaseAdap
 class WorkerRunnerConfig:
     worker_id: str
     heartbeat_interval_seconds: int = 15
-    heartbeat_timeout_seconds: int = 90
+    heartbeat_timeout_seconds: int = 600
     poll_interval_seconds: float = 1.0
     sql_spool_batch_size: int = 1000
 
