@@ -120,6 +120,18 @@ def test_reveal_secret_fails_closed_when_audit_write_fails() -> None:
         store.reveal_secret(ref)
 
 
+def test_reveal_secret_default_fail_close_does_not_touch_when_audit_fails() -> None:
+    storage = _InMemorySecretStorage()
+    storage.fail_audit = True
+    store = _build_secret_store(storage)
+
+    ref = store.store_secret("hunter2", SecretKind.DATASOURCE_PASSWORD)
+    with pytest.raises(SecretAuditError):
+        store.reveal_secret(ref)
+
+    assert storage.touch_count_by_ref.get(ref.ref, 0) == 0
+
+
 def test_reveal_secret_break_glass_returns_plaintext_and_logs_critical(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -192,6 +204,7 @@ class _InMemorySecretStorage(_SecretStorage):
     def __init__(self) -> None:
         self.records: dict[str, _SecretRecord] = {}
         self.audit_details: list[dict[str, str]] = []
+        self.touch_count_by_ref: dict[str, int] = {}
         self.fail_audit = False
 
     def insert_secret(self, ref: str, kind: SecretKind, ciphertext: bytes) -> None:
@@ -203,6 +216,7 @@ class _InMemorySecretStorage(_SecretStorage):
     def touch_secret(self, ref: str) -> None:
         if ref not in self.records:
             raise SecretNotFoundError(f"SecretRef not found: {ref}")
+        self.touch_count_by_ref[ref] = self.touch_count_by_ref.get(ref, 0) + 1
 
     def update_secret_ciphertext(self, ref: str, ciphertext: bytes) -> None:
         record = self.records[ref]

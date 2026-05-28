@@ -256,8 +256,8 @@ class LocalFileSecretStore(SecretStore):
         except InvalidToken as exc:
             raise SecretDecryptError(f"SecretRef cannot be decrypted: {ref.ref}") from exc
 
-        self._storage.touch_secret(ref.ref)
         self._audit_reveal_or_fail(ref)
+        self._storage.touch_secret(ref.ref)
         return plaintext
 
     def rotate_secret(self, ref: SecretRef, new_plaintext: str) -> SecretRef:
