@@ -50,25 +50,54 @@ test-contract:  ## tests/contract/(默认 skip,Codex 实现后启用)
 test-e2e:  ## tests/e2e/(默认 xfail,2.0.0 骨架完成才转绿)
 	$(UV) run pytest tests/e2e
 
-# ─── 元数据 PG(Step 1.6 接 docker-compose 后实现) ───
-pg-up:  ## 起元数据 PG 容器(2.0 端口 15432,与 1.x 隔离)
-	@echo "TODO Step 1.6: docker compose -f docker/dev-pg.yml up -d"
+# ─── 元数据 PG(dev) ───
+# 启动前需要先 export POSTGRES_DEV_PASSWORD=$(openssl rand -base64 24)
+# R8:不写明文密码到任何配置/脚本,docker-compose 用 env var,失败有提示
+pg-up:  ## 起元数据 PG 容器(端口 127.0.0.1:15432,与 1.x 隔离)
+	@test -n "$$POSTGRES_DEV_PASSWORD" || { \
+		echo "POSTGRES_DEV_PASSWORD 未设置。请运行:"; \
+		echo "  export POSTGRES_DEV_PASSWORD=\$$(openssl rand -base64 24)"; \
+		exit 1; \
+	}
+	docker compose -f docker/dev-pg.yml up -d
+	@echo "等待 PG ready..."
+	@for i in 1 2 3 4 5 6 7 8 9 10; do \
+		docker exec dataops-v2-pg pg_isready -U dataops -d dataops -q && exit 0; \
+		sleep 1; \
+	done; \
+	echo "PG 启动超时"; exit 1
 
-pg-down:  ## 停元数据 PG 容器
-	@echo "TODO Step 1.6: docker compose -f docker/dev-pg.yml down"
+pg-down:  ## 停元数据 PG 容器(保留数据 volume)
+	docker compose -f docker/dev-pg.yml down
+
+pg-down-clean:  ## 停 + 删数据 volume(危险:dev 数据清零)
+	docker compose -f docker/dev-pg.yml down -v
 
 pg-psql:  ## 进入元数据 PG psql
-	@echo "TODO Step 1.6: docker exec -it dataops-v2-pg psql -U dataops"
+	docker exec -it dataops-v2-pg psql -U dataops -d dataops
 
-# ─── Alembic(Step 1.6 实现) ───
-alembic-init:  ## 初始化 Alembic 目录结构(只跑一次)
-	@echo "TODO Step 1.6: uv run alembic init -t generic app/db/migrations"
+# ─── Alembic ───
+# DATAOPS_DATABASE_URL 拼接,密码取自 POSTGRES_DEV_PASSWORD env(R8)
+DEV_DB_URL = postgresql+psycopg://dataops:$(POSTGRES_DEV_PASSWORD)@127.0.0.1:15432/dataops
 
 alembic-up:  ## 应用所有迁移到 head
-	$(UV) run alembic upgrade head
+	@test -n "$$POSTGRES_DEV_PASSWORD" || { echo "POSTGRES_DEV_PASSWORD 未设置"; exit 1; }
+	DATAOPS_DATABASE_URL="$(DEV_DB_URL)" $(UV) run alembic upgrade head
 
 alembic-down:  ## 回退一格
-	$(UV) run alembic downgrade -1
+	@test -n "$$POSTGRES_DEV_PASSWORD" || { echo "POSTGRES_DEV_PASSWORD 未设置"; exit 1; }
+	DATAOPS_DATABASE_URL="$(DEV_DB_URL)" $(UV) run alembic downgrade -1
+
+alembic-current:  ## 显示当前 migration 状态
+	@test -n "$$POSTGRES_DEV_PASSWORD" || { echo "POSTGRES_DEV_PASSWORD 未设置"; exit 1; }
+	DATAOPS_DATABASE_URL="$(DEV_DB_URL)" $(UV) run alembic current
+
+alembic-history:  ## migration 历史
+	$(UV) run alembic history
+
+alembic-check:  ## 校验 metadata 与当前 DB schema 是否一致
+	@test -n "$$POSTGRES_DEV_PASSWORD" || { echo "POSTGRES_DEV_PASSWORD 未设置"; exit 1; }
+	DATAOPS_DATABASE_URL="$(DEV_DB_URL)" $(UV) run alembic check
 
 # ─── 清理 ───
 clean:  ## 清理缓存

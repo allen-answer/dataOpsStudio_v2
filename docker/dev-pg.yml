@@ -1,0 +1,33 @@
+# 元数据 PG 容器(dev / Step 1.6 验证 alembic 迁移用)。
+#
+# ★ 隔离 1.x:容器名 / volume / network 全部 v2- 前缀,绝不复用 1.x 资源
+# ★ 端口 127.0.0.1:15432(loopback only)—— 避开 1.x 5432 / 8010 / daily-report-bot 8000
+# ★ POSTGRES_PASSWORD 走 env var(R8 红线:配置文件不写明文凭据)。
+#   生成 + 设置:export POSTGRES_DEV_PASSWORD=$(openssl rand -base64 24)
+#   未设置时 docker compose 会拒绝启动并打印提示。
+#
+# 用法:make pg-up / make alembic-up / make pg-psql / make pg-down
+
+name: dataops-v2-dev
+
+services:
+  pg:
+    image: postgres:16-alpine
+    container_name: dataops-v2-pg
+    ports:
+      - "127.0.0.1:15432:5432"
+    environment:
+      POSTGRES_USER: dataops
+      POSTGRES_PASSWORD: ${POSTGRES_DEV_PASSWORD:?需要 export POSTGRES_DEV_PASSWORD=$(openssl rand -base64 24)}
+      POSTGRES_DB: dataops
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dataops -d dataops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+    name: dataops-v2-pgdata
