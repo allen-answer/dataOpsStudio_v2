@@ -46,7 +46,11 @@ class _SpoolManifest:
 
 
 class LocalFsResultStore(ResultStore):
-    """本地文件 ResultStore,ResultSet spool 使用 parquet part 文件。"""
+    """本地文件 ResultStore,ResultSet spool 使用 parquet part 文件。
+
+    单写者假设:同一个 result_set_id 由一个 worker 顺序 append_spool 写入。
+    多 worker 并发写同一 spool 不是 2.0.0 目标,需要后续引入文件锁/事务清单。
+    """
 
     def __init__(
         self,
