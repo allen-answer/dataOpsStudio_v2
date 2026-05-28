@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.job import Job, JobKind, JobStatus
@@ -43,7 +43,11 @@ def test_worker_cancel_safe_point_marks_cancelled() -> None:
         result_store,
         lambda datasource_id: _conn_info(datasource_id),
         lambda conn_info, cancel_check: adapter,
-        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=1),
+        WorkerRunnerConfig(
+            worker_id="worker-1",
+            sql_spool_batch_size=1,
+            cancel_check_row_interval=1,
+        ),
     )
 
     assert runner.run_once() is True
@@ -81,6 +85,83 @@ def test_worker_empty_queue_returns_false() -> None:
     )
 
     assert runner.run_once() is False
+
+
+def test_cancel_check_throttled_to_every_n_rows() -> None:
+    """F3: per-row cancel check is throttled to every 5000 rows."""
+
+    rows = 50_000
+    row_interval = 5000
+    batch_size = 1000
+    flush_per_batch = 1
+    expected_max = (rows // row_interval) + (rows // batch_size) * flush_per_batch + 5
+    job = _make_job(payload={"sql": "SELECT many", "result_set_id": "rs-many"})
+    backend = _FakeBackend([job])
+    result_store = _CountingResultStore()
+
+    def adapter_factory(
+        conn_info: DatasourceConnInfo,
+        cancel_check: Callable[[], bool],
+    ) -> _RangeAdapter:
+        return _RangeAdapter(rows)
+
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        adapter_factory,
+        WorkerRunnerConfig(
+            worker_id="worker-1",
+            sql_spool_batch_size=batch_size,
+            cancel_check_row_interval=row_interval,
+        ),
+    )
+
+    assert runner.run_once() is True
+
+    assert result_store.row_count_by_result_set == {"rs-many": rows}
+    assert backend.cancel_check_count <= expected_max, (
+        f"F3 节流回归:每行检查重新出现?got {backend.cancel_check_count} > 上限 {expected_max}"
+    )
+    assert backend.cancel_check_count >= rows // row_interval, (
+        f"F3 节流太狠:got {backend.cancel_check_count} < 下限 {rows // row_interval}"
+    )
+    assert backend.completed == [("job-1", ResultRef(backend="local_fs", uri="spool/rs-many"))]
+
+
+def test_worker_cancel_still_stops_within_interval() -> None:
+    row_count = 20_000
+    job = _make_job(payload={"sql": "SELECT many", "result_set_id": "rs-cancel"})
+    backend = _FakeBackend([job])
+    backend.cancel_after_checks = 2
+    result_store = _CountingResultStore()
+    adapter_holder: dict[str, _RangeAdapter] = {}
+
+    def adapter_factory(
+        conn_info: DatasourceConnInfo,
+        cancel_check: Callable[[], bool],
+    ) -> _RangeAdapter:
+        adapter = _RangeAdapter(row_count)
+        adapter_holder["adapter"] = adapter
+        return adapter
+
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        adapter_factory,
+        WorkerRunnerConfig(
+            worker_id="worker-1",
+            sql_spool_batch_size=10_000,
+            cancel_check_row_interval=5000,
+        ),
+    )
+
+    assert runner.run_once() is True
+
+    assert adapter_holder["adapter"].rows_yielded <= 5000
+    assert backend.cancelled == [("job-1", "cancel requested")]
+    assert backend.completed == []
 
 
 class _FakeBackend:
@@ -125,6 +206,10 @@ class _FakeBackend:
     ) -> object:
         return object()
 
+    @property
+    def cancel_check_count(self) -> int:
+        return self._cancel_checks
+
 
 class _FakeResultStore:
     def __init__(self) -> None:
@@ -137,12 +222,36 @@ class _FakeResultStore:
         return ResultRef(backend="local_fs", uri=f"spool/{result_set_id}")
 
 
+class _CountingResultStore:
+    def __init__(self) -> None:
+        self.row_count_by_result_set: dict[str, int] = {}
+
+    def append_spool(self, result_set_id: str, rows: list[Row]) -> None:
+        self.row_count_by_result_set[result_set_id] = self.row_count_by_result_set.get(
+            result_set_id, 0
+        ) + len(rows)
+
+    def spool_ref(self, result_set_id: str) -> ResultRef:
+        return ResultRef(backend="local_fs", uri=f"spool/{result_set_id}")
+
+
 class _FakeAdapter:
     def __init__(self, rows: list[Row]) -> None:
         self._rows = rows
 
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
         yield from self._rows
+
+
+class _RangeAdapter:
+    def __init__(self, row_count: int) -> None:
+        self._row_count = row_count
+        self.rows_yielded = 0
+
+    def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
+        for index in range(self._row_count):
+            self.rows_yielded += 1
+            yield Row(values=[index])
 
 
 def _make_job(

@@ -77,6 +77,7 @@ class WorkerRunnerConfig:
     heartbeat_timeout_seconds: int = 600
     poll_interval_seconds: float = 1.0
     sql_spool_batch_size: int = 1000
+    cancel_check_row_interval: int = 5000
 
 
 class WorkerRunner:
@@ -90,6 +91,8 @@ class WorkerRunner:
     ) -> None:
         if config.sql_spool_batch_size <= 0:
             raise ValueError("sql_spool_batch_size must be positive")
+        if config.cancel_check_row_interval <= 0:
+            raise ValueError("cancel_check_row_interval must be positive")
         self._backend = backend
         self._result_store = result_store
         self._datasource_loader = datasource_loader
@@ -141,9 +144,14 @@ class WorkerRunner:
         )
 
         batch: list[Row] = []
+        rows_since_cancel_check = 0
+        cancel_check_row_interval = self._config.cancel_check_row_interval
         last_heartbeat = time.monotonic()
         for row in adapter.execute_select(sql, params):
-            self._check_cancel(job.id)
+            rows_since_cancel_check += 1
+            if rows_since_cancel_check >= cancel_check_row_interval:
+                self._check_cancel(job.id)
+                rows_since_cancel_check = 0
             batch.append(row)
             if len(batch) >= self._config.sql_spool_batch_size:
                 self._flush_batch(job.id, result_set_id, batch)
@@ -158,9 +166,9 @@ class WorkerRunner:
         return self._result_store.spool_ref(result_set_id)
 
     def _flush_batch(self, job_id: str, result_set_id: str, batch: list[Row]) -> None:
+        # Cancel during append_spool is caught at the next batch or row interval.
         self._check_cancel(job_id)
         self._result_store.append_spool(result_set_id, batch)
-        self._check_cancel(job_id)
 
     def _heartbeat_if_due(
         self,
@@ -257,6 +265,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
             worker_id=actual_settings.worker.worker_id,
             heartbeat_interval_seconds=actual_settings.worker.heartbeat_interval_seconds,
             heartbeat_timeout_seconds=actual_settings.worker.heartbeat_timeout_seconds,
+            cancel_check_row_interval=actual_settings.worker.cancel_check_row_interval,
         ),
     )
 
