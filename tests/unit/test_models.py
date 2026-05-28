@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import pathlib
+import re
+
 from app.db.models import (
     APPLICATION_SECRET_KINDS,
     audit_logs,
@@ -35,10 +38,9 @@ def test_all_alembic_revision_ids_under_32_chars() -> None:
     历史教训:0002_add_datasources_database_name(34 字符)在 CI PG 上挂,
     截短到 0002_datasources_database_name(30 字符)才过。
     """
-    import re
-    import pathlib
-
-    versions_dir = pathlib.Path(__file__).parent.parent.parent / "app" / "db" / "migrations" / "versions"
+    versions_dir = (
+        pathlib.Path(__file__).parent.parent.parent / "app" / "db" / "migrations" / "versions"
+    )
     pattern = re.compile(r'^revision:\s*str\s*=\s*["\'](.+)["\']', re.MULTILINE)
     violations: list[tuple[str, str, int]] = []
     for f in versions_dir.glob("[0-9]*.py"):
