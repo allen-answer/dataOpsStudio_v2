@@ -29,17 +29,13 @@ def test_acceptance_portable_flow() -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True, reason="docker compose 流程同 portable(契约 §5 验收)"
-)
+@pytest.mark.xfail(strict=True, reason="docker compose 流程同 portable(契约 §5 验收)")
 def test_acceptance_docker_compose_flow() -> None:
     """docker compose(api+worker+pg)跑通同样流程。"""
     raise NotImplementedError("Step 2 / Step 3 完成后实现")
 
 
-@pytest.mark.xfail(
-    strict=True, reason="migrate_from_v1.py 完成才转绿(Codex T8)"
-)
+@pytest.mark.xfail(strict=True, reason="migrate_from_v1.py 完成才转绿(Codex T8)")
 def test_acceptance_migrate_from_v1() -> None:
     """1.x 数据 migrate 进 2.0 PG(允许个别字段失败)。"""
     raise NotImplementedError("Codex T8(tools/migrate_from_v1.py)完成后实现")
