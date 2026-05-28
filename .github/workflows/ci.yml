@@ -207,3 +207,72 @@ jobs:
       - name: Skip notice (T2 not yet merged)
         if: hashFiles('tests/unit/test_mysql_adapter.py') == ''
         run: echo "::notice::tests/unit/test_mysql_adapter.py 不存在 — T2 (MySQL adapter) 尚未合并,跳过 R6 integration test。T2 合并后本 job 自动启用。"
+
+  # ─── PG queue 并发硬证据:PostgresJobBackend FOR UPDATE SKIP LOCKED 真验证 ───
+  # 跑 tests/integration/test_postgres_jobbackend.py 4 个并发 / 故障场景:
+  #   - 8 worker thread × 25 job 并发 claim → 每个 job 恰好执行一次
+  #     (★ PG queue 关键性质:FOR UPDATE SKIP LOCKED 不重复)
+  #   - 5 reaper thread × 12 stale job → sum(requeued) == 12 无双计
+  #     (★ Reaper 并发安全:CTE + FOR UPDATE SKIP LOCKED 原子)
+  #   - retry budget=0 stale → 直接 failed
+  #   - 旧 worker 迟到 complete → SQL ownership 条件拒(F1 不变量)
+  # 与 mysql-integration 并行,独立 postgres:16-alpine service container。
+  #
+  # ★ Gate:T1 合并前 tests/integration/test_postgres_jobbackend.py 不存在,
+  #   hashFiles 跳过本步,主 4 job 仍绿。T1 合并后 gate 永真,强制跑。
+  pg-integration:
+    name: PG Queue Concurrency (T1 hard evidence)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: dataops
+          POSTGRES_PASSWORD: ci_test_pwd_not_real_secret
+          POSTGRES_DB: dataops
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Sync deps
+        run: uv sync --all-groups
+
+      # PG service health check 已等 ready,这里再 ping 暴露版本到 job log
+      - name: Wait for PG ready
+        if: hashFiles('tests/integration/test_postgres_jobbackend.py') != ''
+        env:
+          PGPASSWORD: ci_test_pwd_not_real_secret
+        run: |
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 15432 -U dataops -d dataops -q 2>/dev/null; then
+              echo "PG ready after ${i} attempts"
+              psql -h 127.0.0.1 -p 15432 -U dataops -d dataops -c "SELECT version();" 2>/dev/null | head -3
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "PG did not become ready in 60s"; exit 1
+
+      - name: pytest tests/integration/ (PG queue concurrency + reaper + ownership)
+        if: hashFiles('tests/integration/test_postgres_jobbackend.py') != ''
+        env:
+          # 测试用 metadata.create_all 自建 schema,直接给 URL 即可。
+          # _pg_engine_or_skip 优先读 DATAOPS_TEST_PG_URL,fallback DATAOPS_DATABASE_URL。
+          DATAOPS_TEST_PG_URL: postgresql+psycopg://dataops:ci_test_pwd_not_real_secret@127.0.0.1:15432/dataops
+        run: uv run pytest -m integration tests/integration/ -v
+
+      - name: Skip notice (T1 not yet merged)
+        if: hashFiles('tests/integration/test_postgres_jobbackend.py') == ''
+        run: echo "::notice::tests/integration/test_postgres_jobbackend.py 不存在 — T1 (PG JobBackend) 尚未合并,跳过 PG queue 并发 integration test。T1 合并后本 job 自动启用。"
