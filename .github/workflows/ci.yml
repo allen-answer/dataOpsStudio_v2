@@ -1,0 +1,127 @@
+# CI —— 红线 R1-R9 + 单测 + alembic 真实迁移
+# 契约 §10.5 + §4
+#
+# R9 配套:CI 矩阵只跑 PG service,不跑 SQLite(2.0 永不支持)
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  UV_VERSION: "0.11.16"
+
+jobs:
+  # ─── R1/R3/R5 + 代码风格 + AST 红线 ───
+  lint:
+    name: Lint & Format & Type & AST Red Lines
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Sync deps (all groups)
+        run: uv sync --all-groups
+
+      # R1 / R3:driver/crypto import 越界(ruff TID251 banned-api)
+      - name: ruff check (R1/R3 banned-api)
+        run: uv run ruff check app tests tools
+
+      - name: ruff format check
+        run: uv run ruff format --check app tests tools
+
+      - name: mypy strict
+        run: uv run mypy app tests
+
+      # R2 / R6:AST 模式红线(密码字段访问 / cursor 字段)
+      # severity: error 的规则命中后 ast-grep 自动 exit 1
+      - name: ast-grep red lines (R2/R6)
+        run: uv run sg scan --config tools/lint/sgconfig.yml
+
+  # ─── R8:gitleaks(secret 扫描 + 配置文件明文 password) ───
+  gitleaks:
+    name: Secret Scan (R8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # gitleaks 需要全 history
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+  # ─── 单元测试 + 真实 PG alembic 迁移 ───
+  # R9 配套:只在 PostgreSQL service 上跑,不跑 SQLite
+  test:
+    name: Unit Tests & Alembic Migration (PG 16)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: dataops
+          POSTGRES_PASSWORD: ci_test_pwd_not_real_secret
+          POSTGRES_DB: dataops
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Sync deps
+        run: uv sync --all-groups
+
+      # 包含 R4/R5/R6/R7 的 Python 层校验(test_redlines.py + test_redaction.py 等)
+      - name: pytest unit
+        run: uv run pytest tests/unit -v
+
+      # 真实 alembic 迁移(契约 §10.5 each PR 验证 schema 可迁)
+      - name: alembic upgrade head
+        env:
+          PGPASSWORD: ci_test_pwd_not_real_secret
+          DATAOPS_DATABASE_URL: postgresql+psycopg://dataops@localhost:15432/dataops
+        run: uv run alembic upgrade head
+
+      - name: alembic check (no schema drift)
+        env:
+          PGPASSWORD: ci_test_pwd_not_real_secret
+          DATAOPS_DATABASE_URL: postgresql+psycopg://dataops@localhost:15432/dataops
+        run: uv run alembic check
+
+      # R4 DB 层防御 smoke:insert bootstrap kind 应被拒
+      - name: R4 DB CHECK smoke (master_key INSERT must FAIL)
+        env:
+          PGPASSWORD: ci_test_pwd_not_real_secret
+        run: |
+          set +e
+          OUTPUT=$(psql -h localhost -p 15432 -U dataops -d dataops -c \
+            "INSERT INTO secret_refs (ref, kind, ciphertext) VALUES ('test_r4', 'master_key', '\x00');" 2>&1)
+          EXIT=$?
+          set -e
+          if [ "$EXIT" -eq 0 ]; then
+            echo "R4 violation: master_key kind INSERT was NOT rejected by DB CHECK"
+            exit 1
+          fi
+          echo "$OUTPUT" | grep -q "violates check constraint" || { echo "Unexpected error type"; exit 1; }
+          echo "OK: R4 DB CHECK rejected master_key INSERT"
