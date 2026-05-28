@@ -1,0 +1,56 @@
+# R10 红线:f-string 拼前缀 + uuid4().hex / str(uuid4()) 禁止
+#
+# 教训:T1 PR #3 pg-integration job 首次跑 真 PG 时 4 个测试全红 ——
+# `f"user-{uuid4().hex}"` = 37 字符超 VARCHAR(36) StringDataRightTruncation。
+# fixture 用 prefix 拼 uuid 的写法让 id 长度不可预测,等到真库才暴露。
+#
+# 规则原则:直接赋值/return 显式长度,拼前缀让长度不可预测。
+#   直接调用:    uuid4().hex                 → 32 字符,稳定
+#                str(uuid4())                → 36 字符,稳定
+#                uuid4().hex[:N]             → N 字符,稳定
+#                secrets.token_urlsafe(48)   → 64 字符,稳定
+#   f-string 拼: f"prefix-{uuid4().hex}"      → 32 + prefix 长,不稳定
+#                f"prefix_{str(uuid4())}"     → 36 + prefix 长,不稳定
+#                f"{uuid4().hex}"             → 多余 f-string,直接调用即可
+#
+# 例外:测试如确需带 prefix(如调试可读性),用 普通字符串 +(R10 不拦):
+#                "user_" + uuid4().hex[:8]    # 取消 R10 拦截
+# 但同样的长度风险,需配合 schema 字段长度做计算 —— 不推荐。
+#
+# 不在乎 prefix 时,直接 uuid4().hex / str(uuid4()) 是最简且 schema 安全。
+
+id: r10-no-uuid-prefix-concat
+language: python
+severity: error
+message: |
+  R10 红线:f-string 内嵌 uuid4().hex / str(uuid4()) 禁止(拼前缀让 id 长度
+  不可预测,易超 schema 字段)。
+
+  改:
+    x = str(uuid4())     # 36 字符稳定,对齐 VARCHAR(36)
+    y = uuid4().hex      # 32 字符
+    z = uuid4().hex[:N]  # 切片显式长度
+
+  历史教训:T1 PR #3 因 f"user-{uuid4().hex}" = 37 > 36 整死 4 个 PG
+  integration test;真 PG 跑才暴露,fixture 用 prefix 拼是根因。
+
+files:
+  - "**/*.py"
+
+rule:
+  any:
+    # f-string 内 uuid4().hex
+    - pattern: uuid4().hex
+      inside:
+        kind: interpolation
+        stopBy: end
+    # f-string 内 uuid4().hex[:N] 切片
+    - pattern: uuid4().hex[$$$]
+      inside:
+        kind: interpolation
+        stopBy: end
+    # f-string 内 str(uuid4())
+    - pattern: str(uuid4())
+      inside:
+        kind: interpolation
+        stopBy: end

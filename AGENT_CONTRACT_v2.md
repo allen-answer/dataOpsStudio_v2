@@ -279,6 +279,7 @@ class Job:
 | R7 | Workflow 节点必须在白名单内 | 校验 job_kind ∈ ALLOWED_WORKFLOW_NODE_KINDS;禁 shell/python/任意HTTP |
 | R8 | 配置文件禁止明文密码字段 | gitleaks + `config/*.json|yml` 出现明文 `password:` fail |
 | R9 | CI 不跑 SQLite backend(2.0 不支持) | 测试矩阵只有 PG |
+| R10 | f-string 拼接 `uuid4().hex` / `str(uuid4())` 禁止(拼前缀让 id 长度不可预测,超 schema 字段) | ast-grep:`tools/lint/rules/r10_no_uuid_prefix_concat.yml` —— 教训见 T1 PR #3(37 字符 id 超 VARCHAR(36),4 PG integration test 全红) |
 
 **ALLOWED_WORKFLOW_NODE_KINDS**(R7):
 ```python
