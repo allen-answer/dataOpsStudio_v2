@@ -151,6 +151,10 @@ datasources = Table(
     Column("host", String(255), nullable=False),
     Column("port", Integer(), nullable=False),
     Column("username", String(255), nullable=False),
+    # 业务连接的库/schema/service —— 与 DatasourceConnInfo.database 对应。
+    # ★ 列名用 database_name(避 SQL 保留字 `database`);
+    #   domain 字段叫 database,应用层做名字映射。
+    Column("database_name", String(128), nullable=True),
     # ★ NO FK(跨存储 secret 引用,见 SecretRef domain)
     Column("password_secret_ref", String(64), nullable=False),
     Column("environment", String(32), nullable=False, server_default="dev"),

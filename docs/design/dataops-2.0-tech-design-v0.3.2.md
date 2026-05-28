@@ -921,6 +921,11 @@ project_members (project_id, user_id, role)
 -- 数据源
 datasources (
   id, project_id, name, db_type, host, port, username,
+  database_name VARCHAR(128) NULL,            -- 业务连接的库/schema/service;
+                                              -- 映射 DatasourceConnInfo.database
+                                              -- ★ 列名用 database_name(database 是 SQL 保留字)
+                                              -- ★ NULL + 应用层 Pydantic 非空校验,避 DEFAULT '' garbage
+                                              -- 2.0.0 alembic migration 0002 引入
   password_secret_ref VARCHAR(64) NOT NULL,   -- Application Secret
   environment, capability_profile_jsonb, ...
 )

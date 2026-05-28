@@ -19,6 +19,15 @@ from app.db.models import (
 )
 
 
+def test_datasources_has_database_name_column() -> None:
+    """migration 0002 加的 database_name 列必须在 metadata 中
+    (防 models.py 与 migration 漂移;DatasourceConnInfo.database 映射至此)。
+    """
+    cols = set(datasources.columns.keys())
+    assert "database_name" in cols
+    assert datasources.columns["database_name"].nullable is True
+
+
 def test_metadata_has_10_tables() -> None:
     expected = {
         "users",
