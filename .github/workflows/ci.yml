@@ -47,6 +47,7 @@ jobs:
         run: uv run sg scan --config tools/lint/sgconfig.yml
 
   # ─── R8:gitleaks(secret 扫描 + 配置文件明文 password) ───
+  # 直接下二进制,不用 gitleaks-action(后者私有仓需付费 license)
   gitleaks:
     name: Secret Scan (R8)
     runs-on: ubuntu-latest
@@ -55,11 +56,17 @@ jobs:
         with:
           fetch-depth: 0  # gitleaks 需要全 history
 
-      - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_CONFIG: .gitleaks.toml
+      - name: Install gitleaks
+        run: |
+          GITLEAKS_VERSION="8.21.2"
+          curl -sSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: gitleaks detect
+        run: gitleaks detect --redact --no-banner --config .gitleaks.toml --exit-code 1
 
   # ─── 单元测试 + 真实 PG alembic 迁移 ───
   # R9 配套:只在 PostgreSQL service 上跑,不跑 SQLite
