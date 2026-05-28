@@ -213,7 +213,8 @@ def _prepare_db(engine: Engine) -> tuple[str, str]:
             ),
             {
                 "id": owner_id,
-                "username": f"user_{uuid4().hex}",
+                # R10:不要 f-string 拼前缀;hex 即唯一
+                "username": uuid4().hex,
                 "password_hash": "not-a-real-hash",
             },
         )
@@ -224,7 +225,7 @@ def _prepare_db(engine: Engine) -> tuple[str, str]:
                 VALUES (:id, :name, :owner_user_id)
                 """
             ),
-            {"id": project_id, "name": f"project_{uuid4().hex}", "owner_user_id": owner_id},
+            {"id": project_id, "name": uuid4().hex, "owner_user_id": owner_id},
         )
     return owner_id, project_id
 

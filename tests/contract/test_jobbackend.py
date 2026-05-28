@@ -159,7 +159,8 @@ def _ensure_owner_project(engine: Engine, user_id: str, project_id: str) -> None
             ),
             {
                 "id": user_id,
-                "username": f"user_{uuid4().hex[:8]}",
+                # R10:不要 f-string 拼前缀;hex 切片即唯一
+                "username": uuid4().hex[:16],
                 "password_hash": "not-a-real-hash",
             },
         )
@@ -171,5 +172,5 @@ def _ensure_owner_project(engine: Engine, user_id: str, project_id: str) -> None
                 ON CONFLICT (id) DO NOTHING
                 """
             ),
-            {"id": project_id, "name": f"project_{uuid4().hex[:8]}", "owner_user_id": user_id},
+            {"id": project_id, "name": uuid4().hex[:16], "owner_user_id": user_id},
         )
