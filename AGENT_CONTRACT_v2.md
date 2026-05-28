@@ -198,11 +198,12 @@ class ResultSet:
 ### 3.5 AiGateway(`app/services/ai/`)— 2.0.0 只做壳
 
 ```python
-class AiGateway:
+class AiGateway(Protocol):
     def complete(self, prompt: str, context: AiContext, options: AiOptions) -> AiResponse: ...
     def stream_complete(self, ...) -> Iterator[AiChunk]: ...
 # 2.0.0:能接 1 个 provider 调通即可。Assist/Copilot 功能后续版本。
 # 但 ★ egress 检查 + 脱敏 + 审计的钩子位 2.0.0 就要留好。
+# 实现:DefaultAiGateway(AiGateway),壳级实现,2.0.0 验证 provider 可调通。
 ```
 
 ### 3.6 Job 领域模型(`app/domain/job.py`)
@@ -219,6 +220,7 @@ class Job:
     datasource_ids: list[str]
     priority: int
     timeout_seconds: int
+    resource_profile: ResourceProfile          # 见 app/domain/resource.py;2.0.0 字段:memory_limit_mb / timeout_seconds(均 Optional[int])
     result_ref: Optional[ResultRef]
     audit_id: str
     worker_id: Optional[str]
