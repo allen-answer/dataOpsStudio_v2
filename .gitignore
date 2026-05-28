@@ -1,4 +1,38 @@
+# ─── Bootstrap secrets — 永不入库(R8 红线) ───
+config/.secret_master.key
+config/secrets/
+config/license.lic
 *.pem
-connect_key.pem
-config
-config/
+*.key
+
+# ─── 运行时本地状态 ───
+data/
+logs/
+tmp/
+backups/
+.venv/
+
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.so
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ─── uv ───
+# 注意:uv.lock 必须进 git(portable 可复现构建依赖此 lockfile)
+
+# ─── 前端 ───
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ─── IDE / OS ───
+.DS_Store
+.idea/
+.vscode/
+*.swp
