@@ -134,6 +134,35 @@ class AdapterCapabilities:
 **2.0.0 adapter 推进顺序**:MySQL(1,骨架验证)→ DM(2)→ Oracle(3,可滑 2.0.x)→ DB2(4,Preview)。
 **骨架设计约束**:首个写 MySQL,但接口设计必须以 **Oracle/DM 为假想验证对象**——防 MySQL-specific 假设固化:标识符大小写(Oracle 默认大写)、分页语法(LIMIT vs ROWNUM/FETCH FIRST)、cursor 语义、类型映射。
 
+#### 3.2a Adapter 入参契约:DatasourceConnInfo(`app/domain/datasource.py`)
+
+所有 DatabaseAdapter 实现的构造器接受统一的 DatasourceConnInfo 入参。1 个实例 = 1 行 datasources PG 表。这避免每个 adapter 自定义构造签名导致的:
+- 调用方代码与每个 adapter 耦合
+- adapter 工厂 / 注册表难以写
+- datasources 表 schema 变更需要改每个 adapter
+
+```python
+class DbType(StrEnum):
+    MYSQL = "mysql"
+    ORACLE = "oracle"
+    DM = "dm"
+    DB2 = "db2"
+    POSTGRESQL = "postgresql"
+
+class DatasourceConnInfo(BaseModel):  # Pydantic v2 BaseModel, ★ frozen=True
+    host: str                  # min_length=1
+    port: int                  # 1..65535
+    username: str              # min_length=1
+    database: str              # min_length=1;映射 datasources.database_name 列(SQL 保留字)
+    password_ref: SecretRef    # ★ kind 校验 == DATASOURCE_PASSWORD(R4 一脉)
+    db_type: DbType
+    extra: dict[str, Any]      # adapter 私有(Oracle service_name / MySQL ssl_mode 等)
+```
+
+★ 持久化对应见 §5.1 datasources 表 + `app/db/models.py`。
+★ `database` 字段:DB 列名为 `database_name`(`database` 是 SQL 保留字,做列名易埋坑),domain 字段叫 `database`,应用层做名字映射。
+★ `extra` 子节存于 `datasources.capability_profile.connection`。
+
 ### 3.3 SecretStore + BootstrapSecrets(`app/infrastructure/secretstore/` + `bootstrap/`)
 
 ```python
