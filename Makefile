@@ -37,6 +37,8 @@ typecheck:  ## mypy strict
 check-redlines:  ## 跑全部红线检查(R1-R9 本地版,CI 会再 enforce 一遍)
 	@echo "→ R1/R3 import 越界:ruff TID251 banned-api"
 	$(UV) run ruff check app tests tools
+	@echo "→ ruff format check(防漏 format 进 CI)"
+	$(UV) run ruff format --check app tests tools
 	@echo "→ R2/R6 字段/调用模式:ast-grep(dev 组依赖,severity=error 自动 exit 1)"
 	$(UV) run sg scan --config tools/lint/sgconfig.yml
 	@echo "→ R8 配置文件明文 secret:gitleaks"

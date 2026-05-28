@@ -24,8 +24,7 @@ def test_r4_secret_kind_python_and_db_consistent() -> None:
     py_kinds = {k.value for k in SecretKind}
     db_kinds = set(APPLICATION_SECRET_KINDS)
     assert py_kinds == db_kinds, (
-        f"R4 不一致:Python={py_kinds} vs DB={db_kinds};"
-        "改动一处必须同步改另一处"
+        f"R4 不一致:Python={py_kinds} vs DB={db_kinds};改动一处必须同步改另一处"
     )
 
 
@@ -51,9 +50,9 @@ def test_r6_resultset_pydantic_has_no_cursor_field() -> None:
     """Pydantic ResultSet 字段集禁含 cursor* 名。"""
     forbidden = {"cursor", "cursor_id", "db_cursor", "cursor_ref", "_cursor"}
     actual = set(ResultSet.model_fields.keys())
-    assert actual.isdisjoint(
-        forbidden
-    ), f"R6 violation: ResultSet has forbidden fields {actual & forbidden}"
+    assert actual.isdisjoint(forbidden), (
+        f"R6 violation: ResultSet has forbidden fields {actual & forbidden}"
+    )
 
 
 # ─── R6:result_sets DB 表无 cursor 字段(metadata 层) ───
@@ -62,9 +61,9 @@ def test_r6_resultset_pydantic_has_no_cursor_field() -> None:
 def test_r6_result_sets_table_has_no_cursor_column() -> None:
     forbidden = {"cursor", "cursor_id", "db_cursor", "cursor_ref"}
     actual = set(result_sets.columns.keys())
-    assert actual.isdisjoint(
-        forbidden
-    ), f"R6 violation: result_sets has forbidden cols {actual & forbidden}"
+    assert actual.isdisjoint(forbidden), (
+        f"R6 violation: result_sets has forbidden cols {actual & forbidden}"
+    )
 
 
 # ─── R6 源码 AST 层:result.py 任何类都不可定义 cursor* 字段 / 类型注解 ───
@@ -108,14 +107,8 @@ def test_r6_result_py_source_no_cursor_field_in_any_class() -> None:
     """
     result_py = PROJECT_ROOT / "app" / "domain" / "result.py"
     fields = _walk_class_field_names_and_types(result_py)
-    cursor_offenders = [
-        (cls, name, t)
-        for cls, name, t in fields
-        if "cursor" in name.lower()
-    ]
-    assert not cursor_offenders, (
-        f"R6 violation in {result_py}: {cursor_offenders}"
-    )
+    cursor_offenders = [(cls, name, t) for cls, name, t in fields if "cursor" in name.lower()]
+    assert not cursor_offenders, f"R6 violation in {result_py}: {cursor_offenders}"
 
 
 def test_r6_result_py_source_no_dbcursor_type_annotation() -> None:
@@ -127,9 +120,7 @@ def test_r6_result_py_source_no_dbcursor_type_annotation() -> None:
         for cls, name, t in fields
         if t is not None and ("Cursor" in t or "DbCursor" in t)
     ]
-    assert not type_offenders, (
-        f"R6 violation in {result_py}(类型注解含 Cursor): {type_offenders}"
-    )
+    assert not type_offenders, f"R6 violation in {result_py}(类型注解含 Cursor): {type_offenders}"
 
 
 # ─── R7 workflow 节点白名单 ───
