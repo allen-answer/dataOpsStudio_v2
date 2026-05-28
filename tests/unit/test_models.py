@@ -28,6 +28,28 @@ def test_datasources_has_database_name_column() -> None:
     assert datasources.columns["database_name"].nullable is True
 
 
+def test_all_alembic_revision_ids_under_32_chars() -> None:
+    """alembic_version.version_num 默认 VARCHAR(32),revision ID 过长会在
+    UPDATE alembic_version 时触发 StringDataRightTruncation。
+
+    历史教训:0002_add_datasources_database_name(34 字符)在 CI PG 上挂,
+    截短到 0002_datasources_database_name(30 字符)才过。
+    """
+    import re
+    import pathlib
+
+    versions_dir = pathlib.Path(__file__).parent.parent.parent / "app" / "db" / "migrations" / "versions"
+    pattern = re.compile(r'^revision:\s*str\s*=\s*["\'](.+)["\']', re.MULTILINE)
+    violations: list[tuple[str, str, int]] = []
+    for f in versions_dir.glob("[0-9]*.py"):
+        m = pattern.search(f.read_text(encoding="utf-8"))
+        if m:
+            rid = m.group(1)
+            if len(rid) > 32:
+                violations.append((f.name, rid, len(rid)))
+    assert not violations, f"revision ID 超 32 字符: {violations}"
+
+
 def test_metadata_has_10_tables() -> None:
     expected = {
         "users",
