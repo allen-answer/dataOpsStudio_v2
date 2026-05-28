@@ -132,3 +132,78 @@ jobs:
           fi
           echo "$OUTPUT" | grep -q "violates check constraint" || { echo "Unexpected error type"; exit 1; }
           echo "OK: R4 DB CHECK rejected master_key INSERT"
+
+  # ─── R6 integration:真 MySQL service 验连接释放 + spool 独立可读 ───
+  # 跑 @pytest.mark.integration 的 R6 测试(test_mysql_adapter.py 里那条):
+  #   - execute_select 后 Threads_connected 不增长(连接释放)
+  #   - monkeypatch pymysql.connect 失败,fetch_range 仍能读 spool
+  #     (证明数据落地本地 parquet,不在 cursor)
+  # 用临时 mysql:8.0 service container,跑完销毁。每次 push/PR 自动守 R6。
+  #
+  # ★ Gate(临时):T2 (MySQL adapter) 合并前 tests/unit/test_mysql_adapter.py 不存在,
+  #   `pytest -m integration` 收集 0 个测试 exit 5 红整个 job。用 hashFiles 作为
+  #   存在性 gate 跳过本步骤,主 lint/test/gitleaks 三 job 仍绿。
+  #   T2 合并后此 gate 永真,本 job 强制跑。若有人之后删 @pytest.mark.integration
+  #   标记,本 job 仍会因 0 测试 exit 5 红 —— 那时主动关注。
+  mysql-integration:
+    name: MySQL Integration (R6)
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci_test_pwd_not_real_secret
+          MYSQL_DATABASE: app
+          MYSQL_USER: dataops
+          MYSQL_PASSWORD: ci_test_pwd_not_real_secret
+        ports:
+          - 3306:3306
+        # MySQL 8 冷启动 ~30s。health-start-period 给 30s 宽限期(此期间 unhealthy
+        # 不计 retry),其后每 10s ping,20 retry = 最多再等 200s,足够。
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pci_test_pwd_not_real_secret"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 30s
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Sync deps
+        run: uv sync --all-groups
+
+      # 双重保险:GitHub Actions service health check 已等 MySQL ready,
+      # 但本步再 ping 一次确认 + 留可见日志(健康检查日志在 service 容器里,
+      # job 日志看不到,这里再 ping 暴露给 job log)
+      - name: Wait for MySQL ready
+        if: hashFiles('tests/unit/test_mysql_adapter.py') != ''
+        run: |
+          for i in $(seq 1 30); do
+            if mysqladmin ping -h 127.0.0.1 -uroot -pci_test_pwd_not_real_secret --silent 2>/dev/null; then
+              echo "MySQL ready after ${i} attempts"
+              mysql -h 127.0.0.1 -uroot -pci_test_pwd_not_real_secret -e "SHOW DATABASES; SELECT VERSION();" 2>/dev/null
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MySQL did not become ready in 60s"; exit 1
+
+      - name: pytest -m integration (R6 hard evidence)
+        if: hashFiles('tests/unit/test_mysql_adapter.py') != ''
+        env:
+          DATAOPS_TEST_MYSQL_HOST: 127.0.0.1
+          DATAOPS_TEST_MYSQL_PORT: "3306"
+          DATAOPS_TEST_MYSQL_USER: dataops
+          DATAOPS_TEST_MYSQL_PASSWORD: ci_test_pwd_not_real_secret
+          DATAOPS_TEST_MYSQL_DATABASE: app
+        run: uv run pytest -m integration -v
+
+      - name: Skip notice (T2 not yet merged)
+        if: hashFiles('tests/unit/test_mysql_adapter.py') == ''
+        run: echo "::notice::tests/unit/test_mysql_adapter.py 不存在 — T2 (MySQL adapter) 尚未合并,跳过 R6 integration test。T2 合并后本 job 自动启用。"
