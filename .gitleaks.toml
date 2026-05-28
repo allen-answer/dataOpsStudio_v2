@@ -8,30 +8,33 @@
 useDefault = true
 
 # ─── R8 自定义规则:配置文件 / yaml / toml 中明文 password 字段 ───
+# 注:Go RE2 不支持 lookahead,占位符排除走 [rules.allowlist] 的 regexes
 [[rules]]
 id = "r8-plaintext-password-in-config"
 description = "R8 红线:配置文件禁明文 password / secret / api_key 字段"
-# 匹配 yaml/json/toml 风格:
-#   password: "abc"
-#   password = "abc"
-#   "password": "abc"
-# 排除占位符:${VAR} / xxx / placeholder / changeme / null
-regex = '''(?i)(password|passwd|secret|api[_-]?key|token)\s*[:=]\s*["']?(?!.*(\$\{|<.+>|xxx|placeholder|changeme|null|REDACTED))[^\s"'$<{][^\s"']{4,}'''
+regex = '''(?i)(password|passwd|pwd|secret|api[_-]?key|token)\s*[:=]\s*["']?[A-Za-z0-9+/=_-]{8,}'''
 path = '''(?i)\.(ya?ml|json|toml|conf|cfg|ini|env|properties)$'''
 tags = ["R8", "config-file", "secret"]
 
-# ─── 排除规则 ───
+[rules.allowlist]
+description = "占位符 / env var / 测试假值 不是 leak"
+regexTarget = "match"
+regexes = [
+    '''\$\{''',                                          # ${VAR} placeholder
+    '''(?i)(xxx|placeholder|changeme|redacted|none|null)''',
+    '''(?i)(test_pwd|hunter2|secret_pwd|leak_value|leak1|leak2|fakepwd)''',  # 测试假值
+    '''https://''',                                      # 包 URL 含 hash
+]
 
-# pyproject.toml ruff TID251 配置含 "password" 字面量(描述 msg),非凭据
-[[rules.allowlist]]
-description = "ruff TID251 banned-api msg 含 'password' 字样,非凭据"
-paths = ["pyproject.toml"]
-
-# uv.lock 含的是 package URL,非凭据
+# ─── 全局例外 ───
 [allowlist]
-description = "uv.lock 是依赖锁文件,URLs 而非 secret"
+description = "lock 文件 / 文档 / 测试 fixture / venv / lint 规则文件 不参与扫描"
 paths = [
     "uv\\.lock",
     "\\.venv/",
-    ".*\\.md$",   # 文档可含 password 字样(例子/规则说明)
+    ".*\\.md$",                  # docs 含 password 字面说明
+    "tests/.*",                  # 测试 fixture 含假凭据
+    "tools/lint/.*",             # ast-grep 规则说明
+    "docs/.*",
+    ".*\\.lock$",
 ]
