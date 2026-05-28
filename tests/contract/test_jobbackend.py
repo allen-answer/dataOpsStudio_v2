@@ -8,13 +8,19 @@ Codex T1 实现 PostgresJobBackend / ThreadPoolJobBackend 后:
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
+from app.db.models import metadata
 from app.domain.job import Job, JobKind, JobStatus
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
+from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.jobbackend.protocol import JobBackend
 
 pytestmark = pytest.mark.contract
@@ -38,11 +44,14 @@ def _make_job(job_id: str = "j_1", priority: int = 0) -> Job:
 
 @pytest.fixture
 def jobbackend() -> JobBackend:
-    """JobBackend impl —— Codex T1 后改成返回真实实例(PG 或 ThreadPool)。"""
-    pytest.skip("Codex T1(infrastructure/jobbackend/)实现后启用")
+    engine = _pg_engine_or_skip()
+    metadata.create_all(engine)
+    _ensure_owner_project(engine, "u_1", "p_1")
+    backend = PostgresJobBackend(engine, worker_id="worker-1")
+    backend.clear_all_jobs_for_tests()
+    return backend
 
 
-@pytest.mark.skip(reason="Codex T1 implements JobBackend")
 def test_enqueue_then_claim_returns_same_job(jobbackend: JobBackend) -> None:
     job = _make_job()
     jobbackend.enqueue(job)
@@ -53,13 +62,11 @@ def test_enqueue_then_claim_returns_same_job(jobbackend: JobBackend) -> None:
     assert claimed.worker_id == "worker-1"
 
 
-@pytest.mark.skip(reason="Codex T1 implements JobBackend")
 def test_claim_next_returns_none_when_empty(jobbackend: JobBackend) -> None:
     """空队列 claim_next 返回 None,不阻塞。"""
     assert jobbackend.claim_next("worker-1") is None
 
 
-@pytest.mark.skip(reason="Codex T1 implements JobBackend")
 def test_claim_respects_priority_then_fifo(jobbackend: JobBackend) -> None:
     """优先级降序;同优先级 FIFO(created_at 升序)。"""
     low = _make_job("j_low", priority=0)
@@ -70,7 +77,6 @@ def test_claim_respects_priority_then_fifo(jobbackend: JobBackend) -> None:
     assert claimed is not None and claimed.id == "j_high"
 
 
-@pytest.mark.skip(reason="Codex T1 implements JobBackend")
 def test_complete_marks_success_and_attaches_result_ref(jobbackend: JobBackend) -> None:
     job = _make_job()
     jobbackend.enqueue(job)
@@ -81,34 +87,43 @@ def test_complete_marks_success_and_attaches_result_ref(jobbackend: JobBackend) 
     assert jobbackend.claim_next("worker-2") is None
 
 
-@pytest.mark.skip(reason="Codex T1 implements JobBackend")
 def test_fail_marks_failed_with_error(jobbackend: JobBackend) -> None:
     job = _make_job()
     jobbackend.enqueue(job)
     jobbackend.claim_next("worker-1")
     jobbackend.fail(job.id, "syntax error at line 1")
+    assert isinstance(jobbackend, PostgresJobBackend)
+    failed = jobbackend.get_job(job.id)
+    assert failed is not None
+    assert failed.status == JobStatus.FAILED
+    assert failed.error == "syntax error at line 1"
 
 
-@pytest.mark.skip(reason="Codex T1 implements JobBackend")
 def test_request_cancel_sets_flag(jobbackend: JobBackend) -> None:
     """request_cancel 只设标记;真正取消由 worker 安全点检查执行(软取消)。"""
     job = _make_job()
     jobbackend.enqueue(job)
     jobbackend.claim_next("worker-1")
     jobbackend.request_cancel(job.id)
+    assert isinstance(jobbackend, PostgresJobBackend)
+    cancelled = jobbackend.get_job(job.id)
+    assert cancelled is not None
+    assert cancelled.cancel_requested is True
 
 
-@pytest.mark.skip(reason="Codex T1 implements JobBackend")
 def test_heartbeat_updates_last_heartbeat(jobbackend: JobBackend) -> None:
     job = _make_job()
     jobbackend.enqueue(job)
     jobbackend.claim_next("worker-1")
-    _ = datetime.now(UTC)  # 用作时间锚点;Codex 实现后改成真实断言 heartbeat > _
+    before = datetime.now(UTC)
     jobbackend.heartbeat(job.id, "worker-1")
-    # 重新查 job(实现细节由 backend 定),验证 last_heartbeat 推进
+    assert isinstance(jobbackend, PostgresJobBackend)
+    updated = jobbackend.get_job(job.id)
+    assert updated is not None
+    assert updated.last_heartbeat is not None
+    assert updated.last_heartbeat >= before
 
 
-@pytest.mark.skip(reason="Codex T1 implements JobBackend(★ FOR UPDATE SKIP LOCKED 关键性)")
 def test_two_workers_claim_disjoint_jobs(jobbackend: JobBackend) -> None:
     """★ PG queue 关键性质:两 worker 并发 claim 不会拿到同一个 job。
 
@@ -123,3 +138,39 @@ def test_two_workers_claim_disjoint_jobs(jobbackend: JobBackend) -> None:
     c2 = jobbackend.claim_next("worker-2")
     assert c1 is not None and c2 is not None
     assert c1.id != c2.id  # 不同 job
+
+
+def _pg_engine_or_skip() -> Engine:
+    url = os.environ.get("DATAOPS_TEST_PG_URL") or os.environ.get("DATAOPS_DATABASE_URL")
+    if not url:
+        pytest.skip("Postgres JobBackend contract tests require DATAOPS_TEST_PG_URL")
+    return create_engine(url)
+
+
+def _ensure_owner_project(engine: Engine, user_id: str, project_id: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO users (id, username, password_hash)
+                VALUES (:id, :username, :password_hash)
+                ON CONFLICT (id) DO NOTHING
+                """
+            ),
+            {
+                "id": user_id,
+                # R10:不要 f-string 拼前缀;hex 切片即唯一
+                "username": uuid4().hex[:16],
+                "password_hash": "not-a-real-hash",
+            },
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO projects (id, name, owner_user_id)
+                VALUES (:id, :name, :owner_user_id)
+                ON CONFLICT (id) DO NOTHING
+                """
+            ),
+            {"id": project_id, "name": uuid4().hex[:16], "owner_user_id": user_id},
+        )
