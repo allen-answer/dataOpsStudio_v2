@@ -102,6 +102,7 @@ class WorkerConfig(BaseSettings):
     max_concurrent_jobs: int = 2
     heartbeat_interval_seconds: int = 15
     heartbeat_timeout_seconds: int = 600  # 慢首行 OLAP 查询优先避免误杀,见 ADR-0018
+    cancel_check_row_interval: int = 5000  # F3:cancel 查询节流间隔
 
 
 class ResultStoreConfig(BaseSettings):

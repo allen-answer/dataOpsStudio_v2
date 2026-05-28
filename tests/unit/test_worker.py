@@ -46,7 +46,7 @@ def test_worker_cancel_safe_point_marks_cancelled() -> None:
         WorkerRunnerConfig(
             worker_id="worker-1",
             sql_spool_batch_size=1,
-            cancel_check_interval_rows=1,
+            cancel_check_row_interval=1,
         ),
     )
 
@@ -87,8 +87,14 @@ def test_worker_empty_queue_returns_false() -> None:
     assert runner.run_once() is False
 
 
-def test_worker_throttles_cancel_checks_for_large_result_sets() -> None:
-    row_count = 1_000_000
+def test_cancel_check_throttled_to_every_n_rows() -> None:
+    """F3: per-row cancel check is throttled to every 5000 rows."""
+
+    rows = 50_000
+    row_interval = 5000
+    batch_size = 1000
+    flush_per_batch = 1
+    expected_max = (rows // row_interval) + (rows // batch_size) * flush_per_batch + 5
     job = _make_job(payload={"sql": "SELECT many", "result_set_id": "rs-many"})
     backend = _FakeBackend([job])
     result_store = _CountingResultStore()
@@ -97,7 +103,7 @@ def test_worker_throttles_cancel_checks_for_large_result_sets() -> None:
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
     ) -> _RangeAdapter:
-        return _RangeAdapter(row_count, cancel_check=cancel_check)
+        return _RangeAdapter(rows)
 
     runner = WorkerRunner(
         backend,
@@ -106,15 +112,20 @@ def test_worker_throttles_cancel_checks_for_large_result_sets() -> None:
         adapter_factory,
         WorkerRunnerConfig(
             worker_id="worker-1",
-            sql_spool_batch_size=10_000,
-            cancel_check_interval_rows=5000,
+            sql_spool_batch_size=batch_size,
+            cancel_check_row_interval=row_interval,
         ),
     )
 
     assert runner.run_once() is True
 
-    assert result_store.row_count_by_result_set == {"rs-many": row_count}
-    assert backend.cancel_check_count <= (row_count // 5000) + 5
+    assert result_store.row_count_by_result_set == {"rs-many": rows}
+    assert backend.cancel_check_count <= expected_max, (
+        f"F3 节流回归:每行检查重新出现?got {backend.cancel_check_count} > 上限 {expected_max}"
+    )
+    assert backend.cancel_check_count >= rows // row_interval, (
+        f"F3 节流太狠:got {backend.cancel_check_count} < 下限 {rows // row_interval}"
+    )
     assert backend.completed == [("job-1", ResultRef(backend="local_fs", uri="spool/rs-many"))]
 
 
@@ -122,7 +133,7 @@ def test_worker_cancel_still_stops_within_interval() -> None:
     row_count = 20_000
     job = _make_job(payload={"sql": "SELECT many", "result_set_id": "rs-cancel"})
     backend = _FakeBackend([job])
-    backend.cancel_after_checks = 3
+    backend.cancel_after_checks = 2
     result_store = _CountingResultStore()
     adapter_holder: dict[str, _RangeAdapter] = {}
 
@@ -130,7 +141,7 @@ def test_worker_cancel_still_stops_within_interval() -> None:
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
     ) -> _RangeAdapter:
-        adapter = _RangeAdapter(row_count, cancel_check=cancel_check)
+        adapter = _RangeAdapter(row_count)
         adapter_holder["adapter"] = adapter
         return adapter
 
@@ -142,7 +153,7 @@ def test_worker_cancel_still_stops_within_interval() -> None:
         WorkerRunnerConfig(
             worker_id="worker-1",
             sql_spool_batch_size=10_000,
-            cancel_check_interval_rows=5000,
+            cancel_check_row_interval=5000,
         ),
     )
 
@@ -233,15 +244,12 @@ class _FakeAdapter:
 
 
 class _RangeAdapter:
-    def __init__(self, row_count: int, *, cancel_check: Callable[[], bool]) -> None:
+    def __init__(self, row_count: int) -> None:
         self._row_count = row_count
-        self._cancel_check = cancel_check
         self.rows_yielded = 0
 
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
         for index in range(self._row_count):
-            if self._cancel_check():
-                break
             self.rows_yielded += 1
             yield Row(values=[index])
 
