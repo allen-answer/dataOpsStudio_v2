@@ -1,0 +1,41 @@
+# R5 红线(契约 §4)配套:业务代码禁 import stdlib logging
+#
+# 背景:R5 脱敏 processor 配在 structlog 上。stdlib logging 是独立管线,
+# 调 `logging.getLogger(__name__).info(password=pwd)` 会绕过脱敏 processor
+# 直接落盘明文。SecretStore 的"零明文落盘"防线被绕。
+#
+# 不能每次靠 review 抓 —— Codex T3 PR 第一版就用了 stdlib logging,虽然
+# 那一句 log 内容不含敏感数据(只 ref + kind),但模式开了口子,后续任何
+# 加 log 都可能漏。
+#
+# 合法例外(仅这两处):
+#   - app/observability/logging.py  ← R5 structlog wrapper 自己,需要
+#     logging.INFO 等 level 常量去配 make_filtering_bound_logger
+#   - app/db/migrations/env.py      ← Alembic 标准 env.py,用 fileConfig
+#     接 alembic.ini 的 logger config(Alembic 内部用 stdlib logging)
+#
+# 违规即 CI fail。命中后建议改:
+#   import logging                  → import structlog
+#   logger = logging.getLogger(__name__) → logger = structlog.get_logger(__name__)
+
+id: r5-no-stdlib-logging-in-business-code
+language: python
+severity: error
+message: |
+  R5 配套违规:业务代码禁 import stdlib logging(绕过 structlog 脱敏 processor)。
+  改用 structlog.get_logger(__name__);仅 app/observability/logging.py 和
+  app/db/migrations/env.py 允许 import logging。
+
+files:
+  - "app/**/*.py"
+
+ignores:
+  - "app/observability/logging.py"
+  - "app/db/migrations/env.py"
+
+rule:
+  any:
+    - pattern: "import logging"
+    - pattern: "import logging as $_"
+    - pattern: "from logging import $$$"
+    - pattern: "from logging.$_ import $$$"
