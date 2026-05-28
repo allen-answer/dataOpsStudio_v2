@@ -75,6 +75,45 @@ def test_worker_unsupported_kind_fails_job() -> None:
     assert "Unsupported job kind" in backend.failed[0][1]
 
 
+def test_worker_runs_test_connection_job_and_completes() -> None:
+    job = _make_job(kind=JobKind.TEST_CONNECTION, payload={"datasource_id": "ds_1"})
+    backend = _FakeBackend([job])
+    adapter = _FakeAdapter([])
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        lambda conn_info, cancel_check: adapter,
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is True
+
+    assert adapter.test_connection_calls == 1
+    assert backend.completed == [
+        ("job-1", ResultRef(backend="local_fs", uri="test_connection/job-1"))
+    ]
+    assert backend.failed == []
+
+
+def test_worker_failed_test_connection_fails_job() -> None:
+    job = _make_job(kind=JobKind.TEST_CONNECTION, payload={"datasource_id": "ds_1"})
+    backend = _FakeBackend([job])
+    adapter = _FakeAdapter([], test_connection_ok=False)
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        lambda conn_info, cancel_check: adapter,
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.completed == []
+    assert backend.failed == [("job-1", "datasource connection test failed")]
+
+
 def test_worker_empty_queue_returns_false() -> None:
     runner = WorkerRunner(
         _FakeBackend([]),
@@ -236,11 +275,17 @@ class _CountingResultStore:
 
 
 class _FakeAdapter:
-    def __init__(self, rows: list[Row]) -> None:
+    def __init__(self, rows: list[Row], *, test_connection_ok: bool = True) -> None:
         self._rows = rows
+        self._test_connection_ok = test_connection_ok
+        self.test_connection_calls = 0
 
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
         yield from self._rows
+
+    def test_connection(self) -> bool:
+        self.test_connection_calls += 1
+        return self._test_connection_ok
 
 
 class _RangeAdapter:
@@ -252,6 +297,9 @@ class _RangeAdapter:
         for index in range(self._row_count):
             self.rows_yielded += 1
             yield Row(values=[index])
+
+    def test_connection(self) -> bool:
+        return True
 
 
 def _make_job(

@@ -32,6 +32,7 @@ def bootstrap(tmp_path: Path) -> LocalFileBootstrapSecrets:
     _write_secret(config_dir / ".secret_master.key", _fernet_key())
     _write_secret(config_dir / "secrets" / "pg_app_password", b"app-pwd\n")
     _write_secret(config_dir / "secrets" / "pg_superuser_password", b"super-pwd\n")
+    _write_secret(config_dir / "secrets" / "jwt_secret", b"jwt-secret\n")
     return LocalFileBootstrapSecrets.from_config_dir(config_dir)
 
 
@@ -46,6 +47,12 @@ def test_get_pg_app_password_returns_str(bootstrap: LocalFileBootstrapSecrets) -
     pwd = bootstrap.get_pg_app_password()
     assert isinstance(pwd, str)
     assert len(pwd) > 0
+
+
+def test_get_jwt_secret_returns_str(bootstrap: LocalFileBootstrapSecrets) -> None:
+    secret = bootstrap.get_jwt_secret()
+    assert isinstance(secret, str)
+    assert len(secret) > 0
 
 
 def test_get_license_file_optional(bootstrap: LocalFileBootstrapSecrets) -> None:
@@ -74,6 +81,7 @@ def test_unix_rejects_non_0400_permissions(tmp_path: Path) -> None:
     _write_secret(config_dir / ".secret_master.key", _fernet_key(), mode=0o600)
     _write_secret(config_dir / "secrets" / "pg_app_password", b"app-pwd\n")
     _write_secret(config_dir / "secrets" / "pg_superuser_password", b"super-pwd\n")
+    _write_secret(config_dir / "secrets" / "jwt_secret", b"jwt-secret\n")
 
     with pytest.raises(BootstrapSecretPermissionError):
         LocalFileBootstrapSecrets.from_config_dir(config_dir).get_master_key()

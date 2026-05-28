@@ -181,6 +181,7 @@ class BootstrapSecrets:
     def get_master_key(self) -> bytes: ...
     def get_pg_app_password(self) -> str: ...
     def get_pg_superuser_password(self) -> str: ...
+    def get_jwt_secret(self) -> str: ...          # T4 最小补充:API 启动验 JWT,不走 PG
     def get_license_file(self) -> Optional[bytes]: ...
 
 class SecretKind(Enum):
@@ -240,7 +241,7 @@ class AiGateway(Protocol):
 ```python
 class Job:
     id: str
-    kind: Literal["sql_query","sql_explain","compare_run","export_excel",
+    kind: Literal["sql_query","test_connection","sql_explain","compare_run","export_excel",
                   "scenario_materialize","scenario_run_all","workflow_run",
                   "ai_assist_call","ai_copilot_run","lineage_analyze"]
     status: Literal["pending","running","success","failed","cancelled","timeout"]

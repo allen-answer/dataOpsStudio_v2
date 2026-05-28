@@ -61,6 +61,7 @@ class BootstrapPaths(BaseSettings):
     master_key_file: Path = Path("config/.secret_master.key")
     pg_app_password_file: Path = Path("config/secrets/pg_app_password")
     pg_superuser_password_file: Path = Path("config/secrets/pg_superuser_password")
+    jwt_secret_file: Path = Path("config/secrets/jwt_secret")
     license_file: Path = Path("config/license.lic")
 
 
