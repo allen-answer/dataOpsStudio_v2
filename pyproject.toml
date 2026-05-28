@@ -1,0 +1,125 @@
+[project]
+name = "dataops-studio"
+version = "2.0.0a0"
+description = "DataOpsStudio 2.0 — database workbench for data engineers & DBAs"
+requires-python = ">=3.12,<3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "allen-answer" }]
+
+dependencies = [
+    # Web
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    # Data validation & config
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    # Metadata DB (PostgreSQL only — see contract §1 R9)
+    "sqlalchemy>=2.0,<3",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.2",
+    # Observability
+    "structlog>=24.4",
+    "prometheus-client>=0.21",
+    # SQL & data
+    "sqlglot>=25.0",
+    "pyarrow>=18",
+    "pandas>=2.2",
+    # Secret crypto — import allowed ONLY in app/infrastructure/secretstore/ (R3)
+    "cryptography>=43",
+    "bcrypt>=4.2",
+    # License signature verification — Ed25519
+    "pynacl>=1.5",
+]
+
+[project.urls]
+Repository = "https://github.com/allen-answer/dataOpsStudio_v2"
+
+# PEP 735 dependency groups — uv supports natively
+[dependency-groups]
+dev = [
+    "ruff>=0.7",
+    "mypy>=1.13",
+]
+test = [
+    "pytest>=8",
+    "pytest-cov>=5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# uv config
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.uv]
+# uv.lock 提交进 git;portable 形态可复现构建依赖此 lockfile
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ruff — formatter + linter + import policy (R1/R3 红线)
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["app/db/migrations/versions"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle / pyflakes
+    "I",             # isort
+    "B",             # bugbear
+    "UP",            # pyupgrade
+    "TID",           # flake8-tidy-imports —— R1/R3 红线
+    "RUF",
+]
+
+# R1/R3 红线:数据库驱动 + 加密原语的 banned-api。
+# 命中后在指定目录之外 import 即 fail。
+# 见 [tool.ruff.lint.per-file-ignores] 给出例外目录。
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"psycopg".msg                  = "R1: PG 驱动只允许在 app/dbclients/ 或 app/infrastructure/db/、app/db/migrations/ import"
+"oracledb".msg                 = "R1: Oracle 驱动只允许在 app/dbclients/ import"
+"pymysql".msg                  = "R1: MySQL 驱动只允许在 app/dbclients/ import"
+"dmPython".msg                 = "R1: DM 驱动只允许在 app/dbclients/ import"
+"ibm_db".msg                   = "R1: DB2 驱动只允许在 app/dbclients/ import"
+"cryptography.fernet".msg      = "R3: Fernet 只允许在 app/infrastructure/secretstore/ import"
+"cryptography.hazmat".msg      = "R3: cryptography.hazmat 只允许在 app/infrastructure/secretstore/ 或 app/infrastructure/license/ import"
+"bcrypt".msg                   = "R3: bcrypt 只允许在 app/infrastructure/secretstore/ import"
+"nacl".msg                     = "R3: PyNaCl 只允许在 app/infrastructure/license/ import"
+
+# 例外:R1/R3 红线在指定目录内不适用(实现层本就需要 import)。
+[tool.ruff.lint.per-file-ignores]
+"app/dbclients/**"                              = ["TID251"]
+"app/infrastructure/**"                         = ["TID251"]
+"app/db/models.py"                              = ["TID251"]
+"app/db/migrations/**"                          = ["TID251"]
+"tests/**"                                      = ["TID251"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mypy
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+exclude = ["app/db/migrations/versions/"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# pytest
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+minversion = "8"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "contract: 接口契约测试(Codex 实现各 Protocol 后启用)",
+    "e2e: 端到端验收测试(契约 §5 验收路径,2.0.0 骨架完成才转绿)",
+    "slow: 慢测试,默认跑;CI 可单独标记隔离",
+]
