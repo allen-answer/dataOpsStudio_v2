@@ -58,6 +58,17 @@ packages = ["app"]
 [tool.uv]
 # uv.lock 提交进 git;portable 形态可复现构建依赖此 lockfile
 
+# Index 选用 Aliyun PyPI 镜像(公共 CDN,全球可达)。
+# 理由:hosted 部署目标是腾讯云 CVM(契约 B14),国内 PyPI 直连
+# 慢到 ~11KB/s,Aliyun/Tencent mirror 都是几 MB/s。Aliyun 选 universal
+# 也能 fallback 海外。任何 contributor 都能从此 mirror 拉到与 PyPI
+# 同 hash 的 wheel(CDN 镜像,内容一致)。
+# 若日后做国际版 hosted,可改回 PyPI 或加 extra-index。
+[[tool.uv.index]]
+name = "aliyun"
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ruff — formatter + linter + import policy (R1/R3 红线)
 # ─────────────────────────────────────────────────────────────────────────────
