@@ -1,0 +1,23 @@
+# R6 红线(契约 §4):ResultSet 禁止持有 DbCursor / cursor 字段
+# 数据走 spool,DB cursor 在 worker 拉取期间秒级持有即关
+#
+# 本规则覆盖源码层:result.py 内的类不可定义 cursor* 字段
+# AST metadata 层校验在 tests/unit/test_models.py + test_redlines.py
+id: r6-no-cursor-field-in-result-module
+language: python
+severity: error
+message: |
+  R6 红线违规:result.py 内禁止定义 cursor* 字段。
+  ResultSet 走 spool,不长期持有 DB cursor。见契约 §4 R6 / 设计稿 §2.6。
+files:
+  - "app/domain/result.py"
+rule:
+  any:
+    - pattern: "cursor: $$$"
+    - pattern: "db_cursor: $$$"
+    - pattern: "cursor_id: $$$"
+    - pattern: "cursor_ref: $$$"
+    - pattern: "_cursor: $$$"
+    - pattern: "self.cursor = $$$"
+    - pattern: "self.db_cursor = $$$"
+    - pattern: "self._cursor = $$$"

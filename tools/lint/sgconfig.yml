@@ -1,0 +1,7 @@
+# ast-grep 配置(R2 / R6 等 AST 模式红线)
+# 用法:uv run sg scan --config tools/lint/sgconfig.yml
+# 见 .github/workflows/ci.yml(CI 强制)+ Makefile check-redlines(本地)
+
+# 注:路径相对于本 sgconfig.yml 所在目录(不是项目根)
+ruleDirs:
+  - rules

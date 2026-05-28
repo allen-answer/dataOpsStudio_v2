@@ -1,0 +1,37 @@
+# gitleaks 配置(R8 红线 + 通用 secret 扫描)
+# CI 用 gitleaks-action@v2 强制;本地可选
+#
+# extend default rules(覆盖 ~120 个常见 secret patterns)
+# + 自定义:配置文件明文 password 字段
+
+[extend]
+useDefault = true
+
+# ─── R8 自定义规则:配置文件 / yaml / toml 中明文 password 字段 ───
+[[rules]]
+id = "r8-plaintext-password-in-config"
+description = "R8 红线:配置文件禁明文 password / secret / api_key 字段"
+# 匹配 yaml/json/toml 风格:
+#   password: "abc"
+#   password = "abc"
+#   "password": "abc"
+# 排除占位符:${VAR} / xxx / placeholder / changeme / null
+regex = '''(?i)(password|passwd|secret|api[_-]?key|token)\s*[:=]\s*["']?(?!.*(\$\{|<.+>|xxx|placeholder|changeme|null|REDACTED))[^\s"'$<{][^\s"']{4,}'''
+path = '''(?i)\.(ya?ml|json|toml|conf|cfg|ini|env|properties)$'''
+tags = ["R8", "config-file", "secret"]
+
+# ─── 排除规则 ───
+
+# pyproject.toml ruff TID251 配置含 "password" 字面量(描述 msg),非凭据
+[[rules.allowlist]]
+description = "ruff TID251 banned-api msg 含 'password' 字样,非凭据"
+paths = ["pyproject.toml"]
+
+# uv.lock 含的是 package URL,非凭据
+[allowlist]
+description = "uv.lock 是依赖锁文件,URLs 而非 secret"
+paths = [
+    "uv\\.lock",
+    "\\.venv/",
+    ".*\\.md$",   # 文档可含 password 字样(例子/规则说明)
+]

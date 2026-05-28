@@ -39,6 +39,8 @@ Repository = "https://github.com/allen-answer/dataOpsStudio_v2"
 dev = [
     "ruff>=0.7",
     "mypy>=1.13",
+    # ast-grep CLI(R2/R6 等需要 AST 模式匹配的红线)
+    "ast-grep-cli>=0.30",
 ]
 test = [
     "pytest>=8",

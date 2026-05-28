@@ -34,14 +34,15 @@ typecheck:  ## mypy strict
 	$(UV) run mypy app
 
 # ─── 红线检查(分层,见契约 §4) ───
-check-redlines:  ## 跑全部红线检查(R1-R9)
+check-redlines:  ## 跑全部红线检查(R1-R9 本地版,CI 会再 enforce 一遍)
 	@echo "→ R1/R3 import 越界:ruff TID251 banned-api"
-	$(UV) run ruff check app tests
-	@echo "→ R2/R6 字段/调用模式:ast-grep"
-	@command -v ast-grep >/dev/null 2>&1 && ast-grep scan --config tools/lint/sgconfig.yml || echo "  (ast-grep 未装,跳过 —— Step 1.7 在 CI 强制)"
+	$(UV) run ruff check app tests tools
+	@echo "→ R2/R6 字段/调用模式:ast-grep(dev 组依赖,severity=error 自动 exit 1)"
+	$(UV) run sg scan --config tools/lint/sgconfig.yml
 	@echo "→ R8 配置文件明文 secret:gitleaks"
-	@command -v gitleaks >/dev/null 2>&1 && gitleaks detect --no-banner --redact || echo "  (gitleaks 未装,跳过 —— Step 1.7 在 CI 强制)"
-	@echo "→ R4/R5/R7 由单测覆盖:见 pytest"
+	@command -v gitleaks >/dev/null 2>&1 && gitleaks detect --no-banner --redact -c .gitleaks.toml || echo "  (gitleaks 未本地装,CI 会跑)"
+	@echo "→ R4/R5/R6/R7 Python 层:pytest tests/unit/test_redlines.py + test_redaction.py + test_models.py"
+	$(UV) run pytest tests/unit/test_redlines.py tests/unit/test_redaction.py tests/unit/test_models.py -q
 
 # ─── 测试 ───
 test:  ## 跑全部测试
