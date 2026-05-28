@@ -22,7 +22,7 @@ def test_pg_queue_concurrent_claims_are_disjoint() -> None:
     engine = _pg_engine_or_skip()
     owner_id, project_id = _prepare_db(engine)
     backend = PostgresJobBackend(engine)
-    job_ids = [f"claim-{uuid4().hex}" for _ in range(25)]
+    job_ids = [str(uuid4()) for _ in range(25)]
     for index, job_id in enumerate(job_ids):
         backend.enqueue(_make_job(job_id, owner_id, project_id, priority=index % 3))
 
@@ -62,7 +62,7 @@ def test_reaper_requeues_stale_running_jobs_once_under_concurrency() -> None:
     engine = _pg_engine_or_skip()
     owner_id, project_id = _prepare_db(engine)
     backend = PostgresJobBackend(engine, job_default_max_retries=1)
-    job_ids = [f"stale-{uuid4().hex}" for _ in range(12)]
+    job_ids = [str(uuid4()) for _ in range(12)]
     for job_id in job_ids:
         backend.enqueue(_make_job(job_id, owner_id, project_id))
         claimed = backend.claim_next("dead-worker")
@@ -125,7 +125,7 @@ def test_reaper_marks_stale_job_failed_when_retry_budget_exhausted() -> None:
     engine = _pg_engine_or_skip()
     owner_id, project_id = _prepare_db(engine)
     backend = PostgresJobBackend(engine, job_default_max_retries=0)
-    job = _make_job(f"stale-fail-{uuid4().hex}", owner_id, project_id)
+    job = _make_job(str(uuid4()), owner_id, project_id)
     backend.enqueue(job)
     assert backend.claim_next("dead-worker") is not None
     with engine.begin() as conn:
@@ -155,7 +155,7 @@ def test_late_complete_after_requeue_is_ignored_by_worker_id_condition() -> None
     dead_worker_backend = PostgresJobBackend(engine, worker_id="dead-worker")
     reaper_backend = PostgresJobBackend(engine, job_default_max_retries=1)
     new_worker_backend = PostgresJobBackend(engine, worker_id="new-worker")
-    job = _make_job(f"late-complete-{uuid4().hex}", owner_id, project_id)
+    job = _make_job(str(uuid4()), owner_id, project_id)
     dead_worker_backend.enqueue(job)
     assert dead_worker_backend.claim_next("dead-worker") is not None
     with engine.begin() as conn:
@@ -199,8 +199,8 @@ def _pg_engine_or_skip() -> Engine:
 
 def _prepare_db(engine: Engine) -> tuple[str, str]:
     metadata.create_all(engine)
-    owner_id = f"user-{uuid4().hex}"
-    project_id = f"project-{uuid4().hex}"
+    owner_id = str(uuid4())
+    project_id = str(uuid4())
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM job_events"))
         conn.execute(text("DELETE FROM jobs"))
@@ -246,6 +246,6 @@ def _make_job(
         priority=priority,
         timeout_seconds=300,
         resource_profile=ResourceProfile(),
-        audit_id=f"audit-{job_id}",
+        audit_id=str(uuid4()),
         payload={"sql": "SELECT 1"},
     )
