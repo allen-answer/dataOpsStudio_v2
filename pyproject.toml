@@ -134,5 +134,6 @@ addopts = "-ra --strict-markers --strict-config"
 markers = [
     "contract: 接口契约测试(Codex 实现各 Protocol 后启用)",
     "e2e: 端到端验收测试(契约 §5 验收路径,2.0.0 骨架完成才转绿)",
+    "integration: 需要外部服务/真实数据库的手动集成测试,默认缺 env skip",
     "slow: 慢测试,默认跑;CI 可单独标记隔离",
 ]
