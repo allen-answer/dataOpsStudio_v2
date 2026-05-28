@@ -272,10 +272,12 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("false"),
         ),
+        # 裸名 —— NAMING_CONVENTION 会自动加 ck_secret_refs_ 前缀,
+        # 形成 ck_secret_refs_kind_is_application_secret;若此处写全名会双重前缀
         sa.CheckConstraint(
             "kind IN ('datasource_password', 'ai_api_key', 'mfa_totp_seed', "
             "'oauth_token', 'webhook_secret', 'signed_url_secret')",
-            name="ck_secret_refs_kind_is_application_secret",
+            name="kind_is_application_secret",
         ),
     )
     op.create_index("ix_secret_refs_kind", "secret_refs", ["kind"])
@@ -336,7 +338,7 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             "state IN ('streaming', 'complete', 'failed', 'closed')",
-            name="ck_result_sets_state_is_valid",
+            name="state_is_valid",
         ),
     )
     op.create_index(
@@ -372,10 +374,10 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("now()"),
         ),
-        sa.CheckConstraint("id = 1", name="ck_license_state_singleton"),
+        sa.CheckConstraint("id = 1", name="singleton"),
         sa.CheckConstraint(
             "mode IN ('trial', 'valid', 'in_grace', 'repair')",
-            name="ck_license_state_mode_is_valid",
+            name="mode_is_valid",
         ),
     )
 
