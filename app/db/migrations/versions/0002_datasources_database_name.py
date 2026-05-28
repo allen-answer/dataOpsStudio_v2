@@ -1,8 +1,12 @@
 """add datasources.database_name column
 
-Revision ID: 0002_add_datasources_database_name
+Revision ID: 0002_datasources_database_name
 Revises: 0001_initial
 Create Date: 2026-05-28
+
+★ revision 字符串长度 ≤ 32(alembic_version.version_num VARCHAR(32))。
+  本 ID 30 字符,后续 migration ID 命名需控制长度,过长会在 alembic upgrade
+  时 UPDATE alembic_version 阶段触发 StringDataRightTruncation。
 
 修正 Step 1 建 datasources 表时漏的"业务连接的库名/schema/service"列。
 DatasourceConnInfo.database 字段直接映射到本列。
@@ -29,7 +33,7 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "0002_add_datasources_database_name"
+revision: str = "0002_datasources_database_name"
 down_revision: str | None = "0001_initial"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
