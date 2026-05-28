@@ -1,8 +1,14 @@
 # DataOpsStudio 2.0 — dev task runner
 # 详细见各 target 注释。三形态部署/打包等专项命令后续 Step 加入。
 
+# Make 默认 /bin/sh,不读用户 PATH;uv 装在 ~/.local/bin(brew/curl 安装均如此),
+# 需显式加进 PATH 让子进程找到。
+SHELL := /bin/bash
+export PATH := $(HOME)/.local/bin:$(PATH)
+
 .PHONY: help install sync lock fmt lint typecheck test test-unit test-contract test-e2e \
-        check-redlines pg-up pg-down pg-psql alembic-init alembic-up alembic-down clean
+        check-redlines pg-up pg-down pg-down-clean pg-psql \
+        alembic-up alembic-down alembic-current alembic-history alembic-check clean
 
 UV ?= uv
 
@@ -77,27 +83,37 @@ pg-psql:  ## 进入元数据 PG psql
 	docker exec -it dataops-v2-pg psql -U dataops -d dataops
 
 # ─── Alembic ───
-# DATAOPS_DATABASE_URL 拼接,密码取自 POSTGRES_DEV_PASSWORD env(R8)
-DEV_DB_URL = postgresql+psycopg://dataops:$(POSTGRES_DEV_PASSWORD)@127.0.0.1:15432/dataops
+# DATABASE_URL 不含密码(避免 base64 特殊字符破坏 URL 解析);
+# 密码走 PGPASSWORD env —— psycopg3 用 libpq,原生读 PGHOST/PGPORT/PGUSER/PGPASSWORD。
+# R8:密码自始至终是 env 变量,不进任何文件。
+DEV_DB_URL = postgresql+psycopg://dataops@127.0.0.1:15432/dataops
 
 alembic-up:  ## 应用所有迁移到 head
 	@test -n "$$POSTGRES_DEV_PASSWORD" || { echo "POSTGRES_DEV_PASSWORD 未设置"; exit 1; }
-	DATAOPS_DATABASE_URL="$(DEV_DB_URL)" $(UV) run alembic upgrade head
+	PGPASSWORD="$$POSTGRES_DEV_PASSWORD" \
+		DATAOPS_DATABASE_URL="$(DEV_DB_URL)" \
+		$(UV) run alembic upgrade head
 
 alembic-down:  ## 回退一格
 	@test -n "$$POSTGRES_DEV_PASSWORD" || { echo "POSTGRES_DEV_PASSWORD 未设置"; exit 1; }
-	DATAOPS_DATABASE_URL="$(DEV_DB_URL)" $(UV) run alembic downgrade -1
+	PGPASSWORD="$$POSTGRES_DEV_PASSWORD" \
+		DATAOPS_DATABASE_URL="$(DEV_DB_URL)" \
+		$(UV) run alembic downgrade -1
 
 alembic-current:  ## 显示当前 migration 状态
 	@test -n "$$POSTGRES_DEV_PASSWORD" || { echo "POSTGRES_DEV_PASSWORD 未设置"; exit 1; }
-	DATAOPS_DATABASE_URL="$(DEV_DB_URL)" $(UV) run alembic current
+	PGPASSWORD="$$POSTGRES_DEV_PASSWORD" \
+		DATAOPS_DATABASE_URL="$(DEV_DB_URL)" \
+		$(UV) run alembic current
 
-alembic-history:  ## migration 历史
+alembic-history:  ## migration 历史(不连库)
 	$(UV) run alembic history
 
-alembic-check:  ## 校验 metadata 与当前 DB schema 是否一致
+alembic-check:  ## 校验 metadata 与当前 DB schema 是否一致(无 drift)
 	@test -n "$$POSTGRES_DEV_PASSWORD" || { echo "POSTGRES_DEV_PASSWORD 未设置"; exit 1; }
-	DATAOPS_DATABASE_URL="$(DEV_DB_URL)" $(UV) run alembic check
+	PGPASSWORD="$$POSTGRES_DEV_PASSWORD" \
+		DATAOPS_DATABASE_URL="$(DEV_DB_URL)" \
+		$(UV) run alembic check
 
 # ─── 清理 ───
 clean:  ## 清理缓存
