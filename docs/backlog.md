@@ -18,20 +18,6 @@
 
 ---
 
-### **T5 或清理时** — BootstrapSecrets 是 plain class 而非 Protocol(契约一致性)
-
-**位置**:`app/infrastructure/bootstrap/protocol.py`
-
-**现状**:与配对的 `SecretStore (Protocol)` 不一致;契约 §3.3 字面写的也是 `class BootstrapSecrets:`(非 Protocol)。T3 review 时已 flag,Codex T4 加 `get_jwt_secret` 时延续 plain class 风格。
-
-**修法**:类比之前 Step 0 把 AiGateway 从 `class` 改 Protocol —— 同样手法把 BootstrapSecrets 改 Protocol,契约 §3.3 同步更新。
-
-**优先级**:低(plain class 实现可工作,只是与 SecretStore 风格不齐)。可在 T5 或专门清理 PR 处理。
-
-**关联**:Step 0 AiGateway 改 Protocol 的 commit `f575503`。
-
----
-
 ### **可选** — 手写 JWT(HS256)→ PyJWT
 
 **位置**:`app/api/security.py`
@@ -43,22 +29,6 @@
 **修法**:`uv add pyjwt` → `security.py` 切 PyJWT API(create / decode / 处理 jwt.ExpiredSignatureError 等)。
 
 **优先级**:低,可选。当前手写实现没漏洞(看过)。如做 GA 前安全审计时被点,即换。
-
----
-
-### **T1 后随时** — `UnsupportedJobKindError` 复用语义不一致
-
-**位置**:`app/worker.py:121` 和 `app/worker.py:240`
-
-**现状**:同一异常类两处 raise:
-- L121:`Unsupported job kind`(JobKind 不在 2.0.0 支持范围 —— 2.0.0 只 sql_query)
-- L240:`Unsupported datasource db_type`(adapter factory 不支持的 DB 方言)
-
-**问题**:两个不同语义共用一个 exception name,catch 不能区分。
-
-**修法**:拆 `UnsupportedDbTypeError(RuntimeError)`。L240 改用新异常。
-
-**优先级**:不阻塞,不影响功能,只影响 future error handling 清晰度。可与 T4/T5 顺手做。
 
 ---
 
@@ -119,18 +89,6 @@
 **修法**:加两个 list 路由,带 `project_id` filter + pagination。schema 已有 `DatasourceResponse` / `JobResponse`,直接 `list[...]` 包裹。
 
 **优先级**:**★ T7 启动前必前置补完**(Codex 加路由 + 我接 T7)。**最迟修复版本:T7 启动时**。
-
----
-
-### **GA 前必修** — FastAPI `/docs` Swagger UI 默认开,生产暴露过多
-
-**位置**:`app/api/app.py:create_app`
-
-**现状**:`FastAPI(title=..., version=...)` 默认 `/docs` / `/redoc` / `/openapi.json` 全开。dogfood 时正好用它图形化调 API,**但生产 GA 前必须关**(暴露所有路由 + 让任何拿到 token 的人交互式调用)。
-
-**修法**:根据 settings(`DATAOPS_API_EXPOSE_DOCS: bool = False`)决定是否传 `docs_url=None, redoc_url=None`。dev 默认开,prod 默认关。
-
-**优先级**:**GA 前必修**。一行改动。
 
 ---
 

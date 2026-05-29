@@ -9,7 +9,7 @@ from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
 from app.domain.schema import Column, Row
 from app.domain.secret import SecretKind, SecretRef
-from app.worker import WorkerRunner, WorkerRunnerConfig
+from app.worker import UnsupportedDbTypeError, WorkerRunner, WorkerRunnerConfig
 
 
 def test_worker_runs_sql_query_to_spool_and_completes() -> None:
@@ -127,6 +127,34 @@ def test_worker_unsupported_kind_fails_job() -> None:
     assert backend.failed
     assert backend.failed[0][0] == "job-1"
     assert "Unsupported job kind" in backend.failed[0][1]
+
+
+def test_worker_unsupported_db_type_fails_with_precise_message() -> None:
+    job = _make_job(payload={"sql": "SELECT 1", "result_set_id": "rs-1"})
+    backend = _FakeBackend([job])
+
+    def load_oracle_datasource(datasource_id: str) -> DatasourceConnInfo:
+        return _conn_info(datasource_id).model_copy(update={"db_type": DbType.ORACLE})
+
+    def adapter_factory(
+        conn_info: DatasourceConnInfo,
+        cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
+    ) -> _ColumnSinkAdapter:
+        raise UnsupportedDbTypeError(f"Unsupported datasource db_type: {conn_info.db_type.value}")
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        load_oracle_datasource,
+        adapter_factory,
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.completed == []
+    assert backend.failed == [("job-1", "Unsupported datasource db_type: oracle")]
 
 
 def test_worker_runs_test_connection_job_and_completes() -> None:

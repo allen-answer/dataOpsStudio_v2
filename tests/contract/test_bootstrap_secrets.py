@@ -1,8 +1,7 @@
 """BootstrapSecrets 契约测试(契约 §3.3)。
 
-★ 注意:BootstrapSecrets 是 plain class(非 Protocol),与 SecretStore 风格
-不一致(契约抽写差异)。Step 1.3 已按契约字面实现,此契约测试同样按 class
-基类模式。
+BootstrapSecrets 与 SecretStore 一样是 Protocol;LocalFileBootstrapSecrets
+是 portable / on-prem 的文件系统实现。
 
 Codex T3 实现 LocalFile / EnvFile / Kms variants 后:
 1. 实现 bootstrap fixture(各形态参数化)
