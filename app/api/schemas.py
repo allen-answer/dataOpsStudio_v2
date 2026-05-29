@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -51,6 +52,16 @@ class DatasourceResponse(BaseModel):
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
+class DatasourceListItem(BaseModel):
+    id: str
+    name: str
+    db_type: DbType
+    host: str
+    port: int
+    database: str
+    created_at: datetime
+
+
 class DatasourceTestResponse(BaseModel):
     ok: bool
 
@@ -73,6 +84,16 @@ class JobResponse(BaseModel):
     result_set_id: str | None = None
     error: str | None = None
     message: str | None = None
+
+
+class JobListItem(BaseModel):
+    id: str
+    kind: str
+    status: JobStatus
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    error: str | None = None
 
 
 class RowResponse(BaseModel):

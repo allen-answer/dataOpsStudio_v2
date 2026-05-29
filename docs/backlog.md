@@ -52,6 +52,22 @@
 
 ---
 
+### **错误体验** — worker 失败时写结构化对外 error code
+
+**位置**:`app/worker.py` / `app/infrastructure/jobbackend/postgres.py` / `app/api/routes/core.py`
+
+**现状**:`jobs.error` 存 worker 捕获到的原始 `str(exc)`,可能是 DB driver 原文、SQL/schema 信息或连接细节。`GET /api/jobs` 列表端点因此不能直接返回 `jobs.error`,只能基于 `status/kind` 做粗分类(`sql_execution_failed` / `datasource_connection_failed` / `query_timeout` 等)。
+
+**不够用**:同为 `sql_query` 的连接失败和 SQL 执行失败目前无法结构化区分;猜 DB 原文 substring 不可靠且有泄敏风险。
+
+**修法**:worker fail 时写结构化对外 error code(连接 / SQL / 超时 / 权限 / 内部错误等),DB 原文只进审计或脱敏日志。API 列表和详情端点直接返回结构化 code,不在端点侧猜原文。
+
+**触发条件**:T7 错误体验/任务列表 polish 或 GA 前错误分层审计时。
+
+**优先级**:中。当前列表端点已安全但不够精确。
+
+---
+
 ## 来自列元数据通道 review(66715f7)
 
 ### **GA 前 / 多方言适配器对齐时补** — `Column.type` 字段是 driver-specific 字符串
@@ -77,20 +93,6 @@
 ---
 
 ## 来自首次云服务器 dogfood(5f27cc5,§5 真链路跑通)
-
-### ★ **T7 前必修** — 列表端点缺失(`GET /api/datasources` / `GET /api/jobs`)
-
-**位置**:`app/api/routes/core.py`
-
-**现状**:有 `POST /datasources` / `GET /datasources/{id}` / `POST /datasources/{id}/test`,**没有 `GET /datasources` 列项目下我的所有 datasource**。jobs 同理:有 `GET /jobs/{id}`,**没有 `GET /jobs` 列我的近期 job**。
-
-**触发条件**:T7 前端任何 UI 第一屏都需要这两个(datasource 下拉、job 历史列表)。
-
-**修法**:加两个 list 路由,带 `project_id` filter + pagination。schema 已有 `DatasourceResponse` / `JobResponse`,直接 `list[...]` 包裹。
-
-**优先级**:**★ T7 启动前必前置补完**(Codex 加路由 + 我接 T7)。**最迟修复版本:T7 启动时**。
-
----
 
 ### **T5 启动时配齐** — license.lic 缺失,T5 一启 middleware 会拦下所有写
 
