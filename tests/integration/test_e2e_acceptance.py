@@ -23,7 +23,12 @@ from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
 from app.infrastructure.secretstore.local_file import LocalFileSecretStore
-from app.worker import PostgresDatasourceLoader, WorkerRunner, WorkerRunnerConfig
+from app.worker import (
+    PostgresDatasourceLoader,
+    PostgresResultSetCatalog,
+    WorkerRunner,
+    WorkerRunnerConfig,
+)
 from tests._asgi_client import AsgiClient
 
 pytestmark = pytest.mark.integration
@@ -252,6 +257,7 @@ def _start_worker_thread(
             poll_interval_seconds=0.05,
             heartbeat_timeout_seconds=600,
         ),
+        PostgresResultSetCatalog(engine),
     )
 
     def worker_loop() -> None:
