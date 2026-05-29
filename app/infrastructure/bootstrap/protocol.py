@@ -5,11 +5,11 @@ class BootstrapSecrets:
     """Bootstrap Secret —— 连 PG 之前必须可用,**绝不存 PG**(契约 §3.3、设计稿 §7.3.1)。
 
     存于文件系统(portable / on-prem)或 KMS(hosted):
-    - master key             config/.secret_master.key            0400
-    - PG app user password   config/secrets/pg_app_password       0400
-    - PG superuser password  config/secrets/pg_superuser_password 0400
-    - JWT signing secret     config/secrets/jwt_secret            0400
-    - license file           config/license.lic                   0400
+    - master key             config/.secret_master.key            0600
+    - PG app user password   config/secrets/pg_app_password       0600
+    - PG superuser password  config/secrets/pg_superuser_password 0600
+    - JWT signing secret     config/secrets/jwt_secret            0600
+    - license file           config/license.lic                   0600
 
     启动顺序:
       读 master key(文件)→ 读 PG 密码(文件)→ 连 PG

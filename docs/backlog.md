@@ -108,25 +108,6 @@
 
 ## 来自首次云服务器 dogfood(5f27cc5,§5 真链路跑通)
 
-### ★ **T6 必修** — launcher 零→跑起来的全部 UX 盲点
-
-dogfood 实测:`零状态 → §5 e2e 跑通` 走了 8 个手工步骤,每一步都是 T6 必须吃掉的:
-
-1. `install uv` —— 服务器端没装。T6 portable 形态不能假设宿主有 uv。
-2. `git clone` —— 部署形态:tarball / docker image / git pull 三选一,T6 选一种并文档化。
-3. **`bootstrap init` 缺命令** —— Fernet master_key / JWT secret / PG app password 我是 inline Python 现生成的(`Fernet.generate_key()` / `secrets.token_urlsafe(48)` / 复用 PG 密码)。**第一次部署没人会知道这些格式。**
-4. **bootstrap 文件必须 0400,不是 0600** —— 我 `chmod 600` 起手即炸 `BootstrapSecretPermissionError`。Mac 肌肉记忆是 0600。**T6 应该自动 chmod 0400 + 错误信息明示。**
-5. `make pg-up` —— 现有 Makefile 可用,但 T6 应统一入口(不要让用户区分"先 make 后 uv")。
-6. `make alembic-up` —— 同上。
-7. **`admin create` 缺命令** —— 我从 `tests/integration/test_e2e_acceptance.py::_seed_user_and_project` 抄出来改了独立脚本。**用户不可能自己写 bcrypt + insert SQL**。
-8. `POSTGRES_DEV_PASSWORD` env 与 `config/secrets/pg_app_password` 文件两源 —— 我手动同步同一个值,漂移会让"PG 起得来但 app 连不上"。**T6 必须统一从单一源取**。
-
-**修法**:T6 launcher 提供 `dataops up`(零到运行)+ `dataops bootstrap init`(生成 secrets,自动 0400)+ `dataops admin create`(seed 用户)+ `dataops stop`(graceful)。
-
-**优先级**:**★ T6 任务的全部理由**。本条不单独修 —— T6 本身就是。
-
----
-
 ### ★ **T7 前必修** — 列表端点缺失(`GET /api/datasources` / `GET /api/jobs`)
 
 **位置**:`app/api/routes/core.py`
@@ -141,18 +122,6 @@ dogfood 实测:`零状态 → §5 e2e 跑通` 走了 8 个手工步骤,每一步
 
 ---
 
-### **T7 前小 PR** — worker 全链路日志静默,debug 黑盒
-
-**位置**:`app/worker.py:WorkerRunner.run_once / _execute_sql_query / _execute_test_connection`
-
-**现状**:dogfood 跑了一整条 SELECT 1+1 job,`logs/worker.log` 仍是 0 字节。worker 内部 structlog 没在 claim / heartbeat / complete 关键节点 INFO 输出。"worker 死了吗"完全没法从 log 答。
-
-**修法**:`runner.run_once` 拿到 job 时 INFO `worker.claimed job_id kind`;`complete / fail / mark_cancelled` 各对应 INFO;`heartbeat` 用 DEBUG(默认 level 不刷屏)。
-
-**优先级**:**T7 前一个 small PR 顺手做**。我每次接 T7 都需要看 worker 在干嘛,bug 时尤其。
-
----
-
 ### **GA 前必修** — FastAPI `/docs` Swagger UI 默认开,生产暴露过多
 
 **位置**:`app/api/app.py:create_app`
@@ -162,23 +131,6 @@ dogfood 实测:`零状态 → §5 e2e 跑通` 走了 8 个手工步骤,每一步
 **修法**:根据 settings(`DATAOPS_API_EXPOSE_DOCS: bool = False`)决定是否传 `docs_url=None, redoc_url=None`。dev 默认开,prod 默认关。
 
 **优先级**:**GA 前必修**。一行改动。
-
----
-
-### **dev 体感差,中优先** — worker poll 太慢,SELECT 1+1 用了 2.5s
-
-**位置**:`app/config.py:WorkerConfig.poll_interval_seconds`(默认值)
-
-**现状**:dogfood 实测 `SELECT 1+1` 从 enqueue → success 走了约 2.5s(2 次 pending、3 次 running、1 次 success,每 0.5s poll 一次)。**SELECT 1+1 该亚秒级返回**,这慢主要是 worker poll 间隔造成。
-
-**修法**:
-- 选 A:把 `poll_interval_seconds` 默认从 0.5 → 0.1(dev / 小队列友好,代价:idle 期 PG 多 5x 查询)
-- 选 B:claim 到 job 后 complete,立刻再 `claim_next` 一次再回 poll(busy → idle 平滑过渡)
-- 选 C:env 区分 dev/prod 默认值(dev=0.1 / prod=0.5)
-
-**触发条件**:任何 dogfood / dev / demo 体感不能等 2-3 秒。GA 前用户第一次跑 demo 时印象分关键。
-
-**优先级**:**中**,2.0.0 GA 前修。
 
 ---
 

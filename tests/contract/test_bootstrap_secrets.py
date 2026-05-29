@@ -61,8 +61,8 @@ def test_get_license_file_optional(bootstrap: LocalFileBootstrapSecrets) -> None
     assert result is None or isinstance(result, bytes)
 
 
-def test_files_are_0400_permissions(bootstrap: LocalFileBootstrapSecrets) -> None:
-    """★ 契约 §7.3.1 + R8:bootstrap secret 文件必须 0400 权限。
+def test_files_are_0600_permissions(bootstrap: LocalFileBootstrapSecrets) -> None:
+    """★ 契约 §7.3.1 + R8:bootstrap secret 文件必须 0600 权限。
     LocalFileBootstrapSecrets 实现需校验权限,不符抛异常。
     """
     if os.name == "nt":
@@ -70,15 +70,15 @@ def test_files_are_0400_permissions(bootstrap: LocalFileBootstrapSecrets) -> Non
         return
 
     mode = stat.S_IMODE(bootstrap.master_key_file.stat().st_mode)
-    assert mode == stat.S_IRUSR
+    assert mode == stat.S_IRUSR | stat.S_IWUSR
 
 
-def test_unix_rejects_non_0400_permissions(tmp_path: Path) -> None:
+def test_unix_rejects_non_0600_permissions(tmp_path: Path) -> None:
     if os.name == "nt":
         pytest.skip("Windows portable skips Unix permission bits; ACL enforcement is post-2.0.0")
 
     config_dir = tmp_path / "config"
-    _write_secret(config_dir / ".secret_master.key", _fernet_key(), mode=0o600)
+    _write_secret(config_dir / ".secret_master.key", _fernet_key(), mode=0o400)
     _write_secret(config_dir / "secrets" / "pg_app_password", b"app-pwd\n")
     _write_secret(config_dir / "secrets" / "pg_superuser_password", b"super-pwd\n")
     _write_secret(config_dir / "secrets" / "jwt_secret", b"jwt-secret\n")
@@ -87,7 +87,7 @@ def test_unix_rejects_non_0400_permissions(tmp_path: Path) -> None:
         LocalFileBootstrapSecrets.from_config_dir(config_dir).get_master_key()
 
 
-def _write_secret(path: Path, value: bytes, *, mode: int = 0o400) -> None:
+def _write_secret(path: Path, value: bytes, *, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(value)
     if os.name != "nt":

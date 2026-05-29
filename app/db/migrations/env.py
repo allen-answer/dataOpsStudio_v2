@@ -1,8 +1,8 @@
 """Alembic env(同步模板)。
 
 DATABASE URL 由 DATAOPS_DATABASE_URL 环境变量提供,**不在 alembic.ini 明文**
-(R8 红线)。dev 用 Makefile 组装 + POSTGRES_DEV_PASSWORD;portable / on-prem
-由 launcher 读 BootstrapSecrets 后注入。
+(R8 红线)。dev / portable / on-prem 都由 launcher 或 Makefile 从
+BootstrapSecrets 文件读取 PG app password 后注入。
 """
 
 from __future__ import annotations

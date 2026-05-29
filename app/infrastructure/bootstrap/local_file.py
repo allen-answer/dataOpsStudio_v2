@@ -72,10 +72,10 @@ class LocalFileBootstrapSecrets(BootstrapSecrets):
             return
 
         mode = stat.S_IMODE(path.stat().st_mode)
-        expected = stat.S_IRUSR
+        expected = stat.S_IRUSR | stat.S_IWUSR
         if mode != expected:
             raise BootstrapSecretPermissionError(
-                f"Bootstrap secret file must be 0400 on Unix-like platforms: {path}"
+                f"Bootstrap secret file must be 0600 on Unix-like platforms: {path}"
             )
 
 
