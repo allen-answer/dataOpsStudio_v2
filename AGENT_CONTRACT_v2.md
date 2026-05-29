@@ -4,7 +4,7 @@
 > 完整设计见 `docs/design/dataops-2.0-tech-design-v0.3.2.md`(1806 行)。
 > 本文件只保留写代码时**必须遵守的硬约束**。两个 agent 共享此契约。
 >
-> **v2 变更**:新增 §9(1.x 开发期定位)+ §10(前端视觉规范:现代清爽风/天空蓝);前端 T7 由 Codex 改划给 Claude Code。
+> **v2 变更**:新增 §9(1.x 开发期定位)+ §10(前端视觉规范:现代清爽风/天空蓝);前端 T7 由 Codex 改划给 Claude Code;补充 §5 云服务器部署约定。
 >
 > **角色分工**:
 > - **Codex = 主力**,写后端实现(adapter / API / worker / job backend / secretstore / license / migrate)
@@ -336,6 +336,42 @@ docker compose(api+worker+pg)跑通同样流程。
 1.x 数据能 migrate 进 PG(允许个别字段失败)。
 ```
 这条 e2e 通过 = 2.0.0 骨架完成。所有任务最终服务于此。
+
+### ★ 部署 / 冷启动验证约定(模式二:云服务器)
+
+2.0.0 dogfood / 部署默认目标是**云服务器**,不是开发者本地机器。冷启动验证
+(`bootstrap init → pg-up → alembic-up → admin create → API+worker → SELECT 1+1`)
+和实际部署都在云服务器执行。
+
+**登录与凭据来源**:
+- agent 通过专用受限部署账号登录云服务器,**不是 root**。该账号权限只够部署
+  DataOpsStudio,不得假设有无限系统权限。
+- SSH host / user / key path / port 等登录凭据只从运行环境变量读取,例如:
+  `DEPLOY_HOST` / `DEPLOY_USER` / `DEPLOY_SSH_KEY_PATH` / `DEPLOY_PORT`。
+- 凭据**绝对不进 GitHub / 代码 / 文档 / 配置 / commit**:
+  服务器 IP、SSH key、账号、任何密码一律不得写进仓库任何文件。
+- 部署脚本只能使用环境变量占位,如 `$DEPLOY_HOST`;禁止内联真实值。
+- 不得把凭据写进日志、临时文件、注释、commit message;不得在代码/脚本中
+  `echo` 出凭据。
+- 每次 commit 前主动确认没有服务器信息混入。gitleaks 会扫,但 agent 不能只靠
+  gitleaks 兜底。
+
+**操作可见、可审查**:
+- 部署前,agent 必须先告诉人"准备在云服务器执行哪些命令、做什么变更",等待确认
+  后再执行。
+- 禁止静默执行不可逆服务器操作,包括但不限于删数据、覆盖运行目录、改系统配置、
+  改防火墙、安全组、systemd unit。
+- 涉及删除/覆盖服务器已有内容的操作,必须先问人并获得明确确认。
+
+**运行时 secret 边界**:
+- DataOpsStudio 元数据库(PG)凭据由 launcher bootstrap 在服务器上生成。
+- PG 凭据不得与云服务器登录凭据混用,不得带回本地,不得 commit。
+- Bootstrap Secret 仍遵守 §3.3:连 PG 之前读文件系统,绝不存进 `secret_refs`。
+
+**CI 边界**:
+- GitHub Actions integration 测试仍使用 Actions 临时 service container。
+- CI 不连接云服务器,也不读取 `DEPLOY_HOST` / `DEPLOY_USER` /
+  `DEPLOY_SSH_KEY_PATH` 等部署凭据。
 
 ---
 
