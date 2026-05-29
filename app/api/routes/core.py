@@ -13,8 +13,10 @@ from app.api.errors import ApiError
 from app.api.schemas import (
     CancelResponse,
     DatasourceCreateRequest,
+    DatasourceListItem,
     DatasourceResponse,
     DatasourceTestResponse,
+    JobListItem,
     JobResponse,
     JobResultResponse,
     LoginRequest,
@@ -151,6 +153,38 @@ def create_datasource(body: DatasourceCreateRequest, request: Request) -> Dataso
     )
 
 
+@router.get("/datasources", response_model=list[DatasourceListItem])
+def list_datasources(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> list[DatasourceListItem]:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        rows = (
+            conn.execute(
+                select(
+                    datasources.c.id,
+                    datasources.c.name,
+                    datasources.c.db_type,
+                    datasources.c.host,
+                    datasources.c.port,
+                    datasources.c.database_name,
+                    datasources.c.created_at,
+                )
+                .select_from(_datasources_visible_to_user(user.id))
+                .where(_project_access_filter(user.id))
+                .order_by(datasources.c.created_at.desc(), datasources.c.id.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            .mappings()
+            .all()
+        )
+    return [_datasource_list_item(row) for row in rows]
+
+
 @router.get("/datasources/{datasource_id}", response_model=DatasourceResponse)
 def get_datasource(datasource_id: str, request: Request) -> DatasourceResponse:
     row = _datasource_for_current_user(request, datasource_id)
@@ -233,6 +267,50 @@ def execute_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse
         detail={"datasource_id": body.datasource_id},
     )
     return SqlExecuteResponse(job_id=job_id, result_set_id=result_set_id)
+
+
+@router.get("/jobs", response_model=list[JobListItem])
+def list_jobs(
+    request: Request,
+    status: JobStatus | None = None,
+    project_id: str | None = None,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list[JobListItem]:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        if project_id is not None:
+            _require_project_access(conn, project_id, user.id)
+
+        filters = [jobs.c.owner_user_id == user.id]
+        if status is not None:
+            filters.append(jobs.c.status == status.value)
+        if project_id is not None:
+            filters.append(jobs.c.project_id == project_id)
+
+        rows = (
+            conn.execute(
+                select(
+                    jobs.c.id,
+                    jobs.c.kind,
+                    jobs.c.status,
+                    jobs.c.created_at,
+                    jobs.c.started_at,
+                    jobs.c.finished_at,
+                    jobs.c.error,
+                )
+                .select_from(_jobs_visible_to_user(user.id))
+                .where(_project_access_filter(user.id))
+                .where(and_(*filters))
+                .order_by(jobs.c.created_at.desc(), jobs.c.id.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            .mappings()
+            .all()
+        )
+    return [_job_list_item(row) for row in rows]
 
 
 @router.get("/jobs/{job_id}", response_model=JobResponse)
@@ -332,6 +410,30 @@ def _require_project_access(conn: Connection, project_id: str, user_id: str) -> 
         raise ApiError(404, "not_found", "Project not found")
 
 
+def _datasources_visible_to_user(user_id: str) -> Any:
+    return datasources.join(projects, datasources.c.project_id == projects.c.id).outerjoin(
+        project_members,
+        and_(
+            project_members.c.project_id == projects.c.id,
+            project_members.c.user_id == user_id,
+        ),
+    )
+
+
+def _jobs_visible_to_user(user_id: str) -> Any:
+    return jobs.join(projects, jobs.c.project_id == projects.c.id).outerjoin(
+        project_members,
+        and_(
+            project_members.c.project_id == projects.c.id,
+            project_members.c.user_id == user_id,
+        ),
+    )
+
+
+def _project_access_filter(user_id: str) -> Any:
+    return or_(projects.c.owner_user_id == user_id, project_members.c.user_id == user_id)
+
+
 def _wait_for_job_terminal(services: ApiServices, job_id: str) -> JobStatus | None:
     deadline = time.monotonic() + services.job_wait_timeout_seconds
     while time.monotonic() < deadline:
@@ -358,6 +460,18 @@ def _datasource_response(row: RowMapping) -> DatasourceResponse:
     )
 
 
+def _datasource_list_item(row: RowMapping) -> DatasourceListItem:
+    return DatasourceListItem(
+        id=str(row["id"]),
+        name=str(row["name"]),
+        db_type=DbType(str(row["db_type"])),
+        host=str(row["host"]),
+        port=int(row["port"]),
+        database=row["database_name"] if row["database_name"] is not None else None,
+        created_at=row["created_at"],
+    )
+
+
 def _job_response(row: RowMapping) -> JobResponse:
     status = JobStatus(str(row["status"]))
     return JobResponse(
@@ -368,6 +482,39 @@ def _job_response(row: RowMapping) -> JobResponse:
         error="job_failed" if status is JobStatus.FAILED else None,
         message="Job failed" if status is JobStatus.FAILED else None,
     )
+
+
+def _job_list_item(row: RowMapping) -> JobListItem:
+    status = JobStatus(str(row["status"]))
+    return JobListItem(
+        id=str(row["id"]),
+        kind=str(row["kind"]),
+        status=status,
+        created_at=row["created_at"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        error=_safe_job_error(
+            status=status,
+            kind=str(row["kind"]),
+            stored_error=_optional_str(row["error"]),
+        ),
+    )
+
+
+def _safe_job_error(*, status: JobStatus, kind: str, stored_error: str | None) -> str | None:
+    if status is JobStatus.CANCELLED:
+        return "cancelled"
+    if status is JobStatus.TIMEOUT:
+        return "query_timeout"
+    if stored_error == "worker heartbeat timed out":
+        return "query_timeout"
+    if status is not JobStatus.FAILED:
+        return None
+    if kind == JobKind.TEST_CONNECTION.value:
+        return "datasource_connection_failed"
+    if kind == JobKind.SQL_QUERY.value:
+        return "sql_execution_failed"
+    return "job_failed"
 
 
 def _result_set_id_from_payload(row: RowMapping) -> str | None:
