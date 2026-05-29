@@ -276,3 +276,94 @@ jobs:
       - name: Skip notice (T1 not yet merged)
         if: hashFiles('tests/integration/test_postgres_jobbackend.py') == ''
         run: echo "::notice::tests/integration/test_postgres_jobbackend.py 不存在 — T1 (PG JobBackend) 尚未合并,跳过 PG queue 并发 integration test。T1 合并后本 job 自动启用。"
+
+  # ─── e2e 双服务硬证据:契约 §5 验收路径(login → datasource → /test → SQL → /result) ───
+  # 跑 tests/integration/test_e2e_acceptance.py(需要 PG + MySQL 都在)。
+  # 这条 e2e 是 T4 + 2.0.0 骨架立住的核心判据 —— 前面 mysql-integration /
+  # pg-integration 各只跑一半服务,e2e 被双 skip,等于契约 §5 验收从没真跑过。
+  # T4 起本 job 真验证。
+  #
+  # ★ Gate:T4 (API + middleware) 合并前 tests/integration/test_e2e_acceptance.py
+  #   不存在,本 job 跳过(其它 5 job 仍绿)。T4 合并后 gate 永真,强制真跑。
+  e2e-integration:
+    name: E2E Acceptance (contract §5 hard evidence)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: dataops
+          POSTGRES_PASSWORD: ci_test_pwd_not_real_secret
+          POSTGRES_DB: dataops
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci_test_pwd_not_real_secret
+          MYSQL_DATABASE: app
+          MYSQL_USER: dataops
+          MYSQL_PASSWORD: ci_test_pwd_not_real_secret
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pci_test_pwd_not_real_secret"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 30s
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Sync deps
+        run: uv sync --all-groups
+
+      - name: Wait for PG ready
+        if: hashFiles('tests/integration/test_e2e_acceptance.py') != ''
+        env:
+          PGPASSWORD: ci_test_pwd_not_real_secret
+        run: |
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 15432 -U dataops -d dataops -q 2>/dev/null; then
+              echo "PG ready after ${i} attempts"; exit 0
+            fi
+            sleep 2
+          done
+          echo "PG did not become ready in 60s"; exit 1
+
+      - name: Wait for MySQL ready
+        if: hashFiles('tests/integration/test_e2e_acceptance.py') != ''
+        run: |
+          for i in $(seq 1 30); do
+            if mysqladmin ping -h 127.0.0.1 -uroot -pci_test_pwd_not_real_secret --silent 2>/dev/null; then
+              echo "MySQL ready after ${i} attempts"; exit 0
+            fi
+            sleep 2
+          done
+          echo "MySQL did not become ready in 60s"; exit 1
+
+      - name: pytest e2e acceptance (real PG + real MySQL)
+        if: hashFiles('tests/integration/test_e2e_acceptance.py') != ''
+        env:
+          DATAOPS_TEST_PG_URL: postgresql+psycopg://dataops:ci_test_pwd_not_real_secret@127.0.0.1:15432/dataops
+          DATAOPS_TEST_MYSQL_HOST: 127.0.0.1
+          DATAOPS_TEST_MYSQL_PORT: "3306"
+          DATAOPS_TEST_MYSQL_USER: dataops
+          DATAOPS_TEST_MYSQL_PASSWORD: ci_test_pwd_not_real_secret
+          DATAOPS_TEST_MYSQL_DATABASE: app
+        run: uv run pytest tests/integration/test_e2e_acceptance.py -v
+
+      - name: Skip notice (T4 not yet merged)
+        if: hashFiles('tests/integration/test_e2e_acceptance.py') == ''
+        run: echo "::notice::tests/integration/test_e2e_acceptance.py 不存在 — T4 尚未合并,跳过契约 §5 e2e。T4 合并后本 job 自动启用。"

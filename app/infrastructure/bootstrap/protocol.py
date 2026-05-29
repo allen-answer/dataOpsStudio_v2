@@ -8,6 +8,7 @@ class BootstrapSecrets:
     - master key             config/.secret_master.key            0400
     - PG app user password   config/secrets/pg_app_password       0400
     - PG superuser password  config/secrets/pg_superuser_password 0400
+    - JWT signing secret     config/secrets/jwt_secret            0400
     - license file           config/license.lic                   0400
 
     启动顺序:
@@ -28,6 +29,9 @@ class BootstrapSecrets:
         raise NotImplementedError
 
     def get_pg_superuser_password(self) -> str:
+        raise NotImplementedError
+
+    def get_jwt_secret(self) -> str:
         raise NotImplementedError
 
     def get_license_file(self) -> bytes | None:

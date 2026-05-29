@@ -24,6 +24,7 @@ class LocalFileBootstrapSecrets(BootstrapSecrets):
     master_key_file: Path = Path("config/.secret_master.key")
     pg_app_password_file: Path = Path("config/secrets/pg_app_password")
     pg_superuser_password_file: Path = Path("config/secrets/pg_superuser_password")
+    jwt_secret_file: Path = Path("config/secrets/jwt_secret")
     license_file: Path = Path("config/license.lic")
 
     @classmethod
@@ -33,6 +34,7 @@ class LocalFileBootstrapSecrets(BootstrapSecrets):
             master_key_file=root / ".secret_master.key",
             pg_app_password_file=root / "secrets" / "pg_app_password",
             pg_superuser_password_file=root / "secrets" / "pg_superuser_password",
+            jwt_secret_file=root / "secrets" / "jwt_secret",
             license_file=root / "license.lic",
         )
 
@@ -44,6 +46,9 @@ class LocalFileBootstrapSecrets(BootstrapSecrets):
 
     def get_pg_superuser_password(self) -> str:
         return self._read_required_text(self.pg_superuser_password_file)
+
+    def get_jwt_secret(self) -> str:
+        return self._read_required_text(self.jwt_secret_file)
 
     def get_license_file(self) -> bytes | None:
         if not self.license_file.exists():

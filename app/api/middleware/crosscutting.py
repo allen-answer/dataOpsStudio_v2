@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from uuid import uuid4
+
+import structlog
+from fastapi import Request, Response
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
+
+from app.api.errors import error_response
+from app.api.security import CurrentUser, JwtError, bearer_token, decode_access_token
+from app.api.services import ApiServices
+from app.domain.license import LicenseMode
+
+logger = structlog.get_logger(__name__)
+
+_PUBLIC_PATHS = frozenset({"/api/auth/login", "/healthz"})
+_REPAIR_RESTRICTED = frozenset(
+    {
+        ("POST", "/api/datasources"),
+        ("POST", "/api/sql/execute"),
+    }
+)
+
+
+class CrossCuttingMiddleware(BaseHTTPMiddleware):
+    """RequestId → AuthN → License → RateLimit → Audit → handler → Audit."""
+
+    def __init__(self, app: ASGIApp, *, services: ApiServices) -> None:
+        super().__init__(app)
+        self._services = services
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        request_id = request.headers.get("X-Request-ID") or str(uuid4())
+        request.state.request_id = request_id
+        request.state.user = None
+        path = request.url.path
+
+        auth_response = self._authenticate(request)
+        if auth_response is not None:
+            auth_response.headers["X-Request-ID"] = request_id
+            return auth_response
+
+        license_response = self._check_license(request)
+        if license_response is not None:
+            license_response.headers["X-Request-ID"] = request_id
+            return license_response
+
+        rate_response = self._rate_limit(request)
+        if rate_response is not None:
+            rate_response.headers["X-Request-ID"] = request_id
+            return rate_response
+
+        user = _request_user(request)
+        client_ip = request.client.host if request.client else None
+        user_agent = request.headers.get("user-agent")
+        self._services.write_audit(
+            user_id=user.id if user else None,
+            project_id=None,
+            action="api_request_start",
+            resource_type="http",
+            resource_id=f"{request.method} {path}",
+            result="started",
+            request_id=request_id,
+            ip=client_ip,
+            user_agent=user_agent,
+        )
+
+        try:
+            response = await call_next(request)
+        except Exception:
+            self._services.write_audit(
+                user_id=user.id if user else None,
+                project_id=None,
+                action="api_request_end",
+                resource_type="http",
+                resource_id=f"{request.method} {path}",
+                result="error",
+                request_id=request_id,
+                ip=client_ip,
+                user_agent=user_agent,
+            )
+            logger.exception("api request failed", request_id=request_id, path=path)
+            raise
+
+        result = "success" if response.status_code < 400 else "denied"
+        self._services.write_audit(
+            user_id=user.id if user else None,
+            project_id=None,
+            action="api_request_end",
+            resource_type="http",
+            resource_id=f"{request.method} {path}",
+            result=result,
+            request_id=request_id,
+            ip=client_ip,
+            user_agent=user_agent,
+            detail={"status_code": response.status_code},
+        )
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    def _authenticate(self, request: Request) -> Response | None:
+        if request.url.path in _PUBLIC_PATHS:
+            return None
+        try:
+            token = bearer_token(request.headers.get("authorization"))
+            claims = decode_access_token(token, secret=self._services.jwt_secret)
+        except JwtError:
+            return error_response(401, "unauthorized", "Authentication required")
+        request.state.user = CurrentUser(id=claims.user_id, role=claims.role)
+        return None
+
+    def _check_license(self, request: Request) -> Response | None:
+        if request.url.path in _PUBLIC_PATHS:
+            return None
+        if self._services.current_license_mode() is not LicenseMode.REPAIR:
+            return None
+        if _is_repair_restricted(request):
+            return error_response(
+                403,
+                "license_repair_mode",
+                "This action is disabled while license repair is required",
+            )
+        return None
+
+    def _rate_limit(self, request: Request) -> Response | None:
+        key = request.client.host if request.client else "unknown"
+        if self._services.rate_limiter.allow(key):
+            return None
+        return error_response(429, "rate_limited", "Too many requests")
+
+
+def _is_repair_restricted(request: Request) -> bool:
+    method = request.method.upper()
+    path = request.url.path
+    if (method, path) in _REPAIR_RESTRICTED:
+        return True
+    return method == "POST" and path.startswith("/api/datasources/") and path.endswith("/test")
+
+
+def _request_user(request: Request) -> CurrentUser | None:
+    user = getattr(request.state, "user", None)
+    return user if isinstance(user, CurrentUser) else None

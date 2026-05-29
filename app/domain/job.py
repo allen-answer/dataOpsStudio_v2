@@ -21,6 +21,7 @@ class JobKind(StrEnum):
     """
 
     SQL_QUERY = "sql_query"
+    TEST_CONNECTION = "test_connection"
     SQL_EXPLAIN = "sql_explain"
     COMPARE_RUN = "compare_run"
     EXPORT_EXCEL = "export_excel"
