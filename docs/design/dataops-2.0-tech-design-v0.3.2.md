@@ -1136,7 +1136,7 @@ launcher 启动 PG 阶段:
    ├─ 不存在 → initdb
    │   ├─ 生成 PG superuser 密码(随机 32 字节)
    │   ├─ 生成 PG app user(dataops)+ 密码(随机 32 字节)
-   │   ├─ 密码写入 config/secrets/(Bootstrap Secret,见 §7,权限 0400)
+   │   ├─ 密码写入 config/secrets/(Bootstrap Secret,见 §7,权限 0600)
    │   └─ 写 postgresql.conf + pg_hba.conf
    └─ 存在 → 跳过 initdb
 2. 探测端口:默认 127.0.0.1:15432,占用则递增 15433~15499
@@ -1213,9 +1213,9 @@ DataOpsStudio-portable/
 ├── config/
 │   ├── dataops.yml
 │   ├── runtime.json           # 自动生成:实际 PG/API 端口
-│   ├── .secret_master.key     # Bootstrap: master key,0400
+│   ├── .secret_master.key     # Bootstrap: master key,0600
 │   ├── license.lic            # Bootstrap: license
-│   └── secrets/               # Bootstrap secrets,0400
+│   └── secrets/               # Bootstrap secrets,0600
 │       ├── pg_app_password
 │       └── pg_superuser_password
 ├── data/
@@ -1295,10 +1295,10 @@ DataOpsStudio-portable/
 
 | Bootstrap Secret | 位置 | 权限 |
 |---|---|---|
-| master key | `config/.secret_master.key` | 0400 |
-| PG app user password | `config/secrets/pg_app_password` | 0400 |
-| PG superuser password | `config/secrets/pg_superuser_password` | 0400 |
-| license file | `config/license.lic` | 0400 |
+| master key | `config/.secret_master.key` | 0600 |
+| PG app user password | `config/secrets/pg_app_password` | 0600 |
+| PG superuser password | `config/secrets/pg_superuser_password` | 0600 |
+| license file | `config/license.lic` | 0600 |
 
 形态差异:
 
@@ -1358,7 +1358,7 @@ CI 检查:gitleaks + config 明文字段检测 + 业务模块直接读 `ds["pass
 
 ### 7.6 master key 管理与轮换
 
-- portable / on-prem:首次启动生成 32 字节随机 key,写 0400 文件;客户**必须手动备份**(不备份 = 数据无法恢复,文档强调)
+- portable / on-prem:首次启动生成 32 字节随机 key,写 0600 文件;客户**必须手动备份**(不备份 = 数据无法恢复,文档强调)
 - hosted:KMS 自动管理
 - 轮换:`rotate-master-key` admin 命令——旧 key 解密所有 Application Secret → 新 key 重加密 → 写回。Bootstrap Secret(PG 密码等)单独轮换。
 

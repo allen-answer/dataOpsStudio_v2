@@ -60,12 +60,14 @@ test-e2e:  ## tests/e2e/(默认 xfail,2.0.0 骨架完成才转绿)
 	$(UV) run pytest tests/e2e
 
 # ─── 元数据 PG(dev) ───
-# 启动前需要先 export POSTGRES_DEV_PASSWORD=$(openssl rand -base64 24)
-# R8:不写明文密码到任何配置/脚本,docker-compose 用 env var,失败有提示
+# PG app password 统一来自 config/secrets/pg_app_password。
+# 先运行: uv run python -m app.launcher bootstrap init
+PG_APP_PASSWORD_FILE ?= config/secrets/pg_app_password
+
 pg-up:  ## 起元数据 PG 容器(端口 127.0.0.1:15432,与 1.x 隔离)
-	@test -n "$$POSTGRES_DEV_PASSWORD" || { \
-		echo "POSTGRES_DEV_PASSWORD 未设置。请运行:"; \
-		echo "  export POSTGRES_DEV_PASSWORD=\$$(openssl rand -base64 24)"; \
+	@test -r "$(PG_APP_PASSWORD_FILE)" || { \
+		echo "$(PG_APP_PASSWORD_FILE) 不存在。请先运行:"; \
+		echo "  uv run python -m app.launcher bootstrap init"; \
 		exit 1; \
 	}
 	docker compose -f docker/dev-pg.yml up -d
@@ -92,20 +94,20 @@ pg-psql:  ## 进入元数据 PG psql
 DEV_DB_URL = postgresql+psycopg://dataops@127.0.0.1:15432/dataops
 
 alembic-up:  ## 应用所有迁移到 head
-	@test -n "$$POSTGRES_DEV_PASSWORD" || { echo "POSTGRES_DEV_PASSWORD 未设置"; exit 1; }
-	PGPASSWORD="$$POSTGRES_DEV_PASSWORD" \
+	@test -r "$(PG_APP_PASSWORD_FILE)" || { echo "$(PG_APP_PASSWORD_FILE) 不存在"; exit 1; }
+	PGPASSWORD="$$(cat "$(PG_APP_PASSWORD_FILE)")" \
 		DATAOPS_DATABASE_URL="$(DEV_DB_URL)" \
 		$(UV) run alembic upgrade head
 
 alembic-down:  ## 回退一格
-	@test -n "$$POSTGRES_DEV_PASSWORD" || { echo "POSTGRES_DEV_PASSWORD 未设置"; exit 1; }
-	PGPASSWORD="$$POSTGRES_DEV_PASSWORD" \
+	@test -r "$(PG_APP_PASSWORD_FILE)" || { echo "$(PG_APP_PASSWORD_FILE) 不存在"; exit 1; }
+	PGPASSWORD="$$(cat "$(PG_APP_PASSWORD_FILE)")" \
 		DATAOPS_DATABASE_URL="$(DEV_DB_URL)" \
 		$(UV) run alembic downgrade -1
 
 alembic-current:  ## 显示当前 migration 状态
-	@test -n "$$POSTGRES_DEV_PASSWORD" || { echo "POSTGRES_DEV_PASSWORD 未设置"; exit 1; }
-	PGPASSWORD="$$POSTGRES_DEV_PASSWORD" \
+	@test -r "$(PG_APP_PASSWORD_FILE)" || { echo "$(PG_APP_PASSWORD_FILE) 不存在"; exit 1; }
+	PGPASSWORD="$$(cat "$(PG_APP_PASSWORD_FILE)")" \
 		DATAOPS_DATABASE_URL="$(DEV_DB_URL)" \
 		$(UV) run alembic current
 
@@ -113,8 +115,8 @@ alembic-history:  ## migration 历史(不连库)
 	$(UV) run alembic history
 
 alembic-check:  ## 校验 metadata 与当前 DB schema 是否一致(无 drift)
-	@test -n "$$POSTGRES_DEV_PASSWORD" || { echo "POSTGRES_DEV_PASSWORD 未设置"; exit 1; }
-	PGPASSWORD="$$POSTGRES_DEV_PASSWORD" \
+	@test -r "$(PG_APP_PASSWORD_FILE)" || { echo "$(PG_APP_PASSWORD_FILE) 不存在"; exit 1; }
+	PGPASSWORD="$$(cat "$(PG_APP_PASSWORD_FILE)")" \
 		DATAOPS_DATABASE_URL="$(DEV_DB_URL)" \
 		$(UV) run alembic check
 

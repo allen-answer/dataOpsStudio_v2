@@ -102,6 +102,12 @@ class WorkerRunnerConfig:
     cancel_check_row_interval: int = 5000
 
 
+@dataclass(frozen=True)
+class _ExecutionOutcome:
+    result_ref: ResultRef
+    loaded_rows: int | None = None
+
+
 class WorkerRunner:
     def __init__(
         self,
@@ -134,31 +140,64 @@ class WorkerRunner:
                 time.sleep(self._config.poll_interval_seconds)
 
     def run_once(self) -> bool:
-        self._backend.reap_stale_running_jobs(self._config.heartbeat_timeout_seconds)
+        reap_report = self._backend.reap_stale_running_jobs(self._config.heartbeat_timeout_seconds)
+        _log_reap_report(reap_report)
         job = self._backend.claim_next(self._config.worker_id)
         if job is None:
             return False
+        logger.info(
+            "worker job claimed",
+            job_id=job.id,
+            kind=job.kind.value,
+            worker_id=self._config.worker_id,
+        )
         self._execute_claimed_job(job)
         return True
 
     def _execute_claimed_job(self, job: Job) -> None:
+        started_at = time.monotonic()
+        logger.info(
+            "worker job start",
+            job_id=job.id,
+            kind=job.kind.value,
+            worker_id=self._config.worker_id,
+        )
         try:
             self._check_cancel(job.id)
             if job.kind is JobKind.TEST_CONNECTION:
-                result_ref = self._execute_test_connection(job)
+                outcome = self._execute_test_connection(job)
             elif job.kind is JobKind.SQL_QUERY:
-                result_ref = self._execute_sql_query(job)
+                outcome = self._execute_sql_query(job)
             else:
                 raise UnsupportedJobKindError(f"Unsupported job kind: {job.kind.value}")
         except JobCancelled as exc:
             self._backend.mark_cancelled(job.id, str(exc))
+            logger.info(
+                "worker job cancelled",
+                job_id=job.id,
+                kind=job.kind.value,
+                elapsed_seconds=_elapsed_seconds(started_at),
+            )
         except Exception as exc:
             self._backend.fail(job.id, str(exc))
-            logger.exception("worker job failed", job_id=job.id, kind=job.kind.value)
+            logger.exception(
+                "worker job failed",
+                job_id=job.id,
+                kind=job.kind.value,
+                error_type=type(exc).__name__,
+                elapsed_seconds=_elapsed_seconds(started_at),
+            )
         else:
-            self._backend.complete(job.id, result_ref)
+            self._backend.complete(job.id, outcome.result_ref)
+            logger.info(
+                "worker job complete",
+                job_id=job.id,
+                kind=job.kind.value,
+                loaded_rows=outcome.loaded_rows,
+                elapsed_seconds=_elapsed_seconds(started_at),
+            )
 
-    def _execute_sql_query(self, job: Job) -> ResultRef:
+    def _execute_sql_query(self, job: Job) -> _ExecutionOutcome:
         payload = job.payload
         sql = _required_payload_str(payload, "sql")
         params = _payload_params(payload)
@@ -198,12 +237,16 @@ class WorkerRunner:
 
         if batch:
             self._flush_batch(job.id, result_set_id, batch)
-        self._backend.heartbeat(job.id, self._config.worker_id)
+        self._heartbeat(job.id)
         result_ref = self._result_store.spool_ref(result_set_id)
         self._write_result_set_catalog(job, result_set_id, result_ref, columns or [])
-        return result_ref
+        manifest = self._result_store.get_spool_manifest(result_set_id)
+        return _ExecutionOutcome(
+            result_ref=result_ref,
+            loaded_rows=_manifest_int(manifest, "loaded_rows"),
+        )
 
-    def _execute_test_connection(self, job: Job) -> ResultRef:
+    def _execute_test_connection(self, job: Job) -> _ExecutionOutcome:
         datasource_id = _payload_datasource_id(job)
         datasource = self._datasource_loader(datasource_id)
         adapter = self._adapter_factory(
@@ -213,8 +256,8 @@ class WorkerRunner:
         )
         if not adapter.test_connection():
             raise RuntimeError("datasource connection test failed")
-        self._backend.heartbeat(job.id, self._config.worker_id)
-        return ResultRef(backend="local_fs", uri=f"test_connection/{job.id}")
+        self._heartbeat(job.id)
+        return _ExecutionOutcome(ResultRef(backend="local_fs", uri=f"test_connection/{job.id}"))
 
     def _flush_batch(self, job_id: str, result_set_id: str, batch: list[Row]) -> None:
         # Cancel during append_spool is caught at the next batch or row interval.
@@ -230,9 +273,17 @@ class WorkerRunner:
     ) -> float:
         now = time.monotonic()
         if force or now - last_heartbeat >= self._config.heartbeat_interval_seconds:
-            self._backend.heartbeat(job_id, self._config.worker_id)
+            self._heartbeat(job_id)
             return now
         return last_heartbeat
+
+    def _heartbeat(self, job_id: str) -> None:
+        self._backend.heartbeat(job_id, self._config.worker_id)
+        logger.debug(
+            "worker job heartbeat",
+            job_id=job_id,
+            worker_id=self._config.worker_id,
+        )
 
     def _check_cancel(self, job_id: str) -> None:
         if self._backend.is_cancel_requested(job_id):
@@ -366,6 +417,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
             worker_id=actual_settings.worker.worker_id,
             heartbeat_interval_seconds=actual_settings.worker.heartbeat_interval_seconds,
             heartbeat_timeout_seconds=actual_settings.worker.heartbeat_timeout_seconds,
+            poll_interval_seconds=actual_settings.worker.poll_interval_seconds,
             cancel_check_row_interval=actual_settings.worker.cancel_check_row_interval,
         ),
         PostgresResultSetCatalog(engine),
@@ -374,13 +426,17 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
 
 def main() -> None:
     runner = build_worker_runner()
+    logger.info("worker starting")
 
     def handle_signal(signum: int, frame: object) -> None:
+        logger.info("worker stop requested", signal=signum)
+        del frame
         runner.request_stop()
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
     runner.run_forever()
+    logger.info("worker stopped")
 
 
 def _create_metadata_engine(settings: Settings, password: str) -> Engine:
@@ -428,6 +484,21 @@ def _payload_datasource_id(job: Job) -> str:
 
 def _copy_columns(columns: list[Column]) -> list[Column]:
     return [Column.model_validate(column.model_dump()) for column in columns]
+
+
+def _elapsed_seconds(started_at: float) -> float:
+    return round(time.monotonic() - started_at, 3)
+
+
+def _log_reap_report(report: object) -> None:
+    requeued = getattr(report, "requeued", 0)
+    failed = getattr(report, "failed", 0)
+    if not isinstance(requeued, int):
+        requeued = 0
+    if not isinstance(failed, int):
+        failed = 0
+    if requeued or failed:
+        logger.info("worker reaped stale jobs", requeued=requeued, failed=failed)
 
 
 def _manifest_int(manifest: dict[str, Any], key: str) -> int:

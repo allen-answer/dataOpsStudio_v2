@@ -175,7 +175,7 @@ def _write_secret(path: Path, value: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(value)
     if os.name != "nt":
-        path.chmod(0o400)
+        path.chmod(0o600)
 
 
 def _fernet_key() -> bytes:
