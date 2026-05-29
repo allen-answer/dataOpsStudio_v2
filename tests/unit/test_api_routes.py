@@ -8,6 +8,7 @@ from app.api.services import ApiServices
 from app.domain.job import Job, JobKind, JobStatus
 from app.domain.license import LicenseMode
 from app.domain.resource import ResourceProfile
+from app.domain.schema import Column, Row
 from tests._asgi_client import AsgiClient
 
 
@@ -27,6 +28,23 @@ def test_test_datasource_timeout_triggers_request_cancel() -> None:
     assert response.json()["error"] == "job_timeout"
     assert services.job_backend.enqueued_job_id is not None
     assert services.job_backend.cancelled_job_ids == [services.job_backend.enqueued_job_id]
+
+
+def test_get_job_result_returns_columns_and_positional_rows() -> None:
+    services = _ResultServices()
+    app = create_app(services=cast(ApiServices, services))
+    token = create_access_token(user_id="user-1", role="admin", secret=services.jwt_secret)
+
+    response = AsgiClient(app).get(
+        "/api/jobs/job-1/result",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"offset": 0, "limit": 10},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["columns"][0]["name"] == "r"
+    assert payload["rows"][0]["values"][0] == 2
 
 
 class _FakeServices:
@@ -118,3 +136,58 @@ class _AlwaysRunningJobBackend:
 
     def request_cancel(self, job_id: str) -> None:
         self.cancelled_job_ids.append(job_id)
+
+
+class _ResultServices:
+    def __init__(self) -> None:
+        self.jwt_secret = "jwt-secret"
+        self.rate_limiter = _RateLimiter()
+        self.engine = _ResultEngine()
+        self.result_store = _ResultStore()
+        self.audits: list[dict[str, object]] = []
+
+    def current_license_mode(self) -> LicenseMode:
+        return LicenseMode.TRIAL
+
+    def write_audit(self, **kwargs: object) -> None:
+        self.audits.append(kwargs)
+
+
+class _ResultEngine:
+    def connect(self) -> _ResultConnection:
+        return _ResultConnection()
+
+
+class _ResultConnection:
+    def __init__(self) -> None:
+        self._rows: list[dict[str, Any] | None] = [
+            {
+                "id": "job-1",
+                "kind": "sql_query",
+                "status": "success",
+                "project_id": "project-1",
+                "payload": {"result_set_id": "rs-1"},
+            },
+            {"id": "project-1"},
+        ]
+
+    def __enter__(self) -> _ResultConnection:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        return None
+
+    def execute(self, statement: object) -> _FakeResult:
+        return _FakeResult(self._rows.pop(0))
+
+
+class _ResultStore:
+    def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]:
+        return [Row(values=[2])]
+
+    def get_spool_manifest(self, result_set_id: str) -> dict[str, object]:
+        return {
+            "columns": [Column(name="r", type="unknown").model_dump()],
+            "loaded_rows": 1,
+            "truncated": False,
+        }

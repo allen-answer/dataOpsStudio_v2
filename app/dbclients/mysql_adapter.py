@@ -60,6 +60,7 @@ class MySQLAdapter(DatabaseAdapter):
         fetch_chunk_size: int = 1000,
         connect_timeout_seconds: int = 10,
         pymysql_module: Any | None = None,
+        column_sink: Callable[[list[Column]], None] | None = None,
     ) -> None:
         if conn_info.db_type is not DbType.MYSQL:
             raise InvalidDatasourceError("MySQLAdapter requires DbType.MYSQL")
@@ -76,6 +77,7 @@ class MySQLAdapter(DatabaseAdapter):
         self._fetch_chunk_size = fetch_chunk_size
         self._connect_timeout_seconds = connect_timeout_seconds
         self._pymysql = pymysql_module
+        self._column_sink = column_sink
 
     def execute_select(self, sql: str, params: dict[str, Any]) -> Iterator[Row]:
         guarded_sql = validate_readonly_sql(sql)
@@ -222,6 +224,7 @@ class MySQLAdapter(DatabaseAdapter):
             self._apply_statement_timeout(conn)
             cursor = conn.cursor(self._sscursor_class())
             cursor.execute(sql, params or None)
+            self._emit_columns(getattr(cursor, "description", None))
             while True:
                 self._check_cancel()
                 self._check_cursor_deadline(started_at)
@@ -319,6 +322,12 @@ class MySQLAdapter(DatabaseAdapter):
         if time.monotonic() - started_at > self._cursor_max_hold_seconds:
             raise QueryTimeoutError("Query cursor hold time exceeded")
 
+    def _emit_columns(self, description: object) -> None:
+        if self._column_sink is None:
+            return
+        columns = _description_to_columns(description)
+        self._column_sink([column.model_copy(deep=True) for column in columns])
+
 
 def _validate_identifier(identifier: str) -> None:
     if not identifier or _IDENTIFIER_RE.fullmatch(identifier) is None:
@@ -337,6 +346,27 @@ def _description_columns(description: object) -> list[str]:
     for item in description:
         if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)) and item:
             columns.append(str(item[0]))
+    return columns
+
+
+def _description_to_columns(description: object) -> list[Column]:
+    if not isinstance(description, Sequence) or isinstance(description, (str, bytes, bytearray)):
+        return []
+
+    columns: list[Column] = []
+    for item in description:
+        if not isinstance(item, Sequence) or isinstance(item, (str, bytes, bytearray)) or not item:
+            continue
+        type_value = item[1] if len(item) > 1 else None
+        nullable_value = item[6] if len(item) > 6 else None
+        columns.append(
+            Column(
+                name=str(item[0]),
+                type=str(type_value) if type_value is not None else "unknown",
+                nullable=bool(nullable_value) if nullable_value is not None else True,
+                primary_key=False,
+            )
+        )
     return columns
 
 
