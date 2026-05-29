@@ -336,7 +336,8 @@ def _wait_for_job_terminal(services: ApiServices, job_id: str) -> JobStatus | No
         job = services.job_backend.get_job(job_id)
         if job and job.status in {JobStatus.SUCCESS, JobStatus.FAILED, JobStatus.CANCELLED}:
             return job.status
-        time.sleep(0.05)
+        time.sleep(0.2)
+    services.job_backend.request_cancel(job_id)
     return None
 
 
