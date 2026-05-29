@@ -31,6 +31,7 @@ from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.datasource import DbType
 from app.domain.job import Job, JobKind, JobStatus
 from app.domain.resource import ResourceProfile
+from app.domain.schema import Column
 from app.domain.secret import HashedRef, SecretKind
 
 logger = structlog.get_logger(__name__)
@@ -262,6 +263,7 @@ def get_job_result(
         result_set_id=result_set_id,
         offset=offset,
         limit=limit,
+        columns=_columns_from_manifest(manifest),
         rows=[RowResponse(values=row.values) for row in rows],
         loaded_rows=_int_from_manifest(manifest, "loaded_rows"),
         truncated=_bool_from_manifest(manifest, "truncated"),
@@ -395,6 +397,13 @@ def _int_from_manifest(manifest: dict[str, Any] | None, key: str) -> int | None:
 def _bool_from_manifest(manifest: dict[str, Any] | None, key: str) -> bool | None:
     value = manifest.get(key) if manifest else None
     return value if isinstance(value, bool) else None
+
+
+def _columns_from_manifest(manifest: dict[str, Any] | None) -> list[Column]:
+    raw_columns = manifest.get("columns") if manifest else None
+    if not isinstance(raw_columns, list):
+        return []
+    return [Column.model_validate(column) for column in raw_columns if isinstance(column, dict)]
 
 
 def _optional_str(value: object) -> str | None:
