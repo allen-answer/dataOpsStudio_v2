@@ -45,7 +45,7 @@ def create_app(
 
 def _docs_enabled(settings: Settings | None) -> bool:
     if settings is None:
-        return True
+        return False
     if settings.api.enable_docs is not None:
         return settings.api.enable_docs
     return settings.form is Form.DEV

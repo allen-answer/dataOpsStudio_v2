@@ -7,6 +7,14 @@ from app.api.services import ApiServices
 from app.config import ApiConfig, Form, Settings
 
 
+def test_api_docs_disabled_when_settings_not_passed() -> None:
+    app = create_app(services=cast(ApiServices, _NoopServices()))
+
+    assert app.docs_url is None
+    assert app.redoc_url is None
+    assert app.openapi_url is None
+
+
 def test_api_docs_enabled_by_default_in_dev() -> None:
     app = create_app(
         services=cast(ApiServices, _NoopServices()),
