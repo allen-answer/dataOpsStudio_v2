@@ -58,7 +58,7 @@ class DatasourceListItem(BaseModel):
     db_type: DbType
     host: str
     port: int
-    database: str
+    database: str | None = None
     created_at: datetime
 
 

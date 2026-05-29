@@ -52,7 +52,18 @@ def test_list_datasources_filters_by_authz_and_hides_secret_fields() -> None:
                     "created_at": _dt(1),
                     "username": "should-not-return",
                     "password_secret_ref": "secret-should-not-return",
-                }
+                },
+                {
+                    "id": "ds-no-database",
+                    "name": "warehouse-no-db",
+                    "db_type": "mysql",
+                    "host": "mysql2.internal",
+                    "port": 3307,
+                    "database_name": None,
+                    "created_at": _dt(2),
+                    "username": "should-not-return",
+                    "password_secret_ref": "secret-should-not-return",
+                },
             ]
         ]
     )
@@ -75,7 +86,16 @@ def test_list_datasources_filters_by_authz_and_hides_secret_fields() -> None:
             "port": 3306,
             "database": "app",
             "created_at": "2026-01-01T00:00:01Z",
-        }
+        },
+        {
+            "id": "ds-no-database",
+            "name": "warehouse-no-db",
+            "db_type": "mysql",
+            "host": "mysql2.internal",
+            "port": 3307,
+            "database": None,
+            "created_at": "2026-01-01T00:00:02Z",
+        },
     ]
     assert "password" not in response.body.decode("utf-8")
     assert "secret" not in response.body.decode("utf-8")
@@ -151,6 +171,40 @@ def test_list_jobs_filters_paginates_and_hides_payload_and_raw_errors() -> None:
     assert "jobs.status" in statement
     assert "LIMIT" in statement
     assert "OFFSET" in statement
+
+
+def test_list_jobs_classifies_cancelled_without_leaking_reason() -> None:
+    engine = _FakeEngine(
+        [
+            [
+                {
+                    "id": "job-cancelled",
+                    "kind": "sql_query",
+                    "status": "cancelled",
+                    "created_at": _dt(0),
+                    "started_at": None,
+                    "finished_at": _dt(8),
+                    "error": "user requested cancel",
+                    "payload": {"sql": "SELECT cancelled_should_not_return"},
+                }
+            ],
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/jobs",
+        headers=_auth_headers(),
+        params={"status": "cancelled"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [job["id"] for job in payload] == ["job-cancelled"]
+    assert payload[0]["error"] == "cancelled"
+    body = response.body.decode("utf-8")
+    assert "user requested cancel" not in body
+    assert "SELECT cancelled_should_not_return" not in body
 
 
 def test_list_jobs_project_filter_requires_authz() -> None:

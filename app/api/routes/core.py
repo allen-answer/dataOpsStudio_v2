@@ -467,7 +467,7 @@ def _datasource_list_item(row: RowMapping) -> DatasourceListItem:
         db_type=DbType(str(row["db_type"])),
         host=str(row["host"]),
         port=int(row["port"]),
-        database=str(row["database_name"] or ""),
+        database=row["database_name"] if row["database_name"] is not None else None,
         created_at=row["created_at"],
     )
 
