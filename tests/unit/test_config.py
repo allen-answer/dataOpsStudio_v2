@@ -29,6 +29,7 @@ def test_load_settings_defaults() -> None:
     # API 默认 8020 / metrics 8021 —— 避开 1.x 8010 / daily-report-bot 8000
     assert s.api.port == 8020
     assert s.api.metrics_port == 8021
+    assert s.api.enable_docs is None
     # 慢首行 OLAP 查询优先避免误杀;故障恢复宁可晚几分钟。
     assert s.worker.heartbeat_timeout_seconds == 600
     assert s.worker.poll_interval_seconds == 0.1
