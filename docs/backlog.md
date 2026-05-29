@@ -2,44 +2,6 @@
 
 > review 过程中 surfaced 的"暂不阻塞、但要记得"项。每一条标明**最迟修复版本**和**触发条件**;到该版本前必修的标 ★ 必修。
 
-## 来自 T1 (JobBackend + worker) review
-
-### ★ **T4 后补,产品必需** — 列元数据通道缺失
-
-**位置**(跨三模块):
-- `app/dbclients/mysql_adapter.py:execute_select`(流式路径丢 description)
-- `app/infrastructure/resultstore/local_fs.py:_SpoolManifest`(无 columns 字段)
-- `app/worker.py:_execute_sql_query`(不写 `result_sets` 表)
-
-**现状**:SQL 查询结果全链路丢失列名,`/result` API 只能返回 positional values。前端拿到 `[[1, "alice"], [2, "bob"]]` 不知道哪列是 id 哪列是 name。
-
-**根因(三处)**:
-1. **`MySQLAdapter.execute_select` 流式路径只 yield `Row(values=...)`**,没把 `cursor.description` 暴露给 worker。讽刺的是 adapter 内部 `_query_dicts` 用了 description(`_description_columns`),但 execute_select 这条主路径没用。
-2. **`LocalFsResultStore._SpoolManifest` 没有 columns 字段**。manifest 现在记 parts / loaded_rows / data_bytes / truncated,但列元数据零记录。
-3. **T1 worker 没写 `result_sets` 表**。该表(契约 §5.1)和 `domain.ResultSet` 都有 `columns: list[Column]` 字段,worker 实际没填,只在 `jobs.result_ref` 放 spool ref。Schema 给了通道,实现没用上。
-
-**正式补法**(后续独立任务,跨三模块协调,**T1 / T2 / LocalFsResultStore 都要改一点**):
-1. **adapter**:`execute_select` 增加暴露列元数据的途径 —— 执行时拿 `cursor.description`(SSCursor 也支持)。选项:
-   - 改返回类型从 `Iterator[Row]` 到 `Iterator[Row]`,首个特殊 sentinel 带 schema(丑)
-   - 加新方法 `execute_select_with_schema(sql, params) -> tuple[list[Column], Iterator[Row]]`(干净,推荐)
-   - 改 Row 数据结构(伤现有所有 adapter 实现,2.0.0 不动)
-2. **spool**:`_SpoolManifest` 加 `columns: list[Column]` 字段;`LocalFsResultStore` 增 `init_spool(result_set_id, columns)` 或 `append_spool` 首次调用记 columns。
-3. **worker**:`_execute_sql_query` 拿到 adapter 的 columns → 写到 spool manifest + 插入 `result_sets` 表(execution_id / columns / storage_ref / state)。
-4. **API `/result`**:从 manifest(或 result_sets 表)读 columns,返回 `{columns: [{name, type}, ...], rows: [...]}`。
-
-**★ 不要让 API 层解析 SQL 猜列名**(错误的层)。理由:
-- 多表 JOIN 时 `SELECT * FROM a JOIN b ...` 的列展开依赖 driver 实际返回
-- 子查询 / CTE / 函数表达式列名 driver 才知道(`COUNT(*)` 默认列名各方言不同)
-- `cursor.description` 是 driver 给的权威源,SQL 解析推断会漏 / 错
-
-**优先级**:**高,产品必需**。不阻塞骨架 e2e(看不到列名也算"看到数据,知道功能跑通"),**但**严重影响 SQL Workspace 实际可用性 —— 用户看到无列名结果会立刻投诉。
-
-**建议时机**:**2.0.0 骨架(T4-T8)收尾后第一批补全**,在 GA 前补完。属于"骨架后第一波产品化"。
-
-**关联**:契约 §3.2 DatabaseAdapter Protocol(签名要不要扩签名 + 通过新方法),设计稿 §2.6 SQL Workspace,§5.1 result_sets 表 schema。
-
----
-
 ## 来自 T4 (API + middleware) review
 
 ### **T5 做 License 时补** — Middleware 只检 REPAIR,没处理 IN_GRACE
@@ -117,6 +79,30 @@
 **优先级**:不阻塞 2.0.0 / 2.0.x,**2.7.0 hosted scale-out 前必修**(那时 worker fleet 规模化,单 worker 死 10 分钟意味着可见的吞吐损失)。
 
 **关联**:ADR-0018 已记录此 trade-off + 引用本 backlog 项。
+
+---
+
+## 来自列元数据通道 review(66715f7)
+
+### **GA 前 / 多方言适配器对齐时补** — `Column.type` 字段是 driver-specific 字符串
+
+**位置**:`app/dbclients/mysql_adapter.py:_description_to_columns`
+
+**现状**:`type=str(type_value)` 取自 `cursor.description[1]`,对 PyMySQL 是 FIELD_TYPE 整数常量,字符串化后前端拿到的是 `"253"` / `"<class 'pymysql.constants.FIELD_TYPE.LONG'>"` 之类。
+
+**够用**:2.0.0 骨架"看得到列名"够用,不阻塞 §5 e2e。
+
+**不够用**:前端无法按类型染色 / cast / format(日期、数字、bytes 都看不出区别)。Oracle / DM / DB2 adapter 上线后,每方言的 type code 编码各不相同,前端无法统一处理。
+
+**修法**:定义内部 `ColumnType` 枚举(契约新增章节),各 adapter 把 driver-specific code 映射到统一枚举(string / integer / float / decimal / boolean / datetime / date / time / bytes / json / unknown)。`Column.type` 改为枚举字段,原始 driver 类型放 `Column.driver_type: str | None` 备查。
+
+**触发条件**:
+- 第二个 adapter(Oracle / DM / DB2 任一)合并时,**必须**同时引入统一枚举(否则前端代码会被迫做 N 方言条件分支)
+- 或 GA 前前端 SQL Workspace 做"按类型染色"功能时
+
+**优先级**:中高,产品必需(但不阻塞骨架)。**最迟修复版本:2.0.0 GA 前**。
+
+**关联**:契约 §3.2 DatabaseAdapter Protocol,设计稿 §2.6 SQL Workspace 列展示。
 
 ---
 
