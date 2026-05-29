@@ -64,6 +64,28 @@ def test_worker_persists_columns_to_spool_and_catalog() -> None:
     ]
 
 
+def test_worker_fails_if_adapter_emits_columns_twice() -> None:
+    job = _make_job(payload={"sql": "SELECT 1 AS r", "result_set_id": "rs-1"})
+    backend = _FakeBackend([job])
+    adapter = _FakeAdapter(
+        [Row(values=[1])],
+        columns=[Column(name="r", type="unknown")],
+        emit_columns_twice=True,
+    )
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=10),
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.completed == []
+    assert backend.failed == [("job-1", "adapter emitted result columns more than once")]
+
+
 def test_worker_cancel_safe_point_marks_cancelled() -> None:
     job = _make_job(payload={"sql": "SELECT 1", "result_set_id": "rs-1"})
     backend = _FakeBackend([job])
@@ -341,10 +363,12 @@ class _FakeAdapter:
         *,
         test_connection_ok: bool = True,
         columns: list[Column] | None = None,
+        emit_columns_twice: bool = False,
     ) -> None:
         self._rows = rows
         self._test_connection_ok = test_connection_ok
         self._columns = columns or [Column(name="n", type="unknown")]
+        self._emit_columns_twice = emit_columns_twice
         self._column_sink: Callable[[list[Column]], None] | None = None
         self.test_connection_calls = 0
 
@@ -355,6 +379,8 @@ class _FakeAdapter:
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
         if self._column_sink is not None:
             self._column_sink(self._columns)
+            if self._emit_columns_twice:
+                self._column_sink(self._columns)
         yield from self._rows
 
     def test_connection(self) -> bool:

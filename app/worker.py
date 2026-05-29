@@ -165,10 +165,11 @@ class WorkerRunner:
         datasource_id = _payload_datasource_id(job)
         result_set_id = str(payload.get("result_set_id") or job.id)
         datasource = self._datasource_loader(datasource_id)
-        columns: list[Column] = []
+        columns: list[Column] | None = None
 
         def capture_columns(emitted_columns: list[Column]) -> None:
             nonlocal columns
+            assert columns is None, "adapter emitted result columns more than once"
             columns = _copy_columns(emitted_columns)
             self._result_store.set_spool_columns(result_set_id, columns)
 
@@ -198,9 +199,8 @@ class WorkerRunner:
         if batch:
             self._flush_batch(job.id, result_set_id, batch)
         self._backend.heartbeat(job.id, self._config.worker_id)
-        self._result_store.set_spool_columns(result_set_id, columns)
         result_ref = self._result_store.spool_ref(result_set_id)
-        self._write_result_set_catalog(job, result_set_id, result_ref, columns)
+        self._write_result_set_catalog(job, result_set_id, result_ref, columns or [])
         return result_ref
 
     def _execute_test_connection(self, job: Job) -> ResultRef:
