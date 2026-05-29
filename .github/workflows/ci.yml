@@ -367,3 +367,162 @@ jobs:
       - name: Skip notice (T4 not yet merged)
         if: hashFiles('tests/integration/test_e2e_acceptance.py') == ''
         run: echo "::notice::tests/integration/test_e2e_acceptance.py 不存在 — T4 尚未合并,跳过契约 §5 e2e。T4 合并后本 job 自动启用。"
+
+  # ─── Cold-start hard evidence(T6 portable launcher) ────────────────────────
+  # 跑 docs/deployment/quickstart.md 的 §1-§8 全链路:
+  #   apt install pg-16 → launcher bootstrap init → pg-up → alembic-up →
+  #   admin create → up(background)→ login → datasource → SELECT 1+1 →
+  #   断言 columns[0].name=='r' && rows[0].values[0]==2
+  # ★ Gate:T6 合并前 hashFiles('app/launcher.py') == '',skip;合并后自动启用。
+  cold-start:
+    name: Cold-start (T6 hard evidence)
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci_test_pwd_not_real_secret
+          MYSQL_DATABASE: app
+          MYSQL_USER: dataops
+          MYSQL_PASSWORD: ci_test_pwd_not_real_secret
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pci_test_pwd_not_real_secret"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 30s
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install PostgreSQL 16 binaries (apt)
+        if: hashFiles('app/launcher.py') != ''
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-16 postgresql-client-16
+          # 释放 apt 自起的 cluster,launcher 自己管 15432
+          sudo pg_ctlcluster 16 main stop 2>/dev/null || true
+          sudo systemctl disable --now postgresql.service 2>/dev/null || true
+
+      - name: uv sync (Prereq F1)
+        if: hashFiles('app/launcher.py') != ''
+        run: uv sync --all-groups
+
+      - name: launcher doctor (must pass all checks)
+        if: hashFiles('app/launcher.py') != ''
+        env:
+          DATAOPS_HOME: ${{ github.workspace }}/.dataops-runtime
+          DATAOPS_PG_BIN_DIR: /usr/lib/postgresql/16/bin
+        run: uv run python -m app.launcher --root "$DATAOPS_HOME" --pg-bin-dir "$DATAOPS_PG_BIN_DIR" doctor
+
+      - name: launcher bootstrap init
+        if: hashFiles('app/launcher.py') != ''
+        env:
+          DATAOPS_HOME: ${{ github.workspace }}/.dataops-runtime
+          DATAOPS_PG_BIN_DIR: /usr/lib/postgresql/16/bin
+        run: uv run python -m app.launcher --root "$DATAOPS_HOME" --pg-bin-dir "$DATAOPS_PG_BIN_DIR" bootstrap init
+
+      - name: launcher pg-up
+        if: hashFiles('app/launcher.py') != ''
+        env:
+          DATAOPS_HOME: ${{ github.workspace }}/.dataops-runtime
+          DATAOPS_PG_BIN_DIR: /usr/lib/postgresql/16/bin
+        run: uv run python -m app.launcher --root "$DATAOPS_HOME" --pg-bin-dir "$DATAOPS_PG_BIN_DIR" pg-up
+
+      - name: launcher alembic-up
+        if: hashFiles('app/launcher.py') != ''
+        env:
+          DATAOPS_HOME: ${{ github.workspace }}/.dataops-runtime
+          DATAOPS_PG_BIN_DIR: /usr/lib/postgresql/16/bin
+        run: uv run python -m app.launcher --root "$DATAOPS_HOME" --pg-bin-dir "$DATAOPS_PG_BIN_DIR" alembic-up
+
+      - name: launcher admin create
+        if: hashFiles('app/launcher.py') != ''
+        env:
+          DATAOPS_HOME: ${{ github.workspace }}/.dataops-runtime
+          DATAOPS_PG_BIN_DIR: /usr/lib/postgresql/16/bin
+        run: |
+          uv run python -m app.launcher --root "$DATAOPS_HOME" --pg-bin-dir "$DATAOPS_PG_BIN_DIR" admin create \
+            --username admin \
+            --password 'ci_cold_start_not_real_secret' \
+            --project-name Default
+
+      - name: launcher up (background) + healthz
+        if: hashFiles('app/launcher.py') != ''
+        env:
+          DATAOPS_HOME: ${{ github.workspace }}/.dataops-runtime
+          DATAOPS_PG_BIN_DIR: /usr/lib/postgresql/16/bin
+        run: |
+          nohup uv run python -m app.launcher --root "$DATAOPS_HOME" --pg-bin-dir "$DATAOPS_PG_BIN_DIR" up \
+            > "$DATAOPS_HOME/logs/up.log" 2>&1 &
+          echo "$!" > "$DATAOPS_HOME/up.pid"
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:8020/healthz 2>/dev/null; then
+              echo "API ready after ${i} attempts"; exit 0
+            fi
+            sleep 2
+          done
+          echo "API did not become ready in 60s"; exit 1
+
+      - name: §6-§8 cold-start hard evidence (SELECT 1+1 → assert r=2)
+        if: hashFiles('app/launcher.py') != ''
+        run: |
+          set -e
+          API=http://127.0.0.1:8020/api
+          TOKEN=$(curl -sS -X POST $API/auth/login \
+            -H 'content-type: application/json' \
+            -d '{"username":"admin","password":"ci_cold_start_not_real_secret"}' \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+          PROJECT_ID=$(curl -sS $API/projects -H "authorization: Bearer $TOKEN" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
+          BODY=$(python3 -c "import json; print(json.dumps({'project_id':'$PROJECT_ID','name':'ci-mysql','db_type':'mysql','host':'127.0.0.1','port':3306,'username':'dataops','password':'ci_test_pwd_not_real_secret','database':'app','environment':'dev','extra':{}}))")
+          DS_ID=$(curl -sS -X POST $API/datasources \
+            -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' -d "$BODY" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+          TEST=$(curl -sS -X POST "$API/datasources/$DS_ID/test" -H "authorization: Bearer $TOKEN")
+          echo "test_connection: $TEST"
+          OK=$(echo "$TEST" | python3 -c "import sys,json; print(json.load(sys.stdin)['ok'])")
+          [ "$OK" = "True" ] || { echo "test_connection not ok"; exit 1; }
+
+          EX=$(curl -sS -X POST $API/sql/execute -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+            -d "{\"datasource_id\":\"$DS_ID\",\"sql\":\"SELECT 1+1 AS r\",\"params\":{}}")
+          JOB_ID=$(echo "$EX" | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+          STATUS=""
+          for i in $(seq 1 30); do
+            STATUS=$(curl -sS "$API/jobs/$JOB_ID" -H "authorization: Bearer $TOKEN" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+            [ "$STATUS" = "success" ] && break
+            [ "$STATUS" = "failed" ] && { echo "job failed"; exit 1; }
+            [ "$STATUS" = "cancelled" ] && { echo "job cancelled"; exit 1; }
+            sleep 1
+          done
+          [ "$STATUS" = "success" ] || { echo "job did not finish in 30s"; exit 1; }
+
+          RES=$(curl -sS "$API/jobs/$JOB_ID/result?offset=0&limit=10" -H "authorization: Bearer $TOKEN")
+          echo "$RES" | python3 -m json.tool
+          COL=$(echo "$RES" | python3 -c "import sys,json; print(json.load(sys.stdin)['columns'][0]['name'])")
+          VAL=$(echo "$RES" | python3 -c "import sys,json; print(json.load(sys.stdin)['rows'][0]['values'][0])")
+          [ "$COL" = "r" ] || { echo "expected columns[0].name=r, got '$COL'"; exit 1; }
+          [ "$VAL" = "2" ] || { echo "expected rows[0].values[0]=2, got '$VAL'"; exit 1; }
+          echo "::notice::Cold-start §1-§8 verified: columns[0].name=r, rows[0].values[0]=2"
+
+      - name: Dump logs on failure
+        if: failure() && hashFiles('app/launcher.py') != ''
+        env:
+          DATAOPS_HOME: ${{ github.workspace }}/.dataops-runtime
+        run: |
+          echo "==up.log=="; cat "$DATAOPS_HOME/logs/up.log" 2>/dev/null || true
+          echo "==api.log=="; cat "$DATAOPS_HOME/logs/api.log" 2>/dev/null || true
+          echo "==worker.log=="; cat "$DATAOPS_HOME/logs/worker.log" 2>/dev/null || true
+          echo "==pg.log=="; cat "$DATAOPS_HOME/logs/pg.log" 2>/dev/null || true
+
+      - name: Skip notice (T6 not yet merged)
+        if: hashFiles('app/launcher.py') == ''
+        run: echo "::notice::app/launcher.py 不存在 — T6 尚未合并,跳过 cold-start。T6 合并后本 job 自动启用。"
