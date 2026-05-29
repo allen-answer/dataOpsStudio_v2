@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 from app.domain.datasource import DbType
 from app.domain.job import JobStatus
+from app.domain.schema import Column
 
 
 class LoginRequest(BaseModel):
@@ -83,6 +84,7 @@ class JobResultResponse(BaseModel):
     result_set_id: str
     offset: int
     limit: int
+    columns: list[Column] = Field(default_factory=list)
     rows: list[RowResponse]
     loaded_rows: int | None = None
     truncated: bool | None = None

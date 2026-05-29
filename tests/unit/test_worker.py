@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from typing import Protocol
 
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.job import Job, JobKind, JobStatus
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
-from app.domain.schema import Row
+from app.domain.schema import Column, Row
 from app.domain.secret import SecretKind, SecretRef
 from app.worker import WorkerRunner, WorkerRunnerConfig
 
@@ -20,7 +21,7 @@ def test_worker_runs_sql_query_to_spool_and_completes() -> None:
         backend,
         result_store,
         lambda datasource_id: _conn_info(datasource_id),
-        lambda conn_info, cancel_check: adapter,
+        _adapter_factory(adapter),
         WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=1),
     )
 
@@ -30,6 +31,37 @@ def test_worker_runs_sql_query_to_spool_and_completes() -> None:
     assert backend.completed == [("job-1", ResultRef(backend="local_fs", uri="spool/rs-1"))]
     assert backend.failed == []
     assert backend.cancelled == []
+
+
+def test_worker_persists_columns_to_spool_and_catalog() -> None:
+    columns = [Column(name="r", type="unknown")]
+    job = _make_job(payload={"sql": "SELECT 1 AS r", "result_set_id": "rs-1"})
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    catalog = _FakeResultSetCatalog()
+    adapter = _FakeAdapter([Row(values=[1]), Row(values=[2])], columns=columns)
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=10),
+        catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert result_store.columns_by_result_set == {"rs-1": columns}
+    assert catalog.completed == [
+        {
+            "result_set_id": "rs-1",
+            "execution_id": "job-1",
+            "storage_ref": ResultRef(backend="local_fs", uri="spool/rs-1"),
+            "columns": columns,
+            "loaded_rows": 2,
+            "truncated": False,
+        }
+    ]
 
 
 def test_worker_cancel_safe_point_marks_cancelled() -> None:
@@ -42,7 +74,7 @@ def test_worker_cancel_safe_point_marks_cancelled() -> None:
         backend,
         result_store,
         lambda datasource_id: _conn_info(datasource_id),
-        lambda conn_info, cancel_check: adapter,
+        _adapter_factory(adapter),
         WorkerRunnerConfig(
             worker_id="worker-1",
             sql_spool_batch_size=1,
@@ -64,7 +96,7 @@ def test_worker_unsupported_kind_fails_job() -> None:
         backend,
         _FakeResultStore(),
         lambda datasource_id: _conn_info(datasource_id),
-        lambda conn_info, cancel_check: _FakeAdapter([]),
+        _adapter_factory(_FakeAdapter([])),
         WorkerRunnerConfig(worker_id="worker-1"),
     )
 
@@ -83,7 +115,7 @@ def test_worker_runs_test_connection_job_and_completes() -> None:
         backend,
         _FakeResultStore(),
         lambda datasource_id: _conn_info(datasource_id),
-        lambda conn_info, cancel_check: adapter,
+        _adapter_factory(adapter),
         WorkerRunnerConfig(worker_id="worker-1"),
     )
 
@@ -104,7 +136,7 @@ def test_worker_failed_test_connection_fails_job() -> None:
         backend,
         _FakeResultStore(),
         lambda datasource_id: _conn_info(datasource_id),
-        lambda conn_info, cancel_check: adapter,
+        _adapter_factory(adapter),
         WorkerRunnerConfig(worker_id="worker-1"),
     )
 
@@ -119,7 +151,7 @@ def test_worker_empty_queue_returns_false() -> None:
         _FakeBackend([]),
         _FakeResultStore(),
         lambda datasource_id: _conn_info(datasource_id),
-        lambda conn_info, cancel_check: _FakeAdapter([]),
+        _adapter_factory(_FakeAdapter([])),
         WorkerRunnerConfig(worker_id="worker-1"),
     )
 
@@ -141,8 +173,9 @@ def test_cancel_check_throttled_to_every_n_rows() -> None:
     def adapter_factory(
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
     ) -> _RangeAdapter:
-        return _RangeAdapter(rows)
+        return _RangeAdapter(rows).with_column_sink(column_sink)
 
     runner = WorkerRunner(
         backend,
@@ -179,8 +212,9 @@ def test_worker_cancel_still_stops_within_interval() -> None:
     def adapter_factory(
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
     ) -> _RangeAdapter:
-        adapter = _RangeAdapter(row_count)
+        adapter = _RangeAdapter(row_count).with_column_sink(column_sink)
         adapter_holder["adapter"] = adapter
         return adapter
 
@@ -253,9 +287,22 @@ class _FakeBackend:
 class _FakeResultStore:
     def __init__(self) -> None:
         self.rows_by_result_set: dict[str, list[Row]] = {}
+        self.columns_by_result_set: dict[str, list[Column]] = {}
 
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None:
         self.rows_by_result_set.setdefault(result_set_id, []).extend(rows)
+
+    def set_spool_columns(self, result_set_id: str, columns: list[Column]) -> None:
+        self.columns_by_result_set[result_set_id] = list(columns)
+
+    def get_spool_manifest(self, result_set_id: str) -> dict[str, object]:
+        return {
+            "columns": [
+                column.model_dump() for column in self.columns_by_result_set[result_set_id]
+            ],
+            "loaded_rows": len(self.rows_by_result_set.get(result_set_id, [])),
+            "truncated": False,
+        }
 
     def spool_ref(self, result_set_id: str) -> ResultRef:
         return ResultRef(backend="local_fs", uri=f"spool/{result_set_id}")
@@ -264,23 +311,50 @@ class _FakeResultStore:
 class _CountingResultStore:
     def __init__(self) -> None:
         self.row_count_by_result_set: dict[str, int] = {}
+        self.columns_by_result_set: dict[str, list[Column]] = {}
 
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None:
         self.row_count_by_result_set[result_set_id] = self.row_count_by_result_set.get(
             result_set_id, 0
         ) + len(rows)
 
+    def set_spool_columns(self, result_set_id: str, columns: list[Column]) -> None:
+        self.columns_by_result_set[result_set_id] = list(columns)
+
+    def get_spool_manifest(self, result_set_id: str) -> dict[str, object]:
+        return {
+            "columns": [
+                column.model_dump() for column in self.columns_by_result_set[result_set_id]
+            ],
+            "loaded_rows": self.row_count_by_result_set.get(result_set_id, 0),
+            "truncated": False,
+        }
+
     def spool_ref(self, result_set_id: str) -> ResultRef:
         return ResultRef(backend="local_fs", uri=f"spool/{result_set_id}")
 
 
 class _FakeAdapter:
-    def __init__(self, rows: list[Row], *, test_connection_ok: bool = True) -> None:
+    def __init__(
+        self,
+        rows: list[Row],
+        *,
+        test_connection_ok: bool = True,
+        columns: list[Column] | None = None,
+    ) -> None:
         self._rows = rows
         self._test_connection_ok = test_connection_ok
+        self._columns = columns or [Column(name="n", type="unknown")]
+        self._column_sink: Callable[[list[Column]], None] | None = None
         self.test_connection_calls = 0
 
+    def with_column_sink(self, column_sink: Callable[[list[Column]], None]) -> _FakeAdapter:
+        self._column_sink = column_sink
+        return self
+
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
+        if self._column_sink is not None:
+            self._column_sink(self._columns)
         yield from self._rows
 
     def test_connection(self) -> bool:
@@ -292,8 +366,15 @@ class _RangeAdapter:
     def __init__(self, row_count: int) -> None:
         self._row_count = row_count
         self.rows_yielded = 0
+        self._column_sink: Callable[[list[Column]], None] | None = None
+
+    def with_column_sink(self, column_sink: Callable[[list[Column]], None]) -> _RangeAdapter:
+        self._column_sink = column_sink
+        return self
 
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
+        if self._column_sink is not None:
+            self._column_sink([Column(name="n", type="unknown")])
         for index in range(self._row_count):
             self.rows_yielded += 1
             yield Row(values=[index])
@@ -331,3 +412,56 @@ def _conn_info(datasource_id: str) -> DatasourceConnInfo:
         password_ref=SecretRef(ref="secret-1", kind=SecretKind.DATASOURCE_PASSWORD),
         db_type=DbType.MYSQL,
     )
+
+
+class _ColumnSinkAdapter(Protocol):
+    def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]: ...
+
+    def test_connection(self) -> bool: ...
+
+    def with_column_sink(
+        self,
+        column_sink: Callable[[list[Column]], None],
+    ) -> _ColumnSinkAdapter: ...
+
+
+def _adapter_factory(
+    adapter: _ColumnSinkAdapter,
+) -> Callable[
+    [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None]],
+    _ColumnSinkAdapter,
+]:
+    def factory(
+        conn_info: DatasourceConnInfo,
+        cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
+    ) -> _ColumnSinkAdapter:
+        return adapter.with_column_sink(column_sink)
+
+    return factory
+
+
+class _FakeResultSetCatalog:
+    def __init__(self) -> None:
+        self.completed: list[dict[str, object]] = []
+
+    def write_complete(
+        self,
+        *,
+        result_set_id: str,
+        execution_id: str,
+        storage_ref: ResultRef,
+        columns: list[Column],
+        loaded_rows: int,
+        truncated: bool,
+    ) -> None:
+        self.completed.append(
+            {
+                "result_set_id": result_set_id,
+                "execution_id": execution_id,
+                "storage_ref": storage_ref,
+                "columns": list(columns),
+                "loaded_rows": loaded_rows,
+                "truncated": truncated,
+            }
+        )

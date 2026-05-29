@@ -15,7 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from app.domain.result import Manifest, ResultRef
-from app.domain.schema import Row
+from app.domain.schema import Column, Row
 from app.infrastructure.resultstore.protocol import ResultStore
 
 _BACKEND = "local_fs"
@@ -38,6 +38,7 @@ class _PartInfo:
 class _SpoolManifest:
     result_set_id: str
     parts: list[_PartInfo] = field(default_factory=list)
+    columns: list[Column] = field(default_factory=list)
     loaded_rows: int = 0
     data_bytes: int = 0
     truncated: bool = False
@@ -141,6 +142,12 @@ class LocalFsResultStore(ResultStore):
             or manifest.data_bytes >= self._spool_max_bytes
         ):
             manifest.truncated = True
+        self._write_spool_manifest(manifest)
+
+    def set_spool_columns(self, result_set_id: str, columns: list[Column]) -> None:
+        manifest = self._read_spool_manifest(result_set_id)
+        manifest.columns = [Column.model_validate(column.model_dump()) for column in columns]
+        manifest.updated_at = time.time()
         self._write_spool_manifest(manifest)
 
     def get_manifest(self, run_id: str) -> Manifest:
@@ -374,6 +381,7 @@ def _spool_manifest_to_dict(manifest: _SpoolManifest) -> dict[str, Any]:
     return {
         "result_set_id": manifest.result_set_id,
         "parts": [part.__dict__ for part in manifest.parts],
+        "columns": [column.model_dump() for column in manifest.columns],
         "loaded_rows": manifest.loaded_rows,
         "data_bytes": manifest.data_bytes,
         "truncated": manifest.truncated,
@@ -386,6 +394,7 @@ def _spool_manifest_from_dict(payload: dict[str, Any]) -> _SpoolManifest:
     return _SpoolManifest(
         result_set_id=str(payload["result_set_id"]),
         parts=[_PartInfo(**part) for part in payload.get("parts", [])],
+        columns=[Column.model_validate(column) for column in payload.get("columns", [])],
         loaded_rows=int(payload.get("loaded_rows", 0)),
         data_bytes=int(payload.get("data_bytes", 0)),
         truncated=bool(payload.get("truncated", False)),

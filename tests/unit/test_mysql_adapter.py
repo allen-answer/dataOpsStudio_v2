@@ -55,6 +55,41 @@ def test_execute_select_uses_sscursor_reveals_secret_and_closes_resources() -> N
     assert fake_pymysql.connections[0].closed is True
 
 
+def test_execute_select_emits_columns_without_leaking_cursor_reference() -> None:
+    fake_pymysql = _FakePyMySQL()
+    captured_columns: list[Column] = []
+    adapter = MySQLAdapter(
+        _conn_info(),
+        cast(SecretStore, _SecretStore("pwd")),
+        pymysql_module=fake_pymysql,
+        fetch_chunk_size=1,
+        column_sink=captured_columns.extend,
+    )
+
+    rows = list(adapter.execute_select("SELECT 1 AS n", {}))
+
+    assert rows == [Row(values=[1]), Row(values=[2])]
+    assert captured_columns == [Column(name="n", type="unknown")]
+    assert all(not hasattr(column, "cursor") for column in captured_columns)
+    assert fake_pymysql.connections[0].closed is True
+
+
+def test_execute_select_emits_columns_for_zero_row_result() -> None:
+    fake_pymysql = _FakePyMySQL()
+    captured_columns: list[Column] = []
+    adapter = MySQLAdapter(
+        _conn_info(),
+        cast(SecretStore, _SecretStore("pwd")),
+        pymysql_module=fake_pymysql,
+        column_sink=captured_columns.extend,
+    )
+
+    rows = list(adapter.execute_select("SELECT 1 AS n WHERE 1 = 0", {}))
+
+    assert rows == []
+    assert captured_columns == [Column(name="n", type="unknown")]
+
+
 def test_stream_to_spool_then_resultset_reads_without_cursor(tmp_path: Path) -> None:
     fake_pymysql = _FakePyMySQL()
     adapter = MySQLAdapter(
@@ -266,6 +301,8 @@ class _FakeCursor:
 
     def execute(self, sql: str, params: object = None) -> None:
         if sql.lower().startswith("set session"):
+            self._rows = []
+        elif "where 1 = 0" in sql.lower():
             self._rows = []
         else:
             self._rows = [(1,), (2,)]

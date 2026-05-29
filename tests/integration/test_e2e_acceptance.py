@@ -10,14 +10,15 @@ from typing import cast
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, insert
+from sqlalchemy import create_engine, insert, select
 from sqlalchemy.engine import Engine
 
 from app.api.app import create_app
 from app.api.services import ApiServices, RateLimiter
-from app.db.models import metadata, projects, users
+from app.db.models import metadata, projects, result_sets, users
 from app.dbclients.mysql_adapter import MySQLAdapter
 from app.domain.datasource import DatasourceConnInfo
+from app.domain.schema import Column
 from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
@@ -119,8 +120,15 @@ def test_e2e_login_create_mysql_datasource_execute_select(tmp_path: Path) -> Non
             params={"offset": 0, "limit": 10},
         )
         assert result_response.status_code == 200
-        rows = result_response.json()["rows"]
+        result_payload = result_response.json()
+        assert result_payload["columns"][0]["name"] == "r"
+        rows = result_payload["rows"]
         assert rows[0]["values"][0] == 2
+        with pg_engine.connect() as conn:
+            catalog_columns = conn.execute(
+                select(result_sets.c.columns).where(result_sets.c.id == result_set_id)
+            ).scalar_one()
+        assert catalog_columns == result_payload["columns"]
         assert not worker_errors
     finally:
         stop_worker.set()
@@ -217,11 +225,13 @@ def _start_worker_thread(
     def adapter_factory(
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
     ) -> MySQLAdapter:
         return MySQLAdapter(
             conn_info,
             secret_store,
             cancel_check=cancel_check,
+            column_sink=column_sink,
             statement_timeout_seconds=30,
             cursor_max_hold_seconds=300,
         )
@@ -230,7 +240,13 @@ def _start_worker_thread(
         backend,
         result_store,
         datasource_loader,
-        cast(Callable[[DatasourceConnInfo, Callable[[], bool]], MySQLAdapter], adapter_factory),
+        cast(
+            Callable[
+                [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None]],
+                MySQLAdapter,
+            ],
+            adapter_factory,
+        ),
         WorkerRunnerConfig(
             worker_id=worker_id,
             poll_interval_seconds=0.05,

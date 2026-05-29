@@ -4,19 +4,19 @@ import signal
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import structlog
-from sqlalchemy import URL, create_engine, select
+from sqlalchemy import URL, create_engine, delete, insert, select
 from sqlalchemy.engine import Engine
 
 from app.config import Settings, load_settings
-from app.db.models import datasources
+from app.db.models import datasources, result_sets
 from app.dbclients.mysql_adapter import MySQLAdapter
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.job import Job, JobKind
 from app.domain.result import ResultRef
-from app.domain.schema import Row
+from app.domain.schema import Column, Row
 from app.domain.secret import SecretKind, SecretRef
 from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
@@ -32,7 +32,7 @@ class JobCancelled(RuntimeError):
 
 
 class UnsupportedJobKindError(RuntimeError):
-    """2.0.0 worker only supports sql_query."""
+    """2.0.0 worker supports only the job kinds wired in this module."""
 
 
 class BackendLike(Protocol):
@@ -59,6 +59,10 @@ class BackendLike(Protocol):
 class ResultStoreLike(Protocol):
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None: ...
 
+    def set_spool_columns(self, result_set_id: str, columns: list[Column]) -> None: ...
+
+    def get_spool_manifest(self, result_set_id: str) -> dict[str, Any]: ...
+
     def spool_ref(self, result_set_id: str) -> ResultRef: ...
 
 
@@ -68,8 +72,24 @@ class DatabaseAdapterLike(Protocol):
     def test_connection(self) -> bool: ...
 
 
+class ResultSetCatalogLike(Protocol):
+    def write_complete(
+        self,
+        *,
+        result_set_id: str,
+        execution_id: str,
+        storage_ref: ResultRef,
+        columns: list[Column],
+        loaded_rows: int,
+        truncated: bool,
+    ) -> None: ...
+
+
 DatasourceLoader = Callable[[str], DatasourceConnInfo]
-AdapterFactory = Callable[[DatasourceConnInfo, Callable[[], bool]], DatabaseAdapterLike]
+AdapterFactory = Callable[
+    [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None]],
+    DatabaseAdapterLike,
+]
 
 
 @dataclass(frozen=True)
@@ -90,6 +110,7 @@ class WorkerRunner:
         datasource_loader: DatasourceLoader,
         adapter_factory: AdapterFactory,
         config: WorkerRunnerConfig,
+        result_set_catalog: ResultSetCatalogLike | None = None,
     ) -> None:
         if config.sql_spool_batch_size <= 0:
             raise ValueError("sql_spool_batch_size must be positive")
@@ -100,6 +121,7 @@ class WorkerRunner:
         self._datasource_loader = datasource_loader
         self._adapter_factory = adapter_factory
         self._config = config
+        self._result_set_catalog = result_set_catalog
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -143,9 +165,17 @@ class WorkerRunner:
         datasource_id = _payload_datasource_id(job)
         result_set_id = str(payload.get("result_set_id") or job.id)
         datasource = self._datasource_loader(datasource_id)
+        columns: list[Column] = []
+
+        def capture_columns(emitted_columns: list[Column]) -> None:
+            nonlocal columns
+            columns = _copy_columns(emitted_columns)
+            self._result_store.set_spool_columns(result_set_id, columns)
+
         adapter = self._adapter_factory(
             datasource,
             lambda: self._backend.is_cancel_requested(job.id),
+            capture_columns,
         )
 
         batch: list[Row] = []
@@ -168,7 +198,10 @@ class WorkerRunner:
         if batch:
             self._flush_batch(job.id, result_set_id, batch)
         self._backend.heartbeat(job.id, self._config.worker_id)
-        return self._result_store.spool_ref(result_set_id)
+        self._result_store.set_spool_columns(result_set_id, columns)
+        result_ref = self._result_store.spool_ref(result_set_id)
+        self._write_result_set_catalog(job, result_set_id, result_ref, columns)
+        return result_ref
 
     def _execute_test_connection(self, job: Job) -> ResultRef:
         datasource_id = _payload_datasource_id(job)
@@ -176,6 +209,7 @@ class WorkerRunner:
         adapter = self._adapter_factory(
             datasource,
             lambda: self._backend.is_cancel_requested(job.id),
+            lambda columns: None,
         )
         if not adapter.test_connection():
             raise RuntimeError("datasource connection test failed")
@@ -203,6 +237,25 @@ class WorkerRunner:
     def _check_cancel(self, job_id: str) -> None:
         if self._backend.is_cancel_requested(job_id):
             raise JobCancelled("cancel requested")
+
+    def _write_result_set_catalog(
+        self,
+        job: Job,
+        result_set_id: str,
+        result_ref: ResultRef,
+        columns: list[Column],
+    ) -> None:
+        if self._result_set_catalog is None:
+            return
+        manifest = self._result_store.get_spool_manifest(result_set_id)
+        self._result_set_catalog.write_complete(
+            result_set_id=result_set_id,
+            execution_id=job.id,
+            storage_ref=result_ref,
+            columns=columns,
+            loaded_rows=_manifest_int(manifest, "loaded_rows"),
+            truncated=_manifest_bool(manifest, "truncated"),
+        )
 
 
 class PostgresDatasourceLoader:
@@ -237,6 +290,35 @@ class PostgresDatasourceLoader:
         )
 
 
+class PostgresResultSetCatalog:
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def write_complete(
+        self,
+        *,
+        result_set_id: str,
+        execution_id: str,
+        storage_ref: ResultRef,
+        columns: list[Column],
+        loaded_rows: int,
+        truncated: bool,
+    ) -> None:
+        with self._engine.begin() as conn:
+            conn.execute(delete(result_sets).where(result_sets.c.id == result_set_id))
+            conn.execute(
+                insert(result_sets).values(
+                    id=result_set_id,
+                    execution_id=execution_id,
+                    storage_ref=storage_ref.model_dump(),
+                    columns=[column.model_dump() for column in columns],
+                    loaded_rows=loaded_rows,
+                    total_rows=None if truncated else loaded_rows,
+                    state="complete",
+                )
+            )
+
+
 def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
     actual_settings = settings or load_settings()
     configure_logging(actual_settings.logging.level)
@@ -260,6 +342,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
     def adapter_factory(
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
     ) -> DatabaseAdapterLike:
         if conn_info.db_type is not DbType.MYSQL:
             raise UnsupportedJobKindError(
@@ -269,6 +352,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
             conn_info,
             secret_store,
             cancel_check=cancel_check,
+            column_sink=column_sink,
             cursor_max_hold_seconds=actual_settings.result_store.cursor_max_hold_seconds,
             statement_timeout_seconds=actual_settings.worker.heartbeat_timeout_seconds,
         )
@@ -284,6 +368,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
             heartbeat_timeout_seconds=actual_settings.worker.heartbeat_timeout_seconds,
             cancel_check_row_interval=actual_settings.worker.cancel_check_row_interval,
         ),
+        PostgresResultSetCatalog(engine),
     )
 
 
@@ -339,6 +424,20 @@ def _payload_datasource_id(job: Job) -> str:
     if job.datasource_ids:
         return job.datasource_ids[0]
     raise ValueError("Job payload requires datasource_id or job.datasource_ids")
+
+
+def _copy_columns(columns: list[Column]) -> list[Column]:
+    return [Column.model_validate(column.model_dump()) for column in columns]
+
+
+def _manifest_int(manifest: dict[str, Any], key: str) -> int:
+    value = manifest.get(key, 0)
+    return value if isinstance(value, int) else 0
+
+
+def _manifest_bool(manifest: dict[str, Any], key: str) -> bool:
+    value = manifest.get(key, False)
+    return value if isinstance(value, bool) else False
 
 
 if __name__ == "__main__":
