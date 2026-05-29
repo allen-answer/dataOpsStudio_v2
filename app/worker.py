@@ -35,6 +35,10 @@ class UnsupportedJobKindError(RuntimeError):
     """2.0.0 worker supports only the job kinds wired in this module."""
 
 
+class UnsupportedDbTypeError(RuntimeError):
+    """2.0.0 worker supports only datasource db types with registered adapters."""
+
+
 class BackendLike(Protocol):
     def claim_next(self, worker_id: str) -> Job | None: ...
 
@@ -396,7 +400,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
         column_sink: Callable[[list[Column]], None],
     ) -> DatabaseAdapterLike:
         if conn_info.db_type is not DbType.MYSQL:
-            raise UnsupportedJobKindError(
+            raise UnsupportedDbTypeError(
                 f"Unsupported datasource db_type: {conn_info.db_type.value}"
             )
         return MySQLAdapter(

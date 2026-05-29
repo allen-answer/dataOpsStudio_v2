@@ -68,6 +68,9 @@ class _StaticBootstrapSecrets(BootstrapSecrets):
     def get_pg_superuser_password(self) -> str:
         return "super-pwd"
 
+    def get_jwt_secret(self) -> str:
+        return "jwt-secret"
+
     def get_license_file(self) -> bytes | None:
         return None
 
