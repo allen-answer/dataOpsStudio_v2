@@ -65,6 +65,8 @@ class ResultStoreLike(Protocol):
 class DatabaseAdapterLike(Protocol):
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]: ...
 
+    def test_connection(self) -> bool: ...
+
 
 DatasourceLoader = Callable[[str], DatasourceConnInfo]
 AdapterFactory = Callable[[DatasourceConnInfo, Callable[[], bool]], DatabaseAdapterLike]
@@ -120,9 +122,12 @@ class WorkerRunner:
     def _execute_claimed_job(self, job: Job) -> None:
         try:
             self._check_cancel(job.id)
-            if job.kind is not JobKind.SQL_QUERY:
+            if job.kind is JobKind.TEST_CONNECTION:
+                result_ref = self._execute_test_connection(job)
+            elif job.kind is JobKind.SQL_QUERY:
+                result_ref = self._execute_sql_query(job)
+            else:
                 raise UnsupportedJobKindError(f"Unsupported job kind: {job.kind.value}")
-            result_ref = self._execute_sql_query(job)
         except JobCancelled as exc:
             self._backend.mark_cancelled(job.id, str(exc))
         except Exception as exc:
@@ -164,6 +169,18 @@ class WorkerRunner:
             self._flush_batch(job.id, result_set_id, batch)
         self._backend.heartbeat(job.id, self._config.worker_id)
         return self._result_store.spool_ref(result_set_id)
+
+    def _execute_test_connection(self, job: Job) -> ResultRef:
+        datasource_id = _payload_datasource_id(job)
+        datasource = self._datasource_loader(datasource_id)
+        adapter = self._adapter_factory(
+            datasource,
+            lambda: self._backend.is_cancel_requested(job.id),
+        )
+        if not adapter.test_connection():
+            raise RuntimeError("datasource connection test failed")
+        self._backend.heartbeat(job.id, self._config.worker_id)
+        return ResultRef(backend="local_fs", uri=f"test_connection/{job.id}")
 
     def _flush_batch(self, job_id: str, result_set_id: str, batch: list[Row]) -> None:
         # Cancel during append_spool is caught at the next batch or row interval.

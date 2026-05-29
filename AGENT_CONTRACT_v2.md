@@ -15,7 +15,10 @@
 
 ## 0. 黄金法则(违反即拒绝合并)
 
-1. **接口先行**:Step 1 冻结的 Protocol 接口签名是契约,实现必须匹配,不得擅自改签名。要改接口,先改契约 + 通知另一 agent。
+1. **接口先行**:Step 1 冻结的 Protocol 接口签名是契约,实现必须匹配。变更分两类,区别看"会不会弄坏另一方已写的代码":
+   - **纯追加(向后兼容)**:新 method / 新 enum 值 / 新可选字段 — 不会弄坏既有代码。**可直接做,但 commit message 必须明示** `接口追加:xxx`(便于另一方扫 git log 知道契约动了哪),且**同步更新契约 §3 对应章节**。先做后通知 OK。
+   - **破坏性变更**:改签名 / 删除 / 改类型 / 改语义 — 会弄坏既有代码。**必须先改契约 + 通知另一 agent → 等通知确认 → 才改代码**。直接改 = 拒绝合并。
+   - 不确定哪类时,按"破坏性"处理,先问。
 2. **物理隔离**:并行任务不得同时改同一文件/同一目录。见 §6 任务拆分。
 3. **红线是 CI,不是自觉**:§4 的红线全部有对应 CI 检查,提交即拦。
 4. **范围纪律**:只做 §5 列的 2.0.0 骨架内容。其他一律不做,即使"顺手能写"。
@@ -181,6 +184,7 @@ class BootstrapSecrets:
     def get_master_key(self) -> bytes: ...
     def get_pg_app_password(self) -> str: ...
     def get_pg_superuser_password(self) -> str: ...
+    def get_jwt_secret(self) -> str: ...          # T4 最小补充:API 启动验 JWT,不走 PG
     def get_license_file(self) -> Optional[bytes]: ...
 
 class SecretKind(Enum):
@@ -240,7 +244,7 @@ class AiGateway(Protocol):
 ```python
 class Job:
     id: str
-    kind: Literal["sql_query","sql_explain","compare_run","export_excel",
+    kind: Literal["sql_query","test_connection","sql_explain","compare_run","export_excel",
                   "scenario_materialize","scenario_run_all","workflow_run",
                   "ai_assist_call","ai_copilot_run","lineage_analyze"]
     status: Literal["pending","running","success","failed","cancelled","timeout"]

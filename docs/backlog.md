@@ -40,6 +40,50 @@
 
 ---
 
+## 来自 T4 (API + middleware) review
+
+### **T5 做 License 时补** — Middleware 只检 REPAIR,没处理 IN_GRACE
+
+**位置**:`app/api/middleware/crosscutting.py:_check_license`
+
+**现状**:`_check_license` 只在 `LicenseMode.REPAIR` 时拦截 `_REPAIR_RESTRICTED` 路径(POST /api/datasources / /sql/execute / /datasources/{id}/test)。
+
+**遗漏**:设计稿 §8.4 中 `IN_GRACE` mode(过期 ≤7 天)= **只读 + 允许 license 更新 + 备份;禁建任务 / 禁 AI**。当前 middleware 未对 IN_GRACE 做任何检查。
+
+**修法**:T5 实现 License Skeleton + Repair Mode 时,把 `_check_license` 扩为对 `IN_GRACE` 也限制写操作(同 `_REPAIR_RESTRICTED` 路径集),允许只读 GET。
+
+**触发条件**:T5 工作启动时。**优先级**:中(license 任意非 REPAIR 状态都该被覆盖到位)。
+
+---
+
+### **T5 或清理时** — BootstrapSecrets 是 plain class 而非 Protocol(契约一致性)
+
+**位置**:`app/infrastructure/bootstrap/protocol.py`
+
+**现状**:与配对的 `SecretStore (Protocol)` 不一致;契约 §3.3 字面写的也是 `class BootstrapSecrets:`(非 Protocol)。T3 review 时已 flag,Codex T4 加 `get_jwt_secret` 时延续 plain class 风格。
+
+**修法**:类比之前 Step 0 把 AiGateway 从 `class` 改 Protocol —— 同样手法把 BootstrapSecrets 改 Protocol,契约 §3.3 同步更新。
+
+**优先级**:低(plain class 实现可工作,只是与 SecretStore 风格不齐)。可在 T5 或专门清理 PR 处理。
+
+**关联**:Step 0 AiGateway 改 Protocol 的 commit `f575503`。
+
+---
+
+### **可选** — 手写 JWT(HS256)→ PyJWT
+
+**位置**:`app/api/security.py`
+
+**现状**:Codex T4 手实现 HS256(hmac + hashlib + base64),`hmac.compare_digest` 用对了(时序安全),代码逻辑 OK。
+
+**为什么记录**:手写 crypto 是 audit smell。PyJWT / python-jose 是 battle-tested,有维护团队,默认更严(reject `alg: none` 等)。
+
+**修法**:`uv add pyjwt` → `security.py` 切 PyJWT API(create / decode / 处理 jwt.ExpiredSignatureError 等)。
+
+**优先级**:低,可选。当前手写实现没漏洞(看过)。如做 GA 前安全审计时被点,即换。
+
+---
+
 ### **T1 后随时** — `UnsupportedJobKindError` 复用语义不一致
 
 **位置**:`app/worker.py:121` 和 `app/worker.py:240`
