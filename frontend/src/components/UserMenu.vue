@@ -2,15 +2,22 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { LogOut, User as UserIcon, Sun, Moon, Languages, ChevronDown } from 'lucide-vue-next'
+import { LogOut, User as UserIcon, Palette, Languages, ChevronDown } from 'lucide-vue-next'
 import { useAuthStore } from '../stores/auth'
 import { useThemeStore } from '../stores/theme'
+import { variants } from '../variants'
 import { setLocale } from '../i18n'
 
 const { t, locale } = useI18n()
 const router = useRouter()
 const auth = useAuthStore()
-const theme = useThemeStore()
+const themeStore = useThemeStore()
+
+function cycleVariant(): void {
+  const i = variants.findIndex((v) => v.id === themeStore.variant)
+  const next = variants[(i + 1) % variants.length]
+  themeStore.set(next.id)
+}
 
 const open = ref(false)
 const menuRef = ref<HTMLElement | null>(null)
@@ -73,11 +80,15 @@ onUnmounted(() => document.removeEventListener('mousedown', onClickOutside))
 
       <button
         type="button"
-        @click="theme.toggle()"
-        class="w-full text-left px-3 py-2 text-sm hover:bg-slate-50 dark:hover:bg-slate-700/60 text-slate-700 dark:text-slate-200 flex items-center gap-2 transition-colors"
+        @click="cycleVariant"
+        class="w-full text-left px-3 py-2 text-sm hover:chrome-bg-elevated chrome-text-normal flex items-center gap-2 transition-colors"
+        :title="t('common.switch_theme')"
       >
-        <component :is="theme.theme === 'dark' ? Sun : Moon" class="w-4 h-4" />
-        {{ theme.theme === 'dark' ? t('common.light_mode') : t('common.dark_mode') }}
+        <Palette class="w-4 h-4" />
+        <span class="flex-1">{{ t('common.switch_theme') }}</span>
+        <span class="text-xs chrome-text-muted">
+          {{ variants.find((v) => v.id === themeStore.variant)?.name }}
+        </span>
       </button>
 
       <button

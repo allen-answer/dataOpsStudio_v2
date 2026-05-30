@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { LayoutGrid, Database, Terminal, ListChecks, Sparkles } from 'lucide-vue-next'
+import { LayoutGrid, Database, Terminal, ListChecks, Bot } from 'lucide-vue-next'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -42,13 +42,16 @@ function go(item: NavItem): void {
 
 <template>
   <nav
-    class="w-16 shrink-0 border-r border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 py-3 flex flex-col items-center gap-1"
+    class="w-16 shrink-0 border-r chrome-border chrome-bg-panel py-3 flex flex-col items-center gap-1"
   >
+    <!-- 品牌 D 字母,渐变跟当前 variant 走 -->
     <RouterLink
       :to="{ name: 'projects' }"
-      class="w-9 h-9 mb-3 rounded-card bg-sky-gradient grid place-items-center shadow-subtle hover:opacity-90 transition-opacity"
+      class="w-9 h-9 mb-3 rounded-card grid place-items-center shadow-card hover:opacity-90 transition-opacity"
+      style="background-image: var(--gradient-brand);"
+      :title="t('common.app_name')"
     >
-      <Sparkles class="w-4 h-4 text-white" />
+      <span class="text-white text-base font-bold tracking-tight">D</span>
     </RouterLink>
 
     <button
@@ -56,19 +59,49 @@ function go(item: NavItem): void {
       :key="item.name"
       type="button"
       @click="go(item)"
-      class="w-12 py-2 rounded-card flex flex-col items-center gap-0.5 transition-colors relative"
-      :class="
-        isActive(item)
-          ? 'bg-sky-50 dark:bg-sky-500/15 text-sky-600 dark:text-sky-400'
-          : 'text-slate-500 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-800/60 hover:text-slate-700 dark:hover:text-slate-200'
-      "
+      class="w-12 py-2 rounded-card flex flex-col items-center gap-0.5 transition-colors relative chrome-nav-item"
+      :class="isActive(item) && 'chrome-nav-item-active'"
     >
+      <!-- 选中状态左侧立柱 -->
       <span
         v-if="isActive(item)"
-        class="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-r bg-sky-500 dark:bg-sky-400"
-      ></span>
+        class="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-r chrome-accent-bg"
+      />
       <component :is="item.icon" class="w-4 h-4" />
       <span class="text-[10px] font-medium">{{ t(`nav.${item.name}`) }}</span>
     </button>
+
+    <!-- 底部 AI Copilot 入口(★ 后补:T7+1 接 AI Service)-->
+    <button
+      type="button"
+      class="mt-auto w-9 h-9 mb-1 rounded-card grid place-items-center transition-colors chrome-btn-ai"
+      :title="t('nav.ai_copilot')"
+    >
+      <Bot class="w-4 h-4" />
+    </button>
   </nav>
 </template>
+
+<style scoped>
+.chrome-nav-item {
+  color: rgb(var(--text-muted));
+}
+.chrome-nav-item:hover {
+  background-color: rgb(var(--bg-panel-elevated));
+  color: rgb(var(--text-heading));
+}
+.chrome-nav-item-active,
+.chrome-nav-item-active:hover {
+  background-color: rgb(var(--accent) / 0.12);
+  color: rgb(var(--accent));
+}
+
+.chrome-btn-ai {
+  color: rgb(var(--accent));
+  background-color: rgb(var(--accent) / 0.10);
+  border: 1px solid rgb(var(--accent) / 0.30);
+}
+.chrome-btn-ai:hover {
+  background-color: rgb(var(--accent) / 0.18);
+}
+</style>
