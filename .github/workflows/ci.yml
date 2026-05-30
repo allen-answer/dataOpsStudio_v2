@@ -558,3 +558,28 @@ jobs:
       - name: Skip notice (frontend not present)
         if: hashFiles('frontend/package.json') == ''
         run: echo "::notice::frontend/package.json 不存在 — 跳过前端 build。"
+
+  # ─── 治理结构同步守护(AGENTS.md == CLAUDE.md,除首行) ───────────────
+  # 两份是 agent 入口宪法,内容除标题外必须一字一致 —— 任何一边改了对面没改,
+  # 这道闸立刻红。防 review 漏看导致两边规则漂移。
+  agents-doc-sync:
+    name: Agents Doc Sync (AGENTS.md == CLAUDE.md)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: diff AGENTS.md vs CLAUDE.md (skip first line title)
+        if: hashFiles('AGENTS.md') != '' && hashFiles('CLAUDE.md') != ''
+        run: |
+          if ! diff <(tail -n +2 AGENTS.md) <(tail -n +2 CLAUDE.md) > /dev/null; then
+            echo "::error::AGENTS.md 和 CLAUDE.md 内容不一致(除首行标题外)。"
+            echo "::error::两份必须同步;改其中一个必须同步另一个。"
+            echo "─── diff ───"
+            diff <(tail -n +2 AGENTS.md) <(tail -n +2 CLAUDE.md) | head -80
+            exit 1
+          fi
+          echo "✓ AGENTS.md ≡ CLAUDE.md (除首行标题)"
+
+      - name: Skip notice (one or both missing)
+        if: hashFiles('AGENTS.md') == '' || hashFiles('CLAUDE.md') == ''
+        run: echo "::notice::AGENTS.md 或 CLAUDE.md 不存在 — 治理结构尚未落地,跳过同步检查。"
