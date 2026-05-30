@@ -3,8 +3,10 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 const LoginView = () => import('../views/LoginView.vue')
 const AppShellLayout = () => import('../views/AppShellLayout.vue')
 const ProjectsView = () => import('../views/ProjectsView.vue')
+const DatasourcesView = () => import('../views/DatasourcesView.vue')
 const PlaceholderView = () => import('../views/PlaceholderView.vue')
 const DesignSystemPreview = () => import('../views/DesignSystemPreview.vue')
+const TokensView = () => import('../views/TokensView.vue')
 
 const routes: RouteRecordRaw[] = [
   {
@@ -20,6 +22,12 @@ const routes: RouteRecordRaw[] = [
     meta: { public: true }, // 内部参考页,不强制登录
   },
   {
+    path: '/__tokens__',
+    name: 'tokens',
+    component: TokensView,
+    meta: { public: true }, // Figma Make TokensView 镜像;design reference
+  },
+  {
     path: '/',
     component: AppShellLayout,
     children: [
@@ -28,8 +36,7 @@ const routes: RouteRecordRaw[] = [
       {
         path: 'projects/:id/datasources',
         name: 'datasources',
-        component: PlaceholderView,
-        props: { section: 'datasources' },
+        component: DatasourcesView,
       },
       {
         path: 'projects/:id/sql',

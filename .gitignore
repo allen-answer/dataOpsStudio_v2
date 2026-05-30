@@ -39,4 +39,5 @@ frontend/.vite/
 
 # ─── MCP / 临时调试产物 ───
 .playwright-mcp/
-/*.png        # 根目录 PNG(MCP 截图等);frontend/src/assets/*.png 不受影响
+# 根目录 PNG(MCP 截图等);frontend/src/assets/*.png 不受影响
+/*.png
