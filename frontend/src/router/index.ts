@@ -1,5 +1,4 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
-import { installAuthGuard } from './guards'
 
 const LoginView = () => import('../views/LoginView.vue')
 const AppShellLayout = () => import('../views/AppShellLayout.vue')
@@ -56,5 +55,3 @@ export const router = createRouter({
   history: createWebHistory(),
   routes,
 })
-
-installAuthGuard(router)
