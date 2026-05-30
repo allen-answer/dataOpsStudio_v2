@@ -1,0 +1,120 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #app {
+    height: 100%;
+  }
+  body {
+    @apply bg-slate-50 text-slate-800 font-sans text-ui antialiased transition-colors;
+  }
+  /* 深色全局底:slate-50 → slate-900 */
+  [data-theme='dark'] body,
+  body:has([data-theme='dark']) {
+    @apply bg-slate-900 text-slate-100;
+  }
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * Variant tokens — 4 套 design system 切换。改的是真 token,
+ * 不只是配色。每个 [data-variant=...] 定义一套 CSS 变量,所有
+ * 用 var(--xxx) 的元素跟着切。
+ * ───────────────────────────────────────────────────────────────── */
+
+[data-variant='default'] {
+  --color-primary: 14 165 233; /* sky-500 */
+  --color-primary-hover: 2 132 199; /* sky-600 */
+  --gradient-primary: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
+  --gradient-primary-hover: linear-gradient(135deg, #0ea5e9 0%, #0369a1 100%);
+  --gradient-soft: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+  --radius-card: 8px;
+  --radius-input: 6px;
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.08);
+  --shell-pad: 32px;
+  /* 微调 round 1:工作区收紧到 Linear 的 4×10,DBA 看更多行 */
+  --work-row-py: 4px;
+  --work-row-px: 10px;
+  /* 微调 round 1:标题 600 → 500,Linear 那种技术感,less OA */
+  --title-weight: 500;
+  --title-tracking: -0.02em;
+  --signature-soft-border: #bae6fd; /* sky-200 */
+}
+
+/* ─── Default 深色 —— DBA 夜里干活的主战场 ───────────────────────
+ * 深色不是简单"反色",是重新决定:
+ *   - 主色 sky-500 → sky-400(深底下要更亮)
+ *   - 渐变两端整体往亮挪一档(sky-300 → sky-500)
+ *   - 阴影改 1px 蓝色发光边框 + 深底投影,而非黑投影
+ *   - signature soft 渐变改深底里的微亮带
+ * ───────────────────────────────────────────────────────────────── */
+[data-variant='default'][data-theme='dark'] {
+  --color-primary: 56 189 248; /* sky-400 — 提亮一档 */
+  --color-primary-hover: 14 165 233; /* sky-500 */
+  --gradient-primary: linear-gradient(135deg, #7dd3fc 0%, #0ea5e9 100%);
+  --gradient-primary-hover: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
+  --gradient-soft: linear-gradient(135deg, rgba(56, 189, 248, 0.08) 0%, rgba(56, 189, 248, 0.02) 100%);
+  /* 深色用蓝色发光边框 + 黑底投影,不用纯黑阴影 */
+  --shadow-card:
+    0 0 0 1px rgba(56, 189, 248, 0.05),
+    0 1px 2px rgba(0, 0, 0, 0.3);
+  --signature-soft-border: rgba(56, 189, 248, 0.2);
+}
+
+/* 想加新 variant?直接在此处加一个 [data-variant='xxx'] 块,
+   覆盖上面定义的 CSS 变量即可,无需重构组件。 */
+
+/* ─────────────────────────────────────────────────────────────────
+ * Global overrides — 既有的 Tailwind 类绑到 CSS 变量上,
+ * 整页所有 .rounded-card / .shadow-subtle / .bg-sky-gradient*
+ * 自动跟 variant 切。
+ * ───────────────────────────────────────────────────────────────── */
+[data-variant] .rounded-card {
+  border-radius: var(--radius-card);
+}
+[data-variant] .rounded-input {
+  border-radius: var(--radius-input);
+}
+[data-variant] .shadow-subtle {
+  box-shadow: var(--shadow-card);
+}
+[data-variant] .bg-sky-gradient {
+  background-image: var(--gradient-primary);
+}
+[data-variant] .bg-sky-gradient-soft {
+  background-image: var(--gradient-soft);
+  border-color: var(--signature-soft-border);
+}
+[data-variant] .text-h2 {
+  font-weight: var(--title-weight);
+  letter-spacing: var(--title-tracking);
+}
+[data-variant] .text-section {
+  font-weight: var(--title-weight);
+  letter-spacing: var(--title-tracking);
+}
+/* 密度类 —— 显式打上 data-shell-pad / data-work-row 才跟着切 */
+[data-variant] .data-shell-pad {
+  padding: var(--shell-pad);
+}
+[data-variant] .data-work-row > td,
+[data-variant] .data-work-row > th {
+  padding-top: var(--work-row-py);
+  padding-bottom: var(--work-row-py);
+  padding-left: var(--work-row-px);
+  padding-right: var(--work-row-px);
+}
+
+@layer utilities {
+  /* 等宽数字 —— 数据表格列对齐用 */
+  .tabular-mono {
+    @apply font-mono text-data tabular-nums;
+  }
+}

@@ -526,3 +526,35 @@ jobs:
       - name: Skip notice (T6 not yet merged)
         if: hashFiles('app/launcher.py') == ''
         run: echo "::notice::app/launcher.py 不存在 — T6 尚未合并,跳过 cold-start。T6 合并后本 job 自动启用。"
+
+  # ─── 前端 build 底线(T7 phase 1+) ─────────────────────────────────
+  # 前端进 git 就该有 CI 守:vue-tsc + vite build 能不能编译过。
+  # 跟后端红线一个道理 —— build 是最低线,e2e 是另一回事。
+  # ★ Gate:frontend/ 不存在 hashFiles 跳过(防 PR revert)。
+  frontend-build:
+    name: Frontend Build (T7)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        if: hashFiles('frontend/package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: 'frontend/package-lock.json'
+
+      - name: npm ci (clean install)
+        if: hashFiles('frontend/package.json') != ''
+        run: npm ci
+        working-directory: frontend
+
+      - name: vue-tsc + vite build
+        if: hashFiles('frontend/package.json') != ''
+        run: npm run build
+        working-directory: frontend
+
+      - name: Skip notice (frontend not present)
+        if: hashFiles('frontend/package.json') == ''
+        run: echo "::notice::frontend/package.json 不存在 — 跳过前端 build。"
