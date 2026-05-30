@@ -4,7 +4,10 @@
 > 完整设计见 `docs/design/dataops-2.0-tech-design-v0.3.2.md`(1806 行)。
 > 本文件只保留写代码时**必须遵守的硬约束**。两个 agent 共享此契约。
 >
-> **v2 变更**:新增 §9(1.x 开发期定位)+ §10(前端视觉规范:现代清爽风/天空蓝);前端 T7 由 Codex 改划给 Claude Code;补充 §5 云服务器部署约定。
+> **三层文档结构**:
+> - **`AGENT_CORE.md`**(自动加载,< 12KB):速记 + 索引,30 秒看完
+> - **本文件**:执行契约,完整规则定义,**开工前必读**
+> - **`docs/agent-playbook.md`**:历史 changelog + 踩坑案例 + 设计背景,按需查
 >
 > **角色分工**:
 > - **Codex = 主力**,写后端实现(adapter / API / worker / job backend / secretstore / license / migrate)
@@ -283,7 +286,7 @@ class Job:
 | R7 | Workflow 节点必须在白名单内 | 校验 job_kind ∈ ALLOWED_WORKFLOW_NODE_KINDS;禁 shell/python/任意HTTP |
 | R8 | 配置文件禁止明文密码字段 | gitleaks + `config/*.json|yml` 出现明文 `password:` fail |
 | R9 | CI 不跑 SQLite backend(2.0 不支持) | 测试矩阵只有 PG |
-| R10 | f-string 拼接 `uuid4().hex` / `str(uuid4())` 禁止(拼前缀让 id 长度不可预测,超 schema 字段) | ast-grep:`tools/lint/rules/r10_no_uuid_prefix_concat.yml` —— 教训见 T1 PR #3(37 字符 id 超 VARCHAR(36),4 PG integration test 全红) |
+| R10 | f-string 拼接 `uuid4().hex` / `str(uuid4())` 禁止(拼前缀让 id 长度不可预测,超 schema 字段) | ast-grep:`tools/lint/rules/r10_no_uuid_prefix_concat.yml`(触发案例见 `docs/agent-playbook.md §2`) |
 
 **ALLOWED_WORKFLOW_NODE_KINDS**(R7):
 ```python
@@ -400,7 +403,7 @@ docker compose(api+worker+pg)跑通同样流程。
 | T5 License + Repair Mode | `infrastructure/license/` | Step1 接口;Codex |
 | T6 launcher | `launcher.py` | T1/T4 接口;Codex |
 | T7 前端 | `frontend/` | T4 的 API 契约;**★ Claude Code 负责(非 Codex),按 §10 视觉规范** |
-| T8 migrate_from_v1 | `tools/migrate_from_v1.py` | Step1 models;Codex(可参考 1.x,见 §9) |
+| T8 migrate_from_v1 | `tools/migrate_from_v1.py` | Step1 models;Codex(参考 1.x:见 `docs/agent-playbook.md §3` 设计背景)|
 
 **并行铁律**:同一时间,一个任务块只由一个 agent 负责,不得两个 agent 同改一块。
 
@@ -439,40 +442,6 @@ Codex 每完成一个任务块 → Claude Code review:
 - 接口要改 → 先改本契约 §3 → 通知两个 agent → 再改代码
 - 本契约与 v0.3.2 设计稿冲突时,**以设计稿为准**,并修正本契约
 - 本契约只是设计稿的"执行摘要",不是新决策来源
-
----
-
-## 9. 1.x 项目的定位(开发期)
-
-> **参考 1.x 时,看 `docs/legacy/V1_AS_IS.md`(1.x 现状文档,基于真实代码扫描),不要直接翻 1.x 源码猜。** 该文档已记录:目录结构、4 个数据库方言能力矩阵、数据存储结构(JSON + SQLite 9 表)、核心业务规则位置、lineage 真实结构。agent 参考 1.x = 先读这份文档。
-
-1.x 在 2.0 开发期**不发展、不删除、2.0 GA 后 6 个月 EOL**(见设计稿 §10.6)。但它在开发期有四个用途,agent 必须正确对待:
-
-| 用途 | 怎么用 |
-|---|---|
-| **业务规则字典** | 写 2.0 adapter / Compare / Scenario / Lineage 时,1.x 对应实现是验证过的业务规则参考。adapter 是**移植** 1.x(MySQL/Oracle/DM/DB2 方言处理已踩过坑),不是凭空新写。 |
-| **迁移源** | `migrate_from_v1.py`(T8)要读 1.x 数据结构,1.x 代码是迁移逻辑的依据。 |
-| **自用工具** | 2.0 成熟前,1.x 仍是当前可用的生产/自用工具,不可破坏。 |
-| **dogfooding 对照组** | 2.0 每个能力域做完,拿 1.x 同功能对照,验证 2.0 没退化。 |
-
-**关键边界(agent 必读)**:
-- 参考 1.x 的是**业务规则**(方言怎么处理、字段怎么映射),**不是架构**。
-- **架构一律以 2.0 设计稿为准**。1.x 的烂设计(5 套 execution / 明文密码 / ResultSet 截断 / 同进程跑长任务)正是 2.0 要修掉的,**禁止照搬**。
-- 写 adapter 时:查 1.x 怎么连库、怎么处理方言 → 但按 §3.2 的新接口组织代码。
-- 有冲突时:业务规则信 1.x,代码结构信设计稿。
-
-**adapter 移植具体注意(来自 V1_AS_IS.md §2,Codex 写 adapter 必读)**:
-- **DM 方言继承 Oracle**:1.x `DmDialect(OracleDialect)` 只 override 4 个方法(introspect/connect 等)。推进顺序虽是 MySQL→DM→Oracle,但**写 DM 时其方言逻辑大量依赖 Oracle**,需先理解 Oracle 方言。这是隐含依赖。
-- **取消查询是"软取消",不是真 kill**:1.x 无 driver-level cancel,靠 `cancel_requested` flag 在安全点轮询 + statement timeout 兜底。2.0 `DatabaseAdapter.kill_query` 在 MySQL/Oracle/DM/DB2 上大概率**做不到真 kill**,`AdapterCapabilities.server_side_cancel` 多为 False。照 1.x 软取消模式做,不要假设能真 kill。
-- **流式读分两路**:MySQL 用 `SSCursor`(server-side unbuffered),其它驱动用普通 cursor + `fetchmany`。2.0 spool 拉取要按驱动区分。
-- **标识符大小写**:MySQL 反引号原样;Oracle/DM 用 `UPPER()` 包裹 + 双引号 quote。
-- **SQL guard 已有成熟实现**:1.x `app/utils/sql_guard.py:validate_readonly_sql` 是验证过的只读 SQL 校验(首词 SELECT/WITH、拒多语句、拒 FOR UPDATE、禁词集合),2.0 直接移植。
-
-**lineage 注意(来自 V1_AS_IS.md §9)**:
-- 1.x **没有 "lineage aspect" 概念**(代码零 `aspect` 关键字)。lineage 产出是一个 `LineageReport`(20 字段 Pydantic)。
-- 2.0 lineage(2.4.0 才做)**沿用 `app/models/lineage.py` 的 LineageReport schema**,不要发明 aspect 体系。
-- "aspect" 一词只属于资产分类(asset_aspects:6 个标签类型),与 lineage 无关,两套独立。
-- lineage 解析结果不持久化(每次重算),migrate 不迁。
 
 ---
 
