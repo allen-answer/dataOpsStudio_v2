@@ -1,7 +1,7 @@
 # Agent Playbook — DataOps Studio 2.0
 
 > 历史 changelog + 踩坑案例 + 设计背景。**按需查,不是 agent 必读**。
-> 当前的硬规则在 `AGENT_CORE.md`(自动加载) + `AGENT_CONTRACT_v2.md`(开工前读)。
+> 当前的硬规则在 `AGENTS.md` / `CLAUDE.md`(agent 自动加载) + `AGENT_CONTRACT_v2.md`(开工前读)。
 
 ---
 
@@ -112,7 +112,7 @@
 - **curl 200 ≠ 前端真渲染**(只证明 SPA index.html 在,JS 可能挂在 module 阶段)
 - ES module 顶层副作用是定时炸弹;**框架插件初始化顺序敏感时,模块只导出零件,
   装配顺序由应用入口 `main.ts` 控制**
-- → 已落 `AGENT_CORE.md §4` 前端"跑起来"最低标准
+- → 已落 `AGENTS.md` / `CLAUDE.md §4` 前端"跑起来"最低标准
 
 ---
 
@@ -216,11 +216,14 @@ npm run dev
 
 ### 三份文档定位
 
-| 文档 | 行数 | 用途 | 冲突时优先级 |
+| 文档 | 大小 | 用途 | 冲突时优先级 |
 |---|---|---|---|
-| `docs/design/dataops-2.0-tech-design-v0.3.2.md` | 1806 | 产品 + 架构 + 接口完整设计 | **最高(以设计稿为准)** |
-| `AGENT_CONTRACT_v2.md` | ~500 | 执行摘要,agent 硬约束 | 设计稿的执行子集 |
-| `AGENT_CORE.md` | <12KB | 速记 + 索引,自动加载 | contract 的子集 |
+| `docs/design/dataops-2.0-tech-design-v0.3.2.md` | 1806 行 | 产品 + 架构 + 接口完整设计 | **最高(以设计稿为准)** |
+| `AGENT_CONTRACT_v2.md` | ~24KB | 执行契约,agent 硬约束 | 设计稿的执行子集 |
+| `AGENTS.md` / `CLAUDE.md` | ~5.5KB | 宪法 + 速记,agent 自动加载 | contract 的子集 |
+
+`AGENTS.md` 与 `CLAUDE.md` 内容除首行标题外一字一致(CI `Agents Doc Sync` 守护)。
+Codex 自动加载 AGENTS.md,Claude Code 自动加载 CLAUDE.md,两者拿到同一份宪法。
 
 ### Karpathy 4 条来源
 

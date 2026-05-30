@@ -5,9 +5,11 @@
 > 本文件只保留写代码时**必须遵守的硬约束**。两个 agent 共享此契约。
 >
 > **三层文档结构**:
-> - **`AGENT_CORE.md`**(自动加载,< 12KB):速记 + 索引,30 秒看完
+> - **`AGENTS.md` / `CLAUDE.md`**(agent 启动自动加载,~5.5KB):宪法 + 速记
 > - **本文件**:执行契约,完整规则定义,**开工前必读**
 > - **`docs/agent-playbook.md`**:历史 changelog + 踩坑案例 + 设计背景,按需查
+>
+> `AGENTS.md` 与 `CLAUDE.md` 内容除首行标题外**一字一致**,CI `Agents Doc Sync` job 守护。
 >
 > **角色分工**:
 > - **Codex = 主力**,写后端实现(adapter / API / worker / job backend / secretstore / license / migrate)
