@@ -9,12 +9,9 @@
     height: 100%;
   }
   body {
-    @apply bg-slate-50 text-slate-800 font-sans text-ui antialiased transition-colors;
-  }
-  /* 深色全局底:slate-50 → slate-900 */
-  [data-theme='dark'] body,
-  body:has([data-theme='dark']) {
-    @apply bg-slate-900 text-slate-100;
+    background-color: rgb(var(--bg-main));
+    color: rgb(var(--text-normal));
+    @apply font-sans text-ui antialiased transition-colors;
   }
   *,
   *::before,
@@ -24,57 +21,152 @@
 }
 
 /* ─────────────────────────────────────────────────────────────────
- * Variant tokens — 4 套 design system 切换。改的是真 token,
- * 不只是配色。每个 [data-variant=...] 定义一套 CSS 变量,所有
- * 用 var(--xxx) 的元素跟着切。
+ * Variant tokens — 4 套 design system 主题。每个 [data-variant=...]
+ * 是一套完整 token 集合,**mode 已锁进 variant**(spotify-dark / figma-dark
+ * 是深色;modern-light / studio-light 是浅色),不再分离 dark/light toggle。
+ *
+ * 设计源:Figma Make 文件 ThemeContext.tsx + TokensView.tsx。
+ * Tailwind class 字符串改写为 CSS RGB 值,组件层用 rgb(var(--...)) 引用。
  * ───────────────────────────────────────────────────────────────── */
 
-[data-variant='default'] {
-  --color-primary: 14 165 233; /* sky-500 */
-  --color-primary-hover: 2 132 199; /* sky-600 */
-  --gradient-primary: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
-  --gradient-primary-hover: linear-gradient(135deg, #0ea5e9 0%, #0369a1 100%);
-  --gradient-soft: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+/* ─── 1. Spotify Dark ─── zinc + emerald,音乐 app 风,主色绿调亮眼 ─── */
+[data-variant='spotify-dark'] {
+  --mode: dark;
+  /* 背景 */
+  --bg-main: 9 9 11;            /* zinc-950 */
+  --bg-panel: 24 24 27;         /* zinc-900 */
+  --bg-panel-elevated: 39 39 42; /* zinc-800 */
+  /* 边框 */
+  --border: 39 39 42;           /* zinc-800 */
+  --border-subtle: 39 39 42 / 50%;
+  /* 文字 */
+  --text-heading: 244 244 245;  /* zinc-100 */
+  --text-normal: 212 212 216;   /* zinc-300 */
+  --text-muted: 113 113 122;    /* zinc-500 */
+  /* 主色 */
+  --accent: 16 185 129;         /* emerald-500 */
+  --accent-hover: 5 150 105;    /* emerald-600 */
+  --accent-light-bg: 16 185 129 / 10%;
+  /* 渐变(品牌签名) */
+  --gradient-brand: linear-gradient(135deg, #34d399 0%, #0d9488 100%); /* emerald-400 → teal-600 */
+  --gradient-soft: linear-gradient(135deg, rgba(16, 185, 129, 0.08) 0%, rgba(16, 185, 129, 0.02) 100%);
+  /* 编辑器 */
+  --editor-bg: 10 10 10;
+  --editor-text: 212 212 216;
+  --editor-gutter-bg: 18 18 18;
+  --editor-gutter-border: 34 34 34;
+  --editor-gutter-text: 85 85 85;
+  /* 形态 */
   --radius-card: 8px;
   --radius-input: 6px;
-  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.08);
-  --shell-pad: 32px;
-  /* 微调 round 1:工作区收紧到 Linear 的 4×10,DBA 看更多行 */
-  --work-row-py: 4px;
-  --work-row-px: 10px;
-  /* 微调 round 1:标题 600 → 500,Linear 那种技术感,less OA */
-  --title-weight: 500;
-  --title-tracking: -0.02em;
-  --signature-soft-border: #bae6fd; /* sky-200 */
-}
-
-/* ─── Default 深色 —— DBA 夜里干活的主战场 ───────────────────────
- * 深色不是简单"反色",是重新决定:
- *   - 主色 sky-500 → sky-400(深底下要更亮)
- *   - 渐变两端整体往亮挪一档(sky-300 → sky-500)
- *   - 阴影改 1px 蓝色发光边框 + 深底投影,而非黑投影
- *   - signature soft 渐变改深底里的微亮带
- * ───────────────────────────────────────────────────────────────── */
-[data-variant='default'][data-theme='dark'] {
-  --color-primary: 56 189 248; /* sky-400 — 提亮一档 */
-  --color-primary-hover: 14 165 233; /* sky-500 */
-  --gradient-primary: linear-gradient(135deg, #7dd3fc 0%, #0ea5e9 100%);
-  --gradient-primary-hover: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
-  --gradient-soft: linear-gradient(135deg, rgba(56, 189, 248, 0.08) 0%, rgba(56, 189, 248, 0.02) 100%);
-  /* 深色用蓝色发光边框 + 黑底投影,不用纯黑阴影 */
   --shadow-card:
-    0 0 0 1px rgba(56, 189, 248, 0.05),
-    0 1px 2px rgba(0, 0, 0, 0.3);
-  --signature-soft-border: rgba(56, 189, 248, 0.2);
+    0 0 0 1px rgba(16, 185, 129, 0.05),
+    0 1px 2px rgba(0, 0, 0, 0.4);
+  --shell-pad: 24px;
+  --work-row-py: 4px;
+  --work-row-px: 12px;
+  --title-weight: 600;
+  --title-tracking: -0.015em;
 }
 
-/* 想加新 variant?直接在此处加一个 [data-variant='xxx'] 块,
-   覆盖上面定义的 CSS 变量即可,无需重构组件。 */
+/* ─── 2. Figma Dark ─── slate + sky,设计工具风,DBA 主战场 ─── */
+[data-variant='figma-dark'] {
+  --mode: dark;
+  --bg-main: 2 6 23;            /* slate-950 */
+  --bg-panel: 15 23 42;         /* slate-900 */
+  --bg-panel-elevated: 30 41 59; /* slate-800 */
+  --border: 30 41 59;           /* slate-800 */
+  --border-subtle: 30 41 59 / 50%;
+  --text-heading: 241 245 249;  /* slate-100 */
+  --text-normal: 203 213 225;   /* slate-300 */
+  --text-muted: 100 116 139;    /* slate-500 */
+  --accent: 14 165 233;         /* sky-500 */
+  --accent-hover: 2 132 199;    /* sky-600 */
+  --accent-light-bg: 14 165 233 / 10%;
+  --gradient-brand: linear-gradient(135deg, #38bdf8 0%, #2563eb 100%); /* sky-400 → blue-600 */
+  --gradient-soft: linear-gradient(135deg, rgba(14, 165, 233, 0.08) 0%, rgba(14, 165, 233, 0.02) 100%);
+  --editor-bg: 13 17 23;        /* GitHub-dark 经典 */
+  --editor-text: 203 213 225;
+  --editor-gutter-bg: 22 27 34;
+  --editor-gutter-border: 33 38 45;
+  --editor-gutter-text: 72 79 88;
+  --radius-card: 8px;
+  --radius-input: 6px;
+  --shadow-card:
+    0 0 0 1px rgba(14, 165, 233, 0.05),
+    0 1px 2px rgba(0, 0, 0, 0.3);
+  --shell-pad: 24px;
+  --work-row-py: 4px;
+  --work-row-px: 12px;
+  --title-weight: 600;
+  --title-tracking: -0.015em;
+}
+
+/* ─── 3. Modern Light ─── sky-100 + cyan,现代清爽 ─── */
+[data-variant='modern-light'] {
+  --mode: light;
+  --bg-main: 224 242 254;       /* sky-100 */
+  --bg-panel: 241 245 249;      /* slate-100 */
+  --bg-panel-elevated: 226 232 240; /* slate-200 */
+  --border: 203 213 225;        /* slate-300 */
+  --border-subtle: 226 232 240; /* slate-200 */
+  --text-heading: 15 23 42;     /* slate-900 */
+  --text-normal: 51 65 85;      /* slate-700 */
+  --text-muted: 100 116 139;    /* slate-500 */
+  --accent: 8 145 178;          /* cyan-600 */
+  --accent-hover: 14 116 144;   /* cyan-700 */
+  --accent-light-bg: 207 250 254; /* cyan-100 */
+  --gradient-brand: linear-gradient(135deg, #06b6d4 0%, #2563eb 100%); /* cyan-500 → blue-600 */
+  --gradient-soft: linear-gradient(135deg, #ecfeff 0%, #cffafe 100%);
+  --editor-bg: 241 245 249;
+  --editor-text: 30 41 59;
+  --editor-gutter-bg: 226 232 240;
+  --editor-gutter-border: 203 213 225;
+  --editor-gutter-text: 148 163 184;
+  --radius-card: 8px;
+  --radius-input: 6px;
+  --shadow-card: 0 1px 3px rgba(15, 23, 42, 0.08);
+  --shell-pad: 24px;
+  --work-row-py: 4px;
+  --work-row-px: 12px;
+  --title-weight: 600;
+  --title-tracking: -0.015em;
+}
+
+/* ─── 4. Studio Light ─── violet-100 + violet,品牌识别强 ─── */
+[data-variant='studio-light'] {
+  --mode: light;
+  --bg-main: 237 233 254;       /* violet-100 */
+  --bg-panel: 244 244 245;      /* zinc-100 */
+  --bg-panel-elevated: 228 228 231; /* zinc-200 */
+  --border: 212 212 216;        /* zinc-300 */
+  --border-subtle: 228 228 231; /* zinc-200 */
+  --text-heading: 24 24 27;     /* zinc-900 */
+  --text-normal: 63 63 70;      /* zinc-700 */
+  --text-muted: 113 113 122;    /* zinc-500 */
+  --accent: 124 58 237;         /* violet-600 */
+  --accent-hover: 109 40 217;   /* violet-700 */
+  --accent-light-bg: 237 233 254; /* violet-100 */
+  --gradient-brand: linear-gradient(135deg, #8b5cf6 0%, #d946ef 100%); /* violet-500 → fuchsia-600 */
+  --gradient-soft: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%);
+  --editor-bg: 244 244 245;
+  --editor-text: 39 39 42;
+  --editor-gutter-bg: 228 228 231;
+  --editor-gutter-border: 212 212 216;
+  --editor-gutter-text: 161 161 170;
+  --radius-card: 8px;
+  --radius-input: 6px;
+  --shadow-card: 0 1px 3px rgba(124, 58, 237, 0.10);
+  --shell-pad: 24px;
+  --work-row-py: 4px;
+  --work-row-px: 12px;
+  --title-weight: 600;
+  --title-tracking: -0.015em;
+}
 
 /* ─────────────────────────────────────────────────────────────────
- * Global overrides — 既有的 Tailwind 类绑到 CSS 变量上,
- * 整页所有 .rounded-card / .shadow-subtle / .bg-sky-gradient*
- * 自动跟 variant 切。
+ * 全局类绑定 — 既有的 Tailwind 类 + 我们自定义的语义类,
+ * 全部走 CSS 变量,跟着 [data-variant] 切。
  * ───────────────────────────────────────────────────────────────── */
 [data-variant] .rounded-card {
   border-radius: var(--radius-card);
@@ -85,22 +177,19 @@
 [data-variant] .shadow-subtle {
   box-shadow: var(--shadow-card);
 }
-[data-variant] .bg-sky-gradient {
-  background-image: var(--gradient-primary);
+[data-variant] .bg-sky-gradient,
+[data-variant] .bg-brand-gradient {
+  background-image: var(--gradient-brand);
 }
-[data-variant] .bg-sky-gradient-soft {
+[data-variant] .bg-sky-gradient-soft,
+[data-variant] .bg-brand-soft {
   background-image: var(--gradient-soft);
-  border-color: var(--signature-soft-border);
 }
-[data-variant] .text-h2 {
-  font-weight: var(--title-weight);
-  letter-spacing: var(--title-tracking);
-}
+[data-variant] .text-h2,
 [data-variant] .text-section {
   font-weight: var(--title-weight);
   letter-spacing: var(--title-tracking);
 }
-/* 密度类 —— 显式打上 data-shell-pad / data-work-row 才跟着切 */
 [data-variant] .data-shell-pad {
   padding: var(--shell-pad);
 }
@@ -110,6 +199,139 @@
   padding-bottom: var(--work-row-py);
   padding-left: var(--work-row-px);
   padding-right: var(--work-row-px);
+}
+
+/* 语义化 chrome 类 —— 业务组件直接用,无需关心当前 variant */
+[data-variant] .chrome-bg-main {
+  background-color: rgb(var(--bg-main));
+}
+[data-variant] .chrome-bg-panel {
+  background-color: rgb(var(--bg-panel));
+}
+[data-variant] .chrome-bg-elevated {
+  background-color: rgb(var(--bg-panel-elevated));
+}
+[data-variant] .chrome-border {
+  border-color: rgb(var(--border));
+}
+[data-variant] .chrome-border-subtle {
+  border-color: rgb(var(--border-subtle));
+}
+[data-variant] .chrome-text-heading {
+  color: rgb(var(--text-heading));
+}
+[data-variant] .chrome-text-normal {
+  color: rgb(var(--text-normal));
+}
+[data-variant] .chrome-text-muted {
+  color: rgb(var(--text-muted));
+}
+[data-variant] .chrome-accent {
+  color: rgb(var(--accent));
+}
+[data-variant] .chrome-accent-bg {
+  background-color: rgb(var(--accent));
+}
+[data-variant] .chrome-accent-bg-hover:hover {
+  background-color: rgb(var(--accent-hover));
+}
+[data-variant] .chrome-accent-light-bg {
+  background-color: rgb(var(--accent-light-bg));
+}
+
+/* form 控件 */
+[data-variant] .chrome-input {
+  background-color: rgb(var(--bg-panel));
+  border: 1px solid rgb(var(--border));
+  border-radius: var(--radius-input);
+  color: rgb(var(--text-heading));
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  transition: border-color 120ms, box-shadow 120ms;
+}
+[data-variant] .chrome-input::placeholder {
+  color: rgb(var(--text-muted));
+}
+[data-variant] .chrome-input:focus {
+  outline: none;
+  border-color: rgb(var(--accent));
+  box-shadow: 0 0 0 3px rgb(var(--accent) / 0.18);
+}
+[data-variant] .chrome-input:disabled {
+  background-color: rgb(var(--bg-panel-elevated));
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+/* primary 按钮(品牌渐变)*/
+[data-variant] .chrome-btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.625rem 1rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: #ffffff;
+  background-image: var(--gradient-brand);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+  transition: filter 120ms, opacity 120ms;
+  white-space: nowrap;
+  user-select: none;
+}
+[data-variant] .chrome-btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+[data-variant] .chrome-btn-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* secondary 按钮(panel + border)*/
+[data-variant] .chrome-btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.5rem 0.875rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: rgb(var(--text-normal));
+  background-color: rgb(var(--bg-panel));
+  border: 1px solid rgb(var(--border));
+  border-radius: var(--radius-card);
+  transition: background-color 120ms, border-color 120ms;
+  white-space: nowrap;
+  user-select: none;
+}
+[data-variant] .chrome-btn-secondary:hover:not(:disabled) {
+  background-color: rgb(var(--bg-panel-elevated));
+  color: rgb(var(--text-heading));
+}
+[data-variant] .chrome-btn-secondary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ghost icon button(hover 才出现的小图标按钮 / 工具栏)*/
+[data-variant] .chrome-btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  color: rgb(var(--text-muted));
+  background-color: transparent;
+  border-radius: var(--radius-input);
+  transition: background-color 120ms, color 120ms;
+}
+[data-variant] .chrome-btn-ghost:hover:not(:disabled) {
+  background-color: rgb(var(--bg-panel-elevated));
+  color: rgb(var(--text-heading));
+}
+[data-variant] .chrome-btn-ghost:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 @layer utilities {
