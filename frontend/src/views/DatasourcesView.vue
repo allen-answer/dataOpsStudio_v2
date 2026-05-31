@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query'
@@ -80,15 +80,50 @@ const initialForm: FormState = {
   username: '',
   database: '',
   password: '',
-  environment: 'dev',
+  environment: 'sandbox',
 }
 
 const form = reactive<FormState>({ ...initialForm })
 const formError = ref<string | null>(null)
 
+// ─── environment 三档(+ unknown)──────────────────────────
+// 后端 environment 是自由字符串、不做枚举校验,枚举锁定在前端:
+// 与 PRD §3 + figma showcase EnvBadge 对齐(unknown / sandbox / staging / prod)。
+const ENVIRONMENTS = ['unknown', 'sandbox', 'staging', 'prod'] as const
+
+// 选 prod 需二次确认:第一次点「创建」只 arm,第二次才真提交(见 onSubmit)。
+const prodArmed = ref(false)
+watch(
+  () => form.environment,
+  (env) => {
+    if (env !== 'prod') prodArmed.value = false
+  },
+)
+
+// ─── 端口随 db_type 自动默认 ───────────────────────────────
+// 仅当用户没手动改过端口(当前值仍是某个已知默认)时跟随切换,
+// 避免覆盖用户手填的自定义端口。
+const DB_PORT_DEFAULTS: Record<DbType, number> = {
+  mysql: 3306,
+  postgresql: 5432,
+  oracle: 1521,
+  dm: 5236,
+  db2: 50000,
+}
+const KNOWN_DEFAULT_PORTS = new Set(Object.values(DB_PORT_DEFAULTS))
+watch(
+  () => form.db_type,
+  (next) => {
+    if (KNOWN_DEFAULT_PORTS.has(Number(form.port))) {
+      form.port = DB_PORT_DEFAULTS[next]
+    }
+  },
+)
+
 function resetForm(): void {
   Object.assign(form, initialForm)
   formError.value = null
+  prodArmed.value = false
 }
 
 function openModal(): void {
@@ -111,7 +146,7 @@ const createMutation = useMutation({
       username: form.username.trim(),
       database: form.database.trim(),
       password: form.password,
-      environment: form.environment.trim() || 'dev',
+      environment: form.environment || 'sandbox',
       extra: {},
     }),
   onSuccess: async () => {
@@ -130,6 +165,11 @@ async function onSubmit(): Promise<void> {
     !form.password
   ) {
     formError.value = t('datasources.error_missing_field')
+    return
+  }
+  // prod 二次确认:第一次点「创建」只 arm,不提交。
+  if (form.environment === 'prod' && !prodArmed.value) {
+    prodArmed.value = true
     return
   }
   try {
@@ -437,12 +477,15 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
           </div>
           <div class="space-y-1.5">
             <label class="form-label">{{ t('datasources.field_environment') }}</label>
-            <input
+            <select
               v-model="form.environment"
-              type="text"
               class="chrome-input w-full"
               :disabled="createMutation.isPending.value"
-            />
+            >
+              <option v-for="env in ENVIRONMENTS" :key="env" :value="env">
+                {{ t(`datasources.env_${env}`) }}
+              </option>
+            </select>
           </div>
         </div>
 
@@ -510,6 +553,18 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
           />
         </div>
 
+        <!-- prod 二次确认警示(选 prod 时常驻;arm 后文案升级)-->
+        <div
+          v-if="form.environment === 'prod'"
+          class="flex items-start gap-2 rounded-input px-3 py-2 text-xs"
+          style="background-color: rgb(239 68 68 / 0.08); color: rgb(185 28 28);"
+        >
+          <Lock class="w-4 h-4 shrink-0 mt-0.5" />
+          <span>
+            {{ prodArmed ? t('datasources.prod_confirm_hint_armed') : t('datasources.prod_confirm_hint') }}
+          </span>
+        </div>
+
         <!--
           ★ 后补:8 个 allow_* 策略折叠面板(allow_select / allow_dml / allow_ddl / allow_truncate /
           allow_grant / allow_drop / allow_create / allow_replace),后端 R8 落地后在此追加 <details> 块。
@@ -533,13 +588,20 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
           <button
             type="submit"
             class="chrome-btn-primary"
+            :class="{ 'chrome-btn-danger': form.environment === 'prod' && prodArmed }"
             :disabled="createMutation.isPending.value"
           >
             <template v-if="createMutation.isPending.value">
               <LoadingDots />
               <span>{{ t('common.submitting') }}</span>
             </template>
-            <span v-else>{{ t('datasources.create_submit') }}</span>
+            <span v-else>
+              {{
+                form.environment === 'prod' && prodArmed
+                  ? t('datasources.prod_confirm_button')
+                  : t('datasources.create_submit')
+              }}
+            </span>
           </button>
         </div>
       </form>
