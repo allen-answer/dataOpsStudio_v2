@@ -142,6 +142,120 @@ dogfood 实测发现的部署文档项,逐条 T6 / 部署文档要覆盖:
 
 ---
 
+## 来自 T7 前端 review(2δ — 前端已追平现有 5 组 endpoint 能力上限)
+
+> **背景**:T7 phase 2δ 做数据源 §3 时逐条核对 PRD vs 后端,确认 **Part A 前端已基本追平
+> 现有 5 组 endpoint(`auth/login` / `projects` / `datasources` / `sql/execute` / `jobs`)
+> 能支撑的全部范围**。下列 PRD 功能**全部卡在后端缺端点 / 缺字段**,不是前端漏做 ——
+> 前端侧已用 `★ 后补` 注释在对应位置标好,后端补齐即可直接接上(多数无需前端二次改)。
+
+### **T7 前端做满 §3 需要** — 数据源 编辑 / 删除 端点缺失
+
+**位置**:`app/api/routes/core.py`(datasources 路由组)
+
+**现状**:datasources 只有 `POST`(建)/ `GET`(列 + 详情)/ `POST .../test`。**无 `PUT` / `PATCH` / `DELETE`**。
+
+**卡住的前端**:
+- 编辑数据源 modal(PRD §3「编辑 modal」:密码留空 = 不改;名称/类型改动失效旧连接池)→ 需 `PUT /datasources/{id}`
+- 删除数据源 + 引用检查(PRD §3「删除若被 task/workflow 引用则拒绝,列出引用者」)→ 需 `DELETE /datasources/{id}`,被引用返 409 + 引用者列表
+
+**前端就位情况**:`DatasourcesView.vue` hover 操作行已留 Edit/Delete 注释占位(只待端点)。
+
+**触发条件**:T7 要把 §3 数据源页做"满"时。**优先级**:中。
+
+---
+
+### **T7 §3 列表环境列需要** — `DatasourceListItem` 不返 `environment`
+
+**位置**:`app/api/schemas.py:DatasourceListItem`
+
+**现状**:list item 只返 `id / name / db_type / host / port / database / created_at`,**不含 `environment`**。
+但 `DatasourceResponse`(create / GET 详情)是返 `environment` 的 —— 列表少了这个字段。
+
+**卡住的前端**:列表「环境」列(PRD §3:unknown 灰 / sandbox 蓝 / staging 琥珀 / **prod 红 + 🔒**)。
+前端现在用 `(ds as any).environment` 兜底,**后端给 list item 补上 `environment` 字段即自动生效**,前端无需改。
+
+**修法**:`DatasourceListItem` 加 `environment: str`(+ 设计稿 §1.2 的 `environment_verified: bool`,
+驱动 prod 的 🔒 verified 标记)。
+
+**触发条件**:T7 §3 环境列要真有值时。**优先级**:中(2δ 已交付 environment **写入**侧 = 新建三档下拉 + prod 二次确认;此项是**读取**侧)。
+
+---
+
+### **T7 §3 测连体验需要** — `DatasourceTestResponse` 只返 `{ok}`,无版本 / 耗时 / 分类
+
+**位置**:`app/api/schemas.py:DatasourceTestResponse` + `app/api/routes/core.py:test_datasource`
+
+**现状**:测连只返 `{ok: bool}`;失败统一 raise 400 `connection_test_failed`(无分类)。
+
+**卡住的前端**:PRD §3 测连 inline 状态「✓ MySQL 8.0.32 · 235 ms」+ 失败 hover 分类原因
+(认证失败 / 主机不可达 / 超时 / 权限不足,**不暴露 driver raw error**)。
+
+**修法**:成功返 `server_version` + `latency_ms`;失败返**结构化分类 code**(非 driver 原文,与下方
+「worker 失败时写结构化对外 error code」一脉相承)。
+
+**触发条件**:T7 §3 测连体验 polish 时。**优先级**:中。
+
+---
+
+### **T7 §3 权限面板需要** — 无 `operation_policy`(8×allow_*)字段
+
+**位置**:`app/api/schemas.py:DatasourceCreateRequest` + `app/db/models.py:datasources`
+
+**现状**:create 只有 `extra: dict`(→ `capability_profile`,worker 读作 adapter **连接子节**,
+如 ssl_mode / service_name)。**没有独立的 `operation_policy` / 8 个 `allow_*` 字段**;
+现在前端建一组开关 POST 上去也**无处落、worker 不读**。
+
+**卡住的前端**:PRD §3「权限」折叠面板 8 个开关(allow SELECT / EXPLAIN / Oracle PLAN_TABLE /
+DM EXPLAIN / schema 导入 / schema 写入 / scenario 写入 / 自动建对比任务)= 设计稿 §4.5 operation_policy。
+
+**修法**:schema + 表加 `operation_policy`(8 bool),worker 执行前据此校验操作类型。
+**前端就位情况**:`DatasourcesView.vue` 新建表单已留 8×allow_* 折叠面板注释占位。
+
+**触发条件**:设计稿 §4.5 operation_policy 落地时(可能 T5 权限模型一并做)。**优先级**:中。
+
+---
+
+### **T7 §4 SQL 跑非 MySQL 需要** — worker 仅支持 MySQL
+
+**位置**:`app/worker.py:402`(`if conn_info.db_type is not DbType.MYSQL: raise UnsupportedDbTypeError`)
+
+**现状**:2.0.0 worker **只实现 MySQL adapter**;PostgreSQL / Oracle / DM / DB2 数据源跑 SQL 直接
+`UnsupportedDbTypeError`。
+
+**卡住的前端**:SQL 工作台(§4)对非 MySQL 数据源执行 → 任务必 failed。前端**行为正确**
+(正常提交 → 轮询 → 显示 failed),但用户体验是"建了 PG 数据源却跑不了"。
+
+**修法(二选一)**:
+- 后端:补 PostgreSQL(及其它方言)worker adapter
+- 前端兜底(轻量先行):SQL 工作台选到非 MySQL 数据源时,执行按钮旁提示"当前仅支持 MySQL 执行",
+  避免用户提交后才看到 failed(**此项前端可独立做,不阻塞后端**)
+
+**触发条件**:多方言执行上线前 / 或先做前端 warn 兜底。**优先级**:中(2γ e2e 已实锤此限制)。
+
+---
+
+### **T7 §5 Jobs 错误码字典需要** — 见下方「worker 失败时写结构化对外 error code」
+
+§5 任务历史的「结构化错误码字典」(PRD §5)直接依赖 backlog 已有项
+**「错误体验 — worker 失败时写结构化对外 error code」**(本文件 T4 review 段)。
+前端 JobsView 已按 `status/kind` 粗分类,后端出结构化 code 后前端切精确映射。**不重复立项**,在此交叉引用。
+
+---
+
+### **Part B 全部 admin 页需要** — T5 license + admin 路由后端缺失
+
+**位置**:`app/api/routes/`(仅 `core.py`,无 admin 路由组)
+
+**现状**:后端无任何 admin / account 端点。Part B 五页(§6 账户安全 MFA / §7 用户管理 /
+§8 项目管理 / §9 AI 配置 / §10 审计日志)**全部无后端**,PRD 版本归属均为「T5 license + admin 路由后」。
+
+**卡住的前端**:Part B 五页(§6–10)。**现在不能照猜的接口硬建**(违反 contract §0 不臆造)。
+
+**触发条件**:T5 license skeleton + admin 路由落地后。**优先级**:中(GA 前必有,但排在 Part A 收口之后)。
+
+---
+
 ## CI 基础设施
 
 ### **2026-06-02 前先验,2026-09-16 前必升** — GH Actions Node 20 弃用
