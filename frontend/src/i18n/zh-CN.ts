@@ -112,6 +112,8 @@ export default {
     result: '结果',
     no_datasource: '此项目还没有数据源',
     error_pick_ds_or_sql: '请选择数据源并输入 SQL',
+    unsupported_db_warn: '2.0 worker 当前仅支持 MySQL 执行 —— 这个 {db} 数据源暂时跑不了。',
+    unsupported_db_error: '2.0 仅支持 MySQL 执行,暂不支持 {db}。',
     run_to_see_result: '执行后在此查看结果',
     running_hint: '正在执行,worker 处理中…',
     cancelled_hint: '已取消',
