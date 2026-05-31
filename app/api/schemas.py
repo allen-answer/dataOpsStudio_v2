@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -58,12 +58,26 @@ class DatasourceListItem(BaseModel):
     db_type: DbType
     host: str
     port: int
+    environment: str
+    environment_verified: bool = False
     database: str | None = None
     created_at: datetime
 
 
+DatasourceTestErrorCode = Literal[
+    "auth_failed",
+    "host_unreachable",
+    "timeout",
+    "permission_denied",
+    "unknown",
+]
+
+
 class DatasourceTestResponse(BaseModel):
     ok: bool
+    server_version: str | None = None
+    latency_ms: int | None = None
+    error_code: DatasourceTestErrorCode | None = None
 
 
 class SqlExecuteRequest(BaseModel):

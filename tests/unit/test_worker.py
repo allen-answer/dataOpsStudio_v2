@@ -172,9 +172,13 @@ def test_worker_runs_test_connection_job_and_completes() -> None:
     assert runner.run_once() is True
 
     assert adapter.test_connection_calls == 1
-    assert backend.completed == [
-        ("job-1", ResultRef(backend="local_fs", uri="test_connection/job-1"))
-    ]
+    assert len(backend.completed) == 1
+    completed_job_id, result_ref = backend.completed[0]
+    assert completed_job_id == "job-1"
+    assert result_ref.backend == "connection_test"
+    assert result_ref.uri == "test_connection/job-1"
+    assert result_ref.metadata["server_version"] == "MySQL 8.0.test"
+    assert isinstance(result_ref.metadata["latency_ms"], int)
     assert backend.failed == []
 
 
@@ -193,7 +197,7 @@ def test_worker_failed_test_connection_fails_job() -> None:
     assert runner.run_once() is True
 
     assert backend.completed == []
-    assert backend.failed == [("job-1", "datasource connection test failed")]
+    assert backend.failed == [("job-1", "unknown")]
 
 
 def test_worker_empty_queue_returns_false() -> None:
@@ -399,6 +403,7 @@ class _FakeAdapter:
         self._emit_columns_twice = emit_columns_twice
         self._column_sink: Callable[[list[Column]], None] | None = None
         self.test_connection_calls = 0
+        self.last_server_version = "MySQL 8.0.test"
 
     def with_column_sink(self, column_sink: Callable[[list[Column]], None]) -> _FakeAdapter:
         self._column_sink = column_sink

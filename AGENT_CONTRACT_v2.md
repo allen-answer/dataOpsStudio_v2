@@ -216,6 +216,8 @@ class ResultStore(Protocol):
     def gc_expired(self) -> int: ...
 
 # 2.0.0:LocalFsResultStore。S3ResultStore 后置 hosted。
+# ResultRef 允许携带 additive metadata dict,仅放轻量诊断/展示信息
+# (如 connection_test 的 server_version / latency_ms),不得放敏感值或 cursor。
 ```
 
 ```python

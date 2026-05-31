@@ -158,6 +158,7 @@ datasources = Table(
     # ★ NO FK(跨存储 secret 引用,见 SecretRef domain)
     Column("password_secret_ref", String(64), nullable=False),
     Column("environment", String(32), nullable=False, server_default="dev"),
+    Column("environment_verified", Boolean(), nullable=False, server_default=text("false")),
     Column("capability_profile", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),

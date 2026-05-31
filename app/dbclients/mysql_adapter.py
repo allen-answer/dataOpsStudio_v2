@@ -78,6 +78,11 @@ class MySQLAdapter(DatabaseAdapter):
         self._connect_timeout_seconds = connect_timeout_seconds
         self._pymysql = pymysql_module
         self._column_sink = column_sink
+        self._last_server_version: str | None = None
+
+    @property
+    def last_server_version(self) -> str | None:
+        return self._last_server_version
 
     def execute_select(self, sql: str, params: dict[str, Any]) -> Iterator[Row]:
         guarded_sql = validate_readonly_sql(sql)
@@ -94,11 +99,14 @@ class MySQLAdapter(DatabaseAdapter):
     def test_connection(self) -> bool:
         conn = None
         cursor = None
+        self._last_server_version = None
         try:
             conn = self._connect()
             cursor = conn.cursor()
-            cursor.execute("SELECT 1")
-            cursor.fetchone()
+            cursor.execute("SELECT VERSION()")
+            version = _first_cell(cursor.fetchone())
+            if version:
+                self._last_server_version = f"MySQL {version}"
             return True
         except Exception:
             return False
@@ -368,6 +376,16 @@ def _description_to_columns(description: object) -> list[Column]:
             )
         )
     return columns
+
+
+def _first_cell(row: object) -> object | None:
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return next(iter(row.values()), None)
+    if isinstance(row, Sequence) and not isinstance(row, (str, bytes, bytearray)):
+        return row[0] if row else None
+    return row
 
 
 def _row_to_dict(row: object, columns: list[str]) -> dict[str, Any]:

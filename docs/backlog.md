@@ -165,39 +165,6 @@ dogfood 实测发现的部署文档项,逐条 T6 / 部署文档要覆盖:
 
 ---
 
-### **T7 §3 列表环境列需要** — `DatasourceListItem` 不返 `environment`
-
-**位置**:`app/api/schemas.py:DatasourceListItem`
-
-**现状**:list item 只返 `id / name / db_type / host / port / database / created_at`,**不含 `environment`**。
-但 `DatasourceResponse`(create / GET 详情)是返 `environment` 的 —— 列表少了这个字段。
-
-**卡住的前端**:列表「环境」列(PRD §3:unknown 灰 / sandbox 蓝 / staging 琥珀 / **prod 红 + 🔒**)。
-前端现在用 `(ds as any).environment` 兜底,**后端给 list item 补上 `environment` 字段即自动生效**,前端无需改。
-
-**修法**:`DatasourceListItem` 加 `environment: str`(+ 设计稿 §1.2 的 `environment_verified: bool`,
-驱动 prod 的 🔒 verified 标记)。
-
-**触发条件**:T7 §3 环境列要真有值时。**优先级**:中(2δ 已交付 environment **写入**侧 = 新建三档下拉 + prod 二次确认;此项是**读取**侧)。
-
----
-
-### **T7 §3 测连体验需要** — `DatasourceTestResponse` 只返 `{ok}`,无版本 / 耗时 / 分类
-
-**位置**:`app/api/schemas.py:DatasourceTestResponse` + `app/api/routes/core.py:test_datasource`
-
-**现状**:测连只返 `{ok: bool}`;失败统一 raise 400 `connection_test_failed`(无分类)。
-
-**卡住的前端**:PRD §3 测连 inline 状态「✓ MySQL 8.0.32 · 235 ms」+ 失败 hover 分类原因
-(认证失败 / 主机不可达 / 超时 / 权限不足,**不暴露 driver raw error**)。
-
-**修法**:成功返 `server_version` + `latency_ms`;失败返**结构化分类 code**(非 driver 原文,与下方
-「worker 失败时写结构化对外 error code」一脉相承)。
-
-**触发条件**:T7 §3 测连体验 polish 时。**优先级**:中。
-
----
-
 ### **T7 §3 权限面板需要** — 无 `operation_policy`(8×allow_*)字段
 
 **位置**:`app/api/schemas.py:DatasourceCreateRequest` + `app/db/models.py:datasources`
