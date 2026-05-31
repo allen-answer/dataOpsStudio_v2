@@ -288,6 +288,13 @@
   cursor: not-allowed;
 }
 
+/* danger 修饰 —— 叠加在 chrome-btn-primary 上,把品牌渐变盖成红色。
+   用于 prod 二次确认等高危确认按钮。须在 .chrome-btn-primary 之后定义(同特异性靠源序覆盖)。*/
+[data-variant] .chrome-btn-danger {
+  background-image: none;
+  background-color: rgb(220 38 38);
+}
+
 /* secondary 按钮(panel + border)*/
 [data-variant] .chrome-btn-secondary {
   display: inline-flex;
