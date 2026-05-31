@@ -3,6 +3,20 @@ import vue from '@vitejs/plugin-vue'
 
 export default defineConfig({
   plugins: [vue()],
+  build: {
+    // Monaco 编辑器 lazy 加载,自己单独占 ~600 KB gz —— 业务上算正常,
+    // 不让 chunk size 警告刷屏。
+    chunkSizeWarningLimit: 2400,
+    rollupOptions: {
+      output: {
+        manualChunks(id: string) {
+          // monaco 单独成 chunk,跟 SqlWorkspaceView 业务代码分开,
+          // 缓存命中率更高(编辑业务改不影响 monaco chunk hash)。
+          if (id.includes('node_modules/monaco-editor')) return 'monaco'
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
     host: '127.0.0.1',

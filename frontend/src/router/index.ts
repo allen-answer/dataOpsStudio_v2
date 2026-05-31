@@ -7,6 +7,8 @@ const DatasourcesView = () => import('../views/DatasourcesView.vue')
 const PlaceholderView = () => import('../views/PlaceholderView.vue')
 const DesignSystemPreview = () => import('../views/DesignSystemPreview.vue')
 const TokensView = () => import('../views/TokensView.vue')
+const SqlWorkspaceView = () => import('../views/SqlWorkspaceView.vue')
+const JobsView = () => import('../views/JobsView.vue')
 
 const routes: RouteRecordRaw[] = [
   {
@@ -41,14 +43,12 @@ const routes: RouteRecordRaw[] = [
       {
         path: 'projects/:id/sql',
         name: 'sql',
-        component: PlaceholderView,
-        props: { section: 'sql' },
+        component: SqlWorkspaceView,
       },
       {
         path: 'projects/:id/jobs',
         name: 'jobs',
-        component: PlaceholderView,
-        props: { section: 'jobs' },
+        component: JobsView,
       },
     ],
   },
