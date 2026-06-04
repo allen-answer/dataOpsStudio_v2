@@ -8,6 +8,7 @@ from app.api.services import ApiServices
 from app.domain.job import Job, JobKind, JobStatus
 from app.domain.license import LicenseMode
 from app.domain.resource import ResourceProfile
+from app.domain.result import ResultRef
 from app.domain.schema import Column, Row
 from tests._asgi_client import AsgiClient
 
@@ -15,7 +16,8 @@ from tests._asgi_client import AsgiClient
 def test_test_datasource_timeout_triggers_request_cancel() -> None:
     """F2-2:test_datasource 超时返回前必须 request_cancel,避免僵尸 job。"""
 
-    services = _FakeServices()
+    backend = _AlwaysRunningJobBackend()
+    services = _FakeServices(job_backend=backend)
     app = create_app(services=cast(ApiServices, services))
     token = create_access_token(user_id="user-1", role="admin", secret=services.jwt_secret)
 
@@ -24,10 +26,61 @@ def test_test_datasource_timeout_triggers_request_cancel() -> None:
         headers={"Authorization": f"Bearer {token}"},
     )
 
-    assert response.status_code == 504
-    assert response.json()["error"] == "job_timeout"
-    assert services.job_backend.enqueued_job_id is not None
-    assert services.job_backend.cancelled_job_ids == [services.job_backend.enqueued_job_id]
+    assert response.status_code == 200
+    assert response.json()["ok"] is False
+    assert response.json()["error_code"] == "timeout"
+    assert backend.enqueued_job_id is not None
+    assert backend.cancelled_job_ids == [backend.enqueued_job_id]
+
+
+def test_test_datasource_success_returns_structured_probe_result() -> None:
+    services = _FakeServices(
+        job_backend=_TerminalJobBackend(
+            JobStatus.SUCCESS,
+            result_ref=ResultRef(
+                backend="connection_test",
+                uri="test_connection/job-1",
+                metadata={"server_version": "MySQL 8.0.32", "latency_ms": 12},
+            ),
+        )
+    )
+    app = create_app(services=cast(ApiServices, services))
+    token = create_access_token(user_id="user-1", role="admin", secret=services.jwt_secret)
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/test",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["latency_ms"] == 12
+    assert payload["server_version"] == "MySQL 8.0.32"
+    assert payload["error_code"] is None
+
+
+def test_test_datasource_failure_returns_safe_error_code_without_raw_driver_error() -> None:
+    services = _FakeServices(
+        job_backend=_TerminalJobBackend(
+            JobStatus.FAILED,
+            error="Access denied for user should-not-return",
+        )
+    )
+    app = create_app(services=cast(ApiServices, services))
+    token = create_access_token(user_id="user-1", role="admin", secret=services.jwt_secret)
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/test",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["error_code"] == "unknown"
+    assert "Access denied" not in response.body.decode("utf-8")
+    assert "should-not-return" not in response.body.decode("utf-8")
 
 
 def test_get_job_result_returns_columns_and_positional_rows() -> None:
@@ -48,11 +101,11 @@ def test_get_job_result_returns_columns_and_positional_rows() -> None:
 
 
 class _FakeServices:
-    def __init__(self) -> None:
+    def __init__(self, job_backend: object | None = None) -> None:
         self.jwt_secret = "jwt-secret"
         self.rate_limiter = _RateLimiter()
         self.engine = _FakeEngine()
-        self.job_backend = _AlwaysRunningJobBackend()
+        self.job_backend = job_backend or _AlwaysRunningJobBackend()
         self.job_wait_timeout_seconds = 0.01
         self.audits: list[dict[str, object]] = []
 
@@ -85,6 +138,7 @@ class _FakeConnection:
                 "username": "dataops",
                 "database_name": "app",
                 "environment": "test",
+                "environment_verified": False,
                 "capability_profile": {},
             },
             {"id": "project-1"},
@@ -136,6 +190,39 @@ class _AlwaysRunningJobBackend:
 
     def request_cancel(self, job_id: str) -> None:
         self.cancelled_job_ids.append(job_id)
+
+
+class _TerminalJobBackend:
+    def __init__(
+        self,
+        status: JobStatus,
+        error: str | None = None,
+        result_ref: ResultRef | None = None,
+    ) -> None:
+        self.status = status
+        self.error = error
+        self.result_ref = result_ref
+        self.enqueued_job_id: str | None = None
+
+    def enqueue(self, job: Job) -> None:
+        self.enqueued_job_id = job.id
+
+    def get_job(self, job_id: str) -> Job:
+        return Job(
+            id=job_id,
+            kind=JobKind.TEST_CONNECTION,
+            status=self.status,
+            owner_user_id="user-1",
+            project_id="project-1",
+            datasource_ids=["ds-1"],
+            priority=0,
+            timeout_seconds=60,
+            resource_profile=ResourceProfile(),
+            result_ref=self.result_ref,
+            audit_id="audit-1",
+            error=self.error,
+            payload={"datasource_id": "ds-1"},
+        )
 
 
 class _ResultServices:

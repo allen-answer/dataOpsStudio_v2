@@ -31,6 +31,14 @@ def test_datasources_has_database_name_column() -> None:
     assert datasources.columns["database_name"].nullable is True
 
 
+def test_datasources_has_environment_verified_column() -> None:
+    """T7 list response exposes whether environment labeling was verified."""
+
+    cols = set(datasources.columns.keys())
+    assert "environment_verified" in cols
+    assert datasources.columns["environment_verified"].nullable is False
+
+
 def test_all_alembic_revision_ids_under_32_chars() -> None:
     """alembic_version.version_num 默认 VARCHAR(32),revision ID 过长会在
     UPDATE alembic_version 时触发 StringDataRightTruncation。

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -58,12 +58,29 @@ class DatasourceListItem(BaseModel):
     db_type: DbType
     host: str
     port: int
+    environment: str
+    environment_verified: bool = False
     database: str | None = None
     created_at: datetime
 
 
+DatasourceTestErrorCode = Literal[
+    "auth_failed",
+    "host_unreachable",
+    "timeout",
+    "permission_denied",
+    "unknown",
+]
+# 2.0.0 先诚实暴露保守分类:当前实际只稳定产出 unknown / timeout。
+# auth_failed / host_unreachable / permission_denied 是多方言统一错误分类的留位枚举,
+# 待 Oracle / DM / DB2 等 adapter 一起定义结构化错误码后再落精确分类。
+
+
 class DatasourceTestResponse(BaseModel):
     ok: bool
+    server_version: str | None = None
+    latency_ms: int | None = None
+    error_code: DatasourceTestErrorCode | None = None
 
 
 class SqlExecuteRequest(BaseModel):
