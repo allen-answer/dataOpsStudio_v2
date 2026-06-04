@@ -112,6 +112,8 @@ export default {
     result: 'Result',
     no_datasource: 'No datasource in this project',
     error_pick_ds_or_sql: 'Pick a datasource and write some SQL',
+    unsupported_db_warn: '2.0 worker runs MySQL only for now — this {db} datasource cannot execute yet.',
+    unsupported_db_error: 'Execution is MySQL-only in 2.0; {db} is not supported yet.',
     run_to_see_result: 'Run a query to see results here',
     running_hint: 'Running — worker is executing the query…',
     cancelled_hint: 'Cancelled',
