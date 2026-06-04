@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -19,6 +19,7 @@ class ResultRef(BaseModel):
 
     backend: str  # "local_fs" / "s3" / ...
     uri: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class Manifest(BaseModel):

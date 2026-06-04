@@ -104,7 +104,12 @@ def test_e2e_login_create_mysql_datasource_execute_select(tmp_path: Path) -> Non
 
         test_response = client.post(f"/api/datasources/{datasource_id}/test", headers=headers)
         assert test_response.status_code == 200
-        assert test_response.json() == {"ok": True}
+        test_payload = test_response.json()
+        assert test_payload["ok"] is True
+        assert test_payload["error_code"] is None
+        assert isinstance(test_payload["latency_ms"], int)
+        assert test_payload["latency_ms"] >= 0
+        assert test_payload["server_version"].startswith("MySQL ")
 
         execute_response = client.post(
             "/api/sql/execute",

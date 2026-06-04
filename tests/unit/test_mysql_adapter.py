@@ -90,6 +90,41 @@ def test_execute_select_emits_columns_for_zero_row_result() -> None:
     assert captured_columns == [Column(name="n", type="unknown")]
 
 
+def test_test_connection_records_server_version() -> None:
+    fake_pymysql = _FakePyMySQL()
+    adapter = MySQLAdapter(
+        _conn_info(),
+        cast(SecretStore, _SecretStore("pwd")),
+        pymysql_module=fake_pymysql,
+    )
+
+    assert adapter.test_connection() is True
+
+    assert adapter.last_server_version == "MySQL 8.0.test"
+    assert fake_pymysql.connections[0].closed is True
+
+
+def test_test_connection_records_sanitized_error_summary_on_failure() -> None:
+    fake_pymysql = _FailingPyMySQL(
+        RuntimeError("connect failed password=super-secret mysql://user:super-secret@db/app")
+    )
+    adapter = MySQLAdapter(
+        _conn_info(),
+        cast(SecretStore, _SecretStore("super-secret")),
+        pymysql_module=fake_pymysql,
+    )
+
+    assert adapter.test_connection() is False
+
+    assert adapter.last_server_version is None
+    assert adapter.last_connection_error is not None
+    assert adapter.last_connection_error.startswith("RuntimeError")
+    assert "super-secret" not in adapter.last_connection_error
+    assert "mysql://user" not in adapter.last_connection_error
+    assert "<redacted-url>" in adapter.last_connection_error
+    assert "***REDACTED***" in adapter.last_connection_error
+
+
 def test_stream_to_spool_then_resultset_reads_without_cursor(tmp_path: Path) -> None:
     fake_pymysql = _FakePyMySQL()
     adapter = MySQLAdapter(
@@ -273,6 +308,16 @@ class _FakePyMySQL:
         return conn
 
 
+class _FailingPyMySQL:
+    cursors = _FakeCursors
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def connect(self, **kwargs: Any) -> _FakeConnection:
+        raise self._exc
+
+
 class _FakeConnection:
     def __init__(self, kwargs: dict[str, Any]) -> None:
         self.kwargs = kwargs
@@ -302,11 +347,17 @@ class _FakeCursor:
     def execute(self, sql: str, params: object = None) -> None:
         if sql.lower().startswith("set session"):
             self._rows = []
+        elif "version()" in sql.lower():
+            self._rows = [("8.0.test",)]
         elif "where 1 = 0" in sql.lower():
             self._rows = []
         else:
             self._rows = [(1,), (2,)]
         self._offset = 0
+
+    def fetchone(self) -> tuple[Any, ...] | None:
+        rows = self.fetchmany(1)
+        return rows[0] if rows else None
 
     def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
         batch = self._rows[self._offset : self._offset + size]

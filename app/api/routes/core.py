@@ -15,6 +15,7 @@ from app.api.schemas import (
     DatasourceCreateRequest,
     DatasourceListItem,
     DatasourceResponse,
+    DatasourceTestErrorCode,
     DatasourceTestResponse,
     JobListItem,
     JobResponse,
@@ -37,6 +38,14 @@ from app.domain.schema import Column
 from app.domain.secret import HashedRef, SecretKind
 
 logger = structlog.get_logger(__name__)
+
+_DATASOURCE_TEST_ERROR_CODES: tuple[DatasourceTestErrorCode, ...] = (
+    "auth_failed",
+    "host_unreachable",
+    "timeout",
+    "permission_denied",
+    "unknown",
+)
 
 router = APIRouter()
 
@@ -170,6 +179,8 @@ def list_datasources(
                     datasources.c.db_type,
                     datasources.c.host,
                     datasources.c.port,
+                    datasources.c.environment,
+                    datasources.c.environment_verified,
                     datasources.c.database_name,
                     datasources.c.created_at,
                 )
@@ -196,6 +207,7 @@ def test_datasource(datasource_id: str, request: Request) -> DatasourceTestRespo
     services = services_from(request)
     user = current_user_from(request)
     row = _datasource_for_current_user(request, datasource_id)
+    started_at = time.monotonic()
     job_id = new_id()
     job = Job(
         id=job_id,
@@ -211,12 +223,19 @@ def test_datasource(datasource_id: str, request: Request) -> DatasourceTestRespo
         payload={"datasource_id": datasource_id},
     )
     services.job_backend.enqueue(job)
-    status = _wait_for_job_terminal(services, job_id)
-    if status is JobStatus.SUCCESS:
-        return DatasourceTestResponse(ok=True)
-    if status is None:
-        raise ApiError(504, "job_timeout", "Connection test did not finish in time")
-    raise ApiError(400, "connection_test_failed", "Connection test failed")
+    terminal_job = _wait_for_job_terminal(services, job_id)
+    if terminal_job and terminal_job.status is JobStatus.SUCCESS:
+        metadata = terminal_job.result_ref.metadata if terminal_job.result_ref else {}
+        latency_ms = _metadata_int(metadata, "latency_ms")
+        return DatasourceTestResponse(
+            ok=True,
+            server_version=_metadata_str(metadata, "server_version"),
+            latency_ms=latency_ms if latency_ms is not None else _elapsed_ms(started_at),
+        )
+    return DatasourceTestResponse(
+        ok=False,
+        error_code=_datasource_test_error_code(terminal_job),
+    )
 
 
 @router.post("/sql/execute", response_model=SqlExecuteResponse, status_code=202)
@@ -434,12 +453,12 @@ def _project_access_filter(user_id: str) -> Any:
     return or_(projects.c.owner_user_id == user_id, project_members.c.user_id == user_id)
 
 
-def _wait_for_job_terminal(services: ApiServices, job_id: str) -> JobStatus | None:
+def _wait_for_job_terminal(services: ApiServices, job_id: str) -> Job | None:
     deadline = time.monotonic() + services.job_wait_timeout_seconds
     while time.monotonic() < deadline:
         job = services.job_backend.get_job(job_id)
         if job and job.status in {JobStatus.SUCCESS, JobStatus.FAILED, JobStatus.CANCELLED}:
-            return job.status
+            return job
         time.sleep(0.2)
     services.job_backend.request_cancel(job_id)
     return None
@@ -467,9 +486,43 @@ def _datasource_list_item(row: RowMapping) -> DatasourceListItem:
         db_type=DbType(str(row["db_type"])),
         host=str(row["host"]),
         port=int(row["port"]),
+        environment=str(row["environment"]),
+        environment_verified=bool(row["environment_verified"]),
         database=row["database_name"] if row["database_name"] is not None else None,
         created_at=row["created_at"],
     )
+
+
+def _datasource_test_error_code(job: Job | None) -> DatasourceTestErrorCode:
+    if job is None or (
+        job.status is JobStatus.FAILED and job.error == "worker heartbeat timed out"
+    ):
+        return "timeout"
+    if job.status is JobStatus.CANCELLED:
+        return "timeout"
+    if job.status is JobStatus.FAILED:
+        if job.error in _DATASOURCE_TEST_ERROR_CODES:
+            return job.error
+        return "unknown"
+    return "unknown"
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, round((time.monotonic() - started_at) * 1000))
+
+
+def _metadata_str(metadata: dict[str, Any], key: str) -> str | None:
+    value = metadata.get(key)
+    return value if isinstance(value, str) else None
+
+
+def _metadata_int(metadata: dict[str, Any], key: str) -> int | None:
+    value = metadata.get(key)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
 
 
 def _job_response(row: RowMapping) -> JobResponse:

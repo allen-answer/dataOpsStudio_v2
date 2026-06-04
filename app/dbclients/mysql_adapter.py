@@ -16,6 +16,11 @@ from app.domain.secret import SecretKind
 from app.infrastructure.secretstore.protocol import SecretStore
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.$-]+$")
+_PASSWORD_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd)\s*[:=]\s*['\"]?[^'\",\s)]+['\"]?"
+)
+_URL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s'\")]+")
+_MAX_ERROR_SUMMARY_LENGTH = 240
 
 
 class MySQLAdapterError(RuntimeError):
@@ -78,6 +83,16 @@ class MySQLAdapter(DatabaseAdapter):
         self._connect_timeout_seconds = connect_timeout_seconds
         self._pymysql = pymysql_module
         self._column_sink = column_sink
+        self._last_server_version: str | None = None
+        self._last_connection_error: str | None = None
+
+    @property
+    def last_server_version(self) -> str | None:
+        return self._last_server_version
+
+    @property
+    def last_connection_error(self) -> str | None:
+        return self._last_connection_error
 
     def execute_select(self, sql: str, params: dict[str, Any]) -> Iterator[Row]:
         guarded_sql = validate_readonly_sql(sql)
@@ -94,13 +109,18 @@ class MySQLAdapter(DatabaseAdapter):
     def test_connection(self) -> bool:
         conn = None
         cursor = None
+        self._last_server_version = None
+        self._last_connection_error = None
         try:
             conn = self._connect()
             cursor = conn.cursor()
-            cursor.execute("SELECT 1")
-            cursor.fetchone()
+            cursor.execute("SELECT VERSION()")
+            version = _first_cell(cursor.fetchone())
+            if version:
+                self._last_server_version = f"MySQL {version}"
             return True
-        except Exception:
+        except Exception as exc:
+            self._last_connection_error = _connection_error_summary(exc)
             return False
         finally:
             _safe_close(cursor)
@@ -368,6 +388,43 @@ def _description_to_columns(description: object) -> list[Column]:
             )
         )
     return columns
+
+
+def _first_cell(row: object) -> object | None:
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return next(iter(row.values()), None)
+    if isinstance(row, Sequence) and not isinstance(row, (str, bytes, bytearray)):
+        return row[0] if row else None
+    return row
+
+
+def _connection_error_summary(exc: Exception) -> str:
+    parts = [type(exc).__name__]
+    code = _first_int_arg(exc)
+    if code is not None:
+        parts.append(f"code={code}")
+    message = _sanitize_error_text(str(exc))
+    if message:
+        parts.append(f"message={message}")
+    return " ".join(parts)
+
+
+def _first_int_arg(exc: Exception) -> int | None:
+    for arg in getattr(exc, "args", ()):
+        if isinstance(arg, int):
+            return arg
+    return None
+
+
+def _sanitize_error_text(text: str) -> str:
+    sanitized = _PASSWORD_ASSIGNMENT_RE.sub(r"\1=***REDACTED***", text)
+    sanitized = _URL_RE.sub("<redacted-url>", sanitized)
+    sanitized = " ".join(sanitized.split())
+    if len(sanitized) > _MAX_ERROR_SUMMARY_LENGTH:
+        return f"{sanitized[:_MAX_ERROR_SUMMARY_LENGTH]}..."
+    return sanitized
 
 
 def _row_to_dict(row: object, columns: list[str]) -> dict[str, Any]:

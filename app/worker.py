@@ -258,10 +258,28 @@ class WorkerRunner:
             lambda: self._backend.is_cancel_requested(job.id),
             lambda columns: None,
         )
+        started_at = time.monotonic()
         if not adapter.test_connection():
+            error_summary = getattr(adapter, "last_connection_error", None)
+            logger.warning(
+                "datasource test_connection failed",
+                job_id=job.id,
+                datasource_id=datasource_id,
+                error_summary=error_summary if isinstance(error_summary, str) else None,
+            )
             raise RuntimeError("datasource connection test failed")
         self._heartbeat(job.id)
-        return _ExecutionOutcome(ResultRef(backend="local_fs", uri=f"test_connection/{job.id}"))
+        metadata: dict[str, object] = {"latency_ms": _elapsed_ms(started_at)}
+        server_version = getattr(adapter, "last_server_version", None)
+        if isinstance(server_version, str) and server_version:
+            metadata["server_version"] = server_version
+        return _ExecutionOutcome(
+            ResultRef(
+                backend="connection_test",
+                uri=f"test_connection/{job.id}",
+                metadata=metadata,
+            )
+        )
 
     def _flush_batch(self, job_id: str, result_set_id: str, batch: list[Row]) -> None:
         # Cancel during append_spool is caught at the next batch or row interval.
@@ -492,6 +510,10 @@ def _copy_columns(columns: list[Column]) -> list[Column]:
 
 def _elapsed_seconds(started_at: float) -> float:
     return round(time.monotonic() - started_at, 3)
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, round((time.monotonic() - started_at) * 1000))
 
 
 def _log_reap_report(report: object) -> None:
