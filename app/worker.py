@@ -260,7 +260,14 @@ class WorkerRunner:
         )
         started_at = time.monotonic()
         if not adapter.test_connection():
-            raise RuntimeError("unknown")
+            error_summary = getattr(adapter, "last_connection_error", None)
+            logger.warning(
+                "datasource test_connection failed",
+                job_id=job.id,
+                datasource_id=datasource_id,
+                error_summary=error_summary if isinstance(error_summary, str) else None,
+            )
+            raise RuntimeError("datasource connection test failed")
         self._heartbeat(job.id)
         metadata: dict[str, object] = {"latency_ms": _elapsed_ms(started_at)}
         server_version = getattr(adapter, "last_server_version", None)

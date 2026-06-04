@@ -71,6 +71,9 @@ DatasourceTestErrorCode = Literal[
     "permission_denied",
     "unknown",
 ]
+# 2.0.0 先诚实暴露保守分类:当前实际只稳定产出 unknown / timeout。
+# auth_failed / host_unreachable / permission_denied 是多方言统一错误分类的留位枚举,
+# 待 Oracle / DM / DB2 等 adapter 一起定义结构化错误码后再落精确分类。
 
 
 class DatasourceTestResponse(BaseModel):

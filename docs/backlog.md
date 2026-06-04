@@ -62,6 +62,8 @@
 
 **修法**:worker fail 时写结构化对外 error code(连接 / SQL / 超时 / 权限 / 内部错误等),DB 原文只进审计或脱敏日志。API 列表和详情端点直接返回结构化 code,不在端点侧猜原文。
 
+**交叉引用**:T7 Part A P0 已先加 `DatasourceTestResponse.error_code` 留位枚举,但 2.0.0 测连失败仍只稳定产出 `unknown` / `timeout`;`auth_failed` / `host_unreachable` / `permission_denied` 等细分类和多方言 adapter / `Column.type` 统一枚举一起做。
+
 **触发条件**:T7 错误体验/任务列表 polish 或 GA 前错误分层审计时。
 
 **优先级**:中。当前列表端点已安全但不够精确。

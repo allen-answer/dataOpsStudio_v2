@@ -185,7 +185,11 @@ def test_worker_runs_test_connection_job_and_completes() -> None:
 def test_worker_failed_test_connection_fails_job() -> None:
     job = _make_job(kind=JobKind.TEST_CONNECTION, payload={"datasource_id": "ds_1"})
     backend = _FakeBackend([job])
-    adapter = _FakeAdapter([], test_connection_ok=False)
+    adapter = _FakeAdapter(
+        [],
+        test_connection_ok=False,
+        connection_error="OperationalError code=1045 message=access denied",
+    )
     runner = WorkerRunner(
         backend,
         _FakeResultStore(),
@@ -197,7 +201,7 @@ def test_worker_failed_test_connection_fails_job() -> None:
     assert runner.run_once() is True
 
     assert backend.completed == []
-    assert backend.failed == [("job-1", "unknown")]
+    assert backend.failed == [("job-1", "datasource connection test failed")]
 
 
 def test_worker_empty_queue_returns_false() -> None:
@@ -394,11 +398,13 @@ class _FakeAdapter:
         rows: list[Row],
         *,
         test_connection_ok: bool = True,
+        connection_error: str | None = None,
         columns: list[Column] | None = None,
         emit_columns_twice: bool = False,
     ) -> None:
         self._rows = rows
         self._test_connection_ok = test_connection_ok
+        self.last_connection_error = connection_error
         self._columns = columns or [Column(name="n", type="unknown")]
         self._emit_columns_twice = emit_columns_twice
         self._column_sink: Callable[[list[Column]], None] | None = None
