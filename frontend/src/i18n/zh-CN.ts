@@ -94,6 +94,7 @@ export default {
     env_sandbox: 'sandbox(沙箱)',
     env_staging: 'staging(预发)',
     env_prod: 'prod(生产)',
+    env_verified_title: '管理员已核验',
     prod_confirm_hint: '生产环境 —— 再点一次「创建」以二次确认。',
     prod_confirm_hint_armed: '请确认:这将创建一个连接生产库的数据源。',
     prod_confirm_button: '确认 —— 创建生产数据源',
