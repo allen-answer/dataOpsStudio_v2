@@ -28,6 +28,8 @@ export interface DatasourceListItem {
   db_type: DbType
   host: string
   port: number
+  environment: string
+  environment_verified: boolean
   database: string | null
   created_at: string
 }
@@ -45,10 +47,11 @@ export interface DatasourceCreateRequest {
   extra?: Record<string, unknown>
 }
 
-export interface DatasourceResponse extends DatasourceListItem {
+// 详情 / 建后端点(GET /datasources/{id}, POST /datasources)返回体不含 environment_verified
+// —— 该字段只在列表端点(GET /datasources)产出。用 Omit 精确对齐后端,避免凭空多出字段。
+export interface DatasourceResponse extends Omit<DatasourceListItem, 'environment_verified'> {
   project_id: string
   username: string
-  environment: string
   extra: Record<string, unknown>
 }
 

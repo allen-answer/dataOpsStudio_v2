@@ -94,6 +94,7 @@ export default {
     env_sandbox: 'sandbox',
     env_staging: 'staging',
     env_prod: 'prod (production)',
+    env_verified_title: 'Verified by an admin',
     prod_confirm_hint: 'Production environment — click Create once more to confirm.',
     prod_confirm_hint_armed: 'Confirm: this creates a datasource against a LIVE production database.',
     prod_confirm_button: 'Confirm — create prod datasource',

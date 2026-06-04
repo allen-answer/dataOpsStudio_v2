@@ -236,10 +236,11 @@ const DB_TYPE_LABEL: Record<DbType, string> = {
   db2: 'DB2',
 }
 
-// ─── EnvBadge:env 从后端 list 暂未返回(★ T7 后补:list response 加 environment)
-// 这里用 (ds as any).environment 兜底,后端补字段后直接生效,无需前端二次改。
+// ─── EnvBadge ──────────────────────────────────────────────
+// list 端点(GET /datasources)现已返回 environment + environment_verified。
+// 视觉规则见 PRD §3 / D.7:prod 红 + 🔒;environment_verified=true 额外加 ✓(admin 显式 verified)。
 function envOf(ds: DatasourceListItem): string | undefined {
-  return (ds as DatasourceListItem & { environment?: string }).environment
+  return ds.environment || undefined
 }
 function isProd(env: string | undefined): boolean {
   return env?.toLowerCase() === 'prod' || env?.toLowerCase() === 'production'
@@ -365,7 +366,7 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
                 {{ DB_TYPE_LABEL[ds.db_type] }}
               </span>
             </td>
-            <!-- env badge(prod 必带 🔒)-->
+            <!-- env badge(prod 必带 🔒;verified 加 ✓)-->
             <td class="py-2 px-3">
               <span
                 v-if="envOf(ds)"
@@ -374,6 +375,11 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
               >
                 <Lock v-if="isProd(envOf(ds))" class="w-3 h-3" />
                 {{ envOf(ds) }}
+                <CheckCircle2
+                  v-if="ds.environment_verified"
+                  class="w-3 h-3"
+                  :title="t('datasources.env_verified_title')"
+                />
               </span>
               <span v-else class="chrome-text-muted text-xs">—</span>
             </td>
