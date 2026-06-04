@@ -225,28 +225,6 @@ DM EXPLAIN / schema 导入 / schema 写入 / scenario 写入 / 自动建对比�
 
 ---
 
-## CI 基础设施
-
-### **2026-06-02 前先验,2026-09-16 前必升** — GH Actions Node 20 弃用
-
-**位置**:`.github/workflows/ci.yml`(actions/checkout@v4 / astral-sh/setup-uv@v3)
-
-**现状**:CI 全部 7 个 job 都依赖这两个 action。GH Actions 的 deprecation 通告:
-- **2026-06-02**:GH 强制用 Node 24 跑这些 action(action 版本不变,运行时变,**大概率兼容**)
-- **2026-09-16**:这些 action 的当前 major 版本被移除(**必须升 @v5 / @v4**)
-
-**风险**:CI 全靠这些 action 跑红线 / 测试 / cold-start。Node 24 切换小概率破坏,届时所有 jobs 同时红 → 卡住任何 PR 合并(包括"修复 CI"的 PR 本身)。
-
-**建议办法(二选一,推荐先验)**:
-- **选 A 先验**:加 `env: FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"` 在 ci.yml 顶部跑一次完整 7 jobs。绿则放心,等 9 月 deadline 再升;红则立即按选 B 升
-- **选 B 直接升**:`actions/checkout@v5` + `astral-sh/setup-uv@v4`,顺便解决 9 月 deadline
-
-**触发条件**:**2026-06-02 前先做选 A** 消除不确定性(10 分钟);若验红或图省事 → 直接选 B。
-
-**优先级**:**中**。骨架阶段 CI 是单点失败,Node 24 切换日刚好在 T7 / T5 推进期间 —— 别让基础设施在那时炸。
-
----
-
 ## Backlog 维护规则
 
 1. **每个 review 反馈**判断三类:
