@@ -135,7 +135,7 @@
 
 dogfood 实测发现的部署文档项,逐条 T6 / 部署文档要覆盖:
 
-- **graceful stop**:`tmux kill-session` 可能打断正在跑的 job。worker.py 已 `import signal`,但**没文档化"SIGTERM 是 graceful,会等当前 job complete 再退"**。T6 必须暴露 `dataops stop` 命令 + 文档说明信号语义。
+- ~~**graceful stop**:`tmux kill-session` 可能打断正在跑的 job。worker.py 已 `import signal`,但**没文档化"SIGTERM 是 graceful,会等当前 job complete 再退"**。T6 必须暴露 `dataops stop` 命令 + 文档说明信号语义。~~ **已覆盖** → `docs/deployment/upgrade-in-place.md`(graceful `stop` / `--force` 语义 + reaper 心跳恢复)。本条剩余项(systemd / log rotate / TLS)未完,保留。
 - **systemd unit**:tmux 是 dogfood 临时态。正式部署需要 `dataops.service` / `dataops-worker.service` 单元文件 + journald 接管日志。
 - **log rotation**:`tee` 到文件无 rotate,长跑会撑满。systemd journald 自动 rotate 是顺路解决方案。
 - **TLS**:自签 cert 在 dogfood 够,正式部署要 Let's Encrypt 路径文档(1.x 的 nginx-rp 注释里说"备案后切",T6 部署文档延续这套就行)。
