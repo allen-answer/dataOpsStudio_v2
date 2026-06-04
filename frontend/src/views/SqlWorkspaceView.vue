@@ -66,6 +66,18 @@ watch(datasources, (list) => {
   if (!selectedDsId.value && list.length > 0) selectedDsId.value = list[0].id
 })
 
+// ─── 非 MySQL 兜底 ──────────────────────────────────────
+// 2.0.0 worker 仅实现 MySQL adapter(app/worker.py:402),非 MySQL 数据源执行必 failed。
+// 选到非 MySQL 时:执行按钮禁用 + 顶部提示,避免用户提交后才看到 failed。
+// ★ 后端补多方言 adapter 后移除此兜底(见 backlog「T7 §4 SQL 跑非 MySQL」)。
+const selectedDs = computed<DatasourceListItem | undefined>(() =>
+  datasources.value.find((d) => d.id === selectedDsId.value),
+)
+const unsupportedDb = computed<string | null>(() => {
+  const ds = selectedDs.value
+  return ds && ds.db_type !== 'mysql' ? ds.db_type : null
+})
+
 // ─── editor state ───────────────────────────────────────
 const sql = ref<string>('SELECT 1 AS hello;')
 const editorTheme = computed(() => {
@@ -82,9 +94,19 @@ const result = ref<JobResultResponse | null>(null)
 const resultLoading = ref(false)
 const PAGE_SIZE = 100
 
+// 切换数据源 = 新上下文,清掉上一条执行级错误(含非 MySQL 拦截 / SQL guard / 网络)。
+watch(selectedDsId, () => {
+  execError.value = null
+})
+
 async function onExecute(): Promise<void> {
   if (!selectedDsId.value || !sql.value.trim()) {
     execError.value = t('sql.error_pick_ds_or_sql')
+    return
+  }
+  // 非 MySQL 兜底:Cmd+Enter 直接调本函数,绕过按钮 disabled,这里再拦一次。
+  if (unsupportedDb.value) {
+    execError.value = t('sql.unsupported_db_error', { db: unsupportedDb.value })
     return
   }
   execError.value = null
@@ -186,7 +208,8 @@ const isTerminal = computed(
         type="button"
         class="chrome-btn-primary"
         @click="onExecute"
-        :disabled="!selectedDsId || !sql.trim()"
+        :disabled="!selectedDsId || !sql.trim() || !!unsupportedDb"
+        :title="unsupportedDb ? t('sql.unsupported_db_error', { db: unsupportedDb }) : ''"
       >
         <Play class="w-3.5 h-3.5" />
         {{ t('sql.execute') }}
@@ -201,6 +224,16 @@ const isTerminal = computed(
         <Square class="w-3.5 h-3.5" />
         {{ pollState.cancelling ? t('sql.cancelling') : t('sql.cancel') }}
       </button>
+    </div>
+
+    <!-- 非 MySQL 兜底提示(2.0 worker 仅支持 MySQL)-->
+    <div
+      v-if="unsupportedDb"
+      class="flex items-center gap-2 px-6 py-2 text-xs border-b chrome-border-subtle"
+      style="background-color: rgb(180 83 9 / 0.10); color: rgb(180 83 9);"
+    >
+      <AlertTriangle class="w-3.5 h-3.5 shrink-0" />
+      <span>{{ t('sql.unsupported_db_warn', { db: unsupportedDb }) }}</span>
     </div>
 
     <!-- editor 上半 -->
