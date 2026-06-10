@@ -137,6 +137,82 @@ class LicenseStatusResponse(BaseModel):
     edition: str | None = None
     customer: str | None = None
     expires_at: datetime | None = None
+    limits: dict[str, Any] = Field(default_factory=dict)
     features: list[str] = Field(default_factory=list)
     repair_reason: str | None = None
     trial_days_remaining: int | None = None
+
+
+class LicenseUploadRequest(BaseModel):
+    license_text: str = Field(min_length=1)
+
+
+class AdminUserItem(BaseModel):
+    id: str
+    username: str
+    role: str
+    mfa_enabled: bool
+    created_at: datetime
+
+
+class AdminUserCreateRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    role: str = Field(min_length=1)
+    initial_password: str = Field(min_length=1)
+
+
+class AdminUserPatchRequest(BaseModel):
+    role: str = Field(min_length=1)
+
+
+class AdminResetPasswordResponse(BaseModel):
+    temporary_password: str
+
+
+class AdminDeleteBlockedResponse(BaseModel):
+    error: str
+    message: str
+    owned_projects: list[ProjectResponse] = Field(default_factory=list)
+
+
+class AdminProjectItem(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    owner_user_id: str
+    member_count: int
+    datasource_count: int
+    job_count: int
+    created_at: datetime
+
+
+class AdminProjectCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    description: str | None = None
+    owner_user_id: str
+    members: list[str] = Field(default_factory=list)
+
+
+class AdminProjectPatchRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+    description: str | None = None
+    owner_user_id: str | None = None
+    members: list[str] | None = None
+
+
+class AdminProjectDeleteImpactResponse(BaseModel):
+    datasource_count: int
+    job_count: int
+
+
+class AuditLogItem(BaseModel):
+    id: int
+    ts: datetime
+    user_id: str | None = None
+    project_id: str | None = None
+    action: str
+    resource_type: str | None = None
+    resource_id: str | None = None
+    result: str
+    request_id: str | None = None
+    detail: dict[str, Any] | None = None

@@ -57,6 +57,18 @@ def verify_license(
     return _state_from_payload(LicenseMode.VALID, payload, expires)
 
 
+def read_license_limits(path: Path = Path("config/license.lic")) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        payload = data["payload"]
+        if not isinstance(payload, dict):
+            return {}
+        limits = payload.get("limits", {})
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError):
+        return {}
+    return dict(limits) if isinstance(limits, dict) else {}
+
+
 def _trial_30day(now: datetime) -> LicenseState:
     return LicenseState(
         mode=LicenseMode.TRIAL,
