@@ -4,7 +4,9 @@ import os
 import socket
 import stat
 from argparse import Namespace
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -15,6 +17,7 @@ from app.launcher import (
     LauncherError,
     _child_env,
     _pg_ctl_start,
+    _sync_license_state,
     _which,
     command_bootstrap_init,
     command_doctor,
@@ -40,6 +43,19 @@ def test_bootstrap_init_generates_0600_files(tmp_path: Path) -> None:
             bootstrap.jwt_secret_file,
         ):
             assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_bootstrap_init_reports_missing_license_trial_mode(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    context = _context(tmp_path)
+
+    assert command_bootstrap_init(context, Namespace(force=False)) == 0
+
+    output = capsys.readouterr().out
+    assert "license.lic not found" in output
+    assert "30-day trial mode" in output
 
 
 def test_child_env_removes_legacy_postgres_dev_password(
@@ -83,6 +99,28 @@ def test_pg_up_does_not_initdb_when_pgdata_already_exists(
     assert command_pg_up(context, Namespace()) == 0
 
     assert calls == ["ensure"]
+
+
+def test_sync_license_state_preserves_existing_trial_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path)
+    command_bootstrap_init(context, Namespace(force=False))
+    existing_expires_at = datetime(2026, 7, 1, tzinfo=UTC)
+    engine = _LicenseStateEngine(
+        {
+            "id": 1,
+            "mode": "trial",
+            "expires_at": existing_expires_at,
+        }
+    )
+    monkeypatch.setattr("app.launcher._metadata_engine", lambda *args, **kwargs: engine)
+
+    _sync_license_state(context, LocalFileBootstrapSecrets.from_config_dir(tmp_path / "config"))
+
+    assert engine.updated_values is not None
+    assert engine.updated_values["expires_at"] == existing_expires_at
 
 
 def test_pg_ctl_start_uses_runtime_socket_dir(
@@ -187,3 +225,46 @@ def _context(root: Path) -> LauncherContext:
     settings.bootstrap.license_file = root / "config" / "license.lic"
     settings.result_store.local_root = root / "data" / "results"
     return LauncherContext(root=root, repo_root=Path.cwd(), settings=settings, uv="uv")
+
+
+class _LicenseStateEngine:
+    def __init__(self, existing: dict[str, Any] | None) -> None:
+        self.existing = existing
+        self.updated_values: dict[str, Any] | None = None
+
+    def begin(self) -> _LicenseStateConnection:
+        return _LicenseStateConnection(self)
+
+    def dispose(self) -> None:
+        return None
+
+
+class _LicenseStateConnection:
+    def __init__(self, engine: _LicenseStateEngine) -> None:
+        self.engine = engine
+        self.calls = 0
+
+    def __enter__(self) -> _LicenseStateConnection:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        return None
+
+    def execute(self, statement: Any) -> _LicenseStateResult:
+        self.calls += 1
+        if self.calls == 1:
+            return _LicenseStateResult(self.engine.existing)
+        compiled = statement.compile()
+        self.engine.updated_values = dict(compiled.params)
+        return _LicenseStateResult(None)
+
+
+class _LicenseStateResult:
+    def __init__(self, row: dict[str, Any] | None) -> None:
+        self.row = row
+
+    def mappings(self) -> _LicenseStateResult:
+        return self
+
+    def one_or_none(self) -> dict[str, Any] | None:
+        return self.row
