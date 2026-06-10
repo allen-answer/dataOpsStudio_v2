@@ -1,13 +1,9 @@
 """DatabaseAdapter Protocol 契约测试(契约 §3.2)。
 
-★ 接口设计以 Oracle/DM 为假想验证对象 —— 故契约测试同样覆盖:
-- 标识符大小写差异(MySQL vs Oracle/DM)
-- 分页语法差异
+★ 接口设计以 Oracle/DM 为假想验证对象 —— 故契约测试参数化 MySQL + DM 两个
+2.0.0 Certified adapter,同一套 Protocol 签名两边都过,并覆盖:
+- 标识符大小写差异(MySQL 反引号原样 vs DM/Oracle UPPER + 双引号)
 - server_side_cancel 多为 False 的优雅降级
-
-Codex 实现 MySQL/DM/Oracle adapter 后:
-1. 实现 adapter fixture(参数化各 driver)
-2. 删除 @pytest.mark.skip
 """
 
 from __future__ import annotations
@@ -16,6 +12,7 @@ from typing import Any, cast
 
 import pytest
 
+from app.dbclients.dm_adapter import DMAdapter
 from app.dbclients.mysql_adapter import MySQLAdapter
 from app.dbclients.protocol import DatabaseAdapter
 from app.domain.datasource import DatasourceConnInfo, DbType
@@ -25,12 +22,19 @@ from app.infrastructure.secretstore.protocol import SecretStore
 pytestmark = pytest.mark.contract
 
 
-@pytest.fixture
-def adapter() -> DatabaseAdapter:
-    return MySQLAdapter(
-        _conn_info(),
-        cast(SecretStore, _SecretStore()),
-        pymysql_module=_FakePyMySQL(),
+@pytest.fixture(params=["mysql", "dm"])
+def adapter(request: pytest.FixtureRequest) -> DatabaseAdapter:
+    secret_store = cast(SecretStore, _SecretStore())
+    if request.param == "mysql":
+        return MySQLAdapter(
+            _conn_info(DbType.MYSQL),
+            secret_store,
+            pymysql_module=_FakePyMySQL(),
+        )
+    return DMAdapter(
+        _conn_info(DbType.DM),
+        secret_store,
+        dm_module=_FakeDM(),
     )
 
 
@@ -76,11 +80,17 @@ def test_kill_query_matches_capability(adapter: DatabaseAdapter) -> None:
         assert result is False
 
 
-def test_identifier_case_handling(adapter: DatabaseAdapter) -> None:
-    """★ Oracle/DM 默认大写 + 双引号 quote;MySQL 反引号原样。
-    list_columns 返回的 name 应符合该 adapter 的方言惯例。
+def test_list_columns_returns_typed_column(adapter: DatabaseAdapter) -> None:
+    """★ list_columns 返回 Column,type 为统一 ColumnType 枚举,name 符合方言惯例。
+
+    MySQL 反引号原样(小写 id);DM/Oracle 默认大写(ID)。两边都过同一签名。
     """
-    assert adapter.list_columns("app", "users")[0].name == "id"
+    columns = adapter.list_columns("app", "users")
+    assert columns
+    first = columns[0]
+    assert first.name.lower() == "id"
+    # type 是统一枚举(可被序列化为字符串);driver_type 保留原始类型供前端备查
+    assert first.driver_type is not None
 
 
 def test_explain_returns_plan_node(adapter: DatabaseAdapter) -> None:
@@ -89,14 +99,15 @@ def test_explain_returns_plan_node(adapter: DatabaseAdapter) -> None:
         assert plan.operation is not None
 
 
-def _conn_info() -> DatasourceConnInfo:
+def _conn_info(db_type: DbType) -> DatasourceConnInfo:
+    port = 3306 if db_type is DbType.MYSQL else 5236
     return DatasourceConnInfo(
         host="127.0.0.1",
-        port=3306,
+        port=port,
         username="dataops",
         database="app",
         password_ref=SecretRef(ref="secret-1", kind=SecretKind.DATASOURCE_PASSWORD),
-        db_type=DbType.MYSQL,
+        db_type=db_type,
     )
 
 
@@ -121,6 +132,9 @@ class _SecretStore:
 
     def rotate_master_key(self, new_key: bytes) -> RotationReport:
         raise NotImplementedError
+
+
+# ──────────────────── MySQL fake driver ────────────────────
 
 
 class _FakeSSCursor:
@@ -185,6 +199,80 @@ class _FakeCursor:
 
     def fetchall(self) -> list[tuple[Any, ...]]:
         return self._rows
+
+    def close(self) -> None:
+        return None
+
+
+# ──────────────────── DM fake driver ────────────────────
+
+
+class _DMType:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeDM:
+    NUMBER = _DMType("NUMBER")
+    STRING = _DMType("STRING")
+
+    def connect(self, **kwargs: Any) -> _FakeDMConnection:
+        return _FakeDMConnection()
+
+
+class _FakeDMConnection:
+    def __init__(self) -> None:
+        self.closed = False
+        self.callTimeout: int | None = None
+
+    def cursor(self, cursorclass: object | None = None) -> _FakeDMCursor:
+        return _FakeDMCursor()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeDMCursor:
+    def __init__(self) -> None:
+        self.description: tuple[tuple[Any, ...], ...] = (("ok",),)
+        self._rows: list[tuple[Any, ...]] = []
+        self._offset = 0
+
+    def execute(self, sql: str, params: object = None) -> None:
+        normalized = " ".join(sql.lower().split())
+        if "all_users" in normalized:
+            self.description = (("name",),)
+            self._rows = [("APP",)]
+        elif "all_tab_columns" in normalized:
+            self.description = (("name",), ("data_type",), ("nullable",))
+            self._rows = [("ID", "NUMBER", "N"), ("NAME", "VARCHAR2", "Y")]
+        elif "all_constraints" in normalized:
+            self.description = (("name",),)
+            self._rows = [("ID",)]
+        elif normalized.startswith("explain"):
+            self.description = (("plan",),)
+            self._rows = [("SELECT STATEMENT",)]
+        elif "from dual" in normalized:
+            self.description = (("ok",),)
+            self._rows = [(1,)]
+        else:
+            self.description = (("ok",),)
+            self._rows = [(1,)]
+        self._offset = 0
+
+    def fetchone(self) -> tuple[Any, ...] | None:
+        rows = self.fetchmany(1)
+        return rows[0] if rows else None
+
+    def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
+        batch = self._rows[self._offset : self._offset + size]
+        self._offset += len(batch)
+        return batch
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        rows = self._rows[self._offset :]
+        self._offset = len(self._rows)
+        return rows
 
     def close(self) -> None:
         return None

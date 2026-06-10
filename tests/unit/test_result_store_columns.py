@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from app.domain.schema import Column, Row
+from app.domain.schema import Column, ColumnType, Row
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
 
 
 def test_spool_manifest_persists_columns(tmp_path: Path) -> None:
     store = LocalFsResultStore(tmp_path)
-    columns = [Column(name="r", type="unknown", nullable=True)]
+    columns = [Column(name="r", type=ColumnType.UNKNOWN, nullable=True)]
 
     store.set_spool_columns("rs-1", columns)
     store.append_spool("rs-1", [Row(values=[2])])
