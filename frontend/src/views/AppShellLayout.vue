@@ -3,6 +3,7 @@ import { Search } from 'lucide-vue-next'
 import { useI18n } from 'vue-i18n'
 import NavRail from '../components/NavRail.vue'
 import UserMenu from '../components/UserMenu.vue'
+import LicenseBanner from '../components/LicenseBanner.vue'
 
 const { t } = useI18n()
 </script>
@@ -43,6 +44,8 @@ const { t } = useI18n()
           <UserMenu />
         </div>
       </header>
+
+      <LicenseBanner />
 
       <main class="flex-1 overflow-y-auto">
         <RouterView />

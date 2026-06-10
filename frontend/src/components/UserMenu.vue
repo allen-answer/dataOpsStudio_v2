@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { LogOut, User as UserIcon, Palette, Languages, ChevronDown } from 'lucide-vue-next'
+import { LogOut, User as UserIcon, Palette, Languages, ChevronDown, ShieldCheck } from 'lucide-vue-next'
 import { useAuthStore } from '../stores/auth'
 import { useThemeStore } from '../stores/theme'
 import { variants } from '../variants'
@@ -12,6 +12,12 @@ const { t, locale } = useI18n()
 const router = useRouter()
 const auth = useAuthStore()
 const themeStore = useThemeStore()
+
+const isAdmin = computed(() => auth.user?.role === 'admin')
+function goAdmin(): void {
+  close()
+  void router.push({ name: 'admin-users' })
+}
 
 function cycleVariant(): void {
   const i = variants.findIndex((v) => v.id === themeStore.variant)
@@ -98,6 +104,16 @@ onUnmounted(() => document.removeEventListener('mousedown', onClickOutside))
       >
         <Languages class="w-4 h-4" />
         {{ locale === 'zh-CN' ? 'English' : '简体中文' }}
+      </button>
+
+      <button
+        v-if="isAdmin"
+        type="button"
+        @click="goAdmin"
+        class="w-full text-left px-3 py-2 text-sm hover:chrome-bg-elevated chrome-text-normal flex items-center gap-2 transition-colors"
+      >
+        <ShieldCheck class="w-4 h-4" />
+        {{ t('admin.menu_entry') }}
       </button>
 
       <div class="border-t border-slate-100 dark:border-slate-700 mt-1 pt-1">
