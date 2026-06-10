@@ -16,12 +16,11 @@ from app.domain.license import LicenseMode
 logger = structlog.get_logger(__name__)
 
 _PUBLIC_PATHS = frozenset({"/api/auth/login", "/healthz"})
-_REPAIR_RESTRICTED = frozenset(
-    {
-        ("POST", "/api/datasources"),
-        ("POST", "/api/sql/execute"),
-    }
-)
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_LICENSE_UPDATE_PATHS = frozenset({"/api/admin/license", "/api/admin/license/upload"})
+_DIAGNOSTIC_EXPORT_PATHS = frozenset({"/api/admin/diagnostics", "/api/admin/diagnostics/export"})
+_BACKUP_PATHS = frozenset({"/api/admin/backups", "/api/admin/backups/export"})
+_RESTORE_PATHS = frozenset({"/api/admin/backups/restore"})
 
 
 class CrossCuttingMiddleware(BaseHTTPMiddleware):
@@ -118,13 +117,18 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
     def _check_license(self, request: Request) -> Response | None:
         if request.url.path in _PUBLIC_PATHS:
             return None
-        if self._services.current_license_mode() is not LicenseMode.REPAIR:
-            return None
-        if _is_repair_restricted(request):
+        mode = self._services.current_license_mode()
+        if mode is LicenseMode.REPAIR and _is_repair_restricted(request):
             return error_response(
                 403,
                 "license_repair_mode",
                 "This action is disabled while license repair is required",
+            )
+        if mode is LicenseMode.IN_GRACE and _is_in_grace_restricted(request):
+            return error_response(
+                403,
+                "license_in_grace",
+                "This action is disabled while the license is in grace period",
             )
         return None
 
@@ -138,9 +142,45 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
 def _is_repair_restricted(request: Request) -> bool:
     method = request.method.upper()
     path = request.url.path
-    if (method, path) in _REPAIR_RESTRICTED:
-        return True
-    return method == "POST" and path.startswith("/api/datasources/") and path.endswith("/test")
+    if method in _SAFE_METHODS:
+        return False
+    if _is_license_update(method, path):
+        return False
+    if _is_backup_operation(method, path):
+        return False
+    if _is_restore_operation(method, path):
+        return False
+    if _is_diagnostic_export(method, path):
+        return False
+    return True
+
+
+def _is_in_grace_restricted(request: Request) -> bool:
+    method = request.method.upper()
+    path = request.url.path
+    if method in _SAFE_METHODS:
+        return False
+    if _is_license_update(method, path):
+        return False
+    if _is_backup_operation(method, path):
+        return False
+    return True
+
+
+def _is_license_update(method: str, path: str) -> bool:
+    return method in {"POST", "PUT"} and path in _LICENSE_UPDATE_PATHS
+
+
+def _is_backup_operation(method: str, path: str) -> bool:
+    return method == "POST" and path in _BACKUP_PATHS
+
+
+def _is_restore_operation(method: str, path: str) -> bool:
+    return method == "POST" and path in _RESTORE_PATHS
+
+
+def _is_diagnostic_export(method: str, path: str) -> bool:
+    return method == "POST" and path in _DIAGNOSTIC_EXPORT_PATHS
 
 
 def _request_user(request: Request) -> CurrentUser | None:
