@@ -18,9 +18,7 @@ logger = structlog.get_logger(__name__)
 _PUBLIC_PATHS = frozenset({"/api/auth/login", "/healthz"})
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _LICENSE_UPDATE_PATHS = frozenset({"/api/admin/license", "/api/admin/license/upload"})
-_DIAGNOSTIC_EXPORT_PATHS = frozenset(
-    {"/api/admin/diagnostics", "/api/admin/diagnostics/export"}
-)
+_DIAGNOSTIC_EXPORT_PATHS = frozenset({"/api/admin/diagnostics", "/api/admin/diagnostics/export"})
 _BACKUP_PATHS = frozenset({"/api/admin/backups", "/api/admin/backups/export"})
 _RESTORE_PATHS = frozenset({"/api/admin/backups/restore"})
 

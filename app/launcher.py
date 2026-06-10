@@ -578,9 +578,7 @@ def _sync_license_state(
             if existing is None:
                 conn.execute(insert(license_state).values(**values))
             else:
-                conn.execute(
-                    update(license_state).where(license_state.c.id == 1).values(**values)
-                )
+                conn.execute(update(license_state).where(license_state.c.id == 1).values(**values))
     finally:
         engine.dispose()
     if state.mode.value == "trial":
