@@ -5,8 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from app.domain.datasource import DbType
-from app.domain.job import JobStatus
+from app.domain.datasource import DbType, OperationPolicy
+from app.domain.job import JobErrorCode, JobStatus
 from app.domain.schema import Column
 
 
@@ -37,6 +37,21 @@ class DatasourceCreateRequest(BaseModel):
     password: str = Field(min_length=1)
     environment: str = "dev"
     extra: dict[str, Any] = Field(default_factory=dict)
+    operation_policy: OperationPolicy = Field(default_factory=OperationPolicy)
+
+
+class DatasourceUpdateRequest(BaseModel):
+    project_id: str | None = None
+    name: str | None = Field(default=None, min_length=1)
+    db_type: DbType | None = None
+    host: str | None = Field(default=None, min_length=1)
+    port: int | None = Field(default=None, ge=1, le=65535)
+    username: str | None = Field(default=None, min_length=1)
+    database: str | None = Field(default=None, min_length=1)
+    password: str | None = None
+    environment: str | None = None
+    extra: dict[str, Any] | None = None
+    operation_policy: OperationPolicy | None = None
 
 
 class DatasourceResponse(BaseModel):
@@ -50,6 +65,7 @@ class DatasourceResponse(BaseModel):
     database: str
     environment: str
     extra: dict[str, Any] = Field(default_factory=dict)
+    operation_policy: OperationPolicy = Field(default_factory=OperationPolicy)
 
 
 class DatasourceListItem(BaseModel):
@@ -61,7 +77,20 @@ class DatasourceListItem(BaseModel):
     environment: str
     environment_verified: bool = False
     database: str | None = None
+    operation_policy: OperationPolicy = Field(default_factory=OperationPolicy)
     created_at: datetime
+
+
+class DatasourceReferenceItem(BaseModel):
+    job_id: str
+    kind: str
+    status: JobStatus
+
+
+class DatasourceDeleteBlockedResponse(BaseModel):
+    error: str
+    message: str
+    references: list[DatasourceReferenceItem] = Field(default_factory=list)
 
 
 DatasourceTestErrorCode = Literal[
@@ -100,6 +129,7 @@ class JobResponse(BaseModel):
     status: JobStatus
     result_set_id: str | None = None
     error: str | None = None
+    error_code: JobErrorCode | None = None
     message: str | None = None
 
 
@@ -111,6 +141,7 @@ class JobListItem(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     error: str | None = None
+    error_code: JobErrorCode | None = None
 
 
 class RowResponse(BaseModel):

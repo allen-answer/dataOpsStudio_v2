@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from typing import Protocol
 
-from app.domain.datasource import DatasourceConnInfo, DbType
-from app.domain.job import Job, JobKind, JobStatus
+from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
+from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Row
@@ -83,7 +83,7 @@ def test_worker_fails_if_adapter_emits_columns_twice() -> None:
     assert runner.run_once() is True
 
     assert backend.completed == []
-    assert backend.failed == [("job-1", "adapter emitted result columns more than once")]
+    assert backend.failed == [("job-1", "sql_failed")]
 
 
 def test_worker_cancel_safe_point_marks_cancelled() -> None:
@@ -124,9 +124,7 @@ def test_worker_unsupported_kind_fails_job() -> None:
 
     assert runner.run_once() is True
 
-    assert backend.failed
-    assert backend.failed[0][0] == "job-1"
-    assert "Unsupported job kind" in backend.failed[0][1]
+    assert backend.failed == [("job-1", "internal")]
 
 
 def test_worker_unsupported_db_type_fails_with_precise_message() -> None:
@@ -154,7 +152,7 @@ def test_worker_unsupported_db_type_fails_with_precise_message() -> None:
     assert runner.run_once() is True
 
     assert backend.completed == []
-    assert backend.failed == [("job-1", "Unsupported datasource db_type: oracle")]
+    assert backend.failed == [("job-1", "unsupported_db_type")]
 
 
 def test_worker_runs_test_connection_job_and_completes() -> None:
@@ -201,7 +199,35 @@ def test_worker_failed_test_connection_fails_job() -> None:
     assert runner.run_once() is True
 
     assert backend.completed == []
-    assert backend.failed == [("job-1", "datasource connection test failed")]
+    assert backend.failed == [("job-1", "auth_failed")]
+
+
+def test_worker_policy_denies_select_before_adapter_runs() -> None:
+    job = _make_job(payload={"sql": "SELECT 1", "result_set_id": "rs-1"})
+    backend = _FakeBackend([job])
+    error_writer = _FakeErrorCodeWriter()
+    adapter = _FakeAdapter([Row(values=[1])])
+
+    def load_denied_datasource(datasource_id: str) -> DatasourceConnInfo:
+        return _conn_info(datasource_id).model_copy(
+            update={"operation_policy": OperationPolicy(allow_select=False)}
+        )
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        load_denied_datasource,
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        job_error_code_writer=error_writer,
+    )
+
+    assert runner.run_once() is True
+
+    assert adapter.execute_select_calls == 0
+    assert backend.completed == []
+    assert backend.failed == [("job-1", "permission_denied")]
+    assert error_writer.error_codes == [("job-1", JobErrorCode.PERMISSION_DENIED)]
 
 
 def test_worker_empty_queue_returns_false() -> None:
@@ -392,6 +418,14 @@ class _CountingResultStore:
         return ResultRef(backend="local_fs", uri=f"spool/{result_set_id}")
 
 
+class _FakeErrorCodeWriter:
+    def __init__(self) -> None:
+        self.error_codes: list[tuple[str, JobErrorCode]] = []
+
+    def set_error_code(self, job_id: str, error_code: JobErrorCode) -> None:
+        self.error_codes.append((job_id, error_code))
+
+
 class _FakeAdapter:
     def __init__(
         self,
@@ -409,6 +443,7 @@ class _FakeAdapter:
         self._emit_columns_twice = emit_columns_twice
         self._column_sink: Callable[[list[Column]], None] | None = None
         self.test_connection_calls = 0
+        self.execute_select_calls = 0
         self.last_server_version = "MySQL 8.0.test"
 
     def with_column_sink(self, column_sink: Callable[[list[Column]], None]) -> _FakeAdapter:
@@ -416,6 +451,7 @@ class _FakeAdapter:
         return self
 
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
+        self.execute_select_calls += 1
         if self._column_sink is not None:
             self._column_sink(self._columns)
             if self._emit_columns_twice:

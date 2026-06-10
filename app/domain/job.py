@@ -42,6 +42,16 @@ class JobStatus(StrEnum):
     TIMEOUT = "timeout"
 
 
+class JobErrorCode(StrEnum):
+    CONNECTION_FAILED = "connection_failed"
+    SQL_FAILED = "sql_failed"
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
+    PERMISSION_DENIED = "permission_denied"
+    UNSUPPORTED_DB_TYPE = "unsupported_db_type"
+    INTERNAL = "internal"
+
+
 # Workflow 节点白名单(R7 红线;契约 §4)。
 # 节点 kind 与 Job kind 部分重叠但不相等:workflow 节点含 notify/sleep/branch,
 # 但不能起 workflow_run / ai_assist_call / ai_copilot_run(防嵌套 + AI 出站滥用)。
@@ -85,6 +95,7 @@ class Job(BaseModel):
     cancel_requested: bool = False
     cancel_reason: str | None = None
     error: str | None = None
+    error_code: JobErrorCode | None = None
     retry_count: int = 0
     payload: dict[str, Any] = Field(default_factory=dict)
     parent_workflow_run_id: str | None = None

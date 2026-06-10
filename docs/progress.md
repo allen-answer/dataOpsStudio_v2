@@ -7,34 +7,24 @@
 
 ---
 
-## 当前 Wave:Wave 1(三线并行,目录零重叠)
-
-| 任务 | 负责 | 分支 | 目录边界(铁律:不越界) | 状态 | PR |
-|---|---|---|---|---|---|
-| T5 License + Repair Mode + admin 路由 | Codex | `feat/t5-license-repair-mode` | `infrastructure/license/` + `api/` + `launcher.py` | 进行中(license 主体 + middleware 完成;admin endpoint 清单已人确认,路由实现中) | — |
-| T8 migrate_from_v1 | Claude 4.8 ① | `feat/t8-migrate-from-v1` | `tools/` + `tests/`(**不动 app/**) | **已合并** | [#26](https://github.com/allen-answer/dataOpsStudio_v2/pull/26) |
-| DM adapter + ColumnType 统一枚举 | Claude 4.8 ② | `feat/dm-adapter-columntype` | `dbclients/` + `domain/` + `worker.py` 仅 dispatch 一处 | PR 待审(review 已过,backlog 收尾已补) | [#25](https://github.com/allen-answer/dataOpsStudio_v2/pull/25) |
-| 全部 PR review(R1–R10 + 接口一致性) | review agent(主会话) | — | — | 常驻 | — |
-
-**Wave 1 冲突预埋点(已规避)**:
-- `worker.py`:仅 DM adapter 任务可碰(dispatch 一处);结构化 error code 改造留 Wave 2
-- `schemas.py`:仅 T5 可碰;operation_policy 留 Wave 2
-
-## Wave 2(解锁条件:T5 合并)
+## 当前 Wave:Wave 2
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| Datasource polish:`PUT/DELETE /datasources/{id}`(409 引用检查)+ operation_policy(8×allow_*)+ worker 结构化 error code | Codex | T5 合并(schemas.py 释放)+ DM adapter 合并(worker.py 释放) | — | — |
-| T7 Part B admin 三页 + License 管理(§7 用户 / §8 项目 / §10 审计 + License 状态横条/上传)| Claude 4.8 ① | T5 admin 路由合并 | PR 待审(build 过 + 浏览器渲染/守卫验证;**真后端验证待人工**)| feat/t7-partb-admin-pages |
-| AI Gateway 接 1 provider 调通 + T6 尾巴(systemd unit / log rotate / TLS 文档) | Claude 4.8 ② | 无 | PR 待审 | [#29](https://github.com/allen-answer/dataOpsStudio_v2/pull/29) |
+| Datasource polish:`PUT/DELETE /datasources/{id}`(409 引用检查)+ operation_policy(8×allow_*)+ worker 结构化 error code | Codex | 无(依赖已全合并) | PR 待审(review 已过,CI 绿;已并入 main 解决看板冲突) | [#32](https://github.com/allen-answer/dataOpsStudio_v2/pull/32) |
+| T7 Part B admin 三页 + License 管理(§7 用户 / §8 项目 / §10 审计 + License 状态横条/上传) | Claude 4.8 ① | — | **已合并**(daily-server 真后端走查证据见 PR) | [#30](https://github.com/allen-answer/dataOpsStudio_v2/pull/30) |
+| AI Gateway 接 1 provider 调通 + T6 尾巴(systemd unit / log rotate / TLS 文档) | Claude 4.8 ② | — | **已合并** | [#29](https://github.com/allen-answer/dataOpsStudio_v2/pull/29) |
+
+> Part B 剩余两页(§6 账户安全 MFA / §9 AI 配置)+ force-logout **卡后端表/列**,
+> 候选打包为 Wave 4「Part B 后端补全」,见 backlog 交叉项。
 
 ## Wave 3(收口)
 
-| 任务 | 负责 | 依赖 |
-|---|---|---|
-| T7 Part A 收口:编辑/删除 modal + 权限面板 + Jobs 错误码精确映射 | Claude 4.8 | Wave 2 datasource polish 合并 |
-| SQL Workspace 按 ColumnType 染色 | Claude 4.8 | DM adapter + 枚举合并 |
-| §5 验收 e2e 全量对照(contract §5:portable 解压 → … → migrate) | review agent + 人 | 全部合并 |
+| 任务 | 负责 | 依赖 | 状态 | PR |
+|---|---|---|---|---|
+| T7 Part A 收口:编辑/删除 modal + 权限面板 + Jobs 错误码精确映射 | Claude 4.8 | #32 合并 | 未开工 | — |
+| §5 验收 e2e 全量对照(contract §5:portable 解压 → … → migrate) | review agent + 人 | 全部合并 | 未开工 | — |
+| DM 真实例集成验证(backlog 高优先级,Certified 前必做) | review agent + 人 | 需持牌 DM 实例 | 受阻(等 DM 实例) | — |
 
 ---
 
@@ -53,7 +43,13 @@
 
 ## 已完成归档
 
-> 截至本看板建立(2026-06-10),2.0.0 骨架已完成:Step 1 围栏、T1(PG 队列 + worker)、
+> **Wave 1(2026-06-10 全部合并)**:T5 License + Repair Mode + admin 路由
+> ([#28](https://github.com/allen-answer/dataOpsStudio_v2/pull/28),Codex)、
+> T8 migrate_from_v1([#26](https://github.com/allen-answer/dataOpsStudio_v2/pull/26),Claude 4.8)、
+> DM adapter + ColumnType 统一枚举([#25](https://github.com/allen-answer/dataOpsStudio_v2/pull/25),Claude 4.8)。
+> Wave 2 前置:ColumnType 前端适配([#31](https://github.com/allen-answer/dataOpsStudio_v2/pull/31))。
+>
+> 截至看板建立(2026-06-10),2.0.0 骨架已完成:Step 1 围栏、T1(PG 队列 + worker)、
 > T2(MySQL adapter + spool)、T3(SecretStore 两层)、T4(API + middleware + 列元数据)、
 > T6(launcher + 冷启动 CI + 原地升级 runbook)、T7 Part A(phase 1–2δ + §3 核验标,
 > 已追平现有 5 组 endpoint 能力上限)。逐 commit 明细见 `docs/agent-playbook.md §1`。
