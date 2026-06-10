@@ -9,7 +9,7 @@ from typing import Any
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from app.domain.license import LicenseMode
-from app.infrastructure.license.verifier import verify_license
+from app.infrastructure.license.verifier import read_license_limits, verify_license
 
 
 def test_missing_license_is_trial_30day(tmp_path: Path) -> None:
@@ -88,6 +88,14 @@ def test_damaged_license_files_enter_repair_instead_of_crashing(tmp_path: Path) 
 
         assert state.mode is LicenseMode.REPAIR
         assert state.repair_reason == "invalid_signature"
+
+
+def test_read_license_limits_returns_payload_limits(tmp_path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    now = datetime(2026, 6, 10, tzinfo=timezone.utc)
+    path = _write_license(tmp_path, key, expires_at=now + timedelta(days=30))
+
+    assert read_license_limits(path) == {"max_users": 5}
 
 
 def _write_license(
