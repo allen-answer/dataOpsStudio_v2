@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import structlog
@@ -20,6 +21,7 @@ from app.api.schemas import (
     JobListItem,
     JobResponse,
     JobResultResponse,
+    LicenseStatusResponse,
     LoginRequest,
     ProjectResponse,
     RowResponse,
@@ -29,7 +31,7 @@ from app.api.schemas import (
 )
 from app.api.security import create_access_token
 from app.api.services import ApiServices, new_id
-from app.db.models import datasources, jobs, project_members, projects, users
+from app.db.models import datasources, jobs, license_state, project_members, projects, users
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.datasource import DbType
 from app.domain.job import Job, JobKind, JobStatus
@@ -375,6 +377,31 @@ def cancel_job(job_id: str, request: Request) -> CancelResponse:
     return CancelResponse(cancelled=True)
 
 
+@router.get("/license/status", response_model=LicenseStatusResponse)
+def get_license_status(request: Request) -> LicenseStatusResponse:
+    services = services_from(request)
+    with services.engine.connect() as conn:
+        row = (
+            conn.execute(select(license_state).where(license_state.c.id == 1))
+            .mappings()
+            .one_or_none()
+        )
+    if row is None:
+        return LicenseStatusResponse(mode="trial", trial_days_remaining=30)
+
+    expires_at = row["expires_at"] if isinstance(row["expires_at"], datetime) else None
+    mode = str(row["mode"])
+    return LicenseStatusResponse(
+        mode=mode,
+        edition=_optional_str(row["edition"]),
+        customer=_optional_str(row["customer"]),
+        expires_at=expires_at,
+        features=list(row["features"] or []),
+        repair_reason=_optional_str(row["repair_reason"]),
+        trial_days_remaining=_trial_days_remaining(mode, expires_at),
+    )
+
+
 def _user_by_username(services: ApiServices, username: str) -> RowMapping | None:
     with services.engine.connect() as conn:
         return (
@@ -608,6 +635,18 @@ def _columns_from_manifest(manifest: dict[str, Any] | None) -> list[Column]:
 
 def _optional_str(value: object) -> str | None:
     return str(value) if value is not None else None
+
+
+def _trial_days_remaining(mode: str, expires_at: datetime | None) -> int | None:
+    if mode != "trial":
+        return None
+    if expires_at is None:
+        return 30
+    now = datetime.now(timezone.utc)
+    normalized = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+    remaining_seconds = (normalized - now).total_seconds()
+    seconds_per_day = 24 * 60 * 60
+    return max(0, int((remaining_seconds + seconds_per_day - 1) // seconds_per_day))
 
 
 def _audit_business(

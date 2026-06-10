@@ -42,6 +42,19 @@ def test_bootstrap_init_generates_0600_files(tmp_path: Path) -> None:
             assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+def test_bootstrap_init_reports_missing_license_trial_mode(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    context = _context(tmp_path)
+
+    assert command_bootstrap_init(context, Namespace(force=False)) == 0
+
+    output = capsys.readouterr().out
+    assert "license.lic not found" in output
+    assert "30-day trial mode" in output
+
+
 def test_child_env_removes_legacy_postgres_dev_password(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -4,20 +4,6 @@
 
 ## 来自 T4 (API + middleware) review
 
-### **T5 做 License 时补** — Middleware 只检 REPAIR,没处理 IN_GRACE
-
-**位置**:`app/api/middleware/crosscutting.py:_check_license`
-
-**现状**:`_check_license` 只在 `LicenseMode.REPAIR` 时拦截 `_REPAIR_RESTRICTED` 路径(POST /api/datasources / /sql/execute / /datasources/{id}/test)。
-
-**遗漏**:设计稿 §8.4 中 `IN_GRACE` mode(过期 ≤7 天)= **只读 + 允许 license 更新 + 备份;禁建任务 / 禁 AI**。当前 middleware 未对 IN_GRACE 做任何检查。
-
-**修法**:T5 实现 License Skeleton + Repair Mode 时,把 `_check_license` 扩为对 `IN_GRACE` 也限制写操作(同 `_REPAIR_RESTRICTED` 路径集),允许只读 GET。
-
-**触发条件**:T5 工作启动时。**优先级**:中(license 任意非 REPAIR 状态都该被覆盖到位)。
-
----
-
 ### **可选** — 手写 JWT(HS256)→ PyJWT
 
 **位置**:`app/api/security.py`
@@ -95,23 +81,6 @@
 ---
 
 ## 来自首次云服务器 dogfood(5f27cc5,§5 真链路跑通)
-
-### **T5 启动时配齐** — license.lic 缺失,T5 一启 middleware 会拦下所有写
-
-**位置**:`config/license.lic`(BootstrapPaths.license_file)
-
-**现状**:dogfood 跑通的前提是 license middleware 当前**对 IN_GRACE 没处理 + 没 license.lic 时按某种 default mode 通过**(具体 default 行为见 T5 实现)。一旦 T5 把 license 检查严格化,这套 dogfood 配置会因为没 license.lic 而 503 / 403。
-
-**修法**:T5 工作启动时:
-1. 生成 dev / dogfood 用的 license.lic(TRIAL 模式,长效期)
-2. T6 `dataops bootstrap init` 顺手生成 dev license
-3. 启动期没 license 时,launcher 提示而非神秘 503
-
-**触发条件**:T5 工作启动时。**优先级**:T5 工作启动时必同步。
-
-**关联**:本 backlog 上面"T5 做 License 时补 — Middleware 只检 REPAIR,没处理 IN_GRACE"是同一团事的另一面。
-
----
 
 ### **GA 前安全评审会被点** — `POST /api/datasources` 密码以明文进 request body
 
