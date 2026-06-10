@@ -113,6 +113,106 @@ export interface JobResultResponse {
   truncated: boolean | null
 }
 
+// ─── Admin / License(T7 Part B,严格对齐 app/api/schemas.py)─────────────
+
+/** License 5 态 —— 后端 mode 是自由字符串,枚举锚定在前端。 */
+export type LicenseMode = 'valid' | 'trial' | 'in_grace' | 'expired' | 'repair' | string
+
+/** GET /api/license/status(已登录可访问)+ GET/PUT /api/admin/license(admin)。 */
+export interface LicenseStatus {
+  mode: LicenseMode
+  edition: string | null
+  customer: string | null
+  expires_at: string | null
+  limits: Record<string, unknown>
+  features: string[]
+  repair_reason: string | null
+  trial_days_remaining: number | null
+}
+
+/** GET /api/admin/users → AdminUserItem。 */
+export interface AdminUserItem {
+  id: string
+  username: string
+  role: string
+  mfa_enabled: boolean
+  created_at: string
+}
+
+export interface AdminUserCreateRequest {
+  username: string
+  role: string
+  initial_password: string
+}
+
+export interface AdminResetPasswordResponse {
+  temporary_password: string
+}
+
+/** DELETE /api/admin/users/{id} 409 体(user 仍是某些 project 的 owner)。 */
+export interface AdminUserDeleteBlocked {
+  error: string
+  message: string
+  owned_projects: Project[]
+}
+
+/** GET /api/admin/projects → AdminProjectItem(含计数)。 */
+export interface AdminProjectItem {
+  id: string
+  name: string
+  description: string | null
+  owner_user_id: string
+  member_count: number
+  datasource_count: number
+  job_count: number
+  created_at: string
+}
+
+export interface AdminProjectCreateRequest {
+  name: string
+  description?: string | null
+  owner_user_id: string
+  members?: string[]
+}
+
+export interface AdminProjectPatchRequest {
+  name?: string | null
+  description?: string | null
+  owner_user_id?: string | null
+  members?: string[] | null
+}
+
+/** GET /api/admin/projects/{id}/impact + DELETE 响应里的 impact 块。 */
+export interface AdminProjectDeleteImpact {
+  datasource_count: number
+  job_count: number
+}
+
+/** GET /api/admin/audit-logs → AuditLogItem。 */
+export interface AuditLogItem {
+  id: number
+  ts: string
+  user_id: string | null
+  project_id: string | null
+  action: string
+  resource_type: string | null
+  resource_id: string | null
+  result: string
+  request_id: string | null
+  detail: Record<string, unknown> | null
+}
+
+export interface AuditLogFilters {
+  start?: string
+  end?: string
+  user_id?: string
+  action?: string
+  result?: string
+  resource_type?: string
+  limit?: number
+  offset?: number
+}
+
 /** 服务端错误响应统一形态(由 ApiError handler 产出)。 */
 export interface ApiErrorBody {
   error?: string
