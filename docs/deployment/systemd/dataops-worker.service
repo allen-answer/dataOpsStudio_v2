@@ -1,0 +1,76 @@
+# DataOpsStudio 2.0 — standalone worker (split API/worker layout ONLY)
+#
+# ★ Most deployments do NOT need this unit. `dataops.service` (launcher `up`)
+#   already starts API + worker + managed PG together. Use this unit ONLY when
+#   you run the worker as its own service — e.g. API and worker on separate
+#   hosts, or a horizontally-scaled worker fleet — and start PG + API some other
+#   way. Running BOTH dataops.service and this unit double-starts the worker.
+#
+# This unit runs `python -m app.worker` directly. The worker process installs
+# its own SIGTERM handler (app/worker.py:main): on SIGTERM it sets stop and the
+# run loop exits only AFTER the in-flight job finishes (run_forever checks the
+# stop flag between jobs). systemd's `stop` therefore drains gracefully — same
+# semantics as `launcher stop` (NOT `stop --force`).
+#
+# ── Placeholders (★ substitute locally; NEVER commit real values) ─────────────
+#   <DEPLOY_USER> / <DEPLOY_GROUP>     unprivileged deploy account (NOT root)
+#   /path/to/dataOpsStudio_v2          repo checkout on the host
+#   /path/to/dataops-runtime           DATAOPS_HOME
+#
+# The worker connects to the metadata PostgreSQL using DATAOPS_PG_* settings and
+# reads the PG app password from the bootstrap secret file under DATAOPS_HOME, so
+# PG must already be reachable before this unit starts.
+#
+# ── Install ───────────────────────────────────────────────────────────────────
+#   sudo cp dataops-worker.service /etc/systemd/system/dataops-worker.service
+#   # edit placeholders, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dataops-worker.service
+
+[Unit]
+Description=DataOpsStudio 2.0 worker
+Documentation=file:///path/to/dataOpsStudio_v2/docs/deployment/quickstart.md
+After=network-online.target
+Wants=network-online.target
+# If PG is managed locally by another unit, add it here, e.g.:
+# After=dataops-pg.service
+# Requires=dataops-pg.service
+
+[Service]
+Type=simple
+User=<DEPLOY_USER>
+Group=<DEPLOY_GROUP>
+WorkingDirectory=/path/to/dataOpsStudio_v2
+
+Environment=DATAOPS_HOME=/path/to/dataops-runtime
+# Point the worker at the metadata DB if it is not on the defaults
+# (127.0.0.1:15432 / user dataops / db dataops — see app/config.py):
+# Environment=DATAOPS_PG_HOST=127.0.0.1
+# Environment=DATAOPS_PG_PORT=15432
+# Give each worker on a host a distinct id for clean audit/heartbeat rows:
+# Environment=DATAOPS_WORKER_WORKER_ID=worker-1
+
+ExecStart=/usr/bin/env uv run python -m app.worker
+
+# ── Graceful stop ─────────────────────────────────────────────────────────────
+# SIGTERM → worker drains the in-flight job, then exits. A large OLAP query can
+# take minutes; keep TimeoutStopSec generous so systemd does not SIGKILL mid-job.
+# After a forced kill, the JobBackend reaper recovers the stale running job only
+# after heartbeat_timeout_seconds (default 600s, ADR-0018).
+KillSignal=SIGTERM
+TimeoutStopSec=900
+
+Restart=on-failure
+RestartSec=5
+
+# Logging: journald is the single sink (rotated). Do not also tee to a file.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dataops-worker
+
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

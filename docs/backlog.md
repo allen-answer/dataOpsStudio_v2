@@ -96,19 +96,6 @@
 
 ---
 
-### **T6 portable 形态文档化** — stop 语义 / systemd / 日志 rotate / LE TLS
-
-dogfood 实测发现的部署文档项,逐条 T6 / 部署文档要覆盖:
-
-- ~~**graceful stop**:`tmux kill-session` 可能打断正在跑的 job。worker.py 已 `import signal`,但**没文档化"SIGTERM 是 graceful,会等当前 job complete 再退"**。T6 必须暴露 `dataops stop` 命令 + 文档说明信号语义。~~ **已覆盖** → `docs/deployment/upgrade-in-place.md`(graceful `stop` / `--force` 语义 + reaper 心跳恢复)。本条剩余项(systemd / log rotate / TLS)未完,保留。
-- **systemd unit**:tmux 是 dogfood 临时态。正式部署需要 `dataops.service` / `dataops-worker.service` 单元文件 + journald 接管日志。
-- **log rotation**:`tee` 到文件无 rotate,长跑会撑满。systemd journald 自动 rotate 是顺路解决方案。
-- **TLS**:自签 cert 在 dogfood 够,正式部署要 Let's Encrypt 路径文档(1.x 的 nginx-rp 注释里说"备案后切",T6 部署文档延续这套就行)。
-
-**触发条件**:T6 工作启动时。**优先级**:T6 launcher 覆盖 portable 形态时一并。
-
----
-
 ## 来自 T7 前端 review(2δ — 前端已追平现有 5 组 endpoint 能力上限)
 
 > **背景**:T7 phase 2δ 做数据源 §3 时逐条核对 PRD vs 后端,确认 **Part A 前端已基本追平

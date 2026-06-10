@@ -1,0 +1,85 @@
+# DataOpsStudio 2.0 — API + worker + managed PostgreSQL (launcher `up`)
+#
+# This unit runs `python -m app.launcher up`, which supervises the managed
+# PostgreSQL cluster, the API process, and the worker process together — the
+# same foreground command documented in quickstart.md §5 and upgrade-in-place.md
+# §4, now under systemd instead of tmux/nohup.
+#
+# ── Placeholders (★ substitute locally; NEVER commit real values) ─────────────
+#   <DEPLOY_USER>        unprivileged deploy account (NOT root; see contract §5)
+#   <DEPLOY_GROUP>       its primary group
+#   /path/to/dataOpsStudio_v2          repo checkout on the host
+#   /path/to/dataops-runtime           DATAOPS_HOME (data + logs + secrets live here)
+#   /usr/lib/postgresql/16/bin         DATAOPS_PG_BIN_DIR (initdb/pg_ctl/postgres)
+#
+# ── Install ───────────────────────────────────────────────────────────────────
+#   sudo cp dataops.service /etc/systemd/system/dataops.service
+#   # edit the placeholders above, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dataops.service
+#
+# Do NOT also enable dataops-worker.service if you use this unit: `up` already
+# starts the worker. Use dataops-worker.service ONLY for a split API/worker
+# layout where the API is started some other way. See README.md in this folder.
+
+[Unit]
+Description=DataOpsStudio 2.0 (API + worker + managed PostgreSQL)
+Documentation=file:///path/to/dataOpsStudio_v2/docs/deployment/quickstart.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<DEPLOY_USER>
+Group=<DEPLOY_GROUP>
+WorkingDirectory=/path/to/dataOpsStudio_v2
+
+# Runtime root: bootstrap secrets, pgdata, results, and logs live under here.
+Environment=DATAOPS_HOME=/path/to/dataops-runtime
+Environment=DATAOPS_PG_BIN_DIR=/usr/lib/postgresql/16/bin
+# ★ AI is OFF by default for portable/on-prem (design §2.7.6). To enable a
+#   provider, inject the API key as a unit credential — never inline it here and
+#   never commit it (R8). Example (file mode 0600, owned by <DEPLOY_USER>):
+#     Environment=DATAOPS_AI_ENABLED=true
+#     Environment=DATAOPS_AI_PROVIDER=openai_compatible
+#     Environment=DATAOPS_AI_ENDPOINT=https://your-llm-gateway/v1
+#     LoadCredential=ai_api_key:/path/to/dataops-runtime/secrets/ai_api_key
+#     # then in an ExecStartPre/wrapper: export DATAOPS_AI_API_KEY="$(cat "$CREDENTIALS_DIRECTORY/ai_api_key")"
+
+ExecStart=/usr/bin/env uv run python -m app.launcher \
+    --root ${DATAOPS_HOME} \
+    --pg-bin-dir ${DATAOPS_PG_BIN_DIR} \
+    up
+
+# ── Graceful stop (matches `launcher stop`, NOT `stop --force`) ────────────────
+# The launcher installs a SIGTERM handler: on SIGTERM it stops accepting new work
+# and waits for the worker to finish its in-flight job before exiting (see
+# quickstart.md §5 and upgrade-in-place.md §2). systemd sends SIGTERM on `stop`,
+# so a plain `systemctl stop dataops` is the graceful path.
+KillSignal=SIGTERM
+
+# A large in-flight OLAP query can take minutes to finish. TimeoutStopSec must be
+# generous, otherwise systemd escalates to SIGKILL and you lose the in-flight job
+# (the JobBackend reaper then recovers it only after heartbeat_timeout_seconds,
+# default 600s — see ADR-0018). 0 = wait indefinitely for graceful drain; pick a
+# finite ceiling if you prefer a hard bound.
+TimeoutStopSec=900
+
+# Restart on crash, but not on a clean operator-initiated stop.
+Restart=on-failure
+RestartSec=5
+
+# ── Logging: journald takes over (see "Log rotation" in quickstart.md) ────────
+# The launcher's structlog output goes to stdout/stderr; journald captures both.
+# Do NOT additionally tee to a file — journald is the single sink and it rotates.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dataops
+
+# ── Light hardening (optional; widen if your PG bin dir lives elsewhere) ──────
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
