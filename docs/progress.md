@@ -11,9 +11,9 @@
 
 | 任务 | 负责 | 分支 | 目录边界(铁律:不越界) | 状态 | PR |
 |---|---|---|---|---|---|
-| T5 License + Repair Mode + admin 路由清单 | Codex | `feat/t5-license-repair-mode` | `infrastructure/license/` + `api/` + `launcher.py` | 未开工 | — |
-| T8 migrate_from_v1 | Claude 4.8 ① | `feat/t8-migrate-from-v1` | `tools/` + `tests/`(**不动 app/**) | 未开工 | — |
-| DM adapter + ColumnType 统一枚举 | Claude 4.8 ② | `feat/dm-adapter-columntype` | `dbclients/` + `domain/` + `worker.py` 仅 dispatch 一处 | 未开工 | — |
+| T5 License + Repair Mode + admin 路由 | Codex | `feat/t5-license-repair-mode` | `infrastructure/license/` + `api/` + `launcher.py` | 进行中(license 主体 + middleware 完成;admin endpoint 清单已人确认,路由实现中) | — |
+| T8 migrate_from_v1 | Claude 4.8 ① | `feat/t8-migrate-from-v1` | `tools/` + `tests/`(**不动 app/**) | **已合并** | [#26](https://github.com/allen-answer/dataOpsStudio_v2/pull/26) |
+| DM adapter + ColumnType 统一枚举 | Claude 4.8 ② | `feat/dm-adapter-columntype` | `dbclients/` + `domain/` + `worker.py` 仅 dispatch 一处 | PR 待审(review 已过,backlog 收尾已补) | [#25](https://github.com/allen-answer/dataOpsStudio_v2/pull/25) |
 | 全部 PR review(R1–R10 + 接口一致性) | review agent(主会话) | — | — | 常驻 | — |
 
 **Wave 1 冲突预埋点(已规避)**:
