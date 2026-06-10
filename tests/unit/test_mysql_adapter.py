@@ -11,7 +11,7 @@ from app.dbclients.mysql_adapter import MySQLAdapter
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.result import ResultSet
-from app.domain.schema import Column, Row
+from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import HashedRef, RotationReport, SecretKind, SecretRef
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
 from app.infrastructure.secretstore.protocol import SecretStore
@@ -143,7 +143,7 @@ def test_stream_to_spool_then_resultset_reads_without_cursor(tmp_path: Path) -> 
         result_set_id=result_set_id,
         execution_id="exec-1",
         storage_ref=store.spool_ref(result_set_id),
-        columns=[Column(name="n", type="int", nullable=False)],
+        columns=[Column(name="n", type=ColumnType.INTEGER, driver_type="int", nullable=False)],
         loaded_rows=2,
         total_rows=2,
         state="complete",

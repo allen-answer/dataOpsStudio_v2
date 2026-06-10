@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
@@ -15,9 +16,34 @@ class Row(BaseModel):
     values: list[Any]
 
 
+class ColumnType(StrEnum):
+    """跨方言统一列类型(契约 §3.2 ColumnType)。
+
+    各 adapter 把 driver-specific 类型码(PyMySQL FIELD_TYPE 整数 /
+    dmPython type code 等)映射到这 11 个统一值,前端按此一套语义
+    染色 / cast / format,不再做 N 方言条件分支。原始 driver 类型字符串
+    放 Column.driver_type 备查。
+
+    无法识别的类型码一律落 UNKNOWN(不臆造,留 driver_type 供人工核对)。
+    """
+
+    STRING = "string"
+    INTEGER = "integer"
+    FLOAT = "float"
+    DECIMAL = "decimal"
+    BOOLEAN = "boolean"
+    DATETIME = "datetime"
+    DATE = "date"
+    TIME = "time"
+    BYTES = "bytes"
+    JSON = "json"
+    UNKNOWN = "unknown"
+
+
 class Column(BaseModel):
     name: str
-    type: str  # adapter 上报的类型字符串,如 "VARCHAR(64)" / "NUMBER(10,2)"
+    type: ColumnType = ColumnType.UNKNOWN  # 跨方言统一枚举(前端按此染色)
+    driver_type: str | None = None  # 原始 driver 类型,如 "VARCHAR(64)" / "NUMBER(10,2)"
     nullable: bool = True
     primary_key: bool = False
 

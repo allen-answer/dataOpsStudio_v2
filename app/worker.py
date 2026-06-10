@@ -12,6 +12,7 @@ from sqlalchemy.engine import Engine
 
 from app.config import Settings, load_settings
 from app.db.models import datasources, result_sets
+from app.dbclients.dm_adapter import DMAdapter
 from app.dbclients.mysql_adapter import MySQLAdapter
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.job import Job, JobKind
@@ -22,6 +23,7 @@ from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
 from app.infrastructure.secretstore.local_file import LocalFileSecretStore
+from app.infrastructure.secretstore.protocol import SecretStore
 from app.observability.logging import configure_logging
 
 logger = structlog.get_logger(__name__)
@@ -392,6 +394,41 @@ class PostgresResultSetCatalog:
             )
 
 
+def build_database_adapter(
+    conn_info: DatasourceConnInfo,
+    secret_store: SecretStore,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+    column_sink: Callable[[list[Column]], None] | None = None,
+    cursor_max_hold_seconds: int = 300,
+    statement_timeout_seconds: int = 300,
+) -> DatabaseAdapterLike:
+    """db_type → DatabaseAdapter 分发(2.0.0 Certified:MySQL + DM)。
+
+    其余方言尚无 adapter → UnsupportedDbTypeError(调用方按此 fail job)。
+    抽成模块级纯函数,便于单测 dispatch 而无需起 bootstrap/PG。
+    """
+    if conn_info.db_type is DbType.MYSQL:
+        return MySQLAdapter(
+            conn_info,
+            secret_store,
+            cancel_check=cancel_check,
+            column_sink=column_sink,
+            cursor_max_hold_seconds=cursor_max_hold_seconds,
+            statement_timeout_seconds=statement_timeout_seconds,
+        )
+    if conn_info.db_type is DbType.DM:
+        return DMAdapter(
+            conn_info,
+            secret_store,
+            cancel_check=cancel_check,
+            column_sink=column_sink,
+            cursor_max_hold_seconds=cursor_max_hold_seconds,
+            statement_timeout_seconds=statement_timeout_seconds,
+        )
+    raise UnsupportedDbTypeError(f"Unsupported datasource db_type: {conn_info.db_type.value}")
+
+
 def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
     actual_settings = settings or load_settings()
     configure_logging(actual_settings.logging.level)
@@ -417,11 +454,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
     ) -> DatabaseAdapterLike:
-        if conn_info.db_type is not DbType.MYSQL:
-            raise UnsupportedDbTypeError(
-                f"Unsupported datasource db_type: {conn_info.db_type.value}"
-            )
-        return MySQLAdapter(
+        return build_database_adapter(
             conn_info,
             secret_store,
             cancel_check=cancel_check,

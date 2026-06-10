@@ -6,9 +6,9 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
-from app.dbclients.mysql_types import (
-    column_type_string_to_column_type,
-    field_type_to_column_type,
+from app.dbclients.dm_types import (
+    data_type_string_to_column_type,
+    type_code_to_column_type,
 )
 from app.dbclients.protocol import DatabaseAdapter
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
@@ -26,31 +26,50 @@ _PASSWORD_ASSIGNMENT_RE = re.compile(
 _URL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s'\")]+")
 _MAX_ERROR_SUMMARY_LENGTH = 240
 
+# DM 系统 schema(列 schema 时排除,与 V1 dialect 习惯一致)。
+_SYSTEM_SCHEMAS = (
+    "SYS",
+    "SYSDBA",
+    "SYSAUDITOR",
+    "SYSSSO",
+    "SYSSEC",
+    "CTISYS",
+)
 
-class MySQLAdapterError(RuntimeError):
-    """MySQL adapter 基础异常。错误信息不得包含密码或 SQL 原文。"""
+
+class DMAdapterError(RuntimeError):
+    """DM adapter 基础异常。错误信息不得包含密码或 SQL 原文。"""
 
 
-class QueryCancelledError(MySQLAdapterError):
-    """软取消命中。"""
+class QueryCancelledError(DMAdapterError):
+    """软取消命中(DM 无 driver-level cancel,靠安全点轮询 + statement timeout)。"""
 
 
-class QueryTimeoutError(MySQLAdapterError):
+class QueryTimeoutError(DMAdapterError):
     """cursor 持有超过 cursor_max_hold_seconds。"""
 
 
 class InvalidDatasourceError(ValueError):
-    """DatasourceConnInfo 与 MySQLAdapter 不匹配。"""
+    """DatasourceConnInfo 与 DMAdapter 不匹配。"""
 
 
-class MySQLAdapter(DatabaseAdapter):
-    """MySQL DatabaseAdapter,使用 PyMySQL SSCursor 流式读取。"""
+class DMAdapter(DatabaseAdapter):
+    """DM(达梦)DatabaseAdapter。
+
+    方言细节移植自 1.x `DmDialect(OracleDialect)`(V1_AS_IS §2.3/§2.4):
+    - 标识符:UPPER() 包裹 + 双引号 quote(MySQL 是反引号原样)
+    - 连接探活:`SELECT 1 AS ok FROM dual`
+    - statement timeout:连接属性 `conn.callTimeout`(毫秒),不是会话 SQL
+    - 流式读:普通 cursor + `fetchmany`(不是 MySQL 的 SSCursor)
+    - 列元数据:`all_tab_columns`(无 comment join,与 V1 DM 一致)
+    - 取消:软取消(server_side_cancel=False),不假设能真 kill
+    """
 
     capabilities = AdapterCapabilities(
         execute_select=True,
         explain=True,
         stream_rows=True,
-        server_side_cancel=False,
+        server_side_cancel=False,  # DM 无 driver-level cancel(V1_AS_IS §2.8)
         list_schemas=True,
         list_tables=True,
         list_columns=True,
@@ -68,11 +87,11 @@ class MySQLAdapter(DatabaseAdapter):
         statement_timeout_seconds: int = 300,
         fetch_chunk_size: int = 1000,
         connect_timeout_seconds: int = 10,
-        pymysql_module: Any | None = None,
+        dm_module: Any | None = None,
         column_sink: Callable[[list[Column]], None] | None = None,
     ) -> None:
-        if conn_info.db_type is not DbType.MYSQL:
-            raise InvalidDatasourceError("MySQLAdapter requires DbType.MYSQL")
+        if conn_info.db_type is not DbType.DM:
+            raise InvalidDatasourceError("DMAdapter requires DbType.DM")
         if conn_info.password_ref.kind is not SecretKind.DATASOURCE_PASSWORD:
             raise InvalidDatasourceError("password_ref.kind must be DATASOURCE_PASSWORD")
         if fetch_chunk_size <= 0:
@@ -85,7 +104,7 @@ class MySQLAdapter(DatabaseAdapter):
         self._statement_timeout_seconds = statement_timeout_seconds
         self._fetch_chunk_size = fetch_chunk_size
         self._connect_timeout_seconds = connect_timeout_seconds
-        self._pymysql = pymysql_module
+        self._dm = dm_module
         self._column_sink = column_sink
         self._last_server_version: str | None = None
         self._last_connection_error: str | None = None
@@ -107,6 +126,7 @@ class MySQLAdapter(DatabaseAdapter):
 
     def explain(self, sql: str) -> PlanNode:
         guarded_sql = validate_readonly_sql(sql)
+        # DM 复用 Oracle PLAN_TABLE 协议(V1_AS_IS §4.5):EXPLAIN <sql> 直接返回执行计划文本行。
         rows = self._query_dicts(f"EXPLAIN {guarded_sql}", None)
         return PlanNode(operation="EXPLAIN", details={"rows": rows})
 
@@ -118,10 +138,11 @@ class MySQLAdapter(DatabaseAdapter):
         try:
             conn = self._connect()
             cursor = conn.cursor()
-            cursor.execute("SELECT VERSION()")
-            version = _first_cell(cursor.fetchone())
+            cursor.execute("SELECT 1 AS ok FROM dual")
+            cursor.fetchone()
+            version = self._fetch_server_version(conn)
             if version:
-                self._last_server_version = f"MySQL {version}"
+                self._last_server_version = f"DM {version}"
             return True
         except Exception as exc:
             self._last_connection_error = _connection_error_summary(exc)
@@ -131,14 +152,15 @@ class MySQLAdapter(DatabaseAdapter):
             _safe_close(conn)
 
     def list_schemas(self) -> list[Schema]:
+        placeholders = ", ".join(["?"] * len(_SYSTEM_SCHEMAS))
         rows = self._query_dicts(
-            """
-            SELECT SCHEMA_NAME AS name
-            FROM information_schema.SCHEMATA
-            WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
-            ORDER BY SCHEMA_NAME
+            f"""
+            SELECT USERNAME AS name
+            FROM ALL_USERS
+            WHERE USERNAME NOT IN ({placeholders})
+            ORDER BY USERNAME
             """,
-            None,
+            tuple(_SYSTEM_SCHEMAS),
         )
         return [Schema(name=str(row["name"])) for row in rows]
 
@@ -146,12 +168,16 @@ class MySQLAdapter(DatabaseAdapter):
         _validate_identifier(schema)
         rows = self._query_dicts(
             """
-            SELECT TABLE_SCHEMA AS schema_name, TABLE_NAME AS name, TABLE_TYPE AS table_type
-            FROM information_schema.TABLES
-            WHERE TABLE_SCHEMA = %s
-            ORDER BY TABLE_NAME
+            SELECT OWNER AS schema_name, TABLE_NAME AS name, 'TABLE' AS table_type
+            FROM ALL_TABLES
+            WHERE OWNER = UPPER(?)
+            UNION ALL
+            SELECT OWNER AS schema_name, VIEW_NAME AS name, 'VIEW' AS table_type
+            FROM ALL_VIEWS
+            WHERE OWNER = UPPER(?)
+            ORDER BY name
             """,
-            (schema,),
+            (schema, schema),
         )
         return [
             Table(
@@ -168,23 +194,24 @@ class MySQLAdapter(DatabaseAdapter):
         rows = self._query_dicts(
             """
             SELECT
-                COLUMN_NAME AS name,
-                COLUMN_TYPE AS type,
-                IS_NULLABLE AS nullable,
-                COLUMN_KEY AS column_key
-            FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
-            ORDER BY ORDINAL_POSITION
+                c.COLUMN_NAME AS name,
+                c.DATA_TYPE AS data_type,
+                c.NULLABLE AS nullable
+            FROM ALL_TAB_COLUMNS c
+            WHERE c.OWNER = UPPER(?) AND c.TABLE_NAME = UPPER(?)
+            ORDER BY c.COLUMN_ID
             """,
             (schema, table),
         )
+        primary_keys = self._primary_key_columns(schema, table)
         return [
             Column(
                 name=str(row["name"]),
-                type=column_type_string_to_column_type(row["type"]),
-                driver_type=str(row["type"]) if row["type"] is not None else None,
-                nullable=str(row["nullable"]).upper() == "YES",
-                primary_key=str(row["column_key"]).upper() == "PRI",
+                type=data_type_string_to_column_type(row["data_type"]),
+                driver_type=str(row["data_type"]) if row["data_type"] is not None else None,
+                # Oracle/DM NULLABLE 编码 'Y'/'N'(V1_AS_IS §2.4)
+                nullable=str(row["nullable"]).upper() == "Y",
+                primary_key=str(row["name"]) in primary_keys,
             )
             for row in rows
         ]
@@ -195,16 +222,19 @@ class MySQLAdapter(DatabaseAdapter):
         rows = self._query_dicts(
             """
             SELECT
-                INDEX_NAME AS name,
-                COLUMN_NAME AS column_name,
-                NON_UNIQUE AS non_unique,
-                SEQ_IN_INDEX AS seq_in_index
-            FROM information_schema.STATISTICS
-            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
-            ORDER BY INDEX_NAME, SEQ_IN_INDEX
+                i.INDEX_NAME AS name,
+                ic.COLUMN_NAME AS column_name,
+                i.UNIQUENESS AS uniqueness,
+                ic.COLUMN_POSITION AS column_position
+            FROM ALL_INDEXES i
+            JOIN ALL_IND_COLUMNS ic
+              ON ic.INDEX_OWNER = i.OWNER AND ic.INDEX_NAME = i.INDEX_NAME
+            WHERE i.TABLE_OWNER = UPPER(?) AND i.TABLE_NAME = UPPER(?)
+            ORDER BY i.INDEX_NAME, ic.COLUMN_POSITION
             """,
             (schema, table),
         )
+        primary_keys = self._primary_key_index_names(schema, table)
         grouped: dict[str, dict[str, Any]] = {}
         for row in rows:
             name = str(row["name"])
@@ -212,8 +242,8 @@ class MySQLAdapter(DatabaseAdapter):
                 name,
                 {
                     "columns": [],
-                    "is_unique": int(row["non_unique"]) == 0,
-                    "is_primary": name.upper() == "PRIMARY",
+                    "is_unique": str(row["uniqueness"]).upper() == "UNIQUE",
+                    "is_primary": name in primary_keys,
                 },
             )
             item["columns"].append(str(row["column_name"]))
@@ -231,13 +261,17 @@ class MySQLAdapter(DatabaseAdapter):
     def get_table_ddl(self, schema: str, table: str) -> str:
         _validate_identifier(schema)
         _validate_identifier(table)
-        table_name = f"{_quote_identifier(schema)}.{_quote_identifier(table)}"
-        rows = self._query_tuples(f"SHOW CREATE TABLE {table_name}")
-        if not rows or len(rows[0]) < 2:
-            raise MySQLAdapterError("SHOW CREATE TABLE returned no DDL")
-        return str(rows[0][1])
+        # DM 兼容 Oracle DBMS_METADATA.GET_DDL(标识符大写 + 参数化,不拼字面量)
+        rows = self._query_tuples(
+            "SELECT DBMS_METADATA.GET_DDL('TABLE', UPPER(?), UPPER(?)) FROM dual",
+            (table, schema),
+        )
+        if not rows or not rows[0]:
+            raise DMAdapterError("DBMS_METADATA.GET_DDL returned no DDL")
+        return str(rows[0][0])
 
     def kill_query(self, connection_id: str) -> bool:
+        # DM 无 driver-level cancel(V1_AS_IS §2.8);走软取消,这里恒 False。
         return False
 
     def _stream_select(self, sql: str, params: dict[str, Any]) -> Iterator[Row]:
@@ -247,7 +281,8 @@ class MySQLAdapter(DatabaseAdapter):
         try:
             conn = self._connect()
             self._apply_statement_timeout(conn)
-            cursor = conn.cursor(self._sscursor_class())
+            # DM 流式读:普通 cursor + fetchmany(不是 MySQL SSCursor),V1_AS_IS §2.7
+            cursor = conn.cursor()
             cursor.execute(sql, params or None)
             self._emit_columns(getattr(cursor, "description", None))
             while True:
@@ -280,13 +315,17 @@ class MySQLAdapter(DatabaseAdapter):
             _safe_close(cursor)
             _safe_close(conn)
 
-    def _query_tuples(self, sql: str) -> list[Sequence[Any]]:
+    def _query_tuples(
+        self,
+        sql: str,
+        params: Sequence[Any] | None = None,
+    ) -> list[Sequence[Any]]:
         conn = None
         cursor = None
         try:
             conn = self._connect()
             cursor = conn.cursor()
-            cursor.execute(sql)
+            cursor.execute(sql, params)
             return [
                 tuple(row) if not isinstance(row, dict) else tuple(row.values())
                 for row in cursor.fetchall()
@@ -295,45 +334,77 @@ class MySQLAdapter(DatabaseAdapter):
             _safe_close(cursor)
             _safe_close(conn)
 
+    def _primary_key_columns(self, schema: str, table: str) -> set[str]:
+        rows = self._query_dicts(
+            """
+            SELECT cc.COLUMN_NAME AS name
+            FROM ALL_CONSTRAINTS c
+            JOIN ALL_CONS_COLUMNS cc
+              ON cc.OWNER = c.OWNER AND cc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
+            WHERE c.CONSTRAINT_TYPE = 'P'
+              AND c.OWNER = UPPER(?) AND c.TABLE_NAME = UPPER(?)
+            """,
+            (schema, table),
+        )
+        return {str(row["name"]) for row in rows}
+
+    def _primary_key_index_names(self, schema: str, table: str) -> set[str]:
+        rows = self._query_dicts(
+            """
+            SELECT c.INDEX_NAME AS name
+            FROM ALL_CONSTRAINTS c
+            WHERE c.CONSTRAINT_TYPE = 'P'
+              AND c.OWNER = UPPER(?) AND c.TABLE_NAME = UPPER(?)
+              AND c.INDEX_NAME IS NOT NULL
+            """,
+            (schema, table),
+        )
+        return {str(row["name"]) for row in rows}
+
     def _connect(self) -> Any:
-        pymysql = self._load_pymysql()
+        dm = self._load_dm()
         password = self._secret_store.reveal_secret(self._conn_info.password_ref)
         extra = self._conn_info.extra
+        # dmPython.connect 接口(V1_AS_IS §2.4):server / port / user / password,
+        # schema 指目标 schema(DatasourceConnInfo.database 映射 schema)。
         kwargs: dict[str, Any] = {
-            "host": self._conn_info.host,
-            "port": self._conn_info.port,
             "user": self._conn_info.username,
             "password": password,
-            "database": self._conn_info.database,
-            "charset": str(extra.get("charset", "utf8mb4")),
-            "connect_timeout": int(extra.get("connect_timeout", self._connect_timeout_seconds)),
-            "read_timeout": int(extra.get("read_timeout", self._statement_timeout_seconds or 0))
-            or None,
-            "write_timeout": int(extra.get("write_timeout", self._statement_timeout_seconds or 0))
-            or None,
+            "server": self._conn_info.host,
+            "port": self._conn_info.port,
         }
-        if "ssl" in extra:
-            kwargs["ssl"] = extra["ssl"]
-        return pymysql.connect(**{k: v for k, v in kwargs.items() if v is not None})
+        if self._conn_info.database:
+            kwargs["schema"] = self._conn_info.database
+        connect_timeout = int(extra.get("connect_timeout", self._connect_timeout_seconds))
+        if connect_timeout > 0:
+            # dmPython 用毫秒 login timeout
+            kwargs["connection_timeout"] = connect_timeout * 1000
+        return dm.connect(**kwargs)
 
-    def _load_pymysql(self) -> Any:
-        if self._pymysql is None:
-            self._pymysql = importlib.import_module("pymysql")
-        return self._pymysql
-
-    def _sscursor_class(self) -> Any:
-        return self._load_pymysql().cursors.SSCursor
+    def _load_dm(self) -> Any:
+        if self._dm is None:
+            self._dm = importlib.import_module("dmPython")
+        return self._dm
 
     def _apply_statement_timeout(self, conn: Any) -> None:
         if self._statement_timeout_seconds <= 0:
             return
-        cursor = None
+        # Oracle/DM statement timeout 走连接属性 conn.callTimeout(毫秒),V1_AS_IS §2.4。
         try:
-            millis = int(self._statement_timeout_seconds * 1000)
-            cursor = conn.cursor()
-            cursor.execute("SET SESSION MAX_EXECUTION_TIME = %s", (millis,))
+            conn.callTimeout = int(self._statement_timeout_seconds * 1000)
         except Exception:
             return
+
+    def _fetch_server_version(self, conn: Any) -> str | None:
+        cursor = None
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT BANNER FROM V$VERSION WHERE ROWNUM = 1")
+            row = cursor.fetchone()
+            version = _first_cell(row)
+            return str(version) if version is not None else None
+        except Exception:
+            return None
         finally:
             _safe_close(cursor)
 
@@ -356,15 +427,15 @@ class MySQLAdapter(DatabaseAdapter):
     def _description_to_columns(self, description: object) -> list[Column]:
         """cursor.description → list[Column]。
 
-        description[1] 是 PyMySQL FIELD_TYPE 整数码 → 统一 ColumnType;
-        原始整数码字符串化后塞 driver_type 备查。
+        description[1] 是 dmPython type code / type-object → 统一 ColumnType;
+        原始类型字符串化后塞 driver_type 备查。
         """
         if not isinstance(description, Sequence) or isinstance(
             description, (str, bytes, bytearray)
         ):
             return []
 
-        pymysql = self._load_pymysql()
+        dm = self._load_dm()
         columns: list[Column] = []
         for item in description:
             if (
@@ -378,7 +449,7 @@ class MySQLAdapter(DatabaseAdapter):
             columns.append(
                 Column(
                     name=str(item[0]),
-                    type=field_type_to_column_type(pymysql, type_code),
+                    type=type_code_to_column_type(dm, type_code),
                     driver_type=str(type_code) if type_code is not None else None,
                     nullable=bool(nullable_value) if nullable_value is not None else True,
                     primary_key=False,
@@ -390,11 +461,6 @@ class MySQLAdapter(DatabaseAdapter):
 def _validate_identifier(identifier: str) -> None:
     if not identifier or _IDENTIFIER_RE.fullmatch(identifier) is None:
         raise ValueError("Invalid database identifier")
-
-
-def _quote_identifier(identifier: str) -> str:
-    _validate_identifier(identifier)
-    return ".".join(f"`{part}`" for part in identifier.split("."))
 
 
 def _description_columns(description: object) -> list[str]:
@@ -473,9 +539,9 @@ def _safe_close(obj: object | None) -> None:
 
 
 __all__ = [
+    "DMAdapter",
+    "DMAdapterError",
     "InvalidDatasourceError",
-    "MySQLAdapter",
-    "MySQLAdapterError",
     "QueryCancelledError",
     "QueryTimeoutError",
     "SqlGuardError",
