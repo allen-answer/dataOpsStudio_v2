@@ -69,7 +69,7 @@ def test_execute_select_emits_columns_without_leaking_cursor_reference() -> None
     rows = list(adapter.execute_select("SELECT 1 AS n", {}))
 
     assert rows == [Row(values=[1]), Row(values=[2])]
-    assert captured_columns == [Column(name="n", type="unknown")]
+    assert captured_columns == [Column(name="n", type=ColumnType.UNKNOWN)]
     assert all(not hasattr(column, "cursor") for column in captured_columns)
     assert fake_pymysql.connections[0].closed is True
 
@@ -87,7 +87,7 @@ def test_execute_select_emits_columns_for_zero_row_result() -> None:
     rows = list(adapter.execute_select("SELECT 1 AS n WHERE 1 = 0", {}))
 
     assert rows == []
-    assert captured_columns == [Column(name="n", type="unknown")]
+    assert captured_columns == [Column(name="n", type=ColumnType.UNKNOWN)]
 
 
 def test_test_connection_records_server_version() -> None:

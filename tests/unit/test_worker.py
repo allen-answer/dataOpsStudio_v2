@@ -7,7 +7,7 @@ from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.job import Job, JobKind, JobStatus
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
-from app.domain.schema import Column, Row
+from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import SecretKind, SecretRef
 from app.worker import UnsupportedDbTypeError, WorkerRunner, WorkerRunnerConfig
 
@@ -34,7 +34,7 @@ def test_worker_runs_sql_query_to_spool_and_completes() -> None:
 
 
 def test_worker_persists_columns_to_spool_and_catalog() -> None:
-    columns = [Column(name="r", type="unknown")]
+    columns = [Column(name="r", type=ColumnType.UNKNOWN)]
     job = _make_job(payload={"sql": "SELECT 1 AS r", "result_set_id": "rs-1"})
     backend = _FakeBackend([job])
     result_store = _FakeResultStore()
@@ -69,7 +69,7 @@ def test_worker_fails_if_adapter_emits_columns_twice() -> None:
     backend = _FakeBackend([job])
     adapter = _FakeAdapter(
         [Row(values=[1])],
-        columns=[Column(name="r", type="unknown")],
+        columns=[Column(name="r", type=ColumnType.UNKNOWN)],
         emit_columns_twice=True,
     )
     runner = WorkerRunner(
@@ -405,7 +405,7 @@ class _FakeAdapter:
         self._rows = rows
         self._test_connection_ok = test_connection_ok
         self.last_connection_error = connection_error
-        self._columns = columns or [Column(name="n", type="unknown")]
+        self._columns = columns or [Column(name="n", type=ColumnType.UNKNOWN)]
         self._emit_columns_twice = emit_columns_twice
         self._column_sink: Callable[[list[Column]], None] | None = None
         self.test_connection_calls = 0
@@ -439,7 +439,7 @@ class _RangeAdapter:
 
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
         if self._column_sink is not None:
-            self._column_sink([Column(name="n", type="unknown")])
+            self._column_sink([Column(name="n", type=ColumnType.UNKNOWN)])
         for index in range(self._row_count):
             self.rows_yielded += 1
             yield Row(values=[index])
