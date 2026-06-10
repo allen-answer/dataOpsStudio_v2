@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 from app.api.app import create_app
@@ -118,7 +118,7 @@ def test_get_license_status_without_license_row_returns_trial_countdown() -> Non
 
 
 def test_trial_days_remaining_rounds_up_partial_days() -> None:
-    expires_at = datetime.now(timezone.utc) + timedelta(days=29, hours=23)
+    expires_at = datetime.now(UTC) + timedelta(days=29, hours=23)
 
     assert _trial_days_remaining("trial", expires_at) == 30
 

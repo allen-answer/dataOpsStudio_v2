@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, cast
 
 from app.api.app import create_app
@@ -34,7 +34,7 @@ def test_admin_list_users_projects_mfa_enabled() -> None:
                         "username": "admin",
                         "role": "admin",
                         "mfa_secret_ref": "secret-1",
-                        "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                        "created_at": datetime(2026, 1, 1, tzinfo=UTC),
                     }
                 ]
             ]

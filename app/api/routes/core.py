@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -642,8 +642,8 @@ def _trial_days_remaining(mode: str, expires_at: datetime | None) -> int | None:
         return None
     if expires_at is None:
         return 30
-    now = datetime.now(timezone.utc)
-    normalized = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+    now = datetime.now(UTC)
+    normalized = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=UTC)
     remaining_seconds = (normalized - now).total_seconds()
     seconds_per_day = 24 * 60 * 60
     return max(0, int((remaining_seconds + seconds_per_day - 1) // seconds_per_day))
