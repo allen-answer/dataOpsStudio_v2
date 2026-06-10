@@ -137,6 +137,52 @@ Use `--force` only when you accept that an in-flight worker process may be kille
 the JobBackend reaper will recover stale running jobs after the heartbeat
 timeout.
 
+### Running under systemd (production)
+
+`launcher up` in a foreground terminal (or `tmux`/`nohup`) is fine for dogfood,
+but a long-lived server should run under a process supervisor so an SSH
+disconnect does not take the instance down. Template systemd units live in
+[`systemd/`](./systemd/) — `dataops.service` (all-in-one: managed PG + API +
+worker) and `dataops-worker.service` (split worker layout). They are templates:
+substitute every placeholder path/user locally and never commit real values.
+`systemctl stop` sends SIGTERM, which is the graceful path (same as `stop` above,
+not `stop --force`). See [`systemd/README.md`](./systemd/README.md).
+
+### Log rotation (journald)
+
+Foreground `launcher up` writes plain files under `$DATAOPS_HOME/logs/`; those
+files are **not** rotated, so a long-running instance will eventually fill the
+disk. The supported production answer is to run under systemd and let **journald**
+own the logs (the unit templates set `StandardOutput=journal`). journald rotates
+automatically by size/age — no `logrotate` config needed.
+
+Read and follow the logs:
+
+```bash
+journalctl -u dataops -f                 # all-in-one unit
+journalctl -u dataops -u dataops-worker  # split layout, both units
+journalctl -u dataops --since "1 hour ago"
+```
+
+Recommended quota (cap how much disk journald keeps). Edit
+`/etc/systemd/journald.conf` or drop a file in `/etc/systemd/journald.conf.d/`:
+
+```ini
+[Journal]
+# Persist across reboots so post-mortem logs survive a restart.
+Storage=persistent
+# Hard cap on total journal size; tune to the host's disk.
+SystemMaxUse=2G
+# Drop the oldest data when a single file would exceed this.
+SystemMaxFileSize=200M
+# Keep at most this much history regardless of size.
+MaxRetentionSec=30day
+```
+
+Apply with `sudo systemctl restart systemd-journald`. The application logs are
+already JSON (structlog) with the R5 redaction processor enforced, so secrets
+never reach journald in the first place; the quota just bounds disk usage.
+
 ## 6. Login
 
 ```bash
