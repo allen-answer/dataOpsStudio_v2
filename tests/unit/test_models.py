@@ -39,6 +39,12 @@ def test_datasources_has_environment_verified_column() -> None:
     assert datasources.columns["environment_verified"].nullable is False
 
 
+def test_datasources_has_operation_policy_column() -> None:
+    cols = set(datasources.columns.keys())
+    assert "operation_policy" in cols
+    assert datasources.columns["operation_policy"].nullable is False
+
+
 def test_all_alembic_revision_ids_under_32_chars() -> None:
     """alembic_version.version_num 默认 VARCHAR(32),revision ID 过长会在
     UPDATE alembic_version 时触发 StringDataRightTruncation。
@@ -142,6 +148,7 @@ def test_jobs_has_required_queue_fields() -> None:
         "retry_count",
         "resource_profile",  # Step 0 补
         "audit_id",
+        "error_code",
         "parent_workflow_run_id",
     }
     missing = required - cols

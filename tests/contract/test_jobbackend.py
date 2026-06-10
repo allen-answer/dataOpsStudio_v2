@@ -97,6 +97,7 @@ def test_fail_marks_failed_with_error(jobbackend: JobBackend) -> None:
     assert failed is not None
     assert failed.status == JobStatus.FAILED
     assert failed.error == "syntax error at line 1"
+    assert failed.error_code is None
 
 
 def test_request_cancel_sets_flag(jobbackend: JobBackend) -> None:

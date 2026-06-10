@@ -38,24 +38,6 @@
 
 ---
 
-### **错误体验** — worker 失败时写结构化对外 error code
-
-**位置**:`app/worker.py` / `app/infrastructure/jobbackend/postgres.py` / `app/api/routes/core.py`
-
-**现状**:`jobs.error` 存 worker 捕获到的原始 `str(exc)`,可能是 DB driver 原文、SQL/schema 信息或连接细节。`GET /api/jobs` 列表端点因此不能直接返回 `jobs.error`,只能基于 `status/kind` 做粗分类(`sql_execution_failed` / `datasource_connection_failed` / `query_timeout` 等)。
-
-**不够用**:同为 `sql_query` 的连接失败和 SQL 执行失败目前无法结构化区分;猜 DB 原文 substring 不可靠且有泄敏风险。
-
-**修法**:worker fail 时写结构化对外 error code(连接 / SQL / 超时 / 权限 / 内部错误等),DB 原文只进审计或脱敏日志。API 列表和详情端点直接返回结构化 code,不在端点侧猜原文。
-
-**交叉引用**:T7 Part A P0 已先加 `DatasourceTestResponse.error_code` 留位枚举,但 2.0.0 测连失败仍只稳定产出 `unknown` / `timeout`;`auth_failed` / `host_unreachable` / `permission_denied` 等细分类和多方言 adapter / `Column.type` 统一枚举一起做。
-
-**触发条件**:T7 错误体验/任务列表 polish 或 GA 前错误分层审计时。
-
-**优先级**:中。当前列表端点已安全但不够精确。
-
----
-
 ## 来自 DM adapter review(feat/dm-adapter-columntype)
 
 ### **DM "Certified" 宣称前必做** — DM adapter 缺真实例集成验证
@@ -103,40 +85,6 @@
 > 能支撑的全部范围**。下列 PRD 功能**全部卡在后端缺端点 / 缺字段**,不是前端漏做 ——
 > 前端侧已用 `★ 后补` 注释在对应位置标好,后端补齐即可直接接上(多数无需前端二次改)。
 
-### **T7 前端做满 §3 需要** — 数据源 编辑 / 删除 端点缺失
-
-**位置**:`app/api/routes/core.py`(datasources 路由组)
-
-**现状**:datasources 只有 `POST`(建)/ `GET`(列 + 详情)/ `POST .../test`。**无 `PUT` / `PATCH` / `DELETE`**。
-
-**卡住的前端**:
-- 编辑数据源 modal(PRD §3「编辑 modal」:密码留空 = 不改;名称/类型改动失效旧连接池)→ 需 `PUT /datasources/{id}`
-- 删除数据源 + 引用检查(PRD §3「删除若被 task/workflow 引用则拒绝,列出引用者」)→ 需 `DELETE /datasources/{id}`,被引用返 409 + 引用者列表
-
-**前端就位情况**:`DatasourcesView.vue` hover 操作行已留 Edit/Delete 注释占位(只待端点)。
-
-**触发条件**:T7 要把 §3 数据源页做"满"时。**优先级**:中。
-
----
-
-### **T7 §3 权限面板需要** — 无 `operation_policy`(8×allow_*)字段
-
-**位置**:`app/api/schemas.py:DatasourceCreateRequest` + `app/db/models.py:datasources`
-
-**现状**:create 只有 `extra: dict`(→ `capability_profile`,worker 读作 adapter **连接子节**,
-如 ssl_mode / service_name)。**没有独立的 `operation_policy` / 8 个 `allow_*` 字段**;
-现在前端建一组开关 POST 上去也**无处落、worker 不读**。
-
-**卡住的前端**:PRD §3「权限」折叠面板 8 个开关(allow SELECT / EXPLAIN / Oracle PLAN_TABLE /
-DM EXPLAIN / schema 导入 / schema 写入 / scenario 写入 / 自动建对比任务)= 设计稿 §4.5 operation_policy。
-
-**修法**:schema + 表加 `operation_policy`(8 bool),worker 执行前据此校验操作类型。
-**前端就位情况**:`DatasourcesView.vue` 新建表单已留 8×allow_* 折叠面板注释占位。
-
-**触发条件**:设计稿 §4.5 operation_policy 落地时(可能 T5 权限模型一并做)。**优先级**:中。
-
----
-
 ### **T7 §4 SQL 跑非 MySQL/DM 需要** — worker 仅支持 MySQL / DM
 
 **位置**:`app/worker.py:build_database_adapter`(MySQL / DM 分发,其余 raise UnsupportedDbTypeError)
@@ -153,14 +101,6 @@ PostgreSQL / Oracle / DB2 数据源跑 SQL 仍直接 `UnsupportedDbTypeError`。
   避免用户提交后才看到 failed(**此项前端可独立做,不阻塞后端**)
 
 **触发条件**:多方言执行上线前 / 或先做前端 warn 兜底。**优先级**:中(2γ e2e 已实锤此限制)。
-
----
-
-### **T7 §5 Jobs 错误码字典需要** — 见下方「worker 失败时写结构化对外 error code」
-
-§5 任务历史的「结构化错误码字典」(PRD §5)直接依赖 backlog 已有项
-**「错误体验 — worker 失败时写结构化对外 error code」**(本文件 T4 review 段)。
-前端 JobsView 已按 `status/kind` 粗分类,后端出结构化 code 后前端切精确映射。**不重复立项**,在此交叉引用。
 
 ---
 

@@ -160,6 +160,23 @@ datasources = Table(
     Column("environment", String(32), nullable=False, server_default="dev"),
     Column("environment_verified", Boolean(), nullable=False, server_default=text("false")),
     Column("capability_profile", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),
+    Column(
+        "operation_policy",
+        JSONB(),
+        nullable=False,
+        server_default=text(
+            """'{
+            "allow_select": true,
+            "allow_explain": false,
+            "allow_dm_explain": false,
+            "allow_oracle_plan_table": false,
+            "allow_schema_import": false,
+            "allow_schema_save": false,
+            "allow_scenario_write": false,
+            "allow_record_task": false
+            }'::jsonb"""
+        ),
+    ),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
     UniqueConstraint("project_id", "name", name="uq_datasources_project_name"),
@@ -212,6 +229,7 @@ jobs = Table(
     Column("cancel_requested", Boolean(), nullable=False, server_default=text("false")),
     Column("cancel_reason", String(255), nullable=True),
     Column("error", Text(), nullable=True),
+    Column("error_code", String(64), nullable=True),
     Column("retry_count", Integer(), nullable=False, server_default="0"),
     Column("payload", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),
     Column("parent_workflow_run_id", String(36), nullable=True),  # 自引用 workflow 父 run

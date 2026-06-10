@@ -42,6 +42,23 @@ class DbType(StrEnum):
     POSTGRESQL = "postgresql"
 
 
+class OperationPolicy(BaseModel):
+    """Datasource operation policy(设计稿 §4.5 / PRD §3 权限面板).
+
+    2.0.0 仅执行 allow_select / allow_explain;其余开关先作为显式策略落库,
+    供 2.1+ 能力接入时复用同一校验入口。
+    """
+
+    allow_select: bool = True
+    allow_explain: bool = False
+    allow_dm_explain: bool = False
+    allow_oracle_plan_table: bool = False
+    allow_schema_import: bool = False
+    allow_schema_save: bool = False
+    allow_scenario_write: bool = False
+    allow_record_task: bool = False
+
+
 class DatasourceConnInfo(BaseModel):
     """业务数据库连接信息 —— 所有 adapter 共用入参。
 
@@ -66,6 +83,7 @@ class DatasourceConnInfo(BaseModel):
     password_ref: SecretRef
     db_type: DbType
     extra: dict[str, Any] = Field(default_factory=dict)
+    operation_policy: OperationPolicy = Field(default_factory=OperationPolicy)
 
     @field_validator("password_ref")
     @classmethod
