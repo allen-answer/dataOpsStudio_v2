@@ -30,6 +30,9 @@ dependencies = [
     # License signature verification — Ed25519
     "pynacl>=1.5",
     "pymysql>=1.1",
+    # DM(达梦)driver — import 仅允许在 app/dbclients/(R1)。
+    # cp312 manylinux + win_amd64 wheel 齐全(可 uv/pip 装,无需本地 DM 客户端)。
+    "dmPython>=2.5",
 ]
 
 [project.urls]

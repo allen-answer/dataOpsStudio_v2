@@ -244,6 +244,7 @@ dependencies = [
     { name = "alembic" },
     { name = "bcrypt" },
     { name = "cryptography" },
+    { name = "dmpython" },
     { name = "fastapi" },
     { name = "pandas" },
     { name = "prometheus-client" },
@@ -275,6 +276,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.13" },
     { name = "bcrypt", specifier = ">=4.2" },
     { name = "cryptography", specifier = ">=43" },
+    { name = "dmpython", specifier = ">=2.5" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "pandas", specifier = ">=2.2" },
     { name = "prometheus-client", specifier = ">=0.21" },
@@ -299,6 +301,17 @@ dev = [
 test = [
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-cov", specifier = ">=5" },
+]
+
+[[package]]
+name = "dmpython"
+version = "2.5.32"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/06/a5/82cf0dfd483ef78e7523781ea95892ac921202a355cf158ce1ce72a956ab/dmpython-2.5.32-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:2fbc9602106ec8d894f10d93205d41b4dcfdbc3f67c4d7b5e45452bceea9f7bc" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/21/2c/d9f0f6c39834d73e89ff7e79aa92e677f4e4bea9c07dda917e2e3ad933bd/dmpython-2.5.32-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:bca8530ee0602c8bb4609a3b502cee01025642dbe873acdecc1f249318180ba9" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/d2/7b/9a1997e4db3e32c38a332229b5961f1b5f4bec406c959bf8cbc1fab4992f/dmpython-2.5.32-cp312-cp312-manylinux_2_12_x86_64.manylinux2010_x86_64.whl", hash = "sha256:cdeb42cb6f88b46c35dcf9d295c3c8ffe48a8b6f5713dee3fcc3e8cdd7b572ab" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/3c/61/fee9c3f631dec012034b5a1ef1ee624b0a44740186d2efa23861db252f80/dmpython-2.5.32-cp312-cp312-win_amd64.whl", hash = "sha256:668da85d874aba561b6c0d6dde183ec294411967d64d671e69e41fb6d5523c39" },
 ]
 
 [[package]]

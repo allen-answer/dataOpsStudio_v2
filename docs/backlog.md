@@ -70,27 +70,23 @@
 
 ---
 
-## 来自列元数据通道 review(66715f7)
+## 来自 DM adapter review(feat/dm-adapter-columntype)
 
-### **GA 前 / 多方言适配器对齐时补** — `Column.type` 字段是 driver-specific 字符串
+### **DM "Certified" 宣称前必做** — DM adapter 缺真实例集成验证
 
-**位置**:`app/dbclients/mysql_adapter.py:_description_to_columns`
+**位置**:`app/dbclients/dm_adapter.py` / CI
 
-**现状**:`type=str(type_value)` 取自 `cursor.description[1]`,对 PyMySQL 是 FIELD_TYPE 整数常量,字符串化后前端拿到的是 `"253"` / `"<class 'pymysql.constants.FIELD_TYPE.LONG'>"` 之类。
+**现状**:GH Actions 无可信 DM8 镜像(Docker Hub 仅社区镜像,GB 级 + license 受限),
+本 PR 用 fake 驱动单测 + 契约测试覆盖,**没有任何真 DM 实例跑过的 hard evidence**。
 
-**够用**:2.0.0 骨架"看得到列名"够用,不阻塞 §5 e2e。
+**不够用**:2.0.0 范围写明 "MySQL+DM Certified"。没有真实例验证,"Certified" 站不住
+(dmPython 连接参数 / callTimeout / ALL_* 视图 / DBMS_METADATA 行为均未实测)。
 
-**不够用**:前端无法按类型染色 / cast / format(日期、数字、bytes 都看不出区别)。Oracle / DM / DB2 adapter 上线后,每方言的 type code 编码各不相同,前端无法统一处理。
+**修法**:在持牌环境(自托管 runner 或手动)对真 DM 实例跑一遍
+`@pytest.mark.integration` 级验证(连接 / SELECT 流式 / introspection / EXPLAIN /
+软取消),证据(stdout / 测试报告)归档进 PR 或 docs。
 
-**修法**:定义内部 `ColumnType` 枚举(契约新增章节),各 adapter 把 driver-specific code 映射到统一枚举(string / integer / float / decimal / boolean / datetime / date / time / bytes / json / unknown)。`Column.type` 改为枚举字段,原始 driver 类型放 `Column.driver_type: str | None` 备查。
-
-**触发条件**:
-- 第二个 adapter(Oracle / DM / DB2 任一)合并时,**必须**同时引入统一枚举(否则前端代码会被迫做 N 方言条件分支)
-- 或 GA 前前端 SQL Workspace 做"按类型染色"功能时
-
-**优先级**:中高,产品必需(但不阻塞骨架)。**最迟修复版本:2.0.0 GA 前**。
-
-**关联**:契约 §3.2 DatabaseAdapter Protocol,设计稿 §2.6 SQL Workspace 列展示。
+**触发条件**:对外宣称 DM Certified 前 / 2.0.0 GA 前。**优先级**:高。
 
 ---
 
@@ -185,12 +181,12 @@ DM EXPLAIN / schema 导入 / schema 写入 / scenario 写入 / 自动建对比�
 
 ---
 
-### **T7 §4 SQL 跑非 MySQL 需要** — worker 仅支持 MySQL
+### **T7 §4 SQL 跑非 MySQL/DM 需要** — worker 仅支持 MySQL / DM
 
-**位置**:`app/worker.py:402`(`if conn_info.db_type is not DbType.MYSQL: raise UnsupportedDbTypeError`)
+**位置**:`app/worker.py:build_database_adapter`(MySQL / DM 分发,其余 raise UnsupportedDbTypeError)
 
-**现状**:2.0.0 worker **只实现 MySQL adapter**;PostgreSQL / Oracle / DM / DB2 数据源跑 SQL 直接
-`UnsupportedDbTypeError`。
+**现状**:worker 实现 **MySQL + DM adapter**(DM 自 feat/dm-adapter-columntype);
+PostgreSQL / Oracle / DB2 数据源跑 SQL 仍直接 `UnsupportedDbTypeError`。
 
 **卡住的前端**:SQL 工作台(§4)对非 MySQL 数据源执行 → 任务必 failed。前端**行为正确**
 (正常提交 → 轮询 → 显示 failed),但用户体验是"建了 PG 数据源却跑不了"。

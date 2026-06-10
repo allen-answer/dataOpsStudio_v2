@@ -142,6 +142,37 @@ class AdapterCapabilities:
 **2.0.0 adapter 推进顺序**:MySQL(1,骨架验证)→ DM(2)→ Oracle(3,可滑 2.0.x)→ DB2(4,Preview)。
 **骨架设计约束**:首个写 MySQL,但接口设计必须以 **Oracle/DM 为假想验证对象**——防 MySQL-specific 假设固化:标识符大小写(Oracle 默认大写)、分页语法(LIMIT vs ROWNUM/FETCH FIRST)、cursor 语义、类型映射。
 
+#### 3.2-ColumnType:跨方言统一列类型(`app/domain/schema.py`)
+
+`Column.type` 是**跨方言统一枚举 `ColumnType`**(StrEnum),不是 driver-specific 字符串。各 adapter 把自己的 driver 类型码(PyMySQL FIELD_TYPE 整数 / dmPython type code / Oracle DATA_TYPE 字符串…)**映射到这一套统一值**,前端按一套语义染色 / cast / format,不做 N 方言条件分支。原始 driver 类型字符串放 `Column.driver_type: str | None` 备查。
+
+```python
+class ColumnType(StrEnum):
+    STRING = "string"        # char/varchar/text/clob/enum/set
+    INTEGER = "integer"      # tinyint..bigint / year / bit(int)
+    FLOAT = "float"          # float/double/real/binary_float
+    DECIMAL = "decimal"      # decimal/numeric/Oracle&DM NUMBER(无 scale 信号保守归此)
+    BOOLEAN = "boolean"      # bool/boolean(MySQL tinyint(1) 无可靠信号 → 仍归 INTEGER)
+    DATETIME = "datetime"    # datetime/timestamp
+    DATE = "date"
+    TIME = "time"
+    BYTES = "bytes"          # binary/varbinary/blob/raw/image
+    JSON = "json"
+    UNKNOWN = "unknown"      # 无法识别的 driver 类型码(不臆造;留 driver_type 供人工核对)
+
+class Column(BaseModel):
+    name: str
+    type: ColumnType = ColumnType.UNKNOWN
+    driver_type: str | None = None       # 原始 driver 类型,如 "VARCHAR(64)" / "NUMBER(10,2)"
+    nullable: bool = True
+    primary_key: bool = False
+```
+
+**映射约束**:
+- 无法识别的类型码 → `UNKNOWN`(不猜),且必须填 `driver_type` 供人工核对。
+- 映射逻辑放各 adapter 旁的 `<dialect>_types.py`(R1:仍在 `app/dbclients/`),单测覆盖每条映射。
+- ★ **breaking change(前端契约)**:`/result` & introspection 响应里 `Column.type` 值域从 driver 字符串(MySQL FIELD_TYPE 数字 / Oracle DATA_TYPE)变为上述 11 个稳定值;新增 `driver_type` 字段。前端按枚举判断,不再 parse driver 串。**第二个 adapter 合并时强制同时引入**(backlog 硬规定),避免前端被迫做 N 方言分支。
+
 #### 3.2a Adapter 入参契约:DatasourceConnInfo(`app/domain/datasource.py`)
 
 所有 DatabaseAdapter 实现的构造器接受统一的 DatasourceConnInfo 入参。1 个实例 = 1 行 datasources PG 表。这避免每个 adapter 自定义构造签名导致的:

@@ -6,6 +6,10 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
+from app.dbclients.mysql_types import (
+    column_type_string_to_column_type,
+    field_type_to_column_type,
+)
 from app.dbclients.protocol import DatabaseAdapter
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.capabilities import AdapterCapabilities
@@ -177,7 +181,8 @@ class MySQLAdapter(DatabaseAdapter):
         return [
             Column(
                 name=str(row["name"]),
-                type=str(row["type"]),
+                type=column_type_string_to_column_type(row["type"]),
+                driver_type=str(row["type"]) if row["type"] is not None else None,
                 nullable=str(row["nullable"]).upper() == "YES",
                 primary_key=str(row["column_key"]).upper() == "PRI",
             )
@@ -345,8 +350,41 @@ class MySQLAdapter(DatabaseAdapter):
     def _emit_columns(self, description: object) -> None:
         if self._column_sink is None:
             return
-        columns = _description_to_columns(description)
+        columns = self._description_to_columns(description)
         self._column_sink([column.model_copy(deep=True) for column in columns])
+
+    def _description_to_columns(self, description: object) -> list[Column]:
+        """cursor.description → list[Column]。
+
+        description[1] 是 PyMySQL FIELD_TYPE 整数码 → 统一 ColumnType;
+        原始整数码字符串化后塞 driver_type 备查。
+        """
+        if not isinstance(description, Sequence) or isinstance(
+            description, (str, bytes, bytearray)
+        ):
+            return []
+
+        pymysql = self._load_pymysql()
+        columns: list[Column] = []
+        for item in description:
+            if (
+                not isinstance(item, Sequence)
+                or isinstance(item, (str, bytes, bytearray))
+                or not item
+            ):
+                continue
+            type_code = item[1] if len(item) > 1 else None
+            nullable_value = item[6] if len(item) > 6 else None
+            columns.append(
+                Column(
+                    name=str(item[0]),
+                    type=field_type_to_column_type(pymysql, type_code),
+                    driver_type=str(type_code) if type_code is not None else None,
+                    nullable=bool(nullable_value) if nullable_value is not None else True,
+                    primary_key=False,
+                )
+            )
+        return columns
 
 
 def _validate_identifier(identifier: str) -> None:
@@ -366,27 +404,6 @@ def _description_columns(description: object) -> list[str]:
     for item in description:
         if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)) and item:
             columns.append(str(item[0]))
-    return columns
-
-
-def _description_to_columns(description: object) -> list[Column]:
-    if not isinstance(description, Sequence) or isinstance(description, (str, bytes, bytearray)):
-        return []
-
-    columns: list[Column] = []
-    for item in description:
-        if not isinstance(item, Sequence) or isinstance(item, (str, bytes, bytearray)) or not item:
-            continue
-        type_value = item[1] if len(item) > 1 else None
-        nullable_value = item[6] if len(item) > 6 else None
-        columns.append(
-            Column(
-                name=str(item[0]),
-                type=str(type_value) if type_value is not None else "unknown",
-                nullable=bool(nullable_value) if nullable_value is not None else True,
-                primary_key=False,
-            )
-        )
     return columns
 
 

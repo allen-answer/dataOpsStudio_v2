@@ -9,7 +9,7 @@ from app.domain.job import Job, JobKind, JobStatus
 from app.domain.license import LicenseMode
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
-from app.domain.schema import Column, Row
+from app.domain.schema import Column, ColumnType, Row
 from tests._asgi_client import AsgiClient
 
 
@@ -274,7 +274,7 @@ class _ResultStore:
 
     def get_spool_manifest(self, result_set_id: str) -> dict[str, object]:
         return {
-            "columns": [Column(name="r", type="unknown").model_dump()],
+            "columns": [Column(name="r", type=ColumnType.UNKNOWN).model_dump()],
             "loaded_rows": 1,
             "truncated": False,
         }
