@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +13,7 @@ from app.infrastructure.license.verifier import read_license_limits, verify_lice
 
 
 def test_missing_license_is_trial_30day(tmp_path: Path) -> None:
-    now = datetime(2026, 6, 10, tzinfo=timezone.utc)
+    now = datetime(2026, 6, 10, tzinfo=UTC)
 
     state = verify_license(tmp_path / "missing.lic", now=now)
 
@@ -23,7 +23,7 @@ def test_missing_license_is_trial_30day(tmp_path: Path) -> None:
 
 def test_valid_license_returns_payload_state(tmp_path: Path) -> None:
     key = Ed25519PrivateKey.generate()
-    now = datetime(2026, 6, 10, tzinfo=timezone.utc)
+    now = datetime(2026, 6, 10, tzinfo=UTC)
     path = _write_license(
         tmp_path,
         key,
@@ -41,7 +41,7 @@ def test_valid_license_returns_payload_state(tmp_path: Path) -> None:
 
 def test_expired_within_seven_days_returns_in_grace(tmp_path: Path) -> None:
     key = Ed25519PrivateKey.generate()
-    now = datetime(2026, 6, 10, tzinfo=timezone.utc)
+    now = datetime(2026, 6, 10, tzinfo=UTC)
     path = _write_license(tmp_path, key, expires_at=now - timedelta(days=3))
 
     state = verify_license(path, now=now, public_key=key.public_key())
@@ -52,7 +52,7 @@ def test_expired_within_seven_days_returns_in_grace(tmp_path: Path) -> None:
 
 def test_expired_after_grace_returns_repair_expired(tmp_path: Path) -> None:
     key = Ed25519PrivateKey.generate()
-    now = datetime(2026, 6, 10, tzinfo=timezone.utc)
+    now = datetime(2026, 6, 10, tzinfo=UTC)
     path = _write_license(tmp_path, key, expires_at=now - timedelta(days=8, seconds=1))
 
     state = verify_license(path, now=now, public_key=key.public_key())
@@ -64,7 +64,7 @@ def test_expired_after_grace_returns_repair_expired(tmp_path: Path) -> None:
 def test_bad_signature_returns_repair_invalid_signature(tmp_path: Path) -> None:
     key = Ed25519PrivateKey.generate()
     wrong_key = Ed25519PrivateKey.generate()
-    now = datetime(2026, 6, 10, tzinfo=timezone.utc)
+    now = datetime(2026, 6, 10, tzinfo=UTC)
     path = _write_license(tmp_path, key, expires_at=now + timedelta(days=30))
 
     state = verify_license(path, now=now, public_key=wrong_key.public_key())
@@ -74,7 +74,7 @@ def test_bad_signature_returns_repair_invalid_signature(tmp_path: Path) -> None:
 
 
 def test_damaged_license_files_enter_repair_instead_of_crashing(tmp_path: Path) -> None:
-    now = datetime(2026, 6, 10, tzinfo=timezone.utc)
+    now = datetime(2026, 6, 10, tzinfo=UTC)
     cases = {
         "bom": b"\xef\xbb\xbf{}",
         "truncated": b'{"payload":',
@@ -92,7 +92,7 @@ def test_damaged_license_files_enter_repair_instead_of_crashing(tmp_path: Path) 
 
 def test_read_license_limits_returns_payload_limits(tmp_path: Path) -> None:
     key = Ed25519PrivateKey.generate()
-    now = datetime(2026, 6, 10, tzinfo=timezone.utc)
+    now = datetime(2026, 6, 10, tzinfo=UTC)
     path = _write_license(tmp_path, key, expires_at=now + timedelta(days=30))
 
     assert read_license_limits(path) == {"max_users": 5}

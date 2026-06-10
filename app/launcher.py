@@ -14,7 +14,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -542,7 +542,7 @@ def _sync_license_state(
         password=bootstrap.get_pg_app_password(),
         database=context.settings.db.database,
     )
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     values = {
         "id": 1,
         "edition": state.edition,
@@ -558,7 +558,13 @@ def _sync_license_state(
     try:
         with engine.begin() as conn:
             existing = (
-                conn.execute(select(license_state.c.id).where(license_state.c.id == 1))
+                conn.execute(
+                    select(
+                        license_state.c.id,
+                        license_state.c.mode,
+                        license_state.c.expires_at,
+                    ).where(license_state.c.id == 1)
+                )
                 .mappings()
                 .one_or_none()
             )
