@@ -72,9 +72,28 @@ export interface SqlExecuteResponse {
   result_set_id: string
 }
 
+/**
+ * 跨方言统一列类型(契约 §3.2 ColumnType,11 值枚举)。
+ * 各 adapter 把 driver 类型码映射到这套统一值,前端按此一套语义染色 / 对齐 / 标记,
+ * 不再做方言条件分支。无法识别落 'unknown'。源:app/domain/schema.py ColumnType。
+ */
+export type ColumnType =
+  | 'string'
+  | 'integer'
+  | 'float'
+  | 'decimal'
+  | 'boolean'
+  | 'datetime'
+  | 'date'
+  | 'time'
+  | 'bytes'
+  | 'json'
+  | 'unknown'
+
 export interface Column {
   name: string
-  type: string
+  type: ColumnType // 统一枚举(breaking change:原为 driver 原始字符串)
+  driver_type: string | null // 原始 driver 类型(如 "VARCHAR(64)" / "NUMBER(10,2)"),tooltip 展示
   nullable: boolean
   primary_key: boolean
 }
