@@ -473,11 +473,7 @@ def _owned_projects(conn: Connection, user_id: str) -> list[ProjectResponse]:
 
 
 def _require_project(conn: Connection, project_id: str) -> RowMapping:
-    row = (
-        conn.execute(select(projects).where(projects.c.id == project_id))
-        .mappings()
-        .one_or_none()
-    )
+    row = conn.execute(select(projects).where(projects.c.id == project_id)).mappings().one_or_none()
     if row is None:
         raise ApiError(404, "not_found", "Project not found")
     return row
