@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 from app.api.app import create_app
+from app.api.routes.core import _trial_days_remaining
 from app.api.security import create_access_token
 from app.api.services import ApiServices
 from app.domain.job import Job, JobKind, JobStatus
@@ -98,6 +100,27 @@ def test_get_job_result_returns_columns_and_positional_rows() -> None:
     payload = response.json()
     assert payload["columns"][0]["name"] == "r"
     assert payload["rows"][0]["values"][0] == 2
+
+
+def test_get_license_status_without_license_row_returns_trial_countdown() -> None:
+    services = _LicenseStatusServices(row=None)
+    app = create_app(services=cast(ApiServices, services))
+    token = create_access_token(user_id="user-1", role="admin", secret=services.jwt_secret)
+
+    response = AsgiClient(app).get(
+        "/api/license/status",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["mode"] == "trial"
+    assert response.json()["trial_days_remaining"] == 30
+
+
+def test_trial_days_remaining_rounds_up_partial_days() -> None:
+    expires_at = datetime.now(timezone.utc) + timedelta(days=29, hours=23)
+
+    assert _trial_days_remaining("trial", expires_at) == 30
 
 
 class _FakeServices:
@@ -278,3 +301,39 @@ class _ResultStore:
             "loaded_rows": 1,
             "truncated": False,
         }
+
+
+class _LicenseStatusServices:
+    def __init__(self, row: dict[str, Any] | None) -> None:
+        self.jwt_secret = "jwt-secret"
+        self.rate_limiter = _RateLimiter()
+        self.engine = _SingleRowEngine(row)
+        self.audits: list[dict[str, object]] = []
+
+    def current_license_mode(self) -> LicenseMode:
+        return LicenseMode.TRIAL
+
+    def write_audit(self, **kwargs: object) -> None:
+        self.audits.append(kwargs)
+
+
+class _SingleRowEngine:
+    def __init__(self, row: dict[str, Any] | None) -> None:
+        self._row = row
+
+    def connect(self) -> _SingleRowConnection:
+        return _SingleRowConnection(self._row)
+
+
+class _SingleRowConnection:
+    def __init__(self, row: dict[str, Any] | None) -> None:
+        self._row = row
+
+    def __enter__(self) -> _SingleRowConnection:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        return None
+
+    def execute(self, statement: object) -> _FakeResult:
+        return _FakeResult(self._row)

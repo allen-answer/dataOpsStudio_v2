@@ -130,3 +130,13 @@ class JobResultResponse(BaseModel):
 
 class CancelResponse(BaseModel):
     cancelled: bool
+
+
+class LicenseStatusResponse(BaseModel):
+    mode: str
+    edition: str | None = None
+    customer: str | None = None
+    expires_at: datetime | None = None
+    features: list[str] = Field(default_factory=list)
+    repair_reason: str | None = None
+    trial_days_remaining: int | None = None

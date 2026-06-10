@@ -14,6 +14,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -22,8 +23,9 @@ from sqlalchemy import URL, create_engine, insert, select, text, update
 from sqlalchemy.engine import Engine
 
 from app.config import Settings, load_settings
-from app.db.models import project_members, projects, users
+from app.db.models import license_state, project_members, projects, users
 from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
+from app.infrastructure.license import verify_license
 from app.infrastructure.secretstore.local_file import LocalFileSecretStore
 
 SECRET_FILE_MODE = 0o600
@@ -165,6 +167,7 @@ def command_bootstrap_init(context: LauncherContext, args: argparse.Namespace) -
         print("Windows portable: chmod skipped; Windows ACL hardening is post-2.0.0.")
     else:
         print("Bootstrap secret files are chmod 0600.")
+    _print_license_hint(context)
     return 0
 
 
@@ -239,6 +242,7 @@ def command_alembic_up(context: LauncherContext, args: argparse.Namespace) -> in
         database=context.settings.db.database,
     ).render_as_string(hide_password=False)
     _run([context.uv, "run", "alembic", "upgrade", "head"], cwd=context.repo_root, env=env)
+    _sync_license_state(context, bootstrap)
     print("alembic upgrade head complete")
     return 0
 
@@ -525,6 +529,69 @@ def _write_secret_file(path: Path, value: bytes, *, force: bool) -> bool:
 def _ensure_secret_mode(path: Path) -> None:
     if not _is_windows():
         path.chmod(SECRET_FILE_MODE)
+
+
+def _sync_license_state(
+    context: LauncherContext,
+    bootstrap: LocalFileBootstrapSecrets,
+) -> None:
+    state = verify_license(context.settings.bootstrap.license_file)
+    engine = _metadata_engine(
+        context,
+        user=context.settings.db.user,
+        password=bootstrap.get_pg_app_password(),
+        database=context.settings.db.database,
+    )
+    now = datetime.now(timezone.utc)
+    values = {
+        "id": 1,
+        "edition": state.edition,
+        "customer": state.customer,
+        "expires_at": state.expires_at,
+        "features": state.features,
+        "signature_verified_at": now if state.mode.value in {"valid", "in_grace"} else None,
+        "grace_started_at": now if state.mode.value == "in_grace" else None,
+        "mode": state.mode.value,
+        "repair_reason": state.repair_reason,
+        "updated_at": now,
+    }
+    try:
+        with engine.begin() as conn:
+            existing = (
+                conn.execute(select(license_state.c.id).where(license_state.c.id == 1))
+                .mappings()
+                .one_or_none()
+            )
+            if (
+                existing is not None
+                and state.mode.value == "trial"
+                and existing["mode"] == "trial"
+                and existing["expires_at"] is not None
+            ):
+                values["expires_at"] = existing["expires_at"]
+            if existing is None:
+                conn.execute(insert(license_state).values(**values))
+            else:
+                conn.execute(
+                    update(license_state).where(license_state.c.id == 1).values(**values)
+                )
+    finally:
+        engine.dispose()
+    if state.mode.value == "trial":
+        _print_license_hint(context)
+    elif state.mode.value == "repair":
+        print(f"license state: repair required ({state.repair_reason})")
+    else:
+        print(f"license state: {state.mode.value}")
+
+
+def _print_license_hint(context: LauncherContext) -> None:
+    if context.settings.bootstrap.license_file.exists():
+        return
+    print(
+        "license.lic not found; DataOpsStudio will start in 30-day trial mode. "
+        f"Expected path: {context.settings.bootstrap.license_file}"
+    )
 
 
 def _initdb(context: LauncherContext) -> None:
