@@ -9,6 +9,11 @@ const DesignSystemPreview = () => import('../views/DesignSystemPreview.vue')
 const TokensView = () => import('../views/TokensView.vue')
 const SqlWorkspaceView = () => import('../views/SqlWorkspaceView.vue')
 const JobsView = () => import('../views/JobsView.vue')
+const AdminLayout = () => import('../views/AdminLayout.vue')
+const AdminUsersView = () => import('../views/AdminUsersView.vue')
+const AdminProjectsView = () => import('../views/AdminProjectsView.vue')
+const AdminAuditLogsView = () => import('../views/AdminAuditLogsView.vue')
+const AdminLicenseView = () => import('../views/AdminLicenseView.vue')
 
 const routes: RouteRecordRaw[] = [
   {
@@ -50,6 +55,20 @@ const routes: RouteRecordRaw[] = [
         name: 'jobs',
         component: JobsView,
       },
+    ],
+  },
+  {
+    // admin 后台 —— 独立外壳(深色顶部条 + admin 导航),全部 meta.admin=true。
+    // 守卫双层:guards.ts 拦非 admin;AdminLayout 再做 403 兜底呈现。
+    path: '/admin',
+    component: AdminLayout,
+    meta: { admin: true },
+    children: [
+      { path: '', name: 'admin-home', redirect: { name: 'admin-users' } },
+      { path: 'users', name: 'admin-users', component: AdminUsersView },
+      { path: 'projects', name: 'admin-projects', component: AdminProjectsView },
+      { path: 'license', name: 'admin-license', component: AdminLicenseView },
+      { path: 'audit-logs', name: 'admin-audit', component: AdminAuditLogsView },
     ],
   },
   {
