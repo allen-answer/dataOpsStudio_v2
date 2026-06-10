@@ -26,7 +26,7 @@
 |---|---|---|---|---|
 | Datasource polish:`PUT/DELETE /datasources/{id}`(409 引用检查)+ operation_policy(8×allow_*)+ worker 结构化 error code | Codex | T5 合并(schemas.py 释放)+ DM adapter 合并(worker.py 释放) | — | — |
 | T7 Part B 五页(§6 账户安全 / §7 用户 / §8 项目 / §9 AI 配置 / §10 审计) | Claude 4.8 ① | T5 admin 路由合并 | — | — |
-| AI Gateway 接 1 provider 调通 + T6 尾巴(systemd unit / log rotate / TLS 文档) | Claude 4.8 ② | 无 | PR 待审 | [#PENDING](https://github.com/allen-answer/dataOpsStudio_v2/pulls) |
+| AI Gateway 接 1 provider 调通 + T6 尾巴(systemd unit / log rotate / TLS 文档) | Claude 4.8 ② | 无 | PR 待审 | [#29](https://github.com/allen-answer/dataOpsStudio_v2/pull/29) |
 
 ## Wave 3(收口)
 
