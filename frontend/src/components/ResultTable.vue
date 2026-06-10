@@ -18,16 +18,56 @@ import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ChevronLeft, ChevronRight, AlertTriangle, Database } from 'lucide-vue-next'
 import EmptyState from './EmptyState.vue'
-
-interface Column {
-  name: string
-  type: string
-  nullable: boolean
-  primary_key: boolean
-}
+import type { Column, ColumnType } from '../api/types'
 
 interface Row {
   values: unknown[]
+}
+
+// ─── ColumnType → 展示语义(对齐 / 染色 / 标记)──────────────────────
+// 后端 Column.type 是 11 值统一枚举(契约 §3.2),前端按枚举一套规则染色,
+// 不再 substring 匹配 driver 字符串。driver_type 原文进 tooltip。
+const NUMERIC_TYPES: ReadonlySet<ColumnType> = new Set<ColumnType>([
+  'integer',
+  'float',
+  'decimal',
+])
+// 列头类型标签的色系(语义色,不接 chrome accent —— 跟 variant 无关)。
+const TYPE_LABEL_CLASS: Record<ColumnType, string> = {
+  integer: 'text-sky-600 dark:text-sky-400',
+  float: 'text-sky-600 dark:text-sky-400',
+  decimal: 'text-sky-600 dark:text-sky-400',
+  datetime: 'text-violet-600 dark:text-violet-400',
+  date: 'text-violet-600 dark:text-violet-400',
+  time: 'text-violet-600 dark:text-violet-400',
+  boolean: 'text-emerald-600 dark:text-emerald-400',
+  bytes: 'text-amber-600 dark:text-amber-400',
+  json: 'text-amber-600 dark:text-amber-400',
+  string: 'chrome-text-muted',
+  unknown: 'chrome-text-muted',
+}
+// bytes / json 列头额外标记(短 badge),让二进制 / 结构化列一眼可辨。
+const TYPE_MARKER: Partial<Record<ColumnType, string>> = {
+  bytes: 'BYTES',
+  json: 'JSON',
+}
+
+function isNumber(col: Column): boolean {
+  return NUMERIC_TYPES.has(col.type)
+}
+// datetime/date/time 单元格用独立色,跟普通字符串区分(DBA 一眼挑出时间列)。
+function isTemporal(col: Column): boolean {
+  return col.type === 'datetime' || col.type === 'date' || col.type === 'time'
+}
+function typeLabelClass(col: Column): string {
+  return TYPE_LABEL_CLASS[col.type] ?? 'chrome-text-muted'
+}
+function typeMarker(col: Column): string | undefined {
+  return TYPE_MARKER[col.type]
+}
+// 列头副行展示:有 driver_type 显原文,否则回退到统一枚举值。
+function typeText(col: Column): string {
+  return col.driver_type || col.type
 }
 
 const props = withDefaults(
@@ -70,10 +110,6 @@ function display(v: unknown): string {
 }
 function isNull(v: unknown): boolean {
   return v === null || v === undefined
-}
-function isNumber(col: Column): boolean {
-  const t = col.type.toLowerCase()
-  return /int|num|dec|float|real|double|bigint|smallint/.test(t)
 }
 </script>
 
@@ -131,9 +167,21 @@ function isNumber(col: Column): boolean {
                 >
                   PK
                 </span>
+                <!-- bytes / json 列额外标记 -->
+                <span
+                  v-if="typeMarker(c)"
+                  class="text-[8px] font-mono px-1 rounded border border-amber-300/60 text-amber-600 dark:border-amber-500/40 dark:text-amber-400"
+                >
+                  {{ typeMarker(c) }}
+                </span>
               </div>
-              <div class="text-[10px] chrome-text-muted normal-case font-mono">
-                {{ c.type }}
+              <!-- 副行:driver_type 原文(tooltip 同样显原文 + 统一枚举);按枚举染色 -->
+              <div
+                class="text-[10px] normal-case font-mono truncate max-w-[14rem]"
+                :class="typeLabelClass(c)"
+                :title="`${typeText(c)} · ${c.type}`"
+              >
+                {{ typeText(c) }}
               </div>
             </th>
           </tr>
@@ -153,6 +201,7 @@ function isNumber(col: Column): boolean {
               class="py-1 px-3 font-mono text-xs chrome-text-normal"
               :class="[
                 isNumber(columns[vi]) ? 'text-right tabular-nums' : 'text-left',
+                isTemporal(columns[vi]) && !isNull(v) && 'text-violet-600 dark:text-violet-400',
                 isNull(v) && 'italic chrome-text-muted',
               ]"
             >
