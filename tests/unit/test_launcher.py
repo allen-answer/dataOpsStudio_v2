@@ -250,7 +250,7 @@ class _LicenseStateConnection:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         return None
 
-    def execute(self, statement: object) -> _LicenseStateResult:
+    def execute(self, statement: Any) -> _LicenseStateResult:
         self.calls += 1
         if self.calls == 1:
             return _LicenseStateResult(self.engine.existing)
