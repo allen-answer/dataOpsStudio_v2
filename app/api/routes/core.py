@@ -6,7 +6,8 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Query, Request
-from sqlalchemy import and_, insert, or_, select
+from fastapi.responses import JSONResponse, Response
+from sqlalchemy import and_, delete, insert, or_, select, update
 from sqlalchemy.engine import Connection, RowMapping
 
 from app.api.dependencies import current_user_from, request_id_from, services_from
@@ -14,10 +15,13 @@ from app.api.errors import ApiError
 from app.api.schemas import (
     CancelResponse,
     DatasourceCreateRequest,
+    DatasourceDeleteBlockedResponse,
     DatasourceListItem,
+    DatasourceReferenceItem,
     DatasourceResponse,
     DatasourceTestErrorCode,
     DatasourceTestResponse,
+    DatasourceUpdateRequest,
     JobListItem,
     JobResponse,
     JobResultResponse,
@@ -33,11 +37,11 @@ from app.api.security import create_access_token
 from app.api.services import ApiServices, new_id
 from app.db.models import datasources, jobs, license_state, project_members, projects, users
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
-from app.domain.datasource import DbType
-from app.domain.job import Job, JobKind, JobStatus
+from app.domain.datasource import DbType, OperationPolicy
+from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.resource import ResourceProfile
 from app.domain.schema import Column
-from app.domain.secret import HashedRef, SecretKind
+from app.domain.secret import HashedRef, SecretKind, SecretRef
 
 logger = structlog.get_logger(__name__)
 
@@ -137,6 +141,7 @@ def create_datasource(body: DatasourceCreateRequest, request: Request) -> Dataso
                 password_secret_ref=secret_ref.ref,
                 environment=body.environment,
                 capability_profile=body.extra,
+                operation_policy=body.operation_policy.model_dump(),
             )
         )
     _audit_business(
@@ -161,6 +166,7 @@ def create_datasource(body: DatasourceCreateRequest, request: Request) -> Dataso
         database=body.database,
         environment=body.environment,
         extra=body.extra,
+        operation_policy=body.operation_policy,
     )
 
 
@@ -184,6 +190,7 @@ def list_datasources(
                     datasources.c.environment,
                     datasources.c.environment_verified,
                     datasources.c.database_name,
+                    datasources.c.operation_policy,
                     datasources.c.created_at,
                 )
                 .select_from(_datasources_visible_to_user(user.id))
@@ -202,6 +209,129 @@ def list_datasources(
 def get_datasource(datasource_id: str, request: Request) -> DatasourceResponse:
     row = _datasource_for_current_user(request, datasource_id)
     return _datasource_response(row)
+
+
+@router.put("/datasources/{datasource_id}", response_model=DatasourceResponse)
+def update_datasource(
+    datasource_id: str,
+    body: DatasourceUpdateRequest,
+    request: Request,
+) -> DatasourceResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    old_secret_ref: str | None = None
+    new_secret_ref: str | None = None
+    audit_project_id: str
+    with services.engine.begin() as conn:
+        row = (
+            conn.execute(select(datasources).where(datasources.c.id == datasource_id))
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise ApiError(404, "not_found", "Datasource not found")
+        audit_project_id = str(row["project_id"])
+        _require_project_access(conn, str(row["project_id"]), user.id)
+        if body.project_id is not None:
+            _require_project_access(conn, body.project_id, user.id)
+            audit_project_id = body.project_id
+
+        values: dict[str, object] = {}
+        if body.project_id is not None:
+            values["project_id"] = body.project_id
+        if body.name is not None:
+            values["name"] = body.name
+        if body.db_type is not None:
+            values["db_type"] = body.db_type.value
+        if body.host is not None:
+            values["host"] = body.host
+        if body.port is not None:
+            values["port"] = body.port
+        if body.username is not None:
+            values["username"] = body.username
+        if body.database is not None:
+            values["database_name"] = body.database
+        if body.environment is not None:
+            values["environment"] = body.environment
+        if body.extra is not None:
+            values["capability_profile"] = body.extra
+        if body.operation_policy is not None:
+            values["operation_policy"] = body.operation_policy.model_dump()
+        if body.password:
+            secret_ref = services.secret_store.store_secret(
+                body.password,
+                SecretKind.DATASOURCE_PASSWORD,
+            )
+            new_secret_ref = secret_ref.ref
+            old_secret_ref = str(row["password_secret_ref"])
+            values["password_secret_ref"] = new_secret_ref
+
+        if values:
+            values["updated_at"] = datetime.now(UTC)
+            conn.execute(
+                update(datasources).where(datasources.c.id == datasource_id).values(**values)
+            )
+
+    if old_secret_ref is not None and new_secret_ref is not None:
+        services.secret_store.delete_secret(
+            SecretRef(ref=old_secret_ref, kind=SecretKind.DATASOURCE_PASSWORD)
+        )
+
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=audit_project_id,
+        action="datasource_update",
+        resource_type="datasource",
+        resource_id=datasource_id,
+        result="success",
+        detail={"password_changed": new_secret_ref is not None},
+    )
+    return _datasource_for_current_user_response(request, datasource_id)
+
+
+@router.delete("/datasources/{datasource_id}", response_model=None)
+def delete_datasource(datasource_id: str, request: Request) -> JSONResponse | Response:
+    services = services_from(request)
+    user = current_user_from(request)
+    old_secret_ref: str
+    project_id: str
+    with services.engine.begin() as conn:
+        row = (
+            conn.execute(select(datasources).where(datasources.c.id == datasource_id))
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise ApiError(404, "not_found", "Datasource not found")
+        project_id = str(row["project_id"])
+        old_secret_ref = str(row["password_secret_ref"])
+        _require_project_access(conn, project_id, user.id)
+        references = _datasource_job_references(conn, datasource_id)
+        if references:
+            payload = DatasourceDeleteBlockedResponse(
+                error="datasource_in_use",
+                message="Datasource is referenced by existing jobs",
+                references=references,
+            )
+            return JSONResponse(status_code=409, content=payload.model_dump(mode="json"))
+        conn.execute(delete(datasources).where(datasources.c.id == datasource_id))
+
+    services.secret_store.delete_secret(
+        SecretRef(ref=old_secret_ref, kind=SecretKind.DATASOURCE_PASSWORD)
+    )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="datasource_delete",
+        resource_type="datasource",
+        resource_id=datasource_id,
+        result="success",
+    )
+    return Response(status_code=204)
 
 
 @router.post("/datasources/{datasource_id}/test", response_model=DatasourceTestResponse)
@@ -320,6 +450,7 @@ def list_jobs(
                     jobs.c.started_at,
                     jobs.c.finished_at,
                     jobs.c.error,
+                    jobs.c.error_code,
                 )
                 .select_from(_jobs_visible_to_user(user.id))
                 .where(_project_access_filter(user.id))
@@ -424,6 +555,13 @@ def _datasource_for_current_user(request: Request, datasource_id: str) -> RowMap
         return row
 
 
+def _datasource_for_current_user_response(
+    request: Request,
+    datasource_id: str,
+) -> DatasourceResponse:
+    return _datasource_response(_datasource_for_current_user(request, datasource_id))
+
+
 def _job_for_current_user(request: Request, job_id: str) -> RowMapping:
     services = services_from(request)
     user = current_user_from(request)
@@ -503,6 +641,7 @@ def _datasource_response(row: RowMapping) -> DatasourceResponse:
         database=str(row["database_name"]),
         environment=str(row["environment"]),
         extra=dict(row["capability_profile"] or {}),
+        operation_policy=OperationPolicy.model_validate(row["operation_policy"] or {}),
     )
 
 
@@ -516,6 +655,7 @@ def _datasource_list_item(row: RowMapping) -> DatasourceListItem:
         environment=str(row["environment"]),
         environment_verified=bool(row["environment_verified"]),
         database=row["database_name"] if row["database_name"] is not None else None,
+        operation_policy=OperationPolicy.model_validate(row["operation_policy"] or {}),
         created_at=row["created_at"],
     )
 
@@ -554,12 +694,14 @@ def _metadata_int(metadata: dict[str, Any], key: str) -> int | None:
 
 def _job_response(row: RowMapping) -> JobResponse:
     status = JobStatus(str(row["status"]))
+    error_code = _job_error_code(row)
     return JobResponse(
         id=str(row["id"]),
         kind=str(row["kind"]),
         status=status,
         result_set_id=_result_set_id_from_payload(row),
-        error="job_failed" if status is JobStatus.FAILED else None,
+        error=error_code if status is JobStatus.FAILED else None,
+        error_code=error_code,
         message="Job failed" if status is JobStatus.FAILED else None,
     )
 
@@ -573,15 +715,16 @@ def _job_list_item(row: RowMapping) -> JobListItem:
         created_at=row["created_at"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
-        error=_safe_job_error(
-            status=status,
-            kind=str(row["kind"]),
-            stored_error=_optional_str(row["error"]),
-        ),
+        error=_safe_job_error(status=status, kind=str(row["kind"]), row=row),
+        error_code=_job_error_code(row),
     )
 
 
-def _safe_job_error(*, status: JobStatus, kind: str, stored_error: str | None) -> str | None:
+def _safe_job_error(*, status: JobStatus, kind: str, row: RowMapping) -> str | None:
+    error_code = _job_error_code(row)
+    if error_code is not None:
+        return error_code
+    stored_error = _optional_str(row["error"])
     if status is JobStatus.CANCELLED:
         return "cancelled"
     if status is JobStatus.TIMEOUT:
@@ -595,6 +738,35 @@ def _safe_job_error(*, status: JobStatus, kind: str, stored_error: str | None) -
     if kind == JobKind.SQL_QUERY.value:
         return "sql_execution_failed"
     return "job_failed"
+
+
+def _job_error_code(row: RowMapping) -> JobErrorCode | None:
+    value = row["error_code"] if "error_code" in row else None
+    return JobErrorCode(str(value)) if value is not None else None
+
+
+def _datasource_job_references(
+    conn: Connection,
+    datasource_id: str,
+) -> list[DatasourceReferenceItem]:
+    rows = (
+        conn.execute(
+            select(jobs.c.id, jobs.c.kind, jobs.c.status)
+            .where(jobs.c.datasource_ids.any(datasource_id))
+            .order_by(jobs.c.created_at.desc(), jobs.c.id.desc())
+            .limit(20)
+        )
+        .mappings()
+        .all()
+    )
+    return [
+        DatasourceReferenceItem(
+            job_id=str(row["id"]),
+            kind=str(row["kind"]),
+            status=JobStatus(str(row["status"])),
+        )
+        for row in rows
+    ]
 
 
 def _result_set_id_from_payload(row: RowMapping) -> str | None:

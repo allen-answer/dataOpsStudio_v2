@@ -163,6 +163,16 @@ class _FakeConnection:
                 "environment": "test",
                 "environment_verified": False,
                 "capability_profile": {},
+                "operation_policy": {
+                    "allow_select": True,
+                    "allow_explain": False,
+                    "allow_dm_explain": False,
+                    "allow_oracle_plan_table": False,
+                    "allow_schema_import": False,
+                    "allow_schema_save": False,
+                    "allow_scenario_write": False,
+                    "allow_record_task": False,
+                },
             },
             {"id": "project-1"},
         ]

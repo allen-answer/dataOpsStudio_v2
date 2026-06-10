@@ -7,15 +7,15 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import structlog
-from sqlalchemy import URL, create_engine, delete, insert, select
+from sqlalchemy import URL, create_engine, delete, insert, select, update
 from sqlalchemy.engine import Engine
 
 from app.config import Settings, load_settings
-from app.db.models import datasources, result_sets
+from app.db.models import datasources, jobs, result_sets
 from app.dbclients.dm_adapter import DMAdapter
 from app.dbclients.mysql_adapter import MySQLAdapter
-from app.domain.datasource import DatasourceConnInfo, DbType
-from app.domain.job import Job, JobKind
+from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
+from app.domain.job import Job, JobErrorCode, JobKind
 from app.domain.result import ResultRef
 from app.domain.schema import Column, Row
 from app.domain.secret import SecretKind, SecretRef
@@ -39,6 +39,18 @@ class UnsupportedJobKindError(RuntimeError):
 
 class UnsupportedDbTypeError(RuntimeError):
     """2.0.0 worker supports only datasource db types with registered adapters."""
+
+
+class OperationPolicyDeniedError(RuntimeError):
+    """Datasource operation_policy denied this operation."""
+
+
+class DatasourceConnectionTestError(RuntimeError):
+    """Datasource test failed with a structured public test error code."""
+
+    def __init__(self, error_code: str) -> None:
+        super().__init__(error_code)
+        self.error_code = error_code
 
 
 class BackendLike(Protocol):
@@ -91,6 +103,10 @@ class ResultSetCatalogLike(Protocol):
     ) -> None: ...
 
 
+class JobErrorCodeWriterLike(Protocol):
+    def set_error_code(self, job_id: str, error_code: JobErrorCode) -> None: ...
+
+
 DatasourceLoader = Callable[[str], DatasourceConnInfo]
 AdapterFactory = Callable[
     [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None]],
@@ -123,6 +139,7 @@ class WorkerRunner:
         adapter_factory: AdapterFactory,
         config: WorkerRunnerConfig,
         result_set_catalog: ResultSetCatalogLike | None = None,
+        job_error_code_writer: JobErrorCodeWriterLike | None = None,
     ) -> None:
         if config.sql_spool_batch_size <= 0:
             raise ValueError("sql_spool_batch_size must be positive")
@@ -134,6 +151,7 @@ class WorkerRunner:
         self._adapter_factory = adapter_factory
         self._config = config
         self._result_set_catalog = result_set_catalog
+        self._job_error_code_writer = job_error_code_writer
         self._stop_requested = False
 
     def request_stop(self) -> None:
@@ -185,11 +203,15 @@ class WorkerRunner:
                 elapsed_seconds=_elapsed_seconds(started_at),
             )
         except Exception as exc:
-            self._backend.fail(job.id, str(exc))
+            public_error = _public_error_message(exc)
+            error_code = _job_error_code(exc, job.kind)
+            self._backend.fail(job.id, public_error)
+            self._write_error_code(job.id, error_code)
             logger.exception(
                 "worker job failed",
                 job_id=job.id,
                 kind=job.kind.value,
+                error_code=error_code.value,
                 error_type=type(exc).__name__,
                 elapsed_seconds=_elapsed_seconds(started_at),
             )
@@ -210,6 +232,7 @@ class WorkerRunner:
         datasource_id = _payload_datasource_id(job)
         result_set_id = str(payload.get("result_set_id") or job.id)
         datasource = self._datasource_loader(datasource_id)
+        _require_operation_allowed(datasource.operation_policy, "select")
         columns: list[Column] | None = None
 
         def capture_columns(emitted_columns: list[Column]) -> None:
@@ -263,13 +286,15 @@ class WorkerRunner:
         started_at = time.monotonic()
         if not adapter.test_connection():
             error_summary = getattr(adapter, "last_connection_error", None)
+            error_code = _datasource_test_error_code(error_summary)
             logger.warning(
                 "datasource test_connection failed",
                 job_id=job.id,
                 datasource_id=datasource_id,
+                error_code=error_code,
                 error_summary=error_summary if isinstance(error_summary, str) else None,
             )
-            raise RuntimeError("datasource connection test failed")
+            raise DatasourceConnectionTestError(error_code)
         self._heartbeat(job.id)
         metadata: dict[str, object] = {"latency_ms": _elapsed_ms(started_at)}
         server_version = getattr(adapter, "last_server_version", None)
@@ -312,6 +337,11 @@ class WorkerRunner:
     def _check_cancel(self, job_id: str) -> None:
         if self._backend.is_cancel_requested(job_id):
             raise JobCancelled("cancel requested")
+
+    def _write_error_code(self, job_id: str, error_code: JobErrorCode) -> None:
+        if self._job_error_code_writer is None:
+            return
+        self._job_error_code_writer.set_error_code(job_id, error_code)
 
     def _write_result_set_catalog(
         self,
@@ -362,6 +392,7 @@ class PostgresDatasourceLoader:
             ),
             db_type=DbType(str(row["db_type"])),
             extra=dict(row["capability_profile"] or {}),
+            operation_policy=OperationPolicy.model_validate(row["operation_policy"] or {}),
         )
 
 
@@ -391,6 +422,20 @@ class PostgresResultSetCatalog:
                     total_rows=None if truncated else loaded_rows,
                     state="complete",
                 )
+            )
+
+
+class PostgresJobErrorCodeWriter:
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def set_error_code(self, job_id: str, error_code: JobErrorCode) -> None:
+        with self._engine.begin() as conn:
+            conn.execute(
+                update(jobs)
+                .where(jobs.c.id == job_id)
+                .where(jobs.c.status == "failed")
+                .values(error_code=error_code.value)
             )
 
 
@@ -476,6 +521,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
             cancel_check_row_interval=actual_settings.worker.cancel_check_row_interval,
         ),
         PostgresResultSetCatalog(engine),
+        PostgresJobErrorCodeWriter(engine),
     )
 
 
@@ -568,6 +614,75 @@ def _manifest_int(manifest: dict[str, Any], key: str) -> int:
 def _manifest_bool(manifest: dict[str, Any], key: str) -> bool:
     value = manifest.get(key, False)
     return value if isinstance(value, bool) else False
+
+
+def _require_operation_allowed(policy: OperationPolicy, operation: str) -> None:
+    if operation == "select" and not policy.allow_select:
+        raise OperationPolicyDeniedError("select denied by datasource operation_policy")
+    if operation == "explain" and not policy.allow_explain:
+        raise OperationPolicyDeniedError("explain denied by datasource operation_policy")
+
+
+def _public_error_message(exc: Exception) -> str:
+    if isinstance(exc, DatasourceConnectionTestError):
+        return exc.error_code
+    if isinstance(exc, OperationPolicyDeniedError):
+        return "permission_denied"
+    if isinstance(exc, UnsupportedDbTypeError):
+        return "unsupported_db_type"
+    if isinstance(exc, UnsupportedJobKindError):
+        return "internal"
+    if _is_timeout_error(exc):
+        return "timeout"
+    if _is_cancel_error(exc):
+        return "cancelled"
+    return _job_error_code(exc, JobKind.SQL_QUERY).value
+
+
+def _job_error_code(exc: Exception, kind: JobKind) -> JobErrorCode:
+    if isinstance(exc, OperationPolicyDeniedError):
+        return JobErrorCode.PERMISSION_DENIED
+    if isinstance(exc, UnsupportedDbTypeError):
+        return JobErrorCode.UNSUPPORTED_DB_TYPE
+    if _is_timeout_error(exc):
+        return JobErrorCode.TIMEOUT
+    if _is_cancel_error(exc):
+        return JobErrorCode.CANCELLED
+    if kind is JobKind.TEST_CONNECTION or isinstance(exc, DatasourceConnectionTestError):
+        return JobErrorCode.CONNECTION_FAILED
+    if kind is JobKind.SQL_QUERY:
+        return JobErrorCode.SQL_FAILED
+    return JobErrorCode.INTERNAL
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    return "timeout" in name or "timed out" in text or "timeout" in text
+
+
+def _is_cancel_error(exc: Exception) -> bool:
+    return isinstance(exc, JobCancelled) or "cancel" in type(exc).__name__.lower()
+
+
+def _datasource_test_error_code(error_summary: object) -> str:
+    if not isinstance(error_summary, str) or not error_summary:
+        return "unknown"
+    text = error_summary.lower()
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if "code=1045" in text or "access denied" in text or "authentication" in text:
+        return "auth_failed"
+    if (
+        "code=2003" in text
+        or "code=2005" in text
+        or "can't connect" in text
+        or "cannot connect" in text
+        or "connection refused" in text
+        or "name or service not known" in text
+    ):
+        return "host_unreachable"
+    return "unknown"
 
 
 if __name__ == "__main__":
