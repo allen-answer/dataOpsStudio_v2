@@ -7,6 +7,8 @@ import { setUnauthenticatedHandler, setTokenProvider } from '../api/client'
  *   - api client 拿 token 来自 auth store(getToken)
  *   - 401 时清 store + 跳 /login
  *   - 路由守卫:无 token 跳 /login,有 token 访问 /login 跳 /projects
+ *   - admin 守卫:meta.admin 路由要求 role===admin,否则跳 /projects
+ *     (双层:此处拦 + AdminLayout 内 403 兜底呈现)
  */
 export function installAuthGuard(router: Router): void {
   const auth = useAuthStore()
@@ -24,6 +26,9 @@ export function installAuthGuard(router: Router): void {
       return { name: 'login', query: to.fullPath === '/' ? undefined : { next: to.fullPath } }
     }
     if (auth.isAuthenticated && to.name === 'login') {
+      return { name: 'projects' }
+    }
+    if (to.meta?.admin === true && auth.user?.role !== 'admin') {
       return { name: 'projects' }
     }
   })
