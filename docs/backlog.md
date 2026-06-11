@@ -26,24 +26,18 @@
 
 ## 来自 DM adapter review(feat/dm-adapter-columntype)
 
-### **DM "Certified" 宣称前必做** — DM adapter 缺真实例集成验证
+### **worker DM 数据源需配 DM 客户端加密库**(2026-06-11 真实例验证发现)
 
-**位置**:`app/dbclients/dm_adapter.py` / CI
+**位置**:部署文档 / worker 运行环境
 
-**现状**:GH Actions 无可信 DM8 镜像(Docker Hub 仅社区镜像,GB 级 + license 受限),
-本 PR 用 fake 驱动单测 + 契约测试覆盖,**没有任何真 DM 实例跑过的 hard evidence**。
+**现状**:PyPI `dmpython` 轮子 bundled 加密库缺传递依赖,`dlopen` 加密模块失败
+(`-70089`)。真实例验证时的修法:`DM_HOME=/opt/dmdbms` +
+`LD_LIBRARY_PATH=/opt/dmdbms/bin:/opt/dmdbms/bin/external_crypto_libs`,
+并清掉轮子 `dmpython.libs/` 内的孤立加密库。
 
-**不够用**:2.0.0 范围写明 "MySQL+DM Certified"。没有真实例验证,"Certified" 站不住
-(dmPython 连接参数 / callTimeout / ALL_* 视图 / DBMS_METADATA 行为均未实测)。
-
-**修法**:在持牌环境(自托管 runner 或手动)对真 DM 实例跑一遍
-`@pytest.mark.integration` 级验证(连接 / SELECT 流式 / introspection / EXPLAIN /
-软取消),证据(stdout / 测试报告)归档进 PR 或 docs。
-
-**触发条件**:对外宣称 DM Certified 前。**优先级**:高。
-
-**GA 决策(2026-06-11,人拍板)**:2.0.x GA 以 **"DM Beta"** 口径发布,不宣称
-Certified;本条不阻塞 GA,真实例到位后补验并升级口径。
+**修法**:on-prem 部署有 DM 数据源时,worker 进程需配上述环境;写进部署文档
+(quickstart / docker-compose 的 DM 注记)。**优先级**:中(首个 DM 客户部署前)。
+详见 `docs/acceptance-dm-certified.md`。
 
 ---
 
