@@ -373,7 +373,7 @@ const accentNodes = computed(() => NODES.filter((n) => n.accent))
           <button
             v-if="step === 'mfa'"
             type="button"
-            class="chrome-btn-ghost w-full justify-center text-xs"
+            class="w-full inline-flex items-center justify-center gap-1.5 text-xs chrome-accent hover:underline"
             :disabled="submitting"
             @click="backToCredentials"
           >
