@@ -11,15 +11,11 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| Wave 5A PR-1 battle-tested crypto 替换(PyJWT + pyotp) | Codex | — | **已合并** | [#49](https://github.com/allen-answer/dataOpsStudio_v2/pull/49) |
-| Wave 5A PR-2 TOTP 同窗重放防护 | Codex | PR-1 review(已解锁) | **已合并** | [#50](https://github.com/allen-answer/dataOpsStudio_v2/pull/50) |
-| Wave 5A PR-3 错误码细分 + 残留小项 | Codex | PR-2 review(已解锁) | PR 待审 | [#51](https://github.com/allen-answer/dataOpsStudio_v2/pull/51) |
-| Wave 5B GA 前端收口 —— darkMode 键失配修复(`[data-theme]`→`[data-mode]`)+ UX nit 包(SQL 结果 scrollIntoView / inline 必填校验 / 按钮 in-flight disable / 真会话过期主动登出) | Claude Opus 4.8 | — | PR 待审 | [#48](https://github.com/allen-answer/dataOpsStudio_v2/pull/48) |
-| DM 真实例集成验证(backlog 高优先级,Certified 宣称前必做) | review agent + 人 | 需持牌 DM 实例 | 受阻(等 DM 实例) | — |
+| DM 真实例集成验证(GA 已按 DM Beta 口径发布,Certified 升级前必做) | review agent + 人 | 需持牌 DM 实例 | 受阻(等 DM 实例) | — |
 
-> **下一里程碑候选(待人拍板)**:2.0.x GA 准备 —— GA 前安全加固清单
-> (TOTP 同窗重放 / pyjwt+pyotp 替换 / 密码进 request body 改造,见 backlog)、
-> compose CI hard-evidence job、Tailwind darkMode 键失配、SQL 工作台执行后自动滚动等 UX nit。
+> **2.0.0 GA 已就绪**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
+> 安全项全闭环/落档)。后续候选:Oracle adapter(2.0.x)、外部安全审计触发项、
+> 正式 license 签发(首个商业交付前)。
 
 ---
 
@@ -38,6 +34,15 @@
 
 ## 已完成归档
 
+> **Wave 5 — 2.0.0 GA 准备(2026-06-11 全部合并)**:
+> 5A 后端加固(Codex):pyjwt+pyotp 替换([#49](https://github.com/allen-answer/dataOpsStudio_v2/pull/49))、
+> TOTP 同窗重放防护([#50](https://github.com/allen-answer/dataOpsStudio_v2/pull/50))、
+> 错误码细分 + 残留小项([#51](https://github.com/allen-answer/dataOpsStudio_v2/pull/51))。
+> 5B 前端(Claude 4.8):darkMode 键失配修复 + UX nit 包([#48](https://github.com/allen-answer/dataOpsStudio_v2/pull/48))。
+> 5C(review agent):R3 条文对齐 + GA 四决策落档([#46](https://github.com/allen-answer/dataOpsStudio_v2/pull/46))、
+> Compose CI hard-evidence job([#47](https://github.com/allen-answer/dataOpsStudio_v2/pull/47))。
+> GA 回归走查 + 安全自审:`docs/acceptance-2.0.0-ga.md`(10/10 + 安全项全闭环/落档)。
+>
 > **Wave 4(2026-06-11 全部合并)— Part B 补全,PRD §1–§10 全部落地**:
 > 4A 后端(Codex):revoked_tokens + force-logout([#39](https://github.com/allen-answer/dataOpsStudio_v2/pull/39))、
 > §6 MFA + 改密([#40](https://github.com/allen-answer/dataOpsStudio_v2/pull/40))、
