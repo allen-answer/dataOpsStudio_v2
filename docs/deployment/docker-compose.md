@@ -233,6 +233,38 @@ Named volumes:
 - `dataops-v2-stack-data` — ResultStore spool
 - `dataops-v2-stack-pgdata` — PostgreSQL cluster
 
+## DM 数据源注记 (worker DM 客户端加密库)
+
+The walkthrough above uses MySQL. If you point a datasource at DM (达梦) instead,
+the **worker** service needs two extra environment variables so the `dmpython`
+driver can `dlopen` the DM client crypto modules. Without them, DM connect/execute
+fails with `-70089` (encryption module load failure): the PyPI `dmpython` wheel
+bundles a crypto library missing transitive dependencies, so the driver must use
+the complete library set under a real DM client install. Root cause and the full
+one-time fix are in [`acceptance-dm-certified.md`](../acceptance-dm-certified.md)
+("环境注记").
+
+This requires a DM client install reachable inside the `worker` container (mount
+it as a volume or bake it into a derived image — the stock runtime image does not
+ship DM client libraries). Then add the two env vars to the `worker` service, e.g.
+via a compose override file (`docker/compose.dataops.dm.yml`) so you do not edit
+the base compose YAML:
+
+```yaml
+# docker/compose.dataops.dm.yml — placeholder override, adjust paths to your mount
+services:
+  worker:
+    environment:
+      DM_HOME: /opt/dmdbms                                                   # DM client install inside the container
+      LD_LIBRARY_PATH: /opt/dmdbms/bin:/opt/dmdbms/bin/external_crypto_libs
+```
+
+Apply it alongside the base file:
+
+```bash
+docker compose -f docker/compose.dataops.yml -f docker/compose.dataops.dm.yml up -d
+```
+
 ## Notes / limits
 
 - This stack does not bundle the frontend SPA. The API serves the JSON API only;
