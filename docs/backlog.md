@@ -4,19 +4,6 @@
 
 ## 来自 T4 (API + middleware) review
 
-### **GA 前安全加固** — TOTP 同窗口重放未防
-
-**位置**:`app/infrastructure/secretstore/totp.py:verify_totp_code` + 登录/验证调用方
-
-**现状**:同一个 6 位 code 在其 30s(±1 窗口)有效期内可重复通过校验——标准 TOTP
-实现通常记录"最后已用 counter"(per user),拒绝重放。
-
-**修法**:users 表或缓存记 last_used_totp_counter,verify 通过后推进,小于等于则拒。
-
-**触发条件**:GA 前安全评审,或 MFA 正式对外宣传前。**优先级**:中。
-
----
-
 ### **F2 正解** — Worker 独立心跳线程(取消 OLAP 取舍)
 
 **位置**:`app/worker.py:WorkerRunner`

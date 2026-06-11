@@ -22,16 +22,32 @@ def verify_totp_code(
     now: int | None = None,
     window: int = 1,
 ) -> bool:
+    return accepted_totp_counter(secret=secret, code=code, now=now, window=window) is not None
+
+
+def accepted_totp_counter(
+    *,
+    secret: str,
+    code: str,
+    now: int | None = None,
+    window: int = 1,
+) -> int | None:
     if not code.isdigit() or len(code) != 6:
-        return False
+        return None
     current = int(time.time()) if now is None else now
-    return bool(
-        pyotp.TOTP(secret).verify(
+    current_counter = current // 30
+    totp = pyotp.TOTP(secret)
+    for offset in range(-window, window + 1):
+        counter = current_counter + offset
+        if counter < 0:
+            continue
+        if totp.verify(
             code,
-            for_time=datetime.fromtimestamp(current, UTC),
-            valid_window=window,
-        )
-    )
+            for_time=datetime.fromtimestamp(counter * 30, UTC),
+            valid_window=0,
+        ):
+            return counter
+    return None
 
 
 def totp_code_for_test(*, secret: str, now: int) -> str:
