@@ -33,6 +33,8 @@ dependencies = [
     # DM(达梦)driver — import 仅允许在 app/dbclients/(R1)。
     # cp312 manylinux + win_amd64 wheel 齐全(可 uv/pip 装,无需本地 DM 客户端)。
     "dmPython>=2.5",
+    "pyjwt>=2.13.0",
+    "pyotp>=2.9.0",
 ]
 
 [project.urls]
