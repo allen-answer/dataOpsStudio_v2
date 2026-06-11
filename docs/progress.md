@@ -9,13 +9,15 @@
 
 ## 当前活动项
 
-| 任务 | 负责 | 依赖 | 状态 | PR |
-|---|---|---|---|---|
-| DM 真实例集成验证(GA 已按 DM Beta 口径发布,Certified 升级前必做) | review agent + 人 | 需持牌 DM 实例 | 受阻(等 DM 实例) | — |
+_(空 —— 2.0.0 GA 已发布,DM 已 Certified;无进行中任务。)_
 
-> **2.0.0 GA 已就绪**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
-> 安全项全闭环/落档)。后续候选:Oracle adapter(2.0.x)、外部安全审计触发项、
-> 正式 license 签发(首个商业交付前)。
+> **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
+> 安全项全闭环/落档)。**DM 已 Certified**:真实例验证 8/8 + 修复 3 个 adapter bug,
+> 见 `docs/acceptance-dm-certified.md`([#53](https://github.com/allen-answer/dataOpsStudio_v2/pull/53))。
+>
+> **后续候选(待人拍板,均无 owner/未排期)**:Oracle adapter(2.0.x)、外部安全审计
+> 触发项(密码进 body 改造)、正式 license 签发(首个商业交付前)、worker DM 加密库
+> 部署文档(首个 DM 客户前)、2.1.0 完整 SQL Workspace。
 
 ---
 
