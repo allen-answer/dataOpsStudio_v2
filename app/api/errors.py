@@ -19,6 +19,7 @@ class ApiError(Exception):
     FrozenInstanceError,把任意 4xx 变成 500(2026-06-11 真机实锤;
     回归测试:tests/unit/test_api_errors.py)。
     """
+
     status_code: int
     code: str
     message: str

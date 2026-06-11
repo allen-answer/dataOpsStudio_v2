@@ -9,6 +9,7 @@ __setattr__ 抛 FrozenInstanceError —— 所有"事务内 raise ApiError"的
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 
 import pytest
@@ -17,7 +18,7 @@ from app.api.errors import ApiError
 
 
 @contextmanager
-def _passthrough_cm():
+def _passthrough_cm() -> Iterator[None]:
     yield
 
 
