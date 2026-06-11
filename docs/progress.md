@@ -11,7 +11,7 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| revoked_tokens + admin force-logout | Codex | — | 进行中 | — |
+| revoked_tokens + admin force-logout | Codex | — | PR 待审 | [#39](https://github.com/allen-answer/dataOpsStudio_v2/pull/39) |
 | §6 MFA + 改密 | Codex | PR-1 review | 未开工 | — |
 | §9 AI 配置 + Gateway DB 配置 | Codex | PR-2 review | 未开工 | — |
 
