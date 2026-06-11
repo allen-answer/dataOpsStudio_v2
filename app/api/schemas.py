@@ -309,7 +309,7 @@ class AdminAiConfigResponse(BaseModel):
     provider: AiProvider
     model: str | None = None
     base_url: str | None = None
-    max_auto_egress_level: int = Field(ge=0, le=4)
+    max_auto_egress_level: int = Field(ge=0, le=3)
     l4_requires_optin: bool
     enable_inference: bool
     enable_auto_translation: bool
@@ -325,7 +325,7 @@ class AdminAiConfigUpdateRequest(BaseModel):
     base_url: str | None = Field(default=None, min_length=1)
     api_key: str | None = Field(default=None, min_length=1)
     clear_api_key: bool = False
-    max_auto_egress_level: int = Field(ge=0, le=4)
+    max_auto_egress_level: int = Field(ge=0, le=3)
     l4_requires_optin: bool = True
     enable_inference: bool = False
     enable_auto_translation: bool = False

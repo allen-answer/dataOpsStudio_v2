@@ -60,7 +60,7 @@ def upgrade() -> None:
             name=op.f("ck_ai_configs_provider_is_supported"),
         ),
         sa.CheckConstraint(
-            "max_auto_egress_level >= 0 AND max_auto_egress_level <= 4",
+            "max_auto_egress_level >= 0 AND max_auto_egress_level <= 3",
             name=op.f("ck_ai_configs_max_auto_egress_level_range"),
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_ai_configs")),

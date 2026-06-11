@@ -516,6 +516,8 @@ def _validate_ai_config_update(body: AdminAiConfigUpdateRequest) -> None:
         raise ApiError(400, "unsupported_provider", "Provider is not implemented in 2.0.0")
     if body.enabled and body.provider == "openai_compatible" and not body.base_url:
         raise ApiError(400, "invalid_ai_config", "base_url is required")
+    if not body.l4_requires_optin:
+        raise ApiError(400, "invalid_ai_config", "L4 data always requires explicit opt-in")
 
 
 def _ai_config_values(

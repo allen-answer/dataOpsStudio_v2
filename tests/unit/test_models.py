@@ -9,6 +9,8 @@ from __future__ import annotations
 import pathlib
 import re
 
+from sqlalchemy import CheckConstraint
+
 from app.db.models import (
     APPLICATION_SECRET_KINDS,
     ai_configs,
@@ -115,6 +117,11 @@ def test_mfa_recovery_codes_schema_supports_one_time_codes() -> None:
 def test_ai_configs_schema_stores_key_by_secret_ref_only() -> None:
     cols = set(ai_configs.columns.keys())
     check_names = {c.name for c in ai_configs.constraints if c.name is not None}
+    check_sql = {
+        c.name: str(c.sqltext)
+        for c in ai_configs.constraints
+        if isinstance(c, CheckConstraint) and c.name is not None
+    }
 
     assert cols == {
         "id",
@@ -136,6 +143,7 @@ def test_ai_configs_schema_stores_key_by_secret_ref_only() -> None:
     assert "ck_ai_configs_singleton" in check_names
     assert "ck_ai_configs_provider_is_supported" in check_names
     assert "ck_ai_configs_max_auto_egress_level_range" in check_names
+    assert check_sql["ck_ai_configs_max_auto_egress_level_range"].endswith("<= 3")
 
 
 def test_r6_result_sets_has_no_cursor_field() -> None:

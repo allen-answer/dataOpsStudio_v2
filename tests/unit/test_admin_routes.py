@@ -152,6 +152,34 @@ def test_admin_put_ai_config_stores_key_without_echoing_secret() -> None:
     assert api_key not in repr(services.audits)
 
 
+def test_admin_put_ai_config_rejects_disabling_l4_optin() -> None:
+    api_key = "not-a-real-test-key"
+    services = _AdminServices(_QueueEngine([]))
+    app = create_app(services=cast(ApiServices, services))
+    token = create_access_token(user_id="admin-1", role="admin", secret=services.jwt_secret)
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/admin/ai-config",
+        json_body={
+            "enabled": True,
+            "provider": "mock",
+            "model": "mock-model",
+            "base_url": None,
+            "api_key": api_key,
+            "max_auto_egress_level": 2,
+            "l4_requires_optin": False,
+            "enable_inference": True,
+            "enable_auto_translation": False,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_ai_config"
+    assert services.secret_store.stored == []
+
+
 def test_admin_ai_config_test_uses_mock_provider_and_audits() -> None:
     services = _AdminServices(_QueueEngine([[_ai_config_row(provider="mock")]]))
     app = create_app(services=cast(ApiServices, services))

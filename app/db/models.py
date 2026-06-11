@@ -439,7 +439,7 @@ ai_configs = Table(
         name="provider_is_supported",
     ),
     CheckConstraint(
-        "max_auto_egress_level >= 0 AND max_auto_egress_level <= 4",
+        "max_auto_egress_level >= 0 AND max_auto_egress_level <= 3",
         name="max_auto_egress_level_range",
     ),
 )
