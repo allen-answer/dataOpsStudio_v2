@@ -16,6 +16,7 @@ from app.dbclients.dm_types import (
     data_type_string_to_column_type,
     type_code_to_column_type,
 )
+from app.dbclients.protocol import AdapterConnectionError
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import HashedRef, RotationReport, SecretKind, SecretRef
@@ -128,6 +129,22 @@ def test_test_connection_sanitizes_error_on_failure() -> None:
     assert "dm://user" not in adapter.last_connection_error
     assert "<redacted-url>" in adapter.last_connection_error
     assert "***REDACTED***" in adapter.last_connection_error
+
+
+def test_stream_select_preserves_connection_error_cause() -> None:
+    # from exc(非 from None):AdapterConnectionError 必须链住原始驱动异常,
+    # 便于 worker logger.exception 排障(R5 脱敏 processor 兜底敏感值)。
+    original = RuntimeError("driver connect boom")
+    adapter = DMAdapter(
+        _conn_info(),
+        cast(SecretStore, _SecretStore("pwd")),
+        dm_module=_FailingDM(original),
+    )
+
+    with pytest.raises(AdapterConnectionError) as excinfo:
+        list(adapter.execute_select("SELECT 1", {}))
+
+    assert excinfo.value.__cause__ is original
 
 
 def test_soft_cancel_raises_on_safe_point() -> None:

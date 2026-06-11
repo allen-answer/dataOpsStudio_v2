@@ -246,8 +246,10 @@ class MySQLAdapter(DatabaseAdapter):
         started_at = time.monotonic()
         try:
             conn = self._connect()
-        except Exception:
-            raise AdapterConnectionError("adapter connection failed") from None
+        except Exception as exc:
+            # 保留 cause(from exc 而非 from None):worker 的 logger.exception 会带 cause
+            # 链便于排障,且日志链路有 R5 脱敏 processor 兜底,原始驱动异常不会泄密。
+            raise AdapterConnectionError("adapter connection failed") from exc
         try:
             self._apply_statement_timeout(conn)
             cursor = conn.cursor(self._sscursor_class())
