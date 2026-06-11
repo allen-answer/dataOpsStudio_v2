@@ -214,7 +214,7 @@ function errorMessage(): string {
 </script>
 
 <template>
-  <div class="max-w-6xl mx-auto px-6 lg:px-10 py-8 w-full">
+  <div class="px-6 lg:px-10 py-8 w-full">
     <div class="flex items-end justify-between mb-6">
       <div>
         <h1 class="text-h2 font-semibold tracking-tight chrome-text-heading">

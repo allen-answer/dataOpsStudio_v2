@@ -156,7 +156,7 @@ function errorMessage(): string {
 </script>
 
 <template>
-  <div class="max-w-7xl mx-auto px-6 lg:px-10 py-8 w-full">
+  <div class="px-6 lg:px-10 py-8 w-full">
     <!-- header -->
     <div class="mb-6">
       <div class="text-xs uppercase tracking-wider chrome-text-muted font-medium">

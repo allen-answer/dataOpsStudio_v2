@@ -435,7 +435,7 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
 </script>
 
 <template>
-  <div class="max-w-6xl mx-auto px-6 lg:px-10 py-8 w-full">
+  <div class="px-6 lg:px-10 py-8 w-full">
     <!-- Header -->
     <div class="flex items-end justify-between mb-6">
       <div>
