@@ -40,7 +40,7 @@ function errorMessage(): string {
 </script>
 
 <template>
-  <div class="max-w-5xl mx-auto px-6 lg:px-10 py-10">
+  <div class="px-6 lg:px-10 py-10 w-full">
     <!-- Header -->
     <div class="flex items-end justify-between mb-8">
       <div>

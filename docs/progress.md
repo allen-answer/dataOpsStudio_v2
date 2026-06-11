@@ -22,7 +22,7 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| T7 Part A 收口:编辑/删除 modal + 权限面板 + Jobs 错误码精确映射 | Claude 4.8 | #32 合并 | 未开工 | — |
+| T7 Part A 收口:编辑/删除 modal + 权限面板 + Jobs 错误码精确映射 | Claude 4.8 | #32 合并 | PR 待审(**draft** —— vue-tsc 严格 + build 绿;Playwright 无后端渲染验证编辑/删除/权限面板/错误码各态 console 零红;真后端走查待 daily-server 升级到含 #32 的 main 后由 review agent 走) | [#33](https://github.com/allen-answer/dataOpsStudio_v2/pull/33) |
 | §5 验收 e2e 全量对照(contract §5:portable 解压 → … → migrate) | review agent + 人 | 全部合并 | 未开工 | — |
 | DM 真实例集成验证(backlog 高优先级,Certified 前必做) | review agent + 人 | 需持牌 DM 实例 | 受阻(等 DM 实例) | — |
 

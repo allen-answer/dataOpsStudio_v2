@@ -148,7 +148,7 @@ function errorMessage(): string {
 </script>
 
 <template>
-  <div class="max-w-7xl mx-auto px-6 lg:px-10 py-8 w-full">
+  <div class="px-6 lg:px-10 py-8 w-full">
     <div class="mb-6">
       <h1 class="text-h2 font-semibold tracking-tight chrome-text-heading">{{ t('admin.audit.title') }}</h1>
       <div class="text-sm chrome-text-muted mt-1">{{ t('admin.audit.subtitle') }}</div>

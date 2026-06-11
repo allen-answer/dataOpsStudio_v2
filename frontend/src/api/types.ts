@@ -22,6 +22,34 @@ export interface Project {
 
 export type DbType = 'mysql' | 'oracle' | 'dm' | 'db2' | 'postgresql'
 
+/**
+ * Datasource operation policy(8 个 allow_* 开关)。
+ * 源:app/domain/datasource.py OperationPolicy。默认仅 allow_select=true,其余 false。
+ * 2.0.0 仅 allow_select / allow_explain 真生效,其余先落库供 2.1+ 复用。
+ */
+export interface OperationPolicy {
+  allow_select: boolean
+  allow_explain: boolean
+  allow_dm_explain: boolean
+  allow_oracle_plan_table: boolean
+  allow_schema_import: boolean
+  allow_schema_save: boolean
+  allow_scenario_write: boolean
+  allow_record_task: boolean
+}
+
+/** 后端默认值(app/domain/datasource.py):仅 allow_select 开。 */
+export const DEFAULT_OPERATION_POLICY: OperationPolicy = {
+  allow_select: true,
+  allow_explain: false,
+  allow_dm_explain: false,
+  allow_oracle_plan_table: false,
+  allow_schema_import: false,
+  allow_schema_save: false,
+  allow_scenario_write: false,
+  allow_record_task: false,
+}
+
 export interface DatasourceListItem {
   id: string
   name: string
@@ -31,6 +59,7 @@ export interface DatasourceListItem {
   environment: string
   environment_verified: boolean
   database: string | null
+  operation_policy: OperationPolicy
   created_at: string
 }
 
@@ -45,17 +74,84 @@ export interface DatasourceCreateRequest {
   password: string
   environment?: string
   extra?: Record<string, unknown>
+  operation_policy?: OperationPolicy
+}
+
+/**
+ * PUT /datasources/{id} —— 全字段可选;省略的字段不改。
+ * password 缺省或空字符串 = 不修改密码(后端 `if body.password:` 判定)。
+ * 源:app/api/schemas.py DatasourceUpdateRequest。
+ */
+export interface DatasourceUpdateRequest {
+  project_id?: string
+  name?: string
+  db_type?: DbType
+  host?: string
+  port?: number
+  username?: string
+  database?: string
+  password?: string
+  environment?: string
+  extra?: Record<string, unknown>
+  operation_policy?: OperationPolicy
 }
 
 // 详情 / 建后端点(GET /datasources/{id}, POST /datasources)返回体不含 environment_verified
 // —— 该字段只在列表端点(GET /datasources)产出。用 Omit 精确对齐后端,避免凭空多出字段。
-export interface DatasourceResponse extends Omit<DatasourceListItem, 'environment_verified'> {
+export interface DatasourceResponse
+  extends Omit<DatasourceListItem, 'environment_verified'> {
   project_id: string
   username: string
   extra: Record<string, unknown>
 }
 
+/** DELETE /datasources/{id} 409 体的引用项。源:DatasourceReferenceItem。 */
+export interface DatasourceReferenceItem {
+  job_id: string
+  kind: string
+  status: JobStatus
+}
+
+/** DELETE /datasources/{id} 409 体(被既有 job 引用)。源:DatasourceDeleteBlockedResponse。 */
+export interface DatasourceDeleteBlocked {
+  error: string
+  message: string
+  references: DatasourceReferenceItem[]
+}
+
+/**
+ * 测连失败分类码。源:app/api/schemas.py DatasourceTestErrorCode。
+ * 2.0.0 实际只稳定产出 unknown / timeout;其余为多方言统一留位。
+ */
+export type DatasourceTestErrorCode =
+  | 'auth_failed'
+  | 'host_unreachable'
+  | 'timeout'
+  | 'permission_denied'
+  | 'unknown'
+
+/** POST /datasources/{id}/test 响应。源:DatasourceTestResponse。 */
+export interface DatasourceTestResponse {
+  ok: boolean
+  server_version: string | null
+  latency_ms: number | null
+  error_code: DatasourceTestErrorCode | null
+}
+
 export type JobStatus = 'pending' | 'running' | 'success' | 'failed' | 'cancelled' | 'timeout'
+
+/**
+ * 结构化 job 错误码(7 值)。源:app/domain/job.py JobErrorCode。
+ * 旧 job(error_code 为 null)回落 JobListItem.error 里的粗分类字符串。
+ */
+export type JobErrorCode =
+  | 'connection_failed'
+  | 'sql_failed'
+  | 'timeout'
+  | 'cancelled'
+  | 'permission_denied'
+  | 'unsupported_db_type'
+  | 'internal'
 
 export interface JobListItem {
   id: string
@@ -65,6 +161,7 @@ export interface JobListItem {
   started_at: string | null
   finished_at: string | null
   error: string | null
+  error_code: JobErrorCode | null
 }
 
 export interface SqlExecuteResponse {

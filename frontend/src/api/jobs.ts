@@ -1,5 +1,6 @@
 import { apiClient } from './client'
 import type {
+  JobErrorCode,
   JobListItem,
   JobStatus,
 } from './types'
@@ -10,6 +11,7 @@ export interface JobResponse {
   status: JobStatus
   result_set_id: string | null
   error: string | null
+  error_code: JobErrorCode | null
   message: string | null
 }
 

@@ -16,6 +16,7 @@ import { ListChecks, X, AlertTriangle } from 'lucide-vue-next'
 import { listJobs, getJobResult, cancelJob, type JobResultResponse } from '../api/jobs'
 import { ApiError, type JobListItem, type JobStatus } from '../api/types'
 import JobStatusBadge from '../components/JobStatusBadge.vue'
+import JobErrorBadge from '../components/JobErrorBadge.vue'
 import ResultTable from '../components/ResultTable.vue'
 import EmptyState from '../components/EmptyState.vue'
 import LoadingDots from '../components/LoadingDots.vue'
@@ -155,7 +156,7 @@ function errorMessage(): string {
 </script>
 
 <template>
-  <div class="max-w-7xl mx-auto px-6 lg:px-10 py-8 w-full">
+  <div class="px-6 lg:px-10 py-8 w-full">
     <!-- header -->
     <div class="mb-6">
       <div class="text-xs uppercase tracking-wider chrome-text-muted font-medium">
@@ -239,6 +240,7 @@ function errorMessage(): string {
             <th class="font-medium py-2 px-3">ID</th>
             <th class="font-medium py-2 px-3">{{ t('jobs.col_kind') }}</th>
             <th class="font-medium py-2 px-3">{{ t('jobs.col_status') }}</th>
+            <th class="font-medium py-2 px-3">{{ t('jobs.col_error') }}</th>
             <th class="font-medium py-2 px-3">{{ t('jobs.col_created_at') }}</th>
             <th class="font-medium py-2 px-3">{{ t('jobs.col_duration') }}</th>
             <th class="font-medium py-2 px-3 text-right">{{ t('jobs.col_actions') }}</th>
@@ -257,6 +259,14 @@ function errorMessage(): string {
             <td class="py-2 px-3 chrome-text-normal">{{ j.kind }}</td>
             <td class="py-2 px-3">
               <JobStatusBadge :status="j.status" />
+            </td>
+            <td class="py-2 px-3">
+              <JobErrorBadge :error-code="j.error_code" :error="j.error" />
+              <span
+                v-if="!j.error_code && !j.error"
+                class="chrome-text-muted text-xs"
+                >—</span
+              >
             </td>
             <td class="py-2 px-3 chrome-text-muted tabular-nums">
               {{ formatDate(j.created_at) }}
@@ -305,11 +315,15 @@ function errorMessage(): string {
               <div class="text-xs chrome-text-muted font-mono">
                 job {{ drawerJob.id }}
               </div>
-              <div class="flex items-center gap-2 mt-1">
+              <div class="flex items-center gap-2 mt-1 flex-wrap">
                 <h2 class="text-section font-semibold chrome-text-heading">
                   {{ drawerJob.kind }}
                 </h2>
                 <JobStatusBadge :status="drawerJob.status" size="md" />
+                <JobErrorBadge
+                  :error-code="drawerJob.error_code"
+                  :error="drawerJob.error"
+                />
               </div>
               <div class="text-xs chrome-text-muted mt-1">
                 {{ formatDate(drawerJob.created_at) }} · {{ duration(drawerJob) }}
@@ -325,14 +339,7 @@ function errorMessage(): string {
             </button>
           </div>
 
-          <!-- error 行 -->
-          <div
-            v-if="drawerJob.error"
-            class="px-6 py-3 border-b chrome-border-subtle text-sm font-mono whitespace-pre-wrap"
-            style="background-color: rgb(239 68 68 / 0.08); color: rgb(185 28 28);"
-          >
-            {{ drawerJob.error }}
-          </div>
+          <!-- 拉结果 / cancel 等抽屉内操作的错误行(非 job 自身错误码,后者走头部 badge) -->
           <div
             v-if="drawerError"
             class="px-6 py-3 border-b chrome-border-subtle text-sm"
