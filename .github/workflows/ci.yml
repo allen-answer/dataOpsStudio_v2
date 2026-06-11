@@ -531,6 +531,59 @@ jobs:
   # 前端进 git 就该有 CI 守:vue-tsc + vite build 能不能编译过。
   # 跟后端红线一个道理 —— build 是最低线,e2e 是另一回事。
   # ★ Gate:frontend/ 不存在 hashFiles 跳过(防 PR revert)。
+  # ─── Compose form hard evidence(contract §5"docker compose 跑通同样流程")────
+  # 守护 #35 交付的 compose 形态不回归纸面:build → secrets-init → pg → migrate →
+  # api+worker → healthz → 真登录 → license/projects 鉴权链路。
+  # 完整 SELECT/spool 链路由 cold-start job(portable 形态)覆盖,此处不重复拉 MySQL。
+  compose-stack:
+    name: Compose form (§5 hard evidence)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build stack image
+        run: docker compose -f docker/compose.dataops.yml build
+
+      - name: Bring up stack
+        run: docker compose -f docker/compose.dataops.yml up -d
+
+      - name: Wait for API healthz
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:18020/healthz >/dev/null; then
+              echo "API ready after ${i} attempts"; exit 0
+            fi
+            sleep 3
+          done
+          echo "API not ready in 90s"
+          docker compose -f docker/compose.dataops.yml ps
+          docker compose -f docker/compose.dataops.yml logs --tail 60
+          exit 1
+
+      - name: Admin create + authenticated §5 sample (login / license / projects)
+        run: |
+          ADMIN_PW=$(openssl rand -base64 15)
+          echo "::add-mask::$ADMIN_PW"
+          docker compose -f docker/compose.dataops.yml run --rm admin-create \
+            --username admin --password "$ADMIN_PW" --project-name Default | grep -iv password
+          TOKEN=$(curl -sf -X POST http://127.0.0.1:18020/api/auth/login \
+            -H 'content-type: application/json' \
+            -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PW\"}" | jq -r .access_token)
+          test -n "$TOKEN" && test "$TOKEN" != "null"
+          curl -sf http://127.0.0.1:18020/api/license/status \
+            -H "authorization: Bearer $TOKEN" | jq -e '.mode == "trial"'
+          curl -sf http://127.0.0.1:18020/api/projects \
+            -H "authorization: Bearer $TOKEN" | jq -e 'length >= 1'
+          echo "compose form §5 sample chain OK"
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f docker/compose.dataops.yml logs --tail 120
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f docker/compose.dataops.yml down -v
+
   frontend-build:
     name: Frontend Build (T7)
     runs-on: ubuntu-latest
