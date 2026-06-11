@@ -8,7 +8,7 @@ from typing import Any
 
 from app.dbclients.dm_types import (
     data_type_string_to_column_type,
-    type_code_to_column_type,
+    description_item_to_column_type,
 )
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
@@ -126,8 +126,9 @@ class DMAdapter(DatabaseAdapter):
 
     def explain(self, sql: str) -> PlanNode:
         guarded_sql = validate_readonly_sql(sql)
-        # DM 复用 Oracle PLAN_TABLE 协议(V1_AS_IS §4.5):EXPLAIN <sql> 直接返回执行计划文本行。
-        rows = self._query_dicts(f"EXPLAIN {guarded_sql}", None)
+        # DM 的执行计划语法是 `EXPLAIN FOR <sql>`(裸 `EXPLAIN <sql>` 报 -2002),
+        # 直接返回执行计划文本行。
+        rows = self._query_dicts(f"EXPLAIN FOR {guarded_sql}", None)
         return PlanNode(operation="EXPLAIN", details={"rows": rows})
 
     def test_connection(self) -> bool:
@@ -312,7 +313,11 @@ class DMAdapter(DatabaseAdapter):
             cursor = conn.cursor()
             cursor.execute(sql, params)
             rows = cursor.fetchall()
-            columns = _description_columns(getattr(cursor, "description", None))
+            # DM 把不带引号的别名(AS name)折叠成大写,description 列名因而是
+            # NAME / DATA_TYPE 等;introspection 全程按小写键取值,故此处统一小写化
+            # (一处修,list_schemas/tables/columns/indexes/PK 全链路受益)。
+            raw_columns = _description_columns(getattr(cursor, "description", None))
+            columns = [name.lower() for name in raw_columns]
             return [_row_to_dict(row, columns) for row in rows]
         finally:
             _safe_close(cursor)
@@ -430,8 +435,10 @@ class DMAdapter(DatabaseAdapter):
     def _description_to_columns(self, description: object) -> list[Column]:
         """cursor.description → list[Column]。
 
-        description[1] 是 dmPython type code / type-object → 统一 ColumnType;
-        原始类型字符串化后塞 driver_type 备查。
+        DB-API description 项形如 (name, type_code, display_size, internal_size,
+        precision, scale, null_ok)。dmPython 的 type_code 是 type-object
+        (如 dmPython.NUMBER)→ 统一 ColumnType;NUMBER / DECIMAL 用 scale(idx5)
+        区分整数与小数。原始类型字符串化后塞 driver_type 备查。
         """
         if not isinstance(description, Sequence) or isinstance(
             description, (str, bytes, bytearray)
@@ -448,11 +455,12 @@ class DMAdapter(DatabaseAdapter):
             ):
                 continue
             type_code = item[1] if len(item) > 1 else None
+            scale_value = item[5] if len(item) > 5 else None
             nullable_value = item[6] if len(item) > 6 else None
             columns.append(
                 Column(
                     name=str(item[0]),
-                    type=type_code_to_column_type(dm, type_code),
+                    type=description_item_to_column_type(dm, type_code, scale_value),
                     driver_type=str(type_code) if type_code is not None else None,
                     nullable=bool(nullable_value) if nullable_value is not None else True,
                     primary_key=False,
