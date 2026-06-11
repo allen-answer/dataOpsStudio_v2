@@ -627,21 +627,21 @@ const darkResultRows: [string, number][] = [
   --tw-ring-color: rgb(254 226 226);
   box-shadow: 0 0 0 2px var(--tw-ring-color);
 }
-[data-theme='dark'] .input-error {
+[data-mode='dark'] .input-error {
   --tw-ring-color: rgba(239, 68, 68, 0.2);
 }
 
 /* secondary 按钮在深色下:边/底/字都加深变种 */
-[data-theme='dark'] .btn-secondary {
+[data-mode='dark'] .btn-secondary {
   @apply bg-slate-800 border-slate-700 text-slate-200;
 }
-[data-theme='dark'] .btn-secondary:hover {
+[data-mode='dark'] .btn-secondary:hover {
   @apply bg-slate-700 border-slate-600;
 }
-[data-theme='dark'] .btn-danger-outline {
+[data-mode='dark'] .btn-danger-outline {
   @apply bg-transparent border-red-500/30 text-red-400;
 }
-[data-theme='dark'] .btn-danger-outline:hover {
+[data-mode='dark'] .btn-danger-outline:hover {
   @apply bg-red-500/10 border-red-500/50;
 }
 </style>

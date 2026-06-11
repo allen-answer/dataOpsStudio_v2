@@ -227,6 +227,7 @@ export default {
     create_submit: 'Create',
     create_success: 'Created',
     error_missing_field: 'Please fill in all required fields',
+    field_required: 'Required',
     // Permission panel (8 allow_* flags; only SELECT / EXPLAIN are effective in 2.0.0)
     policy_title: 'Operation permissions',
     policy_hint:
