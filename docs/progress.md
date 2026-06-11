@@ -17,6 +17,14 @@
 
 ---
 
+## Wave 4B(Part B 前端收口)
+
+| 任务 | 负责 | 依赖 | 状态 | PR |
+|---|---|---|---|---|
+| 登录第二因子 + §6 账户安全页 + §9 AI 配置页 + force-logout 按钮(i18n 双语 / QR 库 qrcode / Playwright 无后端渲染 11 用例绿) | Claude Opus 4.8 | Wave 4A 三 PR 合并 | PR 待审(draft;真后端走查待人工) | (待填) |
+
+---
+
 ## Wave 3(收口)
 
 | 任务 | 负责 | 依赖 | 状态 | PR |

@@ -2,6 +2,7 @@
 import { storeToRefs } from 'pinia'
 import { useThemeStore } from './stores/theme'
 import VariantSwitcher from './components/VariantSwitcher.vue'
+import ToastHost from './components/ToastHost.vue'
 
 const themeStore = useThemeStore()
 const { variant } = storeToRefs(themeStore)
@@ -24,5 +25,6 @@ function onUpdate(v: typeof variant.value): void {
     <div class="flex-1 min-h-0 flex">
       <RouterView />
     </div>
+    <ToastHost />
   </div>
 </template>
