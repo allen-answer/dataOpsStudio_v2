@@ -38,6 +38,12 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("GET", "/api/jobs/{job_id}") in routes
     assert ("GET", "/api/jobs/{job_id}/result") in routes
     assert ("POST", "/api/jobs/{job_id}/cancel") in routes
+    assert ("GET", "/api/account/security") in routes
+    assert ("POST", "/api/account/password") in routes
+    assert ("POST", "/api/account/mfa/enroll") in routes
+    assert ("POST", "/api/account/mfa/verify") in routes
+    assert ("POST", "/api/account/mfa/disable") in routes
+    assert ("POST", "/api/account/recovery-codes/regenerate") in routes
 
 
 def test_list_datasources_filters_by_authz_and_hides_secret_fields() -> None:

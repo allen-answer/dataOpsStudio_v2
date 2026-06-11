@@ -18,6 +18,34 @@
 
 ---
 
+### **可选,与手写 JWT 同类** — 手写 TOTP(RFC 6238)→ pyotp
+
+**位置**:`app/infrastructure/secretstore/totp.py`
+
+**现状**:Wave 4A PR-2 手实现 TOTP(SHA1 / 30s / 6 位 / ±1 窗口,`hmac.compare_digest`
+时序安全,实现核对无误)。不引 pyotp 的理由见 PR #40:范围内零依赖变更 +
+hashlib/hmac 留在 secretstore 红线内。
+
+**为什么记录**:与上一条手写 JWT 同性质的 audit smell。安全审计点名时与 JWT 一并换
+(pyotp + pyjwt 同一个 PR 处理)。
+
+**优先级**:低,可选。
+
+---
+
+### **GA 前安全加固** — TOTP 同窗口重放未防
+
+**位置**:`app/infrastructure/secretstore/totp.py:verify_totp_code` + 登录/验证调用方
+
+**现状**:同一个 6 位 code 在其 30s(±1 窗口)有效期内可重复通过校验——标准 TOTP
+实现通常记录"最后已用 counter"(per user),拒绝重放。
+
+**修法**:users 表或缓存记 last_used_totp_counter,verify 通过后推进,小于等于则拒。
+
+**触发条件**:GA 前安全评审,或 MFA 正式对外宣传前。**优先级**:中。
+
+---
+
 ### **F2 正解** — Worker 独立心跳线程(取消 OLAP 取舍)
 
 **位置**:`app/worker.py:WorkerRunner`
@@ -104,17 +132,17 @@ PostgreSQL / Oracle / DB2 数据源跑 SQL 仍直接 `UnsupportedDbTypeError`。
 
 ---
 
-### **Part B 剩余后端页需要** — MFA / AI 配置缺后端
+### **Part B 剩余后端页需要** — AI 配置缺后端
 
-**位置**:`app/api/routes/`、`app/db/models.py`、`app/infrastructure/secretstore/`、`app/services/ai/`
+**位置**:`app/api/routes/`、`app/db/models.py`、`app/services/ai/`
 
 **现状**:T5 已落地 license/admin 基础路由;Wave 4A PR-1 收口 `revoked_tokens` + admin
-force-logout。剩余缺口是 §6 账户安全 MFA / 改密(account 端点 + recovery codes)与
-§9 AI 配置(`ai_configs` + Gateway DB 配置)。
+force-logout。Wave 4A PR-2 收口 §6 账户安全 MFA / 改密(account 端点 + recovery
+codes)。剩余缺口是 §9 AI 配置(`ai_configs` + Gateway DB 配置)。
 
-**卡住的前端**:§6 账户安全页、§9 AI 配置页。
+**卡住的前端**:§9 AI 配置页。
 
-**触发条件**:Wave 4A PR-1 review 后按序做 PR-2(MFA) / PR-3(AI 配置)。
+**触发条件**:Wave 4A PR-2 review 后做 PR-3(AI 配置)。
 **优先级**:中(GA 前必有,但排在 Part A 收口之后)。
 
 ---

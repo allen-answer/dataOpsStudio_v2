@@ -1,4 +1,4 @@
-"""SQLAlchemy 2 Core 元数据 —— 10 张表(契约 §5、设计稿 §5.1)。
+"""SQLAlchemy 2 Core 元数据 —— 12 张表(契约 §5、设计稿 §5.1)。
 
 ★ R4 红线 DB 层防御(secret_refs CHECK):
   kind 限定为 Application Secret 6 种,Bootstrap kind(master_key /
@@ -73,6 +73,7 @@ users = Table(
     Column("password_hash", String(255), nullable=False),
     # ★ NO FK on secret refs(跨存储,KMS 实现下不在 PG)
     Column("mfa_secret_ref", String(64), nullable=True),
+    Column("mfa_pending_secret_ref", String(64), nullable=True),
     Column("role", String(32), nullable=False, server_default="viewer"),
     Column("tokens_revoked_after", DateTime(timezone=True), nullable=True),
     Column(
@@ -87,6 +88,27 @@ users = Table(
         nullable=False,
         server_default=text("now()"),
     ),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mfa_recovery_codes —— 一次性恢复码 bcrypt hash
+# ─────────────────────────────────────────────────────────────────────────────
+mfa_recovery_codes = Table(
+    "mfa_recovery_codes",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column(
+        "user_id",
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("code_hash", String(255), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("used_at", DateTime(timezone=True), nullable=True),
+    Index("ix_mfa_recovery_codes_user_id", "user_id"),
+    Index("ix_mfa_recovery_codes_unused", "user_id", "used_at"),
 )
 
 
@@ -401,6 +423,7 @@ __all__ = [
     "jobs",
     "license_state",
     "metadata",
+    "mfa_recovery_codes",
     "project_members",
     "projects",
     "result_sets",

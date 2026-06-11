@@ -36,10 +36,12 @@ from app.db.models import (
     datasources,
     jobs,
     license_state,
+    mfa_recovery_codes,
     project_members,
     projects,
     users,
 )
+from app.domain.secret import SecretKind, SecretRef
 from app.infrastructure.license import read_license_limits, verify_license
 
 router = APIRouter(prefix="/admin")
@@ -190,9 +192,21 @@ def disable_admin_user_mfa(user_id: str, request: Request) -> AdminUserItem:
     actor = _require_admin(request)
     services = services_from(request)
     with services.engine.begin() as conn:
-        _require_user(conn, user_id)
-        conn.execute(update(users).where(users.c.id == user_id).values(mfa_secret_ref=None))
+        existing = _require_user(conn, user_id)
+        mfa_ref = _optional_str(existing["mfa_secret_ref"])
+        pending_ref = _optional_str(existing["mfa_pending_secret_ref"])
+        conn.execute(delete(mfa_recovery_codes).where(mfa_recovery_codes.c.user_id == user_id))
+        conn.execute(
+            update(users)
+            .where(users.c.id == user_id)
+            .values(mfa_secret_ref=None, mfa_pending_secret_ref=None)
+        )
         row = _user_row(conn, user_id)
+    for ref_value in [mfa_ref, pending_ref]:
+        if ref_value is not None:
+            services.secret_store.delete_secret(
+                SecretRef(ref=ref_value, kind=SecretKind.MFA_TOTP_SEED)
+            )
     _audit_admin(
         services,
         request,
@@ -459,6 +473,7 @@ def _user_row(conn: Connection, user_id: str) -> RowMapping:
                 users.c.username,
                 users.c.role,
                 users.c.mfa_secret_ref,
+                users.c.mfa_pending_secret_ref,
                 users.c.created_at,
             ).where(users.c.id == user_id)
         )

@@ -16,6 +16,7 @@ from app.db.models import (
     jobs,
     license_state,
     metadata,
+    mfa_recovery_codes,
     result_sets,
     revoked_tokens,
     secret_refs,
@@ -67,9 +68,10 @@ def test_all_alembic_revision_ids_under_32_chars() -> None:
     assert not violations, f"revision ID 超 32 字符: {violations}"
 
 
-def test_metadata_has_11_tables() -> None:
+def test_metadata_has_12_tables() -> None:
     expected = {
         "users",
+        "mfa_recovery_codes",
         "revoked_tokens",
         "projects",
         "project_members",
@@ -94,6 +96,18 @@ def test_revoked_tokens_schema_supports_jti_denylist_and_user_cutoff() -> None:
     assert revoked_tokens.columns["jti"].primary_key is True
     assert "ix_revoked_tokens_user_id" in index_names
     assert "ix_revoked_tokens_expires_at" in index_names
+
+
+def test_mfa_recovery_codes_schema_supports_one_time_codes() -> None:
+    user_cols = set(users.columns.keys())
+    code_cols = set(mfa_recovery_codes.columns.keys())
+    index_names = {idx.name for idx in mfa_recovery_codes.indexes}
+
+    assert "mfa_pending_secret_ref" in user_cols
+    assert code_cols == {"id", "user_id", "code_hash", "created_at", "used_at"}
+    assert mfa_recovery_codes.columns["code_hash"].nullable is False
+    assert "ix_mfa_recovery_codes_user_id" in index_names
+    assert "ix_mfa_recovery_codes_unused" in index_names
 
 
 def test_r6_result_sets_has_no_cursor_field() -> None:
@@ -129,6 +143,7 @@ def test_secret_ref_columns_have_no_foreign_key() -> None:
     """secret_ref 字段全部无 FK —— KMS 跨存储引用,加 FK 会让 KMS 实现违反约束。"""
     cases = [
         (users, "mfa_secret_ref"),
+        (users, "mfa_pending_secret_ref"),
         (datasources, "password_secret_ref"),
         (secret_refs, "ref"),  # PK 本身,自然无 FK
         (secret_refs, "created_by"),  # 跨存储 user_id 引用

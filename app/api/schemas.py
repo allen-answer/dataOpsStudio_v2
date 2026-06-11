@@ -13,6 +13,7 @@ from app.domain.schema import Column
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1)
     password: str = Field(min_length=1)
+    mfa_code: str | None = Field(default=None, min_length=1)
 
 
 class TokenResponse(BaseModel):
@@ -176,6 +177,51 @@ class LicenseStatusResponse(BaseModel):
 
 class LicenseUploadRequest(BaseModel):
     license_text: str = Field(min_length=1)
+
+
+class AccountSecurityStatusResponse(BaseModel):
+    mfa_enabled: bool
+    recovery_codes_total: int = 0
+    recovery_codes_used: int = 0
+
+
+class AccountPasswordChangeRequest(BaseModel):
+    old_password: str = Field(min_length=1)
+    new_password: str = Field(min_length=1)
+
+
+class AccountPasswordChangeResponse(BaseModel):
+    changed: bool
+
+
+class MfaEnrollResponse(BaseModel):
+    secret: str
+    otpauth_uri: str
+
+
+class MfaVerifyRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=64)
+
+
+class MfaVerifyResponse(BaseModel):
+    enabled: bool
+    recovery_codes: list[str] = Field(default_factory=list)
+
+
+class MfaDisableRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6)
+
+
+class MfaDisableResponse(BaseModel):
+    enabled: bool = False
+
+
+class RecoveryCodesRegenerateRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6)
+
+
+class RecoveryCodesResponse(BaseModel):
+    recovery_codes: list[str] = Field(default_factory=list)
 
 
 class AdminUserItem(BaseModel):
