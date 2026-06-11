@@ -10,7 +10,7 @@ from app.dbclients.dm_types import (
     data_type_string_to_column_type,
     type_code_to_column_type,
 )
-from app.dbclients.protocol import DatabaseAdapter
+from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.capabilities import AdapterCapabilities
 from app.domain.datasource import DatasourceConnInfo, DbType
@@ -280,6 +280,9 @@ class DMAdapter(DatabaseAdapter):
         started_at = time.monotonic()
         try:
             conn = self._connect()
+        except Exception:
+            raise AdapterConnectionError("adapter connection failed") from None
+        try:
             self._apply_statement_timeout(conn)
             # DM 流式读:普通 cursor + fetchmany(不是 MySQL SSCursor),V1_AS_IS §2.7
             cursor = conn.cursor()

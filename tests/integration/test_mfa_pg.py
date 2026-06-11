@@ -7,12 +7,12 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, insert
+from sqlalchemy import create_engine, insert, select
 from sqlalchemy.engine import Engine
 
 from app.api.app import create_app
 from app.api.services import ApiServices, RateLimiter
-from app.db.models import metadata, users
+from app.db.models import metadata, secret_refs, users
 from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
@@ -93,6 +93,21 @@ def test_mfa_password_and_recovery_flow_on_pg(
     assert enroll_response.status_code == 200
     enroll_payload = enroll_response.json()
     assert enroll_payload["otpauth_uri"].startswith("otpauth://totp/")
+    with engine.connect() as conn:
+        old_pending_ref = conn.execute(
+            select(users.c.mfa_pending_secret_ref).where(users.c.id == user_id)
+        ).scalar_one()
+    assert isinstance(old_pending_ref, str)
+
+    enroll_response = client.post("/api/account/mfa/enroll", headers=headers)
+    assert enroll_response.status_code == 200
+    enroll_payload = enroll_response.json()
+    with engine.connect() as conn:
+        old_pending_row = conn.execute(
+            select(secret_refs.c.ref).where(secret_refs.c.ref == old_pending_ref)
+        ).one_or_none()
+    assert old_pending_row is None
+
     secret = enroll_payload["secret"]
     base_time = int(time.time())
     monkeypatch.setattr("app.infrastructure.secretstore.totp.time.time", lambda: base_time)

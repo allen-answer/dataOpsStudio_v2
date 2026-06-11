@@ -10,7 +10,7 @@ from app.dbclients.mysql_types import (
     column_type_string_to_column_type,
     field_type_to_column_type,
 )
-from app.dbclients.protocol import DatabaseAdapter
+from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.capabilities import AdapterCapabilities
 from app.domain.datasource import DatasourceConnInfo, DbType
@@ -246,6 +246,9 @@ class MySQLAdapter(DatabaseAdapter):
         started_at = time.monotonic()
         try:
             conn = self._connect()
+        except Exception:
+            raise AdapterConnectionError("adapter connection failed") from None
+        try:
             self._apply_statement_timeout(conn)
             cursor = conn.cursor(self._sscursor_class())
             cursor.execute(sql, params or None)

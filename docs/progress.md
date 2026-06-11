@@ -12,8 +12,8 @@
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
 | Wave 5A PR-1 battle-tested crypto 替换(PyJWT + pyotp) | Codex | — | **已合并** | [#49](https://github.com/allen-answer/dataOpsStudio_v2/pull/49) |
-| Wave 5A PR-2 TOTP 同窗重放防护 | Codex | PR-1 review(已解锁) | PR 待审 | [#50](https://github.com/allen-answer/dataOpsStudio_v2/pull/50) |
-| Wave 5A PR-3 错误码细分 + 残留小项 | Codex | PR-2 review | 未开工 | — |
+| Wave 5A PR-2 TOTP 同窗重放防护 | Codex | PR-1 review(已解锁) | **已合并** | [#50](https://github.com/allen-answer/dataOpsStudio_v2/pull/50) |
+| Wave 5A PR-3 错误码细分 + 残留小项 | Codex | PR-2 review(已解锁) | PR 待审 | [#51](https://github.com/allen-answer/dataOpsStudio_v2/pull/51) |
 | Wave 5B GA 前端收口 —— darkMode 键失配修复(`[data-theme]`→`[data-mode]`)+ UX nit 包(SQL 结果 scrollIntoView / inline 必填校验 / 按钮 in-flight disable / 真会话过期主动登出) | Claude Opus 4.8 | — | PR 待审 | [#48](https://github.com/allen-answer/dataOpsStudio_v2/pull/48) |
 | DM 真实例集成验证(backlog 高优先级,Certified 宣称前必做) | review agent + 人 | 需持牌 DM 实例 | 受阻(等 DM 实例) | — |
 

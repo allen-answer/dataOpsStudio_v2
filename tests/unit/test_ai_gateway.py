@@ -142,12 +142,27 @@ def test_build_gateway_disabled_by_default() -> None:
 
 
 def test_build_gateway_falls_back_to_mock_without_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    warnings: list[dict[str, object]] = []
+
+    class _Log:
+        def warning(self, event: str, **kwargs: object) -> None:
+            warnings.append({"event": event, **kwargs})
+
     monkeypatch.delenv(AI_API_KEY_ENV, raising=False)
+    monkeypatch.setattr("app.services.ai.default_gateway._log", _Log())
     cfg = AiGatewayConfig(enabled=True, provider="openai_compatible", endpoint="https://x.invalid")
     gw = build_gateway(cfg)
     # 无 key → 回落 mock,complete 可跑通(不报缺 key)
     resp = gw.complete("hi", AiContext(), AiOptions(purpose="test"))
     assert resp.provider == "mock"
+    assert warnings == [
+        {
+            "event": "ai gateway falling back to mock provider",
+            "provider": "openai_compatible",
+            "has_endpoint": True,
+            "has_api_key": False,
+        }
+    ]
 
 
 def test_build_gateway_uses_openai_with_env_key(monkeypatch: pytest.MonkeyPatch) -> None:
