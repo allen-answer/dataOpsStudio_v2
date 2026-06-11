@@ -7,7 +7,11 @@ import type { Config } from 'tailwindcss'
  */
 export default {
   content: ['./index.html', './src/**/*.{vue,ts}'],
-  darkMode: ['selector', '[data-theme="dark"]'],
+  // ★ Wave 5B 修复:应用实际只在根节点落 [data-variant=...](四变体),
+  // mode 锁在 variant 里;App.vue 同步派生 [data-mode="dark"|"light"]。
+  // 旧值 [data-theme="dark"] 从未在 DOM 出现 → 全仓 `dark:` 前缀类一直失效。
+  // 改用 [data-mode="dark"](解耦 variant 名:spotify-dark / figma-dark 两套深色生效)。
+  darkMode: ['selector', '[data-mode="dark"]'],
   theme: {
     extend: {
       fontFamily: {

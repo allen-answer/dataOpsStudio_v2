@@ -135,6 +135,48 @@ const form = reactive<FormState>({
 const formError = ref<string | null>(null)
 const policyOpen = ref(false) // 权限折叠面板默认收起
 
+// ─── inline 必填校验 ───────────────────────────────────────
+// 提交时静默无反应是 UX 走查 nit:点提交后缺失字段要逐项红框 + 行内提示。
+// 校验在提交时跑一次(submitAttempted 置位);此后用户修字段实时清错。
+type RequiredField = 'name' | 'host' | 'username' | 'database' | 'password'
+const fieldErrors = reactive<Record<RequiredField, boolean>>({
+  name: false,
+  host: false,
+  username: false,
+  database: false,
+  password: false,
+})
+const submitAttempted = ref(false)
+
+function isFieldMissing(f: RequiredField): boolean {
+  // 编辑态密码可留空(= 不改);新建态密码必填。
+  if (f === 'password') return !isEditing.value && !form.password
+  return !String(form[f]).trim()
+}
+
+function validateRequired(): boolean {
+  let ok = true
+  for (const f of ['name', 'host', 'username', 'database', 'password'] as RequiredField[]) {
+    const missing = isFieldMissing(f)
+    fieldErrors[f] = missing
+    if (missing) ok = false
+  }
+  return ok
+}
+
+function clearFieldErrors(): void {
+  for (const k of Object.keys(fieldErrors) as RequiredField[]) fieldErrors[k] = false
+  submitAttempted.value = false
+}
+
+// 提交尝试后,用户改动字段时实时清掉对应字段的红框。
+watch(
+  () => [form.name, form.host, form.username, form.database, form.password],
+  () => {
+    if (submitAttempted.value) validateRequired()
+  },
+)
+
 // ─── 8 个 allow_* 开关(顺序 + 文案 + 生效标 按 PRD §3 权限面板)──
 // 2.0.0 仅 SELECT / EXPLAIN 真生效;其余开关旁标 "2.1+"。
 interface PolicyToggle {
@@ -192,6 +234,7 @@ function resetForm(): void {
   formError.value = null
   prodArmed.value = false
   policyOpen.value = false
+  clearFieldErrors()
 }
 
 function openModal(): void {
@@ -286,15 +329,9 @@ const submitting = computed(
 async function onSubmit(): Promise<void> {
   formError.value = null
   if (editLoading.value) return
-  // 编辑时密码可留空(= 不改);新建时密码必填。
-  const passwordRequired = !isEditing.value
-  if (
-    !form.name.trim() ||
-    !form.host.trim() ||
-    !form.username.trim() ||
-    !form.database.trim() ||
-    (passwordRequired && !form.password)
-  ) {
+  // inline 必填校验:逐项红框 + 行内提示(不再只一句话静默)。
+  submitAttempted.value = true
+  if (!validateRequired()) {
     formError.value = t('datasources.error_missing_field')
     return
   }
@@ -342,6 +379,8 @@ const deleteMutation = useMutation({
 async function onConfirmDelete(): Promise<void> {
   const ds = deleteTarget.value
   if (!ds) return
+  // 防 in-flight 双发(#33:快速双击在 isPending 反应式更新前发两次 DELETE)。
+  if (deleteMutation.isPending.value) return
   deleteError.value = null
   deleteBlocked.value = null
   try {
@@ -659,10 +698,14 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
             v-model="form.name"
             type="text"
             class="chrome-input w-full"
+            :class="{ 'field-invalid': fieldErrors.name }"
             :placeholder="t('datasources.field_name_placeholder')"
             :disabled="submitting"
             autocomplete="off"
           />
+          <p v-if="fieldErrors.name" class="field-error-text">
+            {{ t('datasources.field_required') }}
+          </p>
         </div>
 
         <!-- DB type + 环境 -->
@@ -699,10 +742,14 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
               v-model="form.host"
               type="text"
               class="chrome-input w-full"
+              :class="{ 'field-invalid': fieldErrors.host }"
               :placeholder="t('datasources.field_host_placeholder')"
               :disabled="submitting"
               autocomplete="off"
             />
+            <p v-if="fieldErrors.host" class="field-error-text">
+              {{ t('datasources.field_required') }}
+            </p>
           </div>
           <div class="space-y-1.5">
             <label class="form-label">{{ t('datasources.field_port') }}</label>
@@ -724,9 +771,13 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
             v-model="form.username"
             type="text"
             class="chrome-input w-full"
+            :class="{ 'field-invalid': fieldErrors.username }"
             :disabled="submitting"
             autocomplete="off"
           />
+          <p v-if="fieldErrors.username" class="field-error-text">
+            {{ t('datasources.field_required') }}
+          </p>
         </div>
 
         <!-- 数据库名 -->
@@ -736,10 +787,14 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
             v-model="form.database"
             type="text"
             class="chrome-input w-full"
+            :class="{ 'field-invalid': fieldErrors.database }"
             :placeholder="t('datasources.field_database_placeholder')"
             :disabled="submitting"
             autocomplete="off"
           />
+          <p v-if="fieldErrors.database" class="field-error-text">
+            {{ t('datasources.field_required') }}
+          </p>
         </div>
 
         <!-- 密码(编辑时留空 = 不改)-->
@@ -749,6 +804,7 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
             v-model="form.password"
             type="password"
             class="chrome-input w-full"
+            :class="{ 'field-invalid': fieldErrors.password }"
             :placeholder="
               isEditing
                 ? t('datasources.field_password_edit_placeholder')
@@ -757,6 +813,9 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
             :disabled="submitting"
             autocomplete="new-password"
           />
+          <p v-if="fieldErrors.password" class="field-error-text">
+            {{ t('datasources.field_required') }}
+          </p>
         </div>
 
         <!-- prod 二次确认警示(选 prod 时常驻;arm 后文案升级)-->
@@ -943,5 +1002,14 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
 .form-label {
   @apply block text-xs uppercase tracking-wider font-medium;
   color: rgb(var(--text-muted));
+}
+/* inline 必填校验:红框 + 红色行内提示(沿用现有 red-500 错误调性)*/
+.field-invalid {
+  border-color: rgb(239 68 68) !important;
+  box-shadow: 0 0 0 3px rgb(239 68 68 / 0.16) !important;
+}
+.field-error-text {
+  @apply text-xs;
+  color: rgb(239 68 68);
 }
 </style>

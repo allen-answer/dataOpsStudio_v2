@@ -18,6 +18,32 @@ export function setUnauthenticatedHandler(fn: () => void): void {
 }
 
 /**
+ * 真会话失效的 401 错误码(后端 auth 中间件 / 依赖:app/api/dependencies.py +
+ * middleware/crosscutting.py 均返 error="unauthorized")。
+ * skipAuthRedirect 端点(改密 / 关 MFA / 重生成恢复码 / 登录二步)的业务 401
+ * 是 invalid_password / invalid_mfa_code / mfa_required / invalid_credentials,
+ * 不在此集合 —— 那些不踢下线。
+ */
+const SESSION_EXPIRED_CODES = new Set(['unauthorized', 'unauthenticated'])
+
+/**
+ * isSessionExpired:skipAuthRedirect 调用方在 catch 里判断「这个 401 到底是
+ * 真会话过期还是业务校验失败」。真过期 → 调 triggerUnauthenticated() 主动登出,
+ * 而非落通用错误文案(#42 review nit)。
+ */
+export function isSessionExpired(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 401 && SESSION_EXPIRED_CODES.has(err.code ?? '')
+}
+
+/**
+ * triggerUnauthenticated:手动触发全局 logout + 跳 /login,与 request() 内
+ * 非 skipAuthRedirect 路径走同一回调(router/guards.ts 注册)。
+ */
+export function triggerUnauthenticated(): void {
+  onUnauthenticated()
+}
+
+/**
  * getToken:每次请求时由 auth store 提供。在 main.ts 启动时注入。
  */
 let getToken: () => string | null = () => null

@@ -36,6 +36,7 @@ import {
   disableMfa,
   regenerateRecoveryCodes,
 } from '../api/account'
+import { isSessionExpired, triggerUnauthenticated } from '../api/client'
 import { ApiError, type AccountSecurityStatus } from '../api/types'
 import LoadingDots from '../components/LoadingDots.vue'
 import Modal from '../components/Modal.vue'
@@ -102,6 +103,11 @@ async function submitPassword(): Promise<void> {
   try {
     await pwMutation.mutateAsync()
   } catch (e) {
+    // skipAuthRedirect 端点:真会话过期(error=unauthorized)主动登出,不落业务文案。
+    if (isSessionExpired(e)) {
+      triggerUnauthenticated()
+      return
+    }
     if (e instanceof ApiError && e.code === 'invalid_password') {
       pwError.value = t('account.pw_invalid_old')
     } else {
@@ -158,6 +164,10 @@ async function submitVerify(): Promise<void> {
   try {
     await verifyMutation.mutateAsync()
   } catch (e) {
+    if (isSessionExpired(e)) {
+      triggerUnauthenticated()
+      return
+    }
     if (e instanceof ApiError && e.code === 'invalid_mfa_code') {
       enrollError.value = t('account.mfa_invalid_code')
     } else {
@@ -202,6 +212,10 @@ async function submitDisable(): Promise<void> {
   try {
     await disableMutation.mutateAsync()
   } catch (e) {
+    if (isSessionExpired(e)) {
+      triggerUnauthenticated()
+      return
+    }
     if (e instanceof ApiError && e.code === 'invalid_mfa_code') {
       disableError.value = t('account.mfa_invalid_code')
     } else {
@@ -246,6 +260,10 @@ async function submitRegen(): Promise<void> {
   try {
     await regenMutation.mutateAsync()
   } catch (e) {
+    if (isSessionExpired(e)) {
+      triggerUnauthenticated()
+      return
+    }
     if (e instanceof ApiError && e.code === 'invalid_mfa_code') {
       regenError.value = t('account.mfa_invalid_code')
     } else {
