@@ -188,6 +188,17 @@ class _Services:
     def current_license_mode(self) -> LicenseMode:
         return LicenseMode.TRIAL
 
+    def is_token_revoked(
+        self,
+        *,
+        user_id: str,
+        issued_at: int,
+        expires_at: int,
+        jti: str | None,
+    ) -> bool:
+        del user_id, issued_at, expires_at, jti
+        return False
+
     def write_audit(self, **kwargs: object) -> None:
         self.audits.append(kwargs)
 

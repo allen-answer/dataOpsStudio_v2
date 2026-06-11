@@ -83,15 +83,72 @@ def test_admin_delete_user_returns_owned_projects_409() -> None:
     assert payload["owned_projects"][0]["id"] == "project-1"
 
 
+def test_admin_force_logout_sets_user_cutoff_and_audits() -> None:
+    revoked_after = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    services = _AdminServices(
+        _QueueEngine(
+            [
+                [
+                    {
+                        "id": "user-1",
+                        "username": "target",
+                        "role": "viewer",
+                        "mfa_secret_ref": None,
+                        "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+                    }
+                ]
+            ]
+        ),
+        revoked_after=revoked_after,
+    )
+    app = create_app(services=cast(ApiServices, services))
+    token = create_access_token(user_id="admin-1", role="admin", secret=services.jwt_secret)
+
+    response = AsgiClient(app).post(
+        "/api/admin/users/user-1/force-logout",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "user_id": "user-1",
+        "revoked_after": "2026-01-01T12:00:00Z",
+    }
+    assert services.revoked_users == ["user-1"]
+    assert any(item["action"] == "admin_user_force_logout" for item in services.audits)
+
+
 class _AdminServices:
-    def __init__(self, engine: object) -> None:
+    def __init__(
+        self,
+        engine: object,
+        *,
+        revoked_after: datetime | None = None,
+    ) -> None:
         self.jwt_secret = "jwt-secret"
         self.rate_limiter = _RateLimiter()
         self.engine = engine
         self.audits: list[dict[str, object]] = []
+        self.revoked_after = revoked_after or datetime(2026, 1, 1, tzinfo=UTC)
+        self.revoked_users: list[str] = []
 
     def current_license_mode(self) -> LicenseMode:
         return LicenseMode.TRIAL
+
+    def is_token_revoked(
+        self,
+        *,
+        user_id: str,
+        issued_at: int,
+        expires_at: int,
+        jti: str | None,
+    ) -> bool:
+        del user_id, issued_at, expires_at, jti
+        return False
+
+    def revoke_user_tokens(self, *, user_id: str) -> datetime:
+        self.revoked_users.append(user_id)
+        return self.revoked_after
 
     def write_audit(self, **kwargs: object) -> None:
         self.audits.append(kwargs)
