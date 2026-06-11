@@ -1,0 +1,239 @@
+# DataOpsStudio 2.0 — on-prem Docker stack (contract §5 acceptance form).
+#
+# Brings up the same flow the portable launcher does, but as three long-lived
+# services (pg + api + worker) plus two short-lived init services
+# (secrets-init, migrate). This satisfies the §5 acceptance line:
+#   "docker compose(api+worker+pg)跑通同样流程".
+#
+# ─── Isolation (mirrors docker/dev-pg.yml conventions, independent names) ─────
+# - project name:    dataops-v2-stack
+# - container names: dataops-v2-stack-*
+# - volumes:         dataops-v2-stack-*
+# - all published ports are 127.0.0.1 loopback only
+# - API published on 127.0.0.1:18020 (avoids 5432/8000/8010/8020/15432/16432
+#   already occupied on daily-server). PG is NOT published — only reachable on
+#   the internal compose network.
+#
+# ─── Secrets (R8: no plaintext password in any config file) ───────────────────
+# Bootstrap secrets are GENERATED AT RUNTIME by `secrets-init` into the shared
+# `config` volume and never live in git. The app processes (api/worker/migrate)
+# read them through LocalFileBootstrapSecrets, which enforces 0600 on Unix, so
+# those files are written 0600 owned by the app uid (10001).
+#
+# PostgreSQL runs as its own image uid. To stay image-uid-agnostic (alpine=70,
+# debian=999) without running pg as a custom user — which breaks its socket /
+# initdb ownership assumptions — `secrets-init` writes a SEPARATE pg-readable
+# copy of the app password into the `pgpw` volume, mounted read-only into pg.
+# This mirrors the dev-pg.yml pattern, where the docker `secrets:` file is
+# likewise readable to the postgres user inside the (already isolated) container.
+# Both files are runtime-generated, internal-volume only, never committed.
+# No secret value is ever interpolated into this YAML.
+#
+# ─── Migration placement (design trade-off) ───────────────────────────────────
+# Migrations run in a dedicated short-lived `migrate` service, NOT in the api
+# entrypoint. Rationale:
+#   - api + worker may both start; running `alembic upgrade head` from a single
+#     ordered init service avoids two processes racing the same DDL.
+#   - api/worker stay single-responsibility (no migrate side effect on every
+#     restart / scale-up).
+#   - ordering: secrets-init → pg healthy → migrate → api+worker.
+#
+# Usage (full walkthrough: docs/deployment/docker-compose.md):
+#   docker compose -f docker/compose.dataops.yml up -d --build
+#   docker compose -f docker/compose.dataops.yml run --rm admin-create \
+#     --username admin --password '...' --project-name Default
+
+name: dataops-v2-stack
+
+x-app-image: &app-image
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: dataops-studio:2.0
+
+# Shared env for every app process. Points the launcher/app at the runtime root
+# inside the shared config + data volumes. No secret values here — only paths.
+x-app-env: &app-env
+  DATAOPS_FORM: onprem_docker
+  DATAOPS_JOB_BACKEND: postgres
+  # Bootstrap secret file paths (read by LocalFileBootstrapSecrets).
+  DATAOPS_BOOTSTRAP_MASTER_KEY_FILE: /runtime/config/.secret_master.key
+  DATAOPS_BOOTSTRAP_PG_APP_PASSWORD_FILE: /runtime/config/secrets/pg_app_password
+  DATAOPS_BOOTSTRAP_PG_SUPERUSER_PASSWORD_FILE: /runtime/config/secrets/pg_superuser_password
+  DATAOPS_BOOTSTRAP_JWT_SECRET_FILE: /runtime/config/secrets/jwt_secret
+  DATAOPS_BOOTSTRAP_LICENSE_FILE: /runtime/config/license.lic
+  # Metadata PG: reach the in-network `pg` service. App reads the password from
+  # the bootstrap file above; only host/port/user/db are non-secret env.
+  DATAOPS_PG_HOST: pg
+  DATAOPS_PG_PORT: "5432"
+  DATAOPS_PG_USER: dataops
+  DATAOPS_PG_DATABASE: dataops
+  # ResultStore spool lives in the shared data volume.
+  DATAOPS_RESULT_LOCAL_ROOT: /runtime/data/results
+  # API binds all interfaces *inside* the container; only mapped to loopback host.
+  DATAOPS_API_HOST: 0.0.0.0
+  DATAOPS_API_PORT: "8020"
+
+services:
+  # ── 1. Generate bootstrap secrets once into the shared config volume ────────
+  # Runs as root only to lay down ownership/0600 and pre-own the pgdata volume,
+  # then exits. Idempotent: skips generation if secrets already exist.
+  secrets-init:
+    <<: *app-image
+    container_name: dataops-v2-stack-secrets-init
+    user: "0:0"
+    environment:
+      <<: *app-env
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        # Runtime dirs owned by the app uid; secrets dir 0700.
+        # /runtime itself is on the container layer; make it traversable + let
+        # 10001 create logs/ (bootstrap init calls _ensure_runtime_dirs).
+        install -d -o 10001 -g 10001 -m 755 /runtime
+        install -d -o 10001 -g 10001 -m 700 /runtime/config
+        install -d -o 10001 -g 10001 -m 700 /runtime/config/secrets
+        install -d -o 10001 -g 10001 -m 755 /runtime/data
+        install -d -o 10001 -g 10001 -m 755 /runtime/logs
+        if [ ! -f /runtime/config/secrets/pg_app_password ]; then
+          setpriv --reuid 10001 --regid 10001 --clear-groups -- \
+            python -m app.launcher --root /runtime bootstrap init
+        else
+          echo "bootstrap secrets already present; keeping them"
+        fi
+        # pg-readable copy of the app password (image-uid-agnostic, internal
+        # volume only). 0644 matches the dev-pg.yml docker-secret readability.
+        install -m 644 /runtime/config/secrets/pg_app_password /pgpw/pg_app_password
+        echo "secrets-init complete"
+    volumes:
+      - config:/runtime/config
+      - data:/runtime/data
+      - pgpw:/pgpw
+    restart: "no"
+
+  # ── 2. Metadata PostgreSQL (official image, internal network only) ──────────
+  # Runs as the default postgres image user; reads the pg-readable password copy.
+  pg:
+    image: postgres:16-alpine
+    container_name: dataops-v2-stack-pg
+    depends_on:
+      secrets-init:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_USER: dataops
+      POSTGRES_DB: dataops
+      POSTGRES_PASSWORD_FILE: /run/pgpw/pg_app_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - pgpw:/run/pgpw:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dataops -d dataops"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # ── 3. Run migrations once, before api/worker accept work ───────────────────
+  # alembic runs directly from the locked venv (the runtime image has no uv, so
+  # the launcher's `uv run alembic` path is not used here). The app PG password
+  # is read from the 0600 bootstrap file the migrate container owns (uid 10001)
+  # and exported as PGPASSWORD — same pattern as the dev Makefile. No password is
+  # written into any file or this YAML.
+  migrate:
+    <<: *app-image
+    container_name: dataops-v2-stack-migrate
+    depends_on:
+      pg:
+        condition: service_healthy
+    environment:
+      <<: *app-env
+      # libpq reads these; DATAOPS_DATABASE_URL carries no password.
+      PGHOST: pg
+      PGPORT: "5432"
+      PGUSER: dataops
+      DATAOPS_DATABASE_URL: postgresql+psycopg://dataops@pg:5432/dataops
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        # $$ escapes compose interpolation; the runtime shell sees a single $.
+        export PGPASSWORD="$$(cat /runtime/config/secrets/pg_app_password)"
+        alembic upgrade head
+        echo "alembic upgrade head complete"
+    volumes:
+      - config:/runtime/config
+      - data:/runtime/data
+    restart: "no"
+
+  # ── 4. API ──────────────────────────────────────────────────────────────────
+  api:
+    <<: *app-image
+    container_name: dataops-v2-stack-api
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-env
+    command: ["python", "-m", "app.main"]
+    ports:
+      - "127.0.0.1:18020:8020"
+    volumes:
+      - config:/runtime/config
+      - data:/runtime/data
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8020/healthz').status==200 else 1)\""
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── 5. Worker ─────────────────────────────────────────────────────────────--
+  worker:
+    <<: *app-image
+    container_name: dataops-v2-stack-worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-env
+      DATAOPS_WORKER_WORKER_ID: worker-1
+    command: ["python", "-m", "app.worker"]
+    volumes:
+      - config:/runtime/config
+      - data:/runtime/data
+    # SIGTERM → graceful drain (app/worker.py). Give long queries time on stop.
+    stop_grace_period: 120s
+    restart: unless-stopped
+
+  # ── 6. One-off admin bootstrap (run manually with `compose run --rm`) ───────
+  # Not started by `up`; `profiles` keeps it out of the default set.
+  # Pass admin args after the service name, e.g.
+  #   ... run --rm admin-create --username admin --password '...'
+  admin-create:
+    <<: *app-image
+    container_name: dataops-v2-stack-admin-create
+    profiles: ["tools"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-env
+    entrypoint: ["python", "-m", "app.launcher", "--root", "/runtime", "admin", "create"]
+    volumes:
+      - config:/runtime/config
+      - data:/runtime/data
+    restart: "no"
+
+volumes:
+  config:
+    name: dataops-v2-stack-config
+  data:
+    name: dataops-v2-stack-data
+  pgdata:
+    name: dataops-v2-stack-pgdata
+  pgpw:
+    name: dataops-v2-stack-pgpw

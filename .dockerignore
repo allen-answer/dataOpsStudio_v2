@@ -1,0 +1,57 @@
+# Docker build context exclusions.
+# Keep the image lean and never bake secrets / runtime state into a layer.
+# Only the backend (app/, pyproject.toml, uv.lock, alembic.ini) is needed.
+
+# ─── Bootstrap secrets / credentials — MUST never enter an image layer (R8) ───
+config/.secret_master.key
+config/secrets/
+config/license.lic
+*.pem
+*.key
+
+# ─── Runtime local state ───
+data/
+logs/
+tmp/
+backups/
+.venv/
+
+# ─── Frontend (built/served separately; not part of the backend image) ───
+frontend/
+
+# ─── VCS / docs / CI — not needed at runtime ───
+.git/
+.github/
+docs/
+*.md
+adr/
+
+# ─── Python caches / build artifacts ───
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.so
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ─── Tests / lint tooling (not shipped in the runtime image) ───
+tests/
+tools/
+
+# ─── IDE / OS ───
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ─── MCP / debug artifacts ───
+.playwright-mcp/
+*.png
+
+# ─── Docker / compose files themselves ───
+docker/
+Dockerfile
+.dockerignore
