@@ -200,6 +200,11 @@ class AdminResetPasswordResponse(BaseModel):
     temporary_password: str
 
 
+class AdminForceLogoutResponse(BaseModel):
+    user_id: str
+    revoked_after: datetime
+
+
 class AdminDeleteBlockedResponse(BaseModel):
     error: str
     message: str

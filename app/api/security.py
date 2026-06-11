@@ -7,6 +7,7 @@ import json
 import time
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 
 class JwtError(ValueError):
@@ -18,6 +19,8 @@ class TokenClaims:
     user_id: str
     role: str
     expires_at: int
+    issued_at: int
+    jti: str | None = None
 
 
 @dataclass(frozen=True)
@@ -33,10 +36,18 @@ def create_access_token(
     secret: str,
     ttl_seconds: int = 3600,
     issued_at: int | None = None,
+    jti: str | None = None,
 ) -> str:
     now = int(time.time()) if issued_at is None else issued_at
     header = {"alg": "HS256", "typ": "JWT"}
-    payload = {"sub": user_id, "role": role, "exp": now + ttl_seconds, "iat": now}
+    token_jti = uuid4().hex if jti is None else jti
+    payload = {
+        "sub": user_id,
+        "role": role,
+        "exp": now + ttl_seconds,
+        "iat": now,
+        "jti": token_jti,
+    }
     signing_input = f"{_b64_json(header)}.{_b64_json(payload)}"
     signature = hmac.new(
         secret.encode("utf-8"),
@@ -62,14 +73,23 @@ def decode_access_token(token: str, *, secret: str, now: int | None = None) -> T
 
     payload = _json_from_b64(parts[1])
     exp = payload.get("exp")
+    iat = payload.get("iat", 0)
+    jti = payload.get("jti")
     sub = payload.get("sub")
     role = payload.get("role", "viewer")
-    if not isinstance(exp, int) or not isinstance(sub, str) or not isinstance(role, str):
+    if (
+        not isinstance(exp, int)
+        or not isinstance(iat, int)
+        or not isinstance(sub, str)
+        or not isinstance(role, str)
+    ):
+        raise JwtError("invalid token claims")
+    if jti is not None and not isinstance(jti, str):
         raise JwtError("invalid token claims")
     current = int(time.time()) if now is None else now
     if exp <= current:
         raise JwtError("token expired")
-    return TokenClaims(user_id=sub, role=role, expires_at=exp)
+    return TokenClaims(user_id=sub, role=role, expires_at=exp, issued_at=iat, jti=jti)
 
 
 def bearer_token(authorization: str | None) -> str:

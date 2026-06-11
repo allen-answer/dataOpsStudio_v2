@@ -74,6 +74,7 @@ users = Table(
     # ★ NO FK on secret refs(跨存储,KMS 实现下不在 PG)
     Column("mfa_secret_ref", String(64), nullable=True),
     Column("role", String(32), nullable=False, server_default="viewer"),
+    Column("tokens_revoked_after", DateTime(timezone=True), nullable=True),
     Column(
         "created_at",
         DateTime(timezone=True),
@@ -86,6 +87,26 @@ users = Table(
         nullable=False,
         server_default=text("now()"),
     ),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# revoked_tokens —— JWT jti denylist + 过期惰性清理
+# ─────────────────────────────────────────────────────────────────────────────
+revoked_tokens = Table(
+    "revoked_tokens",
+    metadata,
+    Column("jti", String(64), primary_key=True),
+    Column(
+        "user_id",
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("revoked_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Index("ix_revoked_tokens_user_id", "user_id"),
+    Index("ix_revoked_tokens_expires_at", "expires_at"),
 )
 
 
@@ -383,6 +404,7 @@ __all__ = [
     "project_members",
     "projects",
     "result_sets",
+    "revoked_tokens",
     "secret_refs",
     "users",
 ]
