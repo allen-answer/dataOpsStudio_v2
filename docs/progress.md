@@ -7,30 +7,15 @@
 
 ---
 
-## 当前 Wave:Wave 4A(Part B 后端补全)
+## 当前活动项
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| revoked_tokens + admin force-logout | Codex | — | 已合并 | [#39](https://github.com/allen-answer/dataOpsStudio_v2/pull/39) |
-| §6 MFA + 改密 | Codex | PR-1 review | 已合并 | [#40](https://github.com/allen-answer/dataOpsStudio_v2/pull/40) |
-| §9 AI 配置 + Gateway DB 配置 | Codex | PR-2 review | PR 待审 | [#41](https://github.com/allen-answer/dataOpsStudio_v2/pull/41) |
+| DM 真实例集成验证(backlog 高优先级,Certified 宣称前必做) | review agent + 人 | 需持牌 DM 实例 | 受阻(等 DM 实例) | — |
 
----
-
-## Wave 4B(Part B 前端收口)
-
-| 任务 | 负责 | 依赖 | 状态 | PR |
-|---|---|---|---|---|
-| 登录第二因子 + §6 账户安全页 + §9 AI 配置页 + force-logout 按钮(i18n 双语 / QR 库 qrcode / Playwright 无后端渲染 11 用例绿) | Claude Opus 4.8 | Wave 4A 三 PR 合并 | PR 待审(draft;真后端走查待人工) | [#42](https://github.com/allen-answer/dataOpsStudio_v2/pull/42) |
-
----
-
-## Wave 3(收口)
-
-| 任务 | 负责 | 依赖 | 状态 | PR |
-|---|---|---|---|---|
-| §5 验收 e2e 全量对照(contract §5:portable 解压 → … → migrate + docker compose 同流程) | review agent + 人 | — | **已完成**(报告:`docs/acceptance-2.0.0-skeleton.md`;compose 形态补齐 [#35](https://github.com/allen-answer/dataOpsStudio_v2/pull/35) 待合并) | — |
-| DM 真实例集成验证(backlog 高优先级,Certified 前必做) | review agent + 人 | 需持牌 DM 实例 | 受阻(等 DM 实例) | — |
+> **下一里程碑候选(待人拍板)**:2.0.x GA 准备 —— GA 前安全加固清单
+> (TOTP 同窗重放 / pyjwt+pyotp 替换 / 密码进 request body 改造,见 backlog)、
+> compose CI hard-evidence job、Tailwind darkMode 键失配、SQL 工作台执行后自动滚动等 UX nit。
 
 ---
 
@@ -49,6 +34,21 @@
 
 ## 已完成归档
 
+> **Wave 4(2026-06-11 全部合并)— Part B 补全,PRD §1–§10 全部落地**:
+> 4A 后端(Codex):revoked_tokens + force-logout([#39](https://github.com/allen-answer/dataOpsStudio_v2/pull/39))、
+> §6 MFA + 改密([#40](https://github.com/allen-answer/dataOpsStudio_v2/pull/40))、
+> §9 ai_configs + Gateway DB 配置 + L4 形态锁([#41](https://github.com/allen-answer/dataOpsStudio_v2/pull/41))。
+> 4B 前端(Claude 4.8):登录第二因子 / §6 账户安全页 / §9 AI 配置页 / force-logout
+> ([#42](https://github.com/allen-answer/dataOpsStudio_v2/pull/42),真手机验证器走查证据见 PR)。
+> 走查揪出并修复:T4 潜伏 frozen-ApiError×contextmanager 500
+> ([#43](https://github.com/allen-answer/dataOpsStudio_v2/pull/43) +
+> [#44](https://github.com/allen-answer/dataOpsStudio_v2/pull/44) 补救)、登录第二步按钮塌缩(并入 #42)。
+> 旁支:license sync 回归测试([#38](https://github.com/allen-answer/dataOpsStudio_v2/pull/38))。
+>
+> **2.0.0-skeleton(2026-06-11 打 tag + Release)**:contract §5 全量验收通过
+> (报告 `docs/acceptance-2.0.0-skeleton.md`);compose 形态补齐
+> ([#35](https://github.com/allen-answer/dataOpsStudio_v2/pull/35))。
+>
 > **Wave 3 开发项(2026-06-11 合并)**:T7 Part A 收口 —— 数据源编辑/删除 modal +
 > 权限 8 开关面板 + Jobs 错误码精确映射 + 数据页宽屏流式布局
 > ([#33](https://github.com/allen-answer/dataOpsStudio_v2/pull/33),Claude 4.8;
