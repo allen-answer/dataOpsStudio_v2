@@ -26,9 +26,19 @@ _RESTORE_PATHS = frozenset({"/api/admin/backups/restore"})
 class CrossCuttingMiddleware(BaseHTTPMiddleware):
     """RequestId → AuthN → License → RateLimit → Audit → handler → Audit."""
 
-    def __init__(self, app: ASGIApp, *, services: ApiServices) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        services: ApiServices,
+        serve_frontend: bool = False,
+    ) -> None:
         super().__init__(app)
         self._services = services
+        # 当 API 进程同时伺服前端 SPA(DATAOPS_FRONTEND_DIST 配置)时,前端静态
+        # 资源 / SPA 路由是公开 GET 内容,不走鉴权 / license / 限流 / 审计;只有
+        # /api/* 与 /healthz 仍走完整管线。默认 False = 纯 API,行为与现状一致。
+        self._serve_frontend = serve_frontend
 
     async def dispatch(
         self,
@@ -39,6 +49,11 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
         request.state.request_id = request_id
         request.state.user = None
         path = request.url.path
+
+        if self._is_frontend_request(path):
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = request_id
+            return response
 
         auth_response = self._authenticate(request)
         if auth_response is not None:
@@ -144,6 +159,19 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
         if self._services.rate_limiter.allow(key):
             return None
         return error_response(429, "rate_limited", "Too many requests")
+
+    def _is_frontend_request(self, path: str) -> bool:
+        """前端 SPA 静态 / 路由请求(伺服前端时跳过鉴权管线)。
+
+        仅 /api/* 与 /healthz 走完整鉴权管线;其余路径在 serve_frontend 开启时
+        当作前端公开内容。serve_frontend 关闭(默认)→ 永远 False,行为不变。
+        """
+
+        if not self._serve_frontend:
+            return False
+        if path == "/healthz" or path == "/api" or path.startswith("/api/"):
+            return False
+        return True
 
 
 def _is_repair_restricted(request: Request) -> bool:

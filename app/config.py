@@ -14,6 +14,7 @@
 - DATAOPS_BOOTSTRAP_MASTER_KEY_FILE / DATAOPS_BOOTSTRAP_PG_APP_PASSWORD_FILE / ...
 - DATAOPS_PG_HOST / DATAOPS_PG_PORT / DATAOPS_PG_USER / DATAOPS_PG_DATABASE / ...
 - DATAOPS_API_HOST / DATAOPS_API_PORT / DATAOPS_API_METRICS_PORT / DATAOPS_API_ENABLE_DOCS
+- DATAOPS_FRONTEND_DIST(前端 dist 目录;设置即 API 进程伺服 SPA,默认 API-only)
 - DATAOPS_WORKER_WORKER_ID / DATAOPS_WORKER_MAX_CONCURRENT_JOBS / ...
 - DATAOPS_RESULT_BACKEND / DATAOPS_RESULT_LOCAL_ROOT / ...
 - DATAOPS_AI_ENABLED / DATAOPS_AI_PROVIDER / DATAOPS_AI_MAX_AUTO_EGRESS_LEVEL / ...
@@ -93,6 +94,12 @@ class ApiConfig(BaseSettings):
     port: int = 8020  # 与 1.x 8010 / daily-report-bot 8000 隔离
     metrics_port: int = 8021
     enable_docs: bool | None = None
+
+    # 前端 SPA 静态产物目录(frontend/dist)。设置且目录存在(含 index.html)→
+    # API 进程一并伺服前端(2.0 前后端同机同进程,零反代,见
+    # docs/deployment/quickstart.md)。默认 None = API-only,行为与现状完全一致。
+    # env: DATAOPS_FRONTEND_DIST(非 DATAOPS_API_ 前缀,故用 validation_alias)。
+    frontend_dist: Path | None = Field(default=None, validation_alias="DATAOPS_FRONTEND_DIST")
 
 
 class WorkerConfig(BaseSettings):
