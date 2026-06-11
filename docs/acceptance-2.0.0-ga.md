@@ -37,7 +37,7 @@ CI 十 job 含 Compose form / Cold-start / E2E / MySQL / PG Queue hard evidence 
 | R1–R10 红线 + gitleaks | ✅ 常绿 | CI(R3 条文已对齐执行,#46) |
 | 密码进 request body 改造 | ⏸ 决策 C 推迟 | 触发条件=外部安全审计(#46 落档) |
 | 正式 license 签发 | ⏸ trial-only 发布 | 触发条件=首个商业交付(#46 落档) |
-| DM 真实例验证 | ⏸ 受阻 | GA 以 DM Beta 口径(#46 落档) |
+| DM 真实例验证 | ✅ 已完成(GA 后) | 8/8 真实例验证 + 修 3 bug,DM 升 Certified;`docs/acceptance-dm-certified.md`(#53) |
 
 **结论:GA 安全项全部"已闭环"或"已决策落档",无未知敞口。建议发布 2.0.0 GA。**
 
