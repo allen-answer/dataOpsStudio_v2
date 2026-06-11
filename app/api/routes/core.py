@@ -12,6 +12,7 @@ from sqlalchemy.engine import Connection, RowMapping
 
 from app.api.dependencies import current_user_from, request_id_from, services_from
 from app.api.errors import ApiError
+from app.api.routes.account import consume_recovery_code, verify_user_totp
 from app.api.schemas import (
     CancelResponse,
     DatasourceCreateRequest,
@@ -65,6 +66,24 @@ def login(body: LoginRequest, request: Request) -> TokenResponse:
         HashedRef(ref=str(row["password_hash"]), algorithm="bcrypt"),
     ):
         raise ApiError(401, "invalid_credentials", "Invalid username or password")
+    mfa_ref = _optional_str(row["mfa_secret_ref"])
+    if mfa_ref is not None:
+        if body.mfa_code is None:
+            raise ApiError(401, "mfa_required", "MFA verification required")
+        with services.engine.begin() as conn:
+            totp_ok = verify_user_totp(services, mfa_ref=mfa_ref, code=body.mfa_code)
+            recovery_ok = (
+                False
+                if totp_ok
+                else consume_recovery_code(
+                    conn,
+                    services,
+                    user_id=str(row["id"]),
+                    code=body.mfa_code,
+                )
+            )
+        if not totp_ok and not recovery_ok:
+            raise ApiError(401, "invalid_mfa_code", "Invalid MFA code")
 
     token = create_access_token(
         user_id=str(row["id"]),
