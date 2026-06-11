@@ -13,7 +13,7 @@
 |---|---|---|---|---|
 | revoked_tokens + admin force-logout | Codex | — | 已合并 | [#39](https://github.com/allen-answer/dataOpsStudio_v2/pull/39) |
 | §6 MFA + 改密 | Codex | PR-1 review | 已合并 | [#40](https://github.com/allen-answer/dataOpsStudio_v2/pull/40) |
-| §9 AI 配置 + Gateway DB 配置 | Codex | PR-2 review | 进行中 | — |
+| §9 AI 配置 + Gateway DB 配置 | Codex | PR-2 review | PR 待审 | [#41](https://github.com/allen-answer/dataOpsStudio_v2/pull/41) |
 
 ---
 
