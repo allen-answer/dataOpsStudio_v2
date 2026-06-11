@@ -10,8 +10,15 @@ from fastapi.responses import JSONResponse
 logger = structlog.get_logger(__name__)
 
 
-@dataclass(frozen=True)
+@dataclass
 class ApiError(Exception):
+    """API 业务错误。
+
+    ★ 不能 frozen:异常穿越 @contextmanager(如 sqlalchemy engine.begin())时,
+    contextlib 以 Python 赋值方式设置 exc.__traceback__,frozen dataclass 会抛
+    FrozenInstanceError,把任意 4xx 变成 500(2026-06-11 真机实锤;
+    回归测试:tests/unit/test_api_errors.py)。
+    """
     status_code: int
     code: str
     message: str
