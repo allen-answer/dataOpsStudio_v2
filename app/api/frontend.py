@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -68,7 +68,7 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> None:
         )
 
     @app.get("/{spa_path:path}", include_in_schema=False)
-    def spa_fallback(spa_path: str, request: Request) -> Response:
+    def spa_fallback(spa_path: str) -> Response:
         # /api/* 不存在的路径绝不被 SPA 吞掉:回 API 风格 404 JSON。
         # (正常 /api/* 已被前面注册的 router 命中,不会走到这里。)
         if spa_path == "api" or spa_path.startswith("api/"):
