@@ -42,7 +42,8 @@ def test_mfa_password_and_recovery_flow_on_pg(tmp_path: Path) -> None:
         rate_limiter=RateLimiter(limit=10_000),
     )
     user_id = str(uuid4())
-    username = f"mfa-{uuid4().hex}"
+    username_suffix = uuid4().hex[:24]
+    username = f"mfa-{username_suffix}"
     original_password = uuid4().hex
     changed_password = uuid4().hex
     with engine.begin() as conn:
