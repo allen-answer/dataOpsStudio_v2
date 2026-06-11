@@ -287,6 +287,28 @@ Expected result includes column `r` and the first row value `2`:
 }
 ```
 
+## DM 数据源注记 (worker DM 客户端加密库)
+
+If you create a DM (达梦) datasource instead of MySQL, the **worker** process needs
+two extra environment variables so the `dmpython` driver can `dlopen` the DM
+client crypto modules. Without them, connecting/executing against DM fails with
+`-70089` (encryption module load failure) — the PyPI `dmpython` wheel bundles a
+crypto library missing transitive dependencies, so the driver must instead use
+the complete library set under a real DM client install.
+
+Set these for the process that runs `launcher up` (or the split worker), pointing
+`DM_HOME` at your actual DM install path:
+
+```bash
+export DM_HOME=/opt/dmdbms                                                   # actual DM install path
+export LD_LIBRARY_PATH="$DM_HOME/bin:$DM_HOME/bin/external_crypto_libs"
+$LAUNCHER up
+```
+
+Root cause and the full one-time fix (clearing the wheel's orphaned crypto libs)
+are documented in [`acceptance-dm-certified.md`](../acceptance-dm-certified.md)
+("环境注记").
+
 ## Troubleshooting
 
 ### `doctor` Reports `PG TCP port free: ... is already accepting TCP connections`

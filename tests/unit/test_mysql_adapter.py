@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 
 from app.dbclients.mysql_adapter import MySQLAdapter
+from app.dbclients.protocol import AdapterConnectionError
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.result import ResultSet
@@ -123,6 +124,22 @@ def test_test_connection_records_sanitized_error_summary_on_failure() -> None:
     assert "mysql://user" not in adapter.last_connection_error
     assert "<redacted-url>" in adapter.last_connection_error
     assert "***REDACTED***" in adapter.last_connection_error
+
+
+def test_stream_select_preserves_connection_error_cause() -> None:
+    # from exc(非 from None):AdapterConnectionError 必须链住原始驱动异常,
+    # 便于 worker logger.exception 排障(R5 脱敏 processor 兜底敏感值)。
+    original = RuntimeError("driver connect boom")
+    adapter = MySQLAdapter(
+        _conn_info(),
+        cast(SecretStore, _SecretStore("pwd")),
+        pymysql_module=_FailingPyMySQL(original),
+    )
+
+    with pytest.raises(AdapterConnectionError) as excinfo:
+        list(adapter.execute_select("SELECT 1", {}))
+
+    assert excinfo.value.__cause__ is original
 
 
 def test_stream_to_spool_then_resultset_reads_without_cursor(tmp_path: Path) -> None:

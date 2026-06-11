@@ -24,23 +24,6 @@
 
 ---
 
-## 来自 DM adapter review(feat/dm-adapter-columntype)
-
-### **worker DM 数据源需配 DM 客户端加密库**(2026-06-11 真实例验证发现)
-
-**位置**:部署文档 / worker 运行环境
-
-**现状**:PyPI `dmpython` 轮子 bundled 加密库缺传递依赖,`dlopen` 加密模块失败
-(`-70089`)。真实例验证时的修法:`DM_HOME=/opt/dmdbms` +
-`LD_LIBRARY_PATH=/opt/dmdbms/bin:/opt/dmdbms/bin/external_crypto_libs`,
-并清掉轮子 `dmpython.libs/` 内的孤立加密库。
-
-**修法**:on-prem 部署有 DM 数据源时,worker 进程需配上述环境;写进部署文档
-(quickstart / docker-compose 的 DM 注记)。**优先级**:中(首个 DM 客户部署前)。
-详见 `docs/acceptance-dm-certified.md`。
-
----
-
 ## 来自首次云服务器 dogfood(5f27cc5,§5 真链路跑通)
 
 ### **GA 前安全评审会被点** — `POST /api/datasources` 密码以明文进 request body
