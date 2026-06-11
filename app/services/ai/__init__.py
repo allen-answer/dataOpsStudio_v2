@@ -9,9 +9,11 @@ from __future__ import annotations
 from app.services.ai.default_gateway import (
     AI_API_KEY_ENV,
     AI_MODEL_ENV,
+    AiGatewayRuntimeConfig,
     BudgetGuard,
     DefaultAiGateway,
     build_gateway,
+    build_gateway_from_runtime_config,
 )
 from app.services.ai.errors import (
     AiDisabledError,
@@ -43,6 +45,7 @@ __all__ = [
     "AiDisabledError",
     "AiGateway",
     "AiGatewayError",
+    "AiGatewayRuntimeConfig",
     "AiUsageRecord",
     "AuditSink",
     "BudgetExceededError",
@@ -60,4 +63,5 @@ __all__ = [
     "Redactor",
     "UrllibTransport",
     "build_gateway",
+    "build_gateway_from_runtime_config",
 ]

@@ -9,8 +9,11 @@ from __future__ import annotations
 import pathlib
 import re
 
+from sqlalchemy import CheckConstraint
+
 from app.db.models import (
     APPLICATION_SECRET_KINDS,
+    ai_configs,
     audit_logs,
     datasources,
     jobs,
@@ -68,8 +71,9 @@ def test_all_alembic_revision_ids_under_32_chars() -> None:
     assert not violations, f"revision ID 超 32 字符: {violations}"
 
 
-def test_metadata_has_12_tables() -> None:
+def test_metadata_has_13_tables() -> None:
     expected = {
+        "ai_configs",
         "users",
         "mfa_recovery_codes",
         "revoked_tokens",
@@ -110,6 +114,38 @@ def test_mfa_recovery_codes_schema_supports_one_time_codes() -> None:
     assert "ix_mfa_recovery_codes_unused" in index_names
 
 
+def test_ai_configs_schema_stores_key_by_secret_ref_only() -> None:
+    cols = set(ai_configs.columns.keys())
+    check_names = {c.name for c in ai_configs.constraints if c.name is not None}
+    check_sql = {
+        c.name: str(c.sqltext)
+        for c in ai_configs.constraints
+        if isinstance(c, CheckConstraint) and c.name is not None
+    }
+
+    assert cols == {
+        "id",
+        "enabled",
+        "provider",
+        "model",
+        "base_url",
+        "api_key_secret_ref",
+        "max_auto_egress_level",
+        "l4_requires_optin",
+        "enable_inference",
+        "enable_auto_translation",
+        "created_at",
+        "updated_at",
+    }
+    assert "api_key" not in cols
+    assert ai_configs.columns["api_key_secret_ref"].nullable is True
+    assert len(ai_configs.columns["api_key_secret_ref"].foreign_keys) == 0
+    assert "ck_ai_configs_singleton" in check_names
+    assert "ck_ai_configs_provider_is_supported" in check_names
+    assert "ck_ai_configs_max_auto_egress_level_range" in check_names
+    assert check_sql["ck_ai_configs_max_auto_egress_level_range"].endswith("<= 3")
+
+
 def test_r6_result_sets_has_no_cursor_field() -> None:
     """R6 红线 DB 层:result_sets 表禁有任何 cursor* 字段。"""
     forbidden = {"cursor", "cursor_id", "db_cursor", "cursor_ref"}
@@ -144,6 +180,7 @@ def test_secret_ref_columns_have_no_foreign_key() -> None:
     cases = [
         (users, "mfa_secret_ref"),
         (users, "mfa_pending_secret_ref"),
+        (ai_configs, "api_key_secret_ref"),
         (datasources, "password_secret_ref"),
         (secret_refs, "ref"),  # PK 本身,自然无 FK
         (secret_refs, "created_by"),  # 跨存储 user_id 引用

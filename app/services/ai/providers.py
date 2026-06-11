@@ -8,8 +8,8 @@ completions——它是最薄的真协议(单个 POST /chat/completions,JSON 进
 ★ 不新增依赖:HTTP 用 stdlib urllib(Karpathy #2 简单优先)。Transport 可注入,
 单测用 mock transport 全覆盖,**绝不发真请求**。
 
-★ R8 / 契约 §5:2.0.0 无 ai_configs 表,API key **只从环境变量读**
-(DATAOPS_AI_API_KEY),禁止建表 / 禁止写配置文件。
+★ R8 / 契约 §5:API key 由 Gateway 工厂注入,来源只能是 SecretStore
+或环境变量 fallback;provider 不负责读取配置,也不记录 key。
 
 ★ R5:provider 不打 prompt / 响应原文进日志。
 """
@@ -109,7 +109,7 @@ class OpenAICompatibleProvider:
     """OpenAI-compatible /chat/completions provider(设计稿 §2.7.2 第 5 条)。
 
     endpoint 形如 https://api.openai.com/v1 或私有 LLM 网关 base URL。
-    api_key 由 Gateway 工厂从环境变量注入(R8:不进配置文件 / 不建表)。
+    api_key 由 Gateway 工厂注入(R8:不进配置文件 / 不进明文字段)。
     """
 
     api_key: str

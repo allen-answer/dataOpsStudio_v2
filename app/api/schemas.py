@@ -298,3 +298,42 @@ class AuditLogItem(BaseModel):
     result: str
     request_id: str | None = None
     detail: dict[str, Any] | None = None
+
+
+AiProvider = Literal["off", "mock", "openai_compatible", "anthropic", "ollama"]
+AiApiKeySource = Literal["none", "stored", "env"]
+
+
+class AdminAiConfigResponse(BaseModel):
+    enabled: bool
+    provider: AiProvider
+    model: str | None = None
+    base_url: str | None = None
+    max_auto_egress_level: int = Field(ge=0, le=3)
+    l4_requires_optin: bool
+    enable_inference: bool
+    enable_auto_translation: bool
+    api_key_source: AiApiKeySource
+    has_stored_api_key: bool
+    updated_at: datetime | None = None
+
+
+class AdminAiConfigUpdateRequest(BaseModel):
+    enabled: bool
+    provider: AiProvider
+    model: str | None = Field(default=None, max_length=128)
+    base_url: str | None = Field(default=None, min_length=1)
+    api_key: str | None = Field(default=None, min_length=1)
+    clear_api_key: bool = False
+    max_auto_egress_level: int = Field(ge=0, le=3)
+    l4_requires_optin: bool = True
+    enable_inference: bool = False
+    enable_auto_translation: bool = False
+
+
+class AdminAiConfigTestResponse(BaseModel):
+    ok: bool
+    provider: str
+    model: str | None = None
+    latency_ms: int
+    error: str | None = None

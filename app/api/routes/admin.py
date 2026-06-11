@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 import secrets
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from fastapi import APIRouter, Query, Request
@@ -16,6 +17,9 @@ from sqlalchemy.engine import Connection, RowMapping
 from app.api.dependencies import current_user_from, request_id_from, services_from
 from app.api.errors import ApiError
 from app.api.schemas import (
+    AdminAiConfigResponse,
+    AdminAiConfigTestResponse,
+    AdminAiConfigUpdateRequest,
     AdminForceLogoutResponse,
     AdminProjectCreateRequest,
     AdminProjectDeleteImpactResponse,
@@ -25,6 +29,8 @@ from app.api.schemas import (
     AdminUserCreateRequest,
     AdminUserItem,
     AdminUserPatchRequest,
+    AiApiKeySource,
+    AiProvider,
     AuditLogItem,
     LicenseStatusResponse,
     LicenseUploadRequest,
@@ -32,6 +38,7 @@ from app.api.schemas import (
 )
 from app.api.services import ApiServices
 from app.db.models import (
+    ai_configs,
     audit_logs,
     datasources,
     jobs,
@@ -41,8 +48,15 @@ from app.db.models import (
     projects,
     users,
 )
+from app.domain.ai import AiContext, AiOptions
 from app.domain.secret import SecretKind, SecretRef
 from app.infrastructure.license import read_license_limits, verify_license
+from app.services.ai import (
+    AI_API_KEY_ENV,
+    AiGatewayError,
+    AiGatewayRuntimeConfig,
+    build_gateway_from_runtime_config,
+)
 
 router = APIRouter(prefix="/admin")
 
@@ -392,11 +406,243 @@ def list_admin_audit_logs(
     return [_audit_item(row) for row in rows]
 
 
+@router.get("/ai-config", response_model=AdminAiConfigResponse)
+def get_admin_ai_config(request: Request) -> AdminAiConfigResponse:
+    _require_admin(request)
+    services = services_from(request)
+    with services.engine.connect() as conn:
+        row = _ai_config_row_or_none(conn)
+    return _ai_config_response(row)
+
+
+@router.put("/ai-config", response_model=AdminAiConfigResponse)
+def put_admin_ai_config(
+    body: AdminAiConfigUpdateRequest,
+    request: Request,
+) -> AdminAiConfigResponse:
+    actor = _require_admin(request)
+    services = services_from(request)
+    if body.api_key is not None and body.clear_api_key:
+        raise ApiError(400, "invalid_ai_config", "Choose either api_key or clear_api_key")
+    _validate_ai_config_update(body)
+
+    stored_ref: str | None = None
+    old_ref: str | None = None
+    with services.engine.begin() as conn:
+        existing = _ai_config_row_or_none(conn)
+        old_ref = _optional_str(existing["api_key_secret_ref"]) if existing is not None else None
+        stored_ref = _update_ai_secret_ref(services, old_ref=old_ref, body=body)
+        values = _ai_config_values(body, stored_ref)
+        if existing is None:
+            conn.execute(insert(ai_configs).values(id=1, **values))
+        else:
+            conn.execute(update(ai_configs).where(ai_configs.c.id == 1).values(**values))
+        row = _ai_config_row(conn)
+
+    if body.clear_api_key and old_ref is not None:
+        services.secret_store.delete_secret(SecretRef(ref=old_ref, kind=SecretKind.AI_API_KEY))
+    _audit_admin(
+        services,
+        request,
+        action="admin_ai_config_update",
+        resource_type="ai_config",
+        resource_id="1",
+        user_id=actor.id,
+        detail={
+            "provider": body.provider,
+            "enabled": body.enabled,
+            "api_key_changed": body.api_key is not None,
+            "api_key_cleared": body.clear_api_key,
+        },
+    )
+    return _ai_config_response(row)
+
+
+@router.post("/ai-config/test", response_model=AdminAiConfigTestResponse)
+def test_admin_ai_config(request: Request) -> AdminAiConfigTestResponse:
+    actor = _require_admin(request)
+    services = services_from(request)
+    started = time.monotonic()
+    with services.engine.connect() as conn:
+        row = _ai_config_row_or_none(conn)
+    runtime = _ai_runtime_config(services, row)
+    if not runtime.enabled or runtime.provider in {None, "off"}:
+        return _ai_test_response(runtime, started, ok=False, error="ai_disabled")
+    if runtime.provider not in {"mock", "openai_compatible"}:
+        return _ai_test_response(runtime, started, ok=False, error="unsupported_provider")
+    if runtime.provider == "openai_compatible" and (not runtime.endpoint or not runtime.api_key):
+        return _ai_test_response(runtime, started, ok=False, error="missing_provider_config")
+
+    try:
+        gateway = build_gateway_from_runtime_config(runtime)
+        response = gateway.complete(
+            "ping",
+            AiContext(),
+            AiOptions(purpose="admin_ai_config_test", max_tokens=8),
+        )
+    except AiGatewayError as exc:
+        result = _ai_test_response(runtime, started, ok=False, error=type(exc).__name__)
+    else:
+        result = _ai_test_response(
+            runtime,
+            started,
+            ok=True,
+            provider=response.provider,
+            model=response.model,
+        )
+    _audit_admin(
+        services,
+        request,
+        action="admin_ai_config_test",
+        resource_type="ai_config",
+        resource_id="1",
+        user_id=actor.id,
+        detail={"provider": runtime.provider, "ok": result.ok},
+    )
+    return result
+
+
 def _require_admin(request: Request) -> Any:
     user = current_user_from(request)
     if user.role != "admin":
         raise ApiError(403, "forbidden", "Admin role required")
     return user
+
+
+def _validate_ai_config_update(body: AdminAiConfigUpdateRequest) -> None:
+    if body.provider == "off" and body.enabled:
+        raise ApiError(400, "invalid_ai_config", "provider=off cannot be enabled")
+    if body.enabled and body.provider not in {"mock", "openai_compatible"}:
+        raise ApiError(400, "unsupported_provider", "Provider is not implemented in 2.0.0")
+    if body.enabled and body.provider == "openai_compatible" and not body.base_url:
+        raise ApiError(400, "invalid_ai_config", "base_url is required")
+    if not body.l4_requires_optin:
+        raise ApiError(400, "invalid_ai_config", "L4 data always requires explicit opt-in")
+
+
+def _ai_config_values(
+    body: AdminAiConfigUpdateRequest,
+    api_key_secret_ref: str | None,
+) -> dict[str, object]:
+    now = datetime.now(UTC)
+    return {
+        "enabled": body.enabled,
+        "provider": body.provider,
+        "model": body.model,
+        "base_url": body.base_url,
+        "api_key_secret_ref": api_key_secret_ref,
+        "max_auto_egress_level": body.max_auto_egress_level,
+        "l4_requires_optin": body.l4_requires_optin,
+        "enable_inference": body.enable_inference,
+        "enable_auto_translation": body.enable_auto_translation,
+        "updated_at": now,
+    }
+
+
+def _update_ai_secret_ref(
+    services: ApiServices,
+    *,
+    old_ref: str | None,
+    body: AdminAiConfigUpdateRequest,
+) -> str | None:
+    if body.clear_api_key:
+        return None
+    if body.api_key is None:
+        return old_ref
+    if old_ref is not None:
+        services.secret_store.rotate_secret(
+            SecretRef(ref=old_ref, kind=SecretKind.AI_API_KEY),
+            body.api_key,
+        )
+        return old_ref
+    return services.secret_store.store_secret(body.api_key, SecretKind.AI_API_KEY).ref
+
+
+def _ai_config_row_or_none(conn: Connection) -> RowMapping | None:
+    return conn.execute(select(ai_configs).where(ai_configs.c.id == 1)).mappings().one_or_none()
+
+
+def _ai_config_row(conn: Connection) -> RowMapping:
+    row = _ai_config_row_or_none(conn)
+    if row is None:
+        raise ApiError(404, "not_found", "AI config not found")
+    return row
+
+
+def _ai_config_response(row: RowMapping | None) -> AdminAiConfigResponse:
+    if row is None:
+        return AdminAiConfigResponse(
+            enabled=False,
+            provider="off",
+            max_auto_egress_level=0,
+            l4_requires_optin=True,
+            enable_inference=False,
+            enable_auto_translation=False,
+            api_key_source=_api_key_source(None),
+            has_stored_api_key=False,
+        )
+    stored_ref = _optional_str(row["api_key_secret_ref"])
+    return AdminAiConfigResponse(
+        enabled=bool(row["enabled"]),
+        provider=cast(AiProvider, str(row["provider"])),
+        model=_optional_str(row["model"]),
+        base_url=_optional_str(row["base_url"]),
+        max_auto_egress_level=int(row["max_auto_egress_level"]),
+        l4_requires_optin=bool(row["l4_requires_optin"]),
+        enable_inference=bool(row["enable_inference"]),
+        enable_auto_translation=bool(row["enable_auto_translation"]),
+        api_key_source=_api_key_source(stored_ref),
+        has_stored_api_key=stored_ref is not None,
+        updated_at=row["updated_at"] if isinstance(row["updated_at"], datetime) else None,
+    )
+
+
+def _ai_runtime_config(services: ApiServices, row: RowMapping | None) -> AiGatewayRuntimeConfig:
+    if row is None:
+        return AiGatewayRuntimeConfig()
+    stored_ref = _optional_str(row["api_key_secret_ref"])
+    api_key = None
+    if stored_ref is not None:
+        api_key = services.secret_store.reveal_secret(
+            SecretRef(ref=stored_ref, kind=SecretKind.AI_API_KEY)
+        )
+    elif os.environ.get(AI_API_KEY_ENV):
+        api_key = os.environ[AI_API_KEY_ENV]
+    return AiGatewayRuntimeConfig(
+        enabled=bool(row["enabled"]),
+        provider=_optional_str(row["provider"]),
+        endpoint=_optional_str(row["base_url"]),
+        model=_optional_str(row["model"]),
+        api_key=api_key,
+        max_auto_egress_level=int(row["max_auto_egress_level"]),
+        l4_requires_optin=bool(row["l4_requires_optin"]),
+    )
+
+
+def _api_key_source(stored_ref: str | None) -> AiApiKeySource:
+    if stored_ref is not None:
+        return "stored"
+    if os.environ.get(AI_API_KEY_ENV):
+        return "env"
+    return "none"
+
+
+def _ai_test_response(
+    runtime: AiGatewayRuntimeConfig,
+    started: float,
+    *,
+    ok: bool,
+    error: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+) -> AdminAiConfigTestResponse:
+    return AdminAiConfigTestResponse(
+        ok=ok,
+        provider=provider or runtime.provider or "off",
+        model=model or runtime.model,
+        latency_ms=max(0, round((time.monotonic() - started) * 1000)),
+        error=error,
+    )
 
 
 def _current_license_response(services: ApiServices) -> LicenseStatusResponse:
