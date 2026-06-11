@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from typing import Protocol
 
+from app.dbclients.protocol import AdapterConnectionError
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.resource import ResourceProfile
@@ -153,6 +154,35 @@ def test_worker_unsupported_db_type_fails_with_precise_message() -> None:
 
     assert backend.completed == []
     assert backend.failed == [("job-1", "unsupported_db_type")]
+
+
+def test_worker_sql_connection_error_gets_connection_failed_code() -> None:
+    job = _make_job(payload={"sql": "SELECT 1", "result_set_id": "rs-1"})
+    backend = _FakeBackend([job])
+    error_writer = _FakeErrorCodeWriter()
+
+    def adapter_factory(
+        conn_info: DatasourceConnInfo,
+        cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
+    ) -> _ColumnSinkAdapter:
+        del conn_info, cancel_check, column_sink
+        raise AdapterConnectionError("adapter connection failed")
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        adapter_factory,
+        WorkerRunnerConfig(worker_id="worker-1"),
+        job_error_code_writer=error_writer,
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.completed == []
+    assert backend.failed == [("job-1", "connection_failed")]
+    assert error_writer.error_codes == [("job-1", JobErrorCode.CONNECTION_FAILED)]
 
 
 def test_worker_runs_test_connection_job_and_completes() -> None:

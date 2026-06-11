@@ -8,6 +8,10 @@ from app.domain.plan import PlanNode
 from app.domain.schema import Column, Index, Row, Schema, Table
 
 
+class AdapterConnectionError(RuntimeError):
+    """Adapter failed before it could establish a datasource connection."""
+
+
 class DatabaseAdapter(Protocol):
     """用户数据库 adapter 接口(契约 §3.2、设计稿 §2.9)。
 

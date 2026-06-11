@@ -24,6 +24,8 @@ import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 
+import structlog
+
 from app.config import AiGatewayConfig
 from app.domain.ai import AiChunk, AiContext, AiOptions, AiResponse, EgressLevel
 from app.services.ai.errors import AiDisabledError, BudgetExceededError
@@ -47,6 +49,8 @@ from app.services.ai.providers import (
 AI_API_KEY_ENV = "DATAOPS_AI_API_KEY"
 AI_MODEL_ENV = "DATAOPS_AI_MODEL"
 DEFAULT_MODEL = "gpt-4o-mini"
+
+_log = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -262,5 +266,12 @@ def _provider_from_values(
             api_key=api_key,
             endpoint=endpoint,
             model=model or DEFAULT_MODEL,
+        )
+    if provider_name == "openai_compatible":
+        _log.warning(
+            "ai gateway falling back to mock provider",
+            provider=provider_name,
+            has_endpoint=bool(endpoint),
+            has_api_key=bool(api_key),
         )
     return MockProvider()
