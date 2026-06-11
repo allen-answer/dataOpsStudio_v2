@@ -18,6 +18,34 @@
 
 ---
 
+### **可选,与手写 JWT 同类** — 手写 TOTP(RFC 6238)→ pyotp
+
+**位置**:`app/infrastructure/secretstore/totp.py`
+
+**现状**:Wave 4A PR-2 手实现 TOTP(SHA1 / 30s / 6 位 / ±1 窗口,`hmac.compare_digest`
+时序安全,实现核对无误)。不引 pyotp 的理由见 PR #40:范围内零依赖变更 +
+hashlib/hmac 留在 secretstore 红线内。
+
+**为什么记录**:与上一条手写 JWT 同性质的 audit smell。安全审计点名时与 JWT 一并换
+(pyotp + pyjwt 同一个 PR 处理)。
+
+**优先级**:低,可选。
+
+---
+
+### **GA 前安全加固** — TOTP 同窗口重放未防
+
+**位置**:`app/infrastructure/secretstore/totp.py:verify_totp_code` + 登录/验证调用方
+
+**现状**:同一个 6 位 code 在其 30s(±1 窗口)有效期内可重复通过校验——标准 TOTP
+实现通常记录"最后已用 counter"(per user),拒绝重放。
+
+**修法**:users 表或缓存记 last_used_totp_counter,verify 通过后推进,小于等于则拒。
+
+**触发条件**:GA 前安全评审,或 MFA 正式对外宣传前。**优先级**:中。
+
+---
+
 ### **F2 正解** — Worker 独立心跳线程(取消 OLAP 取舍)
 
 **位置**:`app/worker.py:WorkerRunner`
