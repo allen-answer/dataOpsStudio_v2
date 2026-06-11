@@ -4,35 +4,6 @@
 
 ## 来自 T4 (API + middleware) review
 
-### **可选** — 手写 JWT(HS256)→ PyJWT
-
-**位置**:`app/api/security.py`
-
-**现状**:Codex T4 手实现 HS256(hmac + hashlib + base64),`hmac.compare_digest` 用对了(时序安全),代码逻辑 OK。
-
-**为什么记录**:手写 crypto 是 audit smell。PyJWT / python-jose 是 battle-tested,有维护团队,默认更严(reject `alg: none` 等)。
-
-**修法**:`uv add pyjwt` → `security.py` 切 PyJWT API(create / decode / 处理 jwt.ExpiredSignatureError 等)。
-
-**优先级**:低,可选。当前手写实现没漏洞(看过)。如做 GA 前安全审计时被点,即换。
-
----
-
-### **可选,与手写 JWT 同类** — 手写 TOTP(RFC 6238)→ pyotp
-
-**位置**:`app/infrastructure/secretstore/totp.py`
-
-**现状**:Wave 4A PR-2 手实现 TOTP(SHA1 / 30s / 6 位 / ±1 窗口,`hmac.compare_digest`
-时序安全,实现核对无误)。不引 pyotp 的理由见 PR #40:范围内零依赖变更 +
-hashlib/hmac 留在 secretstore 红线内。
-
-**为什么记录**:与上一条手写 JWT 同性质的 audit smell。安全审计点名时与 JWT 一并换
-(pyotp + pyjwt 同一个 PR 处理)。
-
-**优先级**:低,可选。
-
----
-
 ### **GA 前安全加固** — TOTP 同窗口重放未防
 
 **位置**:`app/infrastructure/secretstore/totp.py:verify_totp_code` + 登录/验证调用方
@@ -82,7 +53,10 @@ hashlib/hmac 留在 secretstore 红线内。
 `@pytest.mark.integration` 级验证(连接 / SELECT 流式 / introspection / EXPLAIN /
 软取消),证据(stdout / 测试报告)归档进 PR 或 docs。
 
-**触发条件**:对外宣称 DM Certified 前 / 2.0.0 GA 前。**优先级**:高。
+**触发条件**:对外宣称 DM Certified 前。**优先级**:高。
+
+**GA 决策(2026-06-11,人拍板)**:2.0.x GA 以 **"DM Beta"** 口径发布,不宣称
+Certified;本条不阻塞 GA,真实例到位后补验并升级口径。
 
 ---
 
@@ -102,7 +76,9 @@ hashlib/hmac 留在 secretstore 红线内。
 - 分两步建:先建 datasource(无密码,占位 secret_ref),再独立 `PATCH /datasources/{id}/password`(明确审计 + 短 TTL token)
 - 或前端先 `POST /secrets`(获 secret_ref),建 datasource 时只传 secret_ref
 
-**优先级**:**低**,GA 前安全评审窗口决定。dogfood / dev 不挡路。
+**优先级**:**低**。**GA 决策(2026-06-11,人拍板)**:选 C —— 不进 GA,
+推迟到真有外部安全审计时再做(届时二选一方案单独立项)。触发条件由
+"GA 前安全评审窗口"改为"外部安全审计启动时"。
 
 ---
 
@@ -129,6 +105,23 @@ PostgreSQL / Oracle / DB2 数据源跑 SQL 仍直接 `UnsupportedDbTypeError`。
   避免用户提交后才看到 failed(**此项前端可独立做,不阻塞后端**)
 
 **触发条件**:多方言执行上线前 / 或先做前端 warn 兜底。**优先级**:中(2γ e2e 已实锤此限制)。
+
+**GA 决策(2026-06-11,人拍板)**:Oracle adapter **滑出 GA,进 2.0.x 后续版本**
+(契约本就允许"Oracle 可滑 2.0.x");DB2 维持 Preview。
+
+---
+
+### **GA 发布口径** — license 以 trial-only 发布,正式签发推迟
+
+**位置**:`app/infrastructure/license/verifier.py`(内置公钥)/ release 流程
+
+**现状**:当前内置公钥是 T5 开发期生成的密钥对;正式 license 签发需要按设计稿 §8.8
+在签发机生成真私钥(私钥永不进仓库/会话,由人保管)并替换内置公钥。
+
+**GA 决策(2026-06-11,人拍板)**:GA 以 **trial-only**(30 天试用,无 license 文件)
+口径发布;正式密钥对与签发流程推迟到首个商业交付前。
+
+**触发条件**:首个需要正式 license 的对外交付。**优先级**:中(商业化前必做)。
 
 ---
 

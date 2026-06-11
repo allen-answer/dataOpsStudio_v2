@@ -314,7 +314,7 @@ class Job:
 |---|---|---|
 | R1 | `services/` 禁止 import 数据库驱动(psycopg/oracledb/pymysql/dmPython/ibm_db) | AST/grep:驱动 import 只允许 `dbclients/` + `infrastructure/` |
 | R2 | 业务代码禁止持有明文密码;只能持 SecretRef | grep `ds["password"]` / `ds.get("password")` / `.password =` 在 services 出现即 fail |
-| R3 | Fernet/bcrypt/hashlib 只允许在 `infrastructure/secretstore/` | import 越界检测 |
+| R3 | secret 加密原语限定目录:Fernet/bcrypt 仅 `secretstore/`;`cryptography.hazmat` 仅 `secretstore/`+`license/`;PyNaCl 仅 `license/`。非 secret 指纹用途的 hashlib/hmac(sql_hash / prompt_hash / JWT HMAC)不受限(与 ruff banned-api 配置一致;此前条文写"hashlib 只允许在 secretstore/"与 CI 及存量实践不符,2026-06-11 修正) | ruff banned-api(TID251)import 越界检测 |
 | R4 | PG 连接密码禁止写入 secret_refs 表 | 代码审查 + 测试:store_secret 不接受 PG_*_PASSWORD kind |
 | R5 | 日志禁止出现敏感值 | structlog 脱敏 processor(强制)+ 测试:打印含 password 的 dict 输出必须 REDACTED |
 | R6 | ResultSet 禁止持有 DbCursor | grep `ResultSet` 类定义不得有 cursor 字段;cursor 持有时长 ≤ cursor_max_hold_seconds |
