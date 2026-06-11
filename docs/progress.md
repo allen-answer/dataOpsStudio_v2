@@ -7,24 +7,15 @@
 
 ---
 
-## 当前 Wave:Wave 2
+## 当前 Wave:Wave 3(收口)
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| Datasource polish:`PUT/DELETE /datasources/{id}`(409 引用检查)+ operation_policy(8×allow_*)+ worker 结构化 error code | Codex | 无(依赖已全合并) | PR 待审(review 已过,CI 绿;已并入 main 解决看板冲突) | [#32](https://github.com/allen-answer/dataOpsStudio_v2/pull/32) |
-| T7 Part B admin 三页 + License 管理(§7 用户 / §8 项目 / §10 审计 + License 状态横条/上传) | Claude 4.8 ① | — | **已合并**(daily-server 真后端走查证据见 PR) | [#30](https://github.com/allen-answer/dataOpsStudio_v2/pull/30) |
-| AI Gateway 接 1 provider 调通 + T6 尾巴(systemd unit / log rotate / TLS 文档) | Claude 4.8 ② | — | **已合并** | [#29](https://github.com/allen-answer/dataOpsStudio_v2/pull/29) |
-
-> Part B 剩余两页(§6 账户安全 MFA / §9 AI 配置)+ force-logout **卡后端表/列**,
-> 候选打包为 Wave 4「Part B 后端补全」,见 backlog 交叉项。
-
-## Wave 3(收口)
-
-| 任务 | 负责 | 依赖 | 状态 | PR |
-|---|---|---|---|---|
-| T7 Part A 收口:编辑/删除 modal + 权限面板 + Jobs 错误码精确映射 | Claude 4.8 | #32 合并 | PR 待审(**draft** —— vue-tsc 严格 + build 绿;Playwright 无后端渲染验证编辑/删除/权限面板/错误码各态 console 零红;真后端走查待 daily-server 升级到含 #32 的 main 后由 review agent 走) | [#33](https://github.com/allen-answer/dataOpsStudio_v2/pull/33) |
-| §5 验收 e2e 全量对照(contract §5:portable 解压 → … → migrate) | review agent + 人 | 全部合并 | 未开工 | — |
+| §5 验收 e2e 全量对照(contract §5:portable 解压 → … → migrate + docker compose 同流程) | review agent + 人 | 全部合并(已满足) | 未开工 | — |
 | DM 真实例集成验证(backlog 高优先级,Certified 前必做) | review agent + 人 | 需持牌 DM 实例 | 受阻(等 DM 实例) | — |
+
+> **Wave 4 候选(待人拍板立项)**:Part B 后端补全 —— §6 账户安全 MFA(users 缺列)
+> / §9 AI 配置(缺 ai_configs 表)/ force-logout(缺 revoked_tokens 表)。
 
 ---
 
@@ -43,6 +34,17 @@
 
 ## 已完成归档
 
+> **Wave 3 开发项(2026-06-11 合并)**:T7 Part A 收口 —— 数据源编辑/删除 modal +
+> 权限 8 开关面板 + Jobs 错误码精确映射 + 数据页宽屏流式布局
+> ([#33](https://github.com/allen-answer/dataOpsStudio_v2/pull/33),Claude 4.8;
+> daily-server 真后端 7 项走查证据见 PR)。
+>
+> **Wave 2(2026-06-11 全部合并)**:Datasource polish(PUT/DELETE + operation_policy +
+> worker 结构化 error code,[#32](https://github.com/allen-answer/dataOpsStudio_v2/pull/32),Codex)、
+> T7 Part B admin 三页 + License 管理([#30](https://github.com/allen-answer/dataOpsStudio_v2/pull/30),
+> Claude 4.8)、AI Gateway 壳 + T6 部署尾巴([#29](https://github.com/allen-answer/dataOpsStudio_v2/pull/29),
+> Claude 4.8)。
+>
 > **Wave 1(2026-06-10 全部合并)**:T5 License + Repair Mode + admin 路由
 > ([#28](https://github.com/allen-answer/dataOpsStudio_v2/pull/28),Codex)、
 > T8 migrate_from_v1([#26](https://github.com/allen-answer/dataOpsStudio_v2/pull/26),Claude 4.8)、
