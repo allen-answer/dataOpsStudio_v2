@@ -12,6 +12,7 @@
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
 | migrate_from_v1:全局数据源(空 project_id)迁入指定项目(`--global-datasource-project` / `--global-datasource-owner`,默认跳过=向后兼容) | Claude 4.8 | — | PR 待审 | `feat/migrate-global-datasources` |
+| API 进程伺服前端 SPA dist(前后端同机同进程零反代;`DATAOPS_FRONTEND_DIST` 设置且 dist 存在→挂载静态+SPA fallback,未设置→API-only 行为不变) | Claude Opus 4.8 | — | PR 待审 | `feat/serve-frontend-dist` |
 
 > **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
 > 安全项全闭环/落档)。**DM 已 Certified**:真实例验证 8/8 + 修复 3 个 adapter bug,

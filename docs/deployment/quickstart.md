@@ -183,6 +183,52 @@ Apply with `sudo systemctl restart systemd-journald`. The application logs are
 already JSON (structlog) with the R5 redaction processor enforced, so secrets
 never reach journald in the first place; the quota just bounds disk usage.
 
+## 5b. Serve the Frontend from the API process (single host, no reverse proxy)
+
+For 2.0 the frontend and backend run on the **same host, same process, with no
+reverse proxy**: the API process serves the built Vue SPA directly. This avoids
+running a separate static server and the local-only `vite dev` + SSH-tunnel
+setup. Skip this whole section if you only want the API (default behavior is
+unchanged — without `DATAOPS_FRONTEND_DIST` set, the API serves no static files).
+
+1. Build the SPA (produces `frontend/dist/` with `index.html` + hashed
+   `assets/`):
+
+   ```bash
+   cd frontend
+   npm ci
+   npm run build
+   cd ..
+   ```
+
+2. Point the API at the built dist directory and start the runtime:
+
+   ```bash
+   export DATAOPS_FRONTEND_DIST="$PWD/frontend/dist"
+   $LAUNCHER up
+   ```
+
+3. Open `http://<host>:8020/` in a browser — the full stack (SPA + API) is now
+   served from port 8020. No port 5173, no tunnel.
+
+Mount semantics:
+
+- `/api/*` and `/healthz` keep their existing routing and take priority; serving
+  the frontend does not weaken API auth (a protected `/api/*` call without a
+  token still returns `401`, and an unknown `/api/*` path still returns API
+  `404` JSON — it is never replaced by `index.html`).
+- `/assets/*` is served from `dist/assets` with a long, immutable cache header
+  (`public, max-age=31536000, immutable`) — safe because Vite content-hashes
+  asset filenames.
+- `index.html` is served with `Cache-Control: no-cache`, so a new release is
+  picked up immediately.
+- Any other GET path that is not a real file (e.g. `/projects/123`,
+  `/admin/users`) returns `index.html`, so client-side routes work on direct
+  link and refresh.
+
+`DATAOPS_FRONTEND_DIST` is ignored (API-only fallback, no error) if the path does
+not exist or has no `index.html` — useful when the dist has not been built yet.
+
 ## 6. Login
 
 ```bash
