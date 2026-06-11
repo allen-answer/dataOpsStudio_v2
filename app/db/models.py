@@ -1,4 +1,4 @@
-"""SQLAlchemy 2 Core 元数据 —— 12 张表(契约 §5、设计稿 §5.1)。
+"""SQLAlchemy 2 Core 元数据 —— 13 张表(契约 §5、设计稿 §5.1)。
 
 ★ R4 红线 DB 层防御(secret_refs CHECK):
   kind 限定为 Application Secret 6 种,Bootstrap kind(master_key /
@@ -415,8 +415,39 @@ license_state = Table(
 )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ai_configs —— AI Gateway singleton 配置(API key 只存 SecretRef)
+# ─────────────────────────────────────────────────────────────────────────────
+ai_configs = Table(
+    "ai_configs",
+    metadata,
+    Column("id", Integer(), primary_key=True),
+    Column("enabled", Boolean(), nullable=False, server_default=text("false")),
+    Column("provider", String(32), nullable=False, server_default="off"),
+    Column("model", String(128), nullable=True),
+    Column("base_url", Text(), nullable=True),
+    Column("api_key_secret_ref", String(64), nullable=True),
+    Column("max_auto_egress_level", Integer(), nullable=False, server_default="0"),
+    Column("l4_requires_optin", Boolean(), nullable=False, server_default=text("true")),
+    Column("enable_inference", Boolean(), nullable=False, server_default=text("false")),
+    Column("enable_auto_translation", Boolean(), nullable=False, server_default=text("false")),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    CheckConstraint("id = 1", name="singleton"),
+    CheckConstraint(
+        "provider IN ('off', 'mock', 'openai_compatible', 'anthropic', 'ollama')",
+        name="provider_is_supported",
+    ),
+    CheckConstraint(
+        "max_auto_egress_level >= 0 AND max_auto_egress_level <= 4",
+        name="max_auto_egress_level_range",
+    ),
+)
+
+
 __all__ = [
     "APPLICATION_SECRET_KINDS",
+    "ai_configs",
     "audit_logs",
     "datasources",
     "job_events",

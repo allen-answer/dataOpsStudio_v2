@@ -132,21 +132,6 @@ PostgreSQL / Oracle / DB2 数据源跑 SQL 仍直接 `UnsupportedDbTypeError`。
 
 ---
 
-### **Part B 剩余后端页需要** — AI 配置缺后端
-
-**位置**:`app/api/routes/`、`app/db/models.py`、`app/services/ai/`
-
-**现状**:T5 已落地 license/admin 基础路由;Wave 4A PR-1 收口 `revoked_tokens` + admin
-force-logout。Wave 4A PR-2 收口 §6 账户安全 MFA / 改密(account 端点 + recovery
-codes)。剩余缺口是 §9 AI 配置(`ai_configs` + Gateway DB 配置)。
-
-**卡住的前端**:§9 AI 配置页。
-
-**触发条件**:Wave 4A PR-2 review 后做 PR-3(AI 配置)。
-**优先级**:中(GA 前必有,但排在 Part A 收口之后)。
-
----
-
 ## Backlog 维护规则
 
 1. **每个 review 反馈**判断三类:

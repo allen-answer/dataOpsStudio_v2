@@ -44,6 +44,9 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("POST", "/api/account/mfa/verify") in routes
     assert ("POST", "/api/account/mfa/disable") in routes
     assert ("POST", "/api/account/recovery-codes/regenerate") in routes
+    assert ("GET", "/api/admin/ai-config") in routes
+    assert ("PUT", "/api/admin/ai-config") in routes
+    assert ("POST", "/api/admin/ai-config/test") in routes
 
 
 def test_list_datasources_filters_by_authz_and_hides_secret_fields() -> None:
