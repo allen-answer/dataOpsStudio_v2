@@ -11,7 +11,7 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| §5 验收 e2e 全量对照(contract §5:portable 解压 → … → migrate + docker compose 同流程) | review agent + 人 | 全部合并(已满足) | 未开工 | — |
+| §5 验收 e2e 全量对照(contract §5:portable 解压 → … → migrate + docker compose 同流程) | review agent + 人 | — | **已完成**(报告:`docs/acceptance-2.0.0-skeleton.md`;compose 形态补齐 [#35](https://github.com/allen-answer/dataOpsStudio_v2/pull/35) 待合并) | — |
 | DM 真实例集成验证(backlog 高优先级,Certified 前必做) | review agent + 人 | 需持牌 DM 实例 | 受阻(等 DM 实例) | — |
 
 > **Wave 4 候选(待人拍板立项)**:Part B 后端补全 —— §6 账户安全 MFA(users 缺列)
