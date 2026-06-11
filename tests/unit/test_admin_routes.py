@@ -7,6 +7,7 @@ from app.api.app import create_app
 from app.api.security import create_access_token
 from app.api.services import ApiServices
 from app.domain.license import LicenseMode
+from app.domain.secret import SecretKind, SecretRef
 from tests._asgi_client import AsgiClient
 
 
@@ -118,6 +119,85 @@ def test_admin_force_logout_sets_user_cutoff_and_audits() -> None:
     assert any(item["action"] == "admin_user_force_logout" for item in services.audits)
 
 
+def test_admin_put_ai_config_stores_key_without_echoing_secret() -> None:
+    api_key = "not-a-real-test-key"
+    row = _ai_config_row(api_key_secret_ref="secret-new")
+    services = _AdminServices(_QueueEngine([[], [], [row]]))
+    app = create_app(services=cast(ApiServices, services))
+    token = create_access_token(user_id="admin-1", role="admin", secret=services.jwt_secret)
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/admin/ai-config",
+        json_body={
+            "enabled": True,
+            "provider": "mock",
+            "model": "mock-model",
+            "base_url": None,
+            "api_key": api_key,
+            "max_auto_egress_level": 2,
+            "l4_requires_optin": True,
+            "enable_inference": True,
+            "enable_auto_translation": False,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["api_key_source"] == "stored"
+    assert payload["has_stored_api_key"] is True
+    assert "api_key" not in payload
+    assert services.secret_store.stored == [api_key]
+    assert api_key not in repr(services.audits)
+
+
+def test_admin_put_ai_config_rejects_disabling_l4_optin() -> None:
+    api_key = "not-a-real-test-key"
+    services = _AdminServices(_QueueEngine([]))
+    app = create_app(services=cast(ApiServices, services))
+    token = create_access_token(user_id="admin-1", role="admin", secret=services.jwt_secret)
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/admin/ai-config",
+        json_body={
+            "enabled": True,
+            "provider": "mock",
+            "model": "mock-model",
+            "base_url": None,
+            "api_key": api_key,
+            "max_auto_egress_level": 2,
+            "l4_requires_optin": False,
+            "enable_inference": True,
+            "enable_auto_translation": False,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_ai_config"
+    assert services.secret_store.stored == []
+
+
+def test_admin_ai_config_test_uses_mock_provider_and_audits() -> None:
+    services = _AdminServices(_QueueEngine([[_ai_config_row(provider="mock")]]))
+    app = create_app(services=cast(ApiServices, services))
+    token = create_access_token(user_id="admin-1", role="admin", secret=services.jwt_secret)
+
+    response = AsgiClient(app).post(
+        "/api/admin/ai-config/test",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["provider"] == "mock"
+    assert payload["error"] is None
+    assert any(item["action"] == "admin_ai_config_test" for item in services.audits)
+
+
 class _AdminServices:
     def __init__(
         self,
@@ -128,6 +208,7 @@ class _AdminServices:
         self.jwt_secret = "jwt-secret"
         self.rate_limiter = _RateLimiter()
         self.engine = engine
+        self.secret_store = _SecretStore()
         self.audits: list[dict[str, object]] = []
         self.revoked_after = revoked_after or datetime(2026, 1, 1, tzinfo=UTC)
         self.revoked_users: list[str] = []
@@ -157,6 +238,28 @@ class _AdminServices:
 class _RateLimiter:
     def allow(self, key: str) -> bool:
         return True
+
+
+class _SecretStore:
+    def __init__(self) -> None:
+        self.stored: list[str] = []
+        self.rotated: list[tuple[str, str]] = []
+        self.deleted: list[str] = []
+
+    def store_secret(self, plaintext: str, kind: SecretKind) -> SecretRef:
+        assert kind is SecretKind.AI_API_KEY
+        self.stored.append(plaintext)
+        return SecretRef(ref="secret-new", kind=kind)
+
+    def rotate_secret(self, ref: SecretRef, new_plaintext: str) -> SecretRef:
+        self.rotated.append((ref.ref, new_plaintext))
+        return ref
+
+    def delete_secret(self, ref: SecretRef) -> None:
+        self.deleted.append(ref.ref)
+
+    def reveal_secret(self, ref: SecretRef) -> str:
+        return f"revealed-{ref.ref}"
 
 
 class _QueueEngine:
@@ -201,3 +304,23 @@ class _QueueResult:
 
     def one(self) -> dict[str, Any]:
         return self.rows[0]
+
+
+def _ai_config_row(
+    *,
+    provider: str = "mock",
+    api_key_secret_ref: str | None = None,
+) -> dict[str, object]:
+    return {
+        "id": 1,
+        "enabled": True,
+        "provider": provider,
+        "model": "mock-model",
+        "base_url": None,
+        "api_key_secret_ref": api_key_secret_ref,
+        "max_auto_egress_level": 2,
+        "l4_requires_optin": True,
+        "enable_inference": True,
+        "enable_auto_translation": False,
+        "updated_at": datetime(2026, 1, 1, tzinfo=UTC),
+    }

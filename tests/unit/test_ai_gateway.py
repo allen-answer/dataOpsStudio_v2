@@ -18,11 +18,13 @@ from app.config import AiGatewayConfig
 from app.domain.ai import AiContext, AiOptions, ContextItem, EgressLevel
 from app.services.ai import (
     AiDisabledError,
+    AiGatewayRuntimeConfig,
     DefaultAiGateway,
     MockProvider,
     OpenAICompatibleProvider,
     ProviderError,
     build_gateway,
+    build_gateway_from_runtime_config,
 )
 from app.services.ai.default_gateway import AI_API_KEY_ENV, AI_MODEL_ENV
 from app.services.ai.hooks import LevelEgressChecker, NoopRedactor
@@ -160,3 +162,23 @@ def test_build_gateway_uses_openai_with_env_key(monkeypatch: pytest.MonkeyPatch)
     provider = gw._provider  # 白盒断言装配结果
     assert isinstance(provider, OpenAICompatibleProvider)
     assert provider.model == "my-model"
+
+
+def test_build_gateway_uses_runtime_config_key_without_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(AI_API_KEY_ENV, raising=False)
+    cfg = AiGatewayRuntimeConfig(
+        enabled=True,
+        provider="openai_compatible",
+        endpoint="https://llm.example.invalid/v1",
+        model="db-model",
+        api_key="not-a-real-test-key",
+        max_auto_egress_level=1,
+    )
+
+    gw = build_gateway_from_runtime_config(cfg)
+
+    provider = gw._provider
+    assert isinstance(provider, OpenAICompatibleProvider)
+    assert provider.model == "db-model"

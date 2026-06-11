@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from dataclasses import dataclass
 
 from app.config import AiGatewayConfig
 from app.domain.ai import AiChunk, AiContext, AiOptions, AiResponse, EgressLevel
@@ -42,10 +43,21 @@ from app.services.ai.providers import (
     Provider,
 )
 
-# ★ R8 / 契约 §5:2.0.0 无 ai_configs 表,API key + 模型名只从环境变量读。
+# ★ R8 / 契约 §5:环境变量仅作为 fallback;DB 配置中的 API key 只经 SecretStore 进入。
 AI_API_KEY_ENV = "DATAOPS_AI_API_KEY"
 AI_MODEL_ENV = "DATAOPS_AI_MODEL"
 DEFAULT_MODEL = "gpt-4o-mini"
+
+
+@dataclass(frozen=True)
+class AiGatewayRuntimeConfig:
+    enabled: bool = False
+    provider: str | None = None
+    endpoint: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+    max_auto_egress_level: int = 0
+    l4_requires_optin: bool = True
 
 
 class BudgetGuard:
@@ -190,7 +202,7 @@ def build_gateway(
 
     provider 选择:
     - config.provider == "openai_compatible" 且配了 endpoint:用真 provider,
-      API key 从 DATAOPS_AI_API_KEY 环境变量读(★ R8:不进配置 / 不建表)。
+      API key 从 DATAOPS_AI_API_KEY 环境变量读(兼容旧部署)。
     - 其它(含未配 / mock / 缺 key):回落 MockProvider,保证默认关 / 无 key 时
       Gateway 仍可构造(complete 会因 enabled=False 抛 AiDisabledError)。
 
@@ -207,13 +219,48 @@ def build_gateway(
     )
 
 
+def build_gateway_from_runtime_config(
+    config: AiGatewayRuntimeConfig,
+    *,
+    provider: Provider | None = None,
+    audit_sink: AuditSink | None = None,
+) -> DefaultAiGateway:
+    if provider is None:
+        provider = _provider_from_values(
+            provider_name=config.provider,
+            endpoint=config.endpoint,
+            api_key=config.api_key,
+            model=config.model,
+        )
+    return DefaultAiGateway(
+        provider,
+        enabled=config.enabled,
+        max_auto_egress_level=EgressLevel(config.max_auto_egress_level),
+        l4_requires_optin=config.l4_requires_optin,
+        audit_sink=audit_sink,
+    )
+
+
 def _provider_from_config(config: AiGatewayConfig) -> Provider:
-    api_key = os.environ.get(AI_API_KEY_ENV)
-    if config.provider == "openai_compatible" and config.endpoint and api_key:
-        model = os.environ.get(AI_MODEL_ENV) or DEFAULT_MODEL
+    return _provider_from_values(
+        provider_name=config.provider,
+        endpoint=config.endpoint,
+        api_key=os.environ.get(AI_API_KEY_ENV),
+        model=os.environ.get(AI_MODEL_ENV),
+    )
+
+
+def _provider_from_values(
+    *,
+    provider_name: str | None,
+    endpoint: str | None,
+    api_key: str | None,
+    model: str | None,
+) -> Provider:
+    if provider_name == "openai_compatible" and endpoint and api_key:
         return OpenAICompatibleProvider(
             api_key=api_key,
-            endpoint=config.endpoint,
-            model=model,
+            endpoint=endpoint,
+            model=model or DEFAULT_MODEL,
         )
     return MockProvider()
