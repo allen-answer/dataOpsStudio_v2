@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.infrastructure.secretstore.totp import (
+    accepted_totp_counter,
     generate_recovery_codes,
     generate_totp_seed,
     provisioning_uri,
@@ -16,6 +17,15 @@ def test_totp_verify_accepts_current_code() -> None:
 
     assert verify_totp_code(secret=secret, code=code, now=now) is True
     assert verify_totp_code(secret=secret, code="000000", now=now, window=0) is False
+
+
+def test_totp_returns_accepted_counter() -> None:
+    secret = generate_totp_seed()
+    now = 1_700_000_000
+    code = totp_code_for_test(secret=secret, now=now)
+
+    assert accepted_totp_counter(secret=secret, code=code, now=now) == now // 30
+    assert accepted_totp_counter(secret=secret, code="000000", now=now, window=0) is None
 
 
 def test_provisioning_uri_contains_issuer_and_secret() -> None:

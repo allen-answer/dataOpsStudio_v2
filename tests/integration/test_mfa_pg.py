@@ -23,7 +23,10 @@ from tests._asgi_client import AsgiClient
 pytestmark = pytest.mark.integration
 
 
-def test_mfa_password_and_recovery_flow_on_pg(tmp_path: Path) -> None:
+def test_mfa_password_and_recovery_flow_on_pg(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     engine = _pg_engine_or_skip()
     metadata.create_all(engine)
     _clear_metadata(engine)
@@ -91,7 +94,9 @@ def test_mfa_password_and_recovery_flow_on_pg(tmp_path: Path) -> None:
     enroll_payload = enroll_response.json()
     assert enroll_payload["otpauth_uri"].startswith("otpauth://totp/")
     secret = enroll_payload["secret"]
-    totp = totp_code_for_test(secret=secret, now=int(time.time()))
+    base_time = int(time.time())
+    monkeypatch.setattr("app.infrastructure.secretstore.totp.time.time", lambda: base_time)
+    totp = totp_code_for_test(secret=secret, now=base_time)
 
     verify_response = client.post(
         "/api/account/mfa/verify",
@@ -116,6 +121,12 @@ def test_mfa_password_and_recovery_flow_on_pg(tmp_path: Path) -> None:
     )
     assert totp_login.status_code == 200
     mfa_headers = {"Authorization": f"Bearer {totp_login.json()['access_token']}"}
+    replayed_totp_login = client.post(
+        "/api/auth/login",
+        json_body={"username": username, "password": changed_password, "mfa_code": totp},
+    )
+    assert replayed_totp_login.status_code == 401
+    assert replayed_totp_login.json()["error"] == "invalid_mfa_code"
 
     recovery_login = client.post(
         "/api/auth/login",
@@ -142,6 +153,41 @@ def test_mfa_password_and_recovery_flow_on_pg(tmp_path: Path) -> None:
     assert status_response.status_code == 200
     assert status_response.json()["recovery_codes_total"] == 8
     assert status_response.json()["recovery_codes_used"] == 1
+
+    regenerate_time = base_time + 30
+    monkeypatch.setattr("app.infrastructure.secretstore.totp.time.time", lambda: regenerate_time)
+    regenerate_totp = totp_code_for_test(secret=secret, now=regenerate_time)
+    regenerate_response = client.post(
+        "/api/account/recovery-codes/regenerate",
+        headers=mfa_headers,
+        json_body={"code": regenerate_totp},
+    )
+    assert regenerate_response.status_code == 200
+    assert len(regenerate_response.json()["recovery_codes"]) == 8
+    replayed_regenerate_response = client.post(
+        "/api/account/recovery-codes/regenerate",
+        headers=mfa_headers,
+        json_body={"code": regenerate_totp},
+    )
+    assert replayed_regenerate_response.status_code == 401
+    assert replayed_regenerate_response.json()["error"] == "invalid_mfa_code"
+    replayed_disable_response = client.post(
+        "/api/account/mfa/disable",
+        headers=mfa_headers,
+        json_body={"code": regenerate_totp},
+    )
+    assert replayed_disable_response.status_code == 401
+    assert replayed_disable_response.json()["error"] == "invalid_mfa_code"
+
+    disable_time = base_time + 60
+    monkeypatch.setattr("app.infrastructure.secretstore.totp.time.time", lambda: disable_time)
+    disable_totp = totp_code_for_test(secret=secret, now=disable_time)
+    disable_response = client.post(
+        "/api/account/mfa/disable",
+        headers=mfa_headers,
+        json_body={"code": disable_totp},
+    )
+    assert disable_response.status_code == 200
 
     admin_disable_response = client.post(
         f"/api/admin/users/{user_id}/mfa/disable",

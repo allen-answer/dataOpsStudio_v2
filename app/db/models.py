@@ -76,6 +76,7 @@ users = Table(
     Column("mfa_pending_secret_ref", String(64), nullable=True),
     Column("role", String(32), nullable=False, server_default="viewer"),
     Column("tokens_revoked_after", DateTime(timezone=True), nullable=True),
+    Column("last_used_totp_counter", BigInteger(), nullable=True),
     Column(
         "created_at",
         DateTime(timezone=True),

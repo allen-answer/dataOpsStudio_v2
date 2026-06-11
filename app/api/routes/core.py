@@ -71,7 +71,13 @@ def login(body: LoginRequest, request: Request) -> TokenResponse:
         if body.mfa_code is None:
             raise ApiError(401, "mfa_required", "MFA verification required")
         with services.engine.begin() as conn:
-            totp_ok = verify_user_totp(services, mfa_ref=mfa_ref, code=body.mfa_code)
+            totp_ok = verify_user_totp(
+                conn,
+                services,
+                user_id=str(row["id"]),
+                mfa_ref=mfa_ref,
+                code=body.mfa_code,
+            )
             recovery_ok = (
                 False
                 if totp_ok

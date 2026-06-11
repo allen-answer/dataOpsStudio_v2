@@ -108,7 +108,9 @@ def test_mfa_recovery_codes_schema_supports_one_time_codes() -> None:
     index_names = {idx.name for idx in mfa_recovery_codes.indexes}
 
     assert "mfa_pending_secret_ref" in user_cols
+    assert "last_used_totp_counter" in user_cols
     assert code_cols == {"id", "user_id", "code_hash", "created_at", "used_at"}
+    assert users.columns["last_used_totp_counter"].nullable is True
     assert mfa_recovery_codes.columns["code_hash"].nullable is False
     assert "ix_mfa_recovery_codes_user_id" in index_names
     assert "ix_mfa_recovery_codes_unused" in index_names
