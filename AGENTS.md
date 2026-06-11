@@ -30,7 +30,7 @@
 |---|---|
 | R1 | `app/services/` 禁止 import 数据库驱动 |
 | R2 | 业务代码禁止持有明文密码,只能持 `SecretRef` |
-| R3 | `cryptography.Fernet` / `bcrypt` / `hashlib` 只允许在 `secretstore/` |
+| R3 | `Fernet`/`bcrypt` 只允许在 `secretstore/`;`hazmat` 限 `secretstore/`+`license/`;非 secret 指纹用途的 `hashlib`(sql_hash 等)不受限 |
 | R4 | PG 连接密码禁止写入 `secret_refs` 表(否则启动循环)|
 | R5 | 日志禁止出现敏感值;structlog 脱敏 processor 强制;禁 stdlib logging |
 | R6 | `ResultSet` 禁止持有 `DbCursor` |

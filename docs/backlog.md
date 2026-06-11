@@ -53,7 +53,10 @@
 `@pytest.mark.integration` 级验证(连接 / SELECT 流式 / introspection / EXPLAIN /
 软取消),证据(stdout / 测试报告)归档进 PR 或 docs。
 
-**触发条件**:对外宣称 DM Certified 前 / 2.0.0 GA 前。**优先级**:高。
+**触发条件**:对外宣称 DM Certified 前。**优先级**:高。
+
+**GA 决策(2026-06-11,人拍板)**:2.0.x GA 以 **"DM Beta"** 口径发布,不宣称
+Certified;本条不阻塞 GA,真实例到位后补验并升级口径。
 
 ---
 
@@ -73,7 +76,9 @@
 - 分两步建:先建 datasource(无密码,占位 secret_ref),再独立 `PATCH /datasources/{id}/password`(明确审计 + 短 TTL token)
 - 或前端先 `POST /secrets`(获 secret_ref),建 datasource 时只传 secret_ref
 
-**优先级**:**低**,GA 前安全评审窗口决定。dogfood / dev 不挡路。
+**优先级**:**低**。**GA 决策(2026-06-11,人拍板)**:选 C —— 不进 GA,
+推迟到真有外部安全审计时再做(届时二选一方案单独立项)。触发条件由
+"GA 前安全评审窗口"改为"外部安全审计启动时"。
 
 ---
 
@@ -100,6 +105,23 @@ PostgreSQL / Oracle / DB2 数据源跑 SQL 仍直接 `UnsupportedDbTypeError`。
   避免用户提交后才看到 failed(**此项前端可独立做,不阻塞后端**)
 
 **触发条件**:多方言执行上线前 / 或先做前端 warn 兜底。**优先级**:中(2γ e2e 已实锤此限制)。
+
+**GA 决策(2026-06-11,人拍板)**:Oracle adapter **滑出 GA,进 2.0.x 后续版本**
+(契约本就允许"Oracle 可滑 2.0.x");DB2 维持 Preview。
+
+---
+
+### **GA 发布口径** — license 以 trial-only 发布,正式签发推迟
+
+**位置**:`app/infrastructure/license/verifier.py`(内置公钥)/ release 流程
+
+**现状**:当前内置公钥是 T5 开发期生成的密钥对;正式 license 签发需要按设计稿 §8.8
+在签发机生成真私钥(私钥永不进仓库/会话,由人保管)并替换内置公钥。
+
+**GA 决策(2026-06-11,人拍板)**:GA 以 **trial-only**(30 天试用,无 license 文件)
+口径发布;正式密钥对与签发流程推迟到首个商业交付前。
+
+**触发条件**:首个需要正式 license 的对外交付。**优先级**:中(商业化前必做)。
 
 ---
 
