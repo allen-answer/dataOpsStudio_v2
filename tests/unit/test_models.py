@@ -17,6 +17,7 @@ from app.db.models import (
     license_state,
     metadata,
     result_sets,
+    revoked_tokens,
     secret_refs,
     users,
 )
@@ -66,9 +67,10 @@ def test_all_alembic_revision_ids_under_32_chars() -> None:
     assert not violations, f"revision ID 超 32 字符: {violations}"
 
 
-def test_metadata_has_10_tables() -> None:
+def test_metadata_has_11_tables() -> None:
     expected = {
         "users",
+        "revoked_tokens",
         "projects",
         "project_members",
         "datasources",
@@ -80,6 +82,18 @@ def test_metadata_has_10_tables() -> None:
         "license_state",
     }
     assert set(metadata.tables.keys()) == expected
+
+
+def test_revoked_tokens_schema_supports_jti_denylist_and_user_cutoff() -> None:
+    user_cols = set(users.columns.keys())
+    token_cols = set(revoked_tokens.columns.keys())
+    index_names = {idx.name for idx in revoked_tokens.indexes}
+
+    assert "tokens_revoked_after" in user_cols
+    assert token_cols == {"jti", "user_id", "revoked_at", "expires_at"}
+    assert revoked_tokens.columns["jti"].primary_key is True
+    assert "ix_revoked_tokens_user_id" in index_names
+    assert "ix_revoked_tokens_expires_at" in index_names
 
 
 def test_r6_result_sets_has_no_cursor_field() -> None:

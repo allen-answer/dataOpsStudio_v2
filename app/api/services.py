@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import structlog
-from sqlalchemy import URL, create_engine, insert, select
+from sqlalchemy import URL, create_engine, delete, insert, select, update
 from sqlalchemy.engine import Engine
 
 from app.config import Settings, load_settings
-from app.db.models import audit_logs, license_state
+from app.db.models import audit_logs, license_state, revoked_tokens, users
 from app.domain.license import LicenseMode
 from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
@@ -58,6 +59,59 @@ class ApiServices:
         if row is None:
             return LicenseMode.TRIAL
         return LicenseMode(str(row["mode"]))
+
+    def is_token_revoked(
+        self,
+        *,
+        user_id: str,
+        issued_at: int,
+        expires_at: int,
+        jti: str | None,
+    ) -> bool:
+        del expires_at
+        now = datetime.now(UTC)
+        issued_at_dt = datetime.fromtimestamp(issued_at, UTC)
+        with self.engine.connect() as conn:
+            row = (
+                conn.execute(select(users.c.tokens_revoked_after).where(users.c.id == user_id))
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                return True
+            revoked_after = row["tokens_revoked_after"]
+            if isinstance(revoked_after, datetime):
+                if revoked_after.tzinfo is None:
+                    revoked_after = revoked_after.replace(tzinfo=UTC)
+                if issued_at_dt <= revoked_after:
+                    return True
+            if jti is None:
+                return False
+            revoked_row = (
+                conn.execute(
+                    select(revoked_tokens.c.jti)
+                    .where(revoked_tokens.c.jti == jti)
+                    .where(revoked_tokens.c.expires_at > now)
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if revoked_row is None:
+                return False
+            return True
+
+    def revoke_user_tokens(self, *, user_id: str) -> datetime:
+        revoked_after = datetime.now(UTC)
+        with self.engine.begin() as conn:
+            conn.execute(delete(revoked_tokens).where(revoked_tokens.c.expires_at <= revoked_after))
+            result = conn.execute(
+                update(users)
+                .where(users.c.id == user_id)
+                .values(tokens_revoked_after=revoked_after, updated_at=revoked_after)
+            )
+            if result.rowcount == 0:
+                raise ValueError("user not found")
+        return revoked_after
 
     def write_audit(
         self,

@@ -16,6 +16,7 @@ from sqlalchemy.engine import Connection, RowMapping
 from app.api.dependencies import current_user_from, request_id_from, services_from
 from app.api.errors import ApiError
 from app.api.schemas import (
+    AdminForceLogoutResponse,
     AdminProjectCreateRequest,
     AdminProjectDeleteImpactResponse,
     AdminProjectItem,
@@ -161,6 +162,27 @@ def reset_admin_user_password(user_id: str, request: Request) -> AdminResetPassw
         user_id=actor.id,
     )
     return AdminResetPasswordResponse(temporary_password=temporary_password)
+
+
+@router.post("/users/{user_id}/force-logout", response_model=AdminForceLogoutResponse)
+def force_logout_admin_user(user_id: str, request: Request) -> AdminForceLogoutResponse:
+    actor = _require_admin(request)
+    services = services_from(request)
+    with services.engine.connect() as conn:
+        _require_user(conn, user_id)
+    try:
+        revoked_after = services.revoke_user_tokens(user_id=user_id)
+    except ValueError as exc:
+        raise ApiError(404, "not_found", "User not found") from exc
+    _audit_admin(
+        services,
+        request,
+        action="admin_user_force_logout",
+        resource_type="user",
+        resource_id=user_id,
+        user_id=actor.id,
+    )
+    return AdminForceLogoutResponse(user_id=user_id, revoked_after=revoked_after)
 
 
 @router.post("/users/{user_id}/mfa/disable", response_model=AdminUserItem)

@@ -111,6 +111,13 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
             claims = decode_access_token(token, secret=self._services.jwt_secret)
         except JwtError:
             return error_response(401, "unauthorized", "Authentication required")
+        if self._services.is_token_revoked(
+            user_id=claims.user_id,
+            issued_at=claims.issued_at,
+            expires_at=claims.expires_at,
+            jti=claims.jti,
+        ):
+            return error_response(401, "unauthorized", "Authentication required")
         request.state.user = CurrentUser(id=claims.user_id, role=claims.role)
         return None
 

@@ -24,7 +24,12 @@ def test_crosscutting_middleware_requires_auth_for_api_paths() -> None:
 def test_crosscutting_middleware_authenticates_and_audits_success() -> None:
     services = _FakeServices()
     app = _app_with_services(services)
-    token = create_access_token(user_id="user-1", role="admin", secret=services.jwt_secret)
+    token = create_access_token(
+        user_id="user-1",
+        role="admin",
+        secret=services.jwt_secret,
+        jti="jti-1",
+    )
 
     response = AsgiClient(app).get(
         "/api/protected",
@@ -37,7 +42,29 @@ def test_crosscutting_middleware_authenticates_and_audits_success() -> None:
         "api_request_start",
         "api_request_end",
     ]
+    assert services.revocation_checks == [
+        {
+            "user_id": "user-1",
+            "jti": "jti-1",
+        }
+    ]
     assert response.headers["x-request-id"]
+
+
+def test_crosscutting_middleware_rejects_revoked_token() -> None:
+    services = _FakeServices()
+    services.token_revoked = True
+    app = _app_with_services(services)
+    token = create_access_token(user_id="user-1", role="admin", secret=services.jwt_secret)
+
+    response = AsgiClient(app).get(
+        "/api/protected",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"error": "unauthorized", "message": "Authentication required"}
+    assert services.audits == []
 
 
 def test_crosscutting_middleware_blocks_repair_mode_mutations() -> None:
@@ -172,9 +199,23 @@ class _FakeServices:
         self.rate_limiter = _RateLimiter()
         self.mode = LicenseMode.TRIAL
         self.audits: list[dict[str, object]] = []
+        self.token_revoked = False
+        self.revocation_checks: list[dict[str, object]] = []
 
     def current_license_mode(self) -> LicenseMode:
         return self.mode
+
+    def is_token_revoked(
+        self,
+        *,
+        user_id: str,
+        issued_at: int,
+        expires_at: int,
+        jti: str | None,
+    ) -> bool:
+        del issued_at, expires_at
+        self.revocation_checks.append({"user_id": user_id, "jti": jti})
+        return self.token_revoked
 
     def write_audit(self, **kwargs: object) -> None:
         self.audits.append(kwargs)
