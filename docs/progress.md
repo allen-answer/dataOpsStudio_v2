@@ -11,6 +11,9 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
+| Wave 5A PR-1 battle-tested crypto 替换(PyJWT + pyotp) | Codex | — | PR 待审 | [#49](https://github.com/allen-answer/dataOpsStudio_v2/pull/49) |
+| Wave 5A PR-2 TOTP 同窗重放防护 | Codex | PR-1 review | 未开工 | — |
+| Wave 5A PR-3 错误码细分 + 残留小项 | Codex | PR-2 review | 未开工 | — |
 | DM 真实例集成验证(backlog 高优先级,Certified 宣称前必做) | review agent + 人 | 需持牌 DM 实例 | 受阻(等 DM 实例) | — |
 
 > **下一里程碑候选(待人拍板)**:2.0.x GA 准备 —— GA 前安全加固清单
