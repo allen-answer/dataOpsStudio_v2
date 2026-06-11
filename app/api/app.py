@@ -8,6 +8,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from app.api.errors import ApiError, api_error_handler, unhandled_error_handler
+from app.api.frontend import mount_frontend, resolve_frontend_dist
 from app.api.middleware.crosscutting import CrossCuttingMiddleware
 from app.api.routes import router
 from app.api.services import ApiServices, build_api_services
@@ -23,6 +24,9 @@ def create_app(
 ) -> FastAPI:
     actual_services = services or build_api_services(settings)
     expose_docs = _docs_enabled(settings)
+    frontend_dist = resolve_frontend_dist(
+        settings.api.frontend_dist if settings is not None else None
+    )
     app = FastAPI(
         title="DataOps Studio API",
         version="2.0.0a0",
@@ -33,12 +37,21 @@ def create_app(
     app.state.services = actual_services
     app.add_exception_handler(ApiError, cast(ExceptionHandler, api_error_handler))
     app.add_exception_handler(Exception, unhandled_error_handler)
-    app.add_middleware(CrossCuttingMiddleware, services=actual_services)
+    app.add_middleware(
+        CrossCuttingMiddleware,
+        services=actual_services,
+        serve_frontend=frontend_dist is not None,
+    )
     app.include_router(router, prefix="/api")
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    # ★ 前端伺服必须在 /api 路由与 /healthz 之后挂载,使其优先匹配,
+    # SPA catch-all 只兜住剩余 GET 路径(见 app.api.frontend 模块文档)。
+    if frontend_dist is not None:
+        mount_frontend(app, frontend_dist)
 
     return app
 
