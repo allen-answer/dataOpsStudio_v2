@@ -120,7 +120,30 @@ def test_sync_license_state_preserves_existing_trial_expiry(
     _sync_license_state(context, LocalFileBootstrapSecrets.from_config_dir(tmp_path / "config"))
 
     assert engine.updated_values is not None
+    assert engine.operation == "update"
     assert engine.updated_values["expires_at"] == existing_expires_at
+
+
+def test_sync_license_state_updates_existing_license_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path)
+    command_bootstrap_init(context, Namespace(force=False))
+    engine = _LicenseStateEngine(
+        {
+            "id": 1,
+            "mode": "valid",
+            "expires_at": datetime(2026, 7, 1, tzinfo=UTC),
+        }
+    )
+    monkeypatch.setattr("app.launcher._metadata_engine", lambda *args, **kwargs: engine)
+
+    _sync_license_state(context, LocalFileBootstrapSecrets.from_config_dir(tmp_path / "config"))
+
+    assert engine.operation == "update"
+    assert engine.updated_values is not None
+    assert engine.updated_values["id"] == 1
 
 
 def test_pg_ctl_start_uses_runtime_socket_dir(
@@ -231,6 +254,7 @@ class _LicenseStateEngine:
     def __init__(self, existing: dict[str, Any] | None) -> None:
         self.existing = existing
         self.updated_values: dict[str, Any] | None = None
+        self.operation: str | None = None
 
     def begin(self) -> _LicenseStateConnection:
         return _LicenseStateConnection(self)
@@ -253,8 +277,11 @@ class _LicenseStateConnection:
     def execute(self, statement: Any) -> _LicenseStateResult:
         self.calls += 1
         if self.calls == 1:
+            selected = {column.name for column in statement.selected_columns}
+            assert {"id", "mode", "expires_at"}.issubset(selected)
             return _LicenseStateResult(self.engine.existing)
         compiled = statement.compile()
+        self.engine.operation = statement.__visit_name__
         self.engine.updated_values = dict(compiled.params)
         return _LicenseStateResult(None)
 
