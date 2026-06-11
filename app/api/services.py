@@ -68,10 +68,10 @@ class ApiServices:
         expires_at: int,
         jti: str | None,
     ) -> bool:
+        del expires_at
         now = datetime.now(UTC)
         issued_at_dt = datetime.fromtimestamp(issued_at, UTC)
-        with self.engine.begin() as conn:
-            conn.execute(delete(revoked_tokens).where(revoked_tokens.c.expires_at <= now))
+        with self.engine.connect() as conn:
             row = (
                 conn.execute(select(users.c.tokens_revoked_after).where(users.c.id == user_id))
                 .mappings()
@@ -98,13 +98,12 @@ class ApiServices:
             )
             if revoked_row is None:
                 return False
-            if expires_at <= int(now.timestamp()):
-                return False
             return True
 
     def revoke_user_tokens(self, *, user_id: str) -> datetime:
         revoked_after = datetime.now(UTC)
         with self.engine.begin() as conn:
+            conn.execute(delete(revoked_tokens).where(revoked_tokens.c.expires_at <= revoked_after))
             result = conn.execute(
                 update(users)
                 .where(users.c.id == user_id)
