@@ -77,18 +77,45 @@ _DATA_TYPE_NAME_TO_COLUMN_TYPE: dict[str, ColumnType] = {
 }
 
 # dmPython DB-API type-object 常量名 → 统一 ColumnType。
-# DB-API 2.0 规定 description[1] 可以是 type-object;dmPython 暴露
-# STRING / NUMBER / DATETIME / BINARY / ROWID 等(沿用 Oracle/通用习惯)。
+# DB-API 2.0 规定 description[1] 可以是 type-object;dmPython 实测暴露
+# NUMBER / DECIMAL / BIGINT / DOUBLE / REAL / STRING / FIXED_STRING /
+# LONG_STRING / TIMESTAMP / DATE / TIME / LOB / FIXED_BINARY / LONG_BINARY 等。
+#
+# ★ NUMBER / DECIMAL 在真实例上无法只凭 type-object 区分整数与小数:
+#   `INT` 列报 dmPython.NUMBER、`DECIMAL(10,2)` 报 dmPython.DECIMAL,
+#   但二者都可能承载整数或小数。真正的判别信号是 description 的 scale
+#   (元组 idx5):scale==0 → INTEGER,scale>0 或 None → DECIMAL。
+#   故 NUMBER / DECIMAL 此表先记为 DECIMAL(无 scale 时的保守默认),
+#   有 scale 信号时由 description_item_to_column_type 覆写为 INTEGER。
 _TYPE_OBJECT_NAME_TO_COLUMN_TYPE: dict[str, ColumnType] = {
+    # 数字(scale 可覆写为 INTEGER)
+    "NUMBER": ColumnType.DECIMAL,
+    "DECIMAL": ColumnType.DECIMAL,
+    # 明确整数类型(不受 scale 影响)
+    "BIGINT": ColumnType.INTEGER,
+    # 浮点
+    "DOUBLE": ColumnType.FLOAT,
+    "REAL": ColumnType.FLOAT,
+    # 字符串
     "STRING": ColumnType.STRING,
     "FIXED_STRING": ColumnType.STRING,
-    "NUMBER": ColumnType.DECIMAL,
+    "LONG_STRING": ColumnType.STRING,
+    "CLOB": ColumnType.STRING,
+    # 时间
     "DATETIME": ColumnType.DATETIME,
     "TIMESTAMP": ColumnType.DATETIME,
+    "DATE": ColumnType.DATE,
+    "TIME": ColumnType.TIME,
+    # 二进制
     "BINARY": ColumnType.BYTES,
+    "FIXED_BINARY": ColumnType.BYTES,
+    "LONG_BINARY": ColumnType.BYTES,
+    "LOB": ColumnType.BYTES,
     "BLOB": ColumnType.BYTES,
-    "CLOB": ColumnType.STRING,
 }
+
+# 这些 type-object 承载整数还是小数取决于 description.scale,需 scale 判别。
+_SCALE_SENSITIVE_TYPE_NAMES = ("NUMBER", "DECIMAL")
 
 
 def data_type_string_to_column_type(raw: object) -> ColumnType:
@@ -125,7 +152,53 @@ def type_code_to_column_type(dm_module: Any, code: object) -> ColumnType:
     return ColumnType.UNKNOWN
 
 
+def description_item_to_column_type(
+    dm_module: Any, code: object, scale: object = None
+) -> ColumnType:
+    """dmPython description 的 (type-object, scale) → 统一 ColumnType。
+
+    在 `type_code_to_column_type` 基础上加 scale 判别:NUMBER / DECIMAL 这类
+    既能承载整数也能承载小数的类型,按 description 的 scale 区分 ——
+    scale==0 → INTEGER,scale>0 或 scale 缺失(None)→ DECIMAL(保守默认)。
+    其余类型(BIGINT / DOUBLE / STRING / TIMESTAMP ...)与 scale 无关,直接映射。
+    """
+    base = type_code_to_column_type(dm_module, code)
+    if base is not ColumnType.DECIMAL:
+        return base
+    # 仅 scale-敏感类型(NUMBER / DECIMAL)且 scale==0 时改判 INTEGER。
+    if not _code_is_scale_sensitive(dm_module, code):
+        return base
+    scale_int = _as_int(scale)
+    if scale_int is not None and scale_int == 0:
+        return ColumnType.INTEGER
+    return ColumnType.DECIMAL
+
+
+def _code_is_scale_sensitive(dm_module: Any, code: object) -> bool:
+    if dm_module is None:
+        return False
+    for name in _SCALE_SENSITIVE_TYPE_NAMES:
+        constant = getattr(dm_module, name, None)
+        if constant is None:
+            continue
+        try:
+            if code == constant or code is constant:
+                return True
+        except Exception:  # pragma: no cover - 异常 __eq__ 的极端兜底
+            continue
+    return False
+
+
+def _as_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
 __all__ = [
     "data_type_string_to_column_type",
+    "description_item_to_column_type",
     "type_code_to_column_type",
 ]
