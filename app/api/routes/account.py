@@ -25,10 +25,10 @@ from app.api.services import ApiServices
 from app.db.models import mfa_recovery_codes, users
 from app.domain.secret import HashedRef, SecretKind, SecretRef
 from app.infrastructure.secretstore.totp import (
+    accepted_totp_counter,
     generate_recovery_codes,
     generate_totp_seed,
     provisioning_uri,
-    verify_totp_code,
 )
 
 router = APIRouter(prefix="/account")
@@ -121,7 +121,8 @@ def verify_account_mfa(body: MfaVerifyRequest, request: Request) -> MfaVerifyRes
         seed = services.secret_store.reveal_secret(
             SecretRef(ref=pending_ref, kind=SecretKind.MFA_TOTP_SEED)
         )
-        if not verify_totp_code(secret=seed, code=body.code):
+        counter = accepted_totp_counter(secret=seed, code=body.code)
+        if counter is None:
             raise ApiError(401, "invalid_mfa_code", "Invalid MFA code")
         codes = _replace_recovery_codes(conn, services, user.id)
         conn.execute(
@@ -130,6 +131,7 @@ def verify_account_mfa(body: MfaVerifyRequest, request: Request) -> MfaVerifyRes
             .values(
                 mfa_secret_ref=pending_ref,
                 mfa_pending_secret_ref=None,
+                last_used_totp_counter=counter,
                 updated_at=datetime.now(UTC),
             )
         )
@@ -148,7 +150,7 @@ def disable_account_mfa(body: MfaDisableRequest, request: Request) -> MfaDisable
         mfa_ref = _optional_str(row["mfa_secret_ref"])
         if mfa_ref is None:
             raise ApiError(409, "mfa_not_enabled", "MFA is not enabled")
-        if not verify_user_totp(services, mfa_ref=mfa_ref, code=body.code):
+        if not verify_user_totp(conn, services, user_id=user.id, mfa_ref=mfa_ref, code=body.code):
             raise ApiError(401, "invalid_mfa_code", "Invalid MFA code")
         conn.execute(delete(mfa_recovery_codes).where(mfa_recovery_codes.c.user_id == user.id))
         conn.execute(
@@ -175,7 +177,7 @@ def regenerate_account_recovery_codes(
         mfa_ref = _optional_str(row["mfa_secret_ref"])
         if mfa_ref is None:
             raise ApiError(409, "mfa_not_enabled", "MFA is not enabled")
-        if not verify_user_totp(services, mfa_ref=mfa_ref, code=body.code):
+        if not verify_user_totp(conn, services, user_id=user.id, mfa_ref=mfa_ref, code=body.code):
             raise ApiError(401, "invalid_mfa_code", "Invalid MFA code")
         codes = _replace_recovery_codes(conn, services, user.id)
     _audit_account(
@@ -188,11 +190,38 @@ def regenerate_account_recovery_codes(
     return RecoveryCodesResponse(recovery_codes=codes)
 
 
-def verify_user_totp(services: ApiServices, *, mfa_ref: str, code: str) -> bool:
+def verify_user_totp(
+    conn: Connection,
+    services: ApiServices,
+    *,
+    user_id: str,
+    mfa_ref: str,
+    code: str,
+) -> bool:
     seed = services.secret_store.reveal_secret(
         SecretRef(ref=mfa_ref, kind=SecretKind.MFA_TOTP_SEED)
     )
-    return verify_totp_code(secret=seed, code=code)
+    counter = accepted_totp_counter(secret=seed, code=code)
+    if counter is None:
+        return False
+    row = (
+        conn.execute(
+            select(users.c.last_used_totp_counter).where(users.c.id == user_id).with_for_update()
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return False
+    last_counter = row["last_used_totp_counter"]
+    if isinstance(last_counter, int) and counter <= last_counter:
+        return False
+    conn.execute(
+        update(users)
+        .where(users.c.id == user_id)
+        .values(last_used_totp_counter=counter, updated_at=datetime.now(UTC))
+    )
+    return True
 
 
 def consume_recovery_code(
