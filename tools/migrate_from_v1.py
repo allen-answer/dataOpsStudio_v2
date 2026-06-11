@@ -7,11 +7,15 @@
         --source <v1_dir> \
         --target <pg_dsn> \
         --v1-secret-key <path/to/.dataops_secret.key> \
-        --master-key-file <path/to/2.0/.secret_master.key>
+        --master-key-file <path/to/2.0/.secret_master.key> \
+        [--global-datasource-project <name> [--global-datasource-owner <username>]]
 
 边界(严守):
 - 只迁 2.0 已建表的源数据(以 app/db/models.py 实测为准):
     users / projects(+project_members) / datasources / jobs / audit_logs
+- 1.x 全局数据源(project_id 为空)无法满足 2.0 NOT NULL FK:默认跳过 + 报告;
+  带 --global-datasource-project 时新建/复用同名承接项目挂入(owner 从已迁移用户
+  按 username 解析,默认 admin,解析不到报错退出)。见 docs/deployment/migrate-from-v1.md。
 - 2.1+ 才有的目标表(compare_tasks / workflows / scenario_templates /
   sql_templates / ai_configs / asset_aspects / refresh_tokens / ...)2.0.0
   骨架未建,**不迁、不建 migration**,只在报告里列"跳过 + 原因"。
@@ -39,9 +43,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import structlog
-from sqlalchemy import create_engine, insert
+from sqlalchemy import create_engine, insert, select
 from sqlalchemy.engine import Connection, Engine
 
 from app.db.models import (
@@ -157,6 +162,26 @@ class MigrationReport:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 迁移选项(CLI 旗标解析后的载体;均可选,默认 = 现行为)
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class MigrationOptions:
+    """run_migration 的可选行为开关。
+
+    global_datasource_project:为 1.x 全局数据源(project_id 为空)新建/复用承接项目名。
+        None = 现行为(全局数据源跳过 + 报告)。
+    global_datasource_owner:承接项目的 owner username(从已迁移用户按 username 解析)。
+    """
+
+    global_datasource_project: str | None = None
+    global_datasource_owner: str = "admin"
+
+
+class MigrationConfigError(RuntimeError):
+    """迁移旗标语义错误(如承接项目 owner 解析不到已迁移用户)。"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Bootstrap(2.0 master key)—— 只为构造 SecretStore;不连 PG,不存 PG。
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
@@ -215,10 +240,15 @@ def migrate_users(
     secret_store: SecretStore,
     v1_decryptor: V1FernetDecryptor,
     report: MigrationReport,
-) -> set[str]:
-    """迁 config/users.json → users。返回成功迁入的 user id 集合(供 FK 校验)。"""
+) -> tuple[set[str], dict[str, str]]:
+    """迁 config/users.json → users。
+
+    返回 (成功迁入的 user id 集合, username → user_id 映射)。
+    id 集合供 FK 校验;username 映射供全局数据源承接项目按 owner username 解析。
+    """
     rep = report.table("users")
     migrated_ids: set[str] = set()
+    username_to_id: dict[str, str] = {}
     for row in rows:
         user_id = _coalesce_str(row.get("id"))
         username = _coalesce_str(row.get("username"))
@@ -260,8 +290,9 @@ def migrate_users(
             values["updated_at"] = created
         conn.execute(insert(users).values(**values))
         migrated_ids.add(user_id)
+        username_to_id[username] = user_id
         rep.migrated += 1
-    return migrated_ids
+    return migrated_ids, username_to_id
 
 
 def migrate_projects(
@@ -341,9 +372,16 @@ def migrate_datasources(
     known_project_ids: set[str],
     secret_store: SecretStore,
     report: MigrationReport,
-) -> None:
-    """迁 config/datasources.json → datasources。明文 password → SecretStore → secret_ref。"""
+    global_project_id: str | None = None,
+) -> int:
+    """迁 config/datasources.json → datasources。明文 password → SecretStore → secret_ref。
+
+    global_project_id:不为 None 时,project_id 为空的 1.x 全局数据源挂入该承接项目;
+        为 None 时维持现行为(全局数据源跳过 + 报告)。
+    返回挂入承接项目的全局数据源条数(供 synthetic project 报告 / log)。
+    """
     rep = report.table("datasources")
+    global_attached = 0
     for row in rows:
         ds_id = _coalesce_str(row.get("id"))
         name = _coalesce_str(row.get("name"))
@@ -358,11 +396,19 @@ def migrate_datasources(
             continue
 
         # project_id:1.x 空字符串 = 全局可见;2.0 datasources.project_id 是 NOT NULL FK。
-        project_id = _coalesce_str(row.get("project_id"))
-        if not project_id or project_id not in known_project_ids:
+        raw_project_id = _coalesce_str(row.get("project_id"))
+        is_global = not raw_project_id
+        if is_global and global_project_id is not None:
+            # 带 --global-datasource-project:全局数据源挂入承接项目。
+            project_id = global_project_id
+            global_attached += 1
+        elif raw_project_id and raw_project_id in known_project_ids:
+            project_id = raw_project_id
+        else:
+            # 全局且未指定承接项目 / 项目缺失或未迁 → 跳过(维持现行为)。
             rep.skip(
                 f"datasource id={ds_id} project_id not migrated/missing "
-                f"(project={project_id or '<global>'})"
+                f"(project={raw_project_id or '<global>'})"
             )
             continue
 
@@ -408,6 +454,43 @@ def migrate_datasources(
         }
         conn.execute(insert(datasources).values(**values))
         rep.migrated += 1
+    return global_attached
+
+
+def create_global_datasource_project(
+    conn: Connection,
+    *,
+    project_name: str,
+    owner_user_id: str,
+    report: MigrationReport,
+) -> str:
+    """新建承接 1.x 全局数据源的 synthetic 项目 + owner membership,返回 project id。
+
+    若已存在同名已迁项目则复用(幂等承接,不重复建)。仅在确有全局数据源时被调用。
+    计入 projects 报告(migrated +1)与 project_members(owner)。
+    """
+    existing = conn.execute(
+        select(projects.c.id).where(projects.c.name == project_name)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return str(existing)
+
+    # R10:别 f-string 拼 uuid;直接用 str(uuid4())。
+    project_id = str(uuid4())
+    conn.execute(
+        insert(projects).values(
+            id=project_id,
+            name=project_name,
+            owner_user_id=owner_user_id,
+            description="migrated: 1.x global datasources",
+        )
+    )
+    report.table("projects").migrated += 1
+    conn.execute(
+        insert(project_members).values(project_id=project_id, user_id=owner_user_id, role="owner")
+    )
+    report.table("project_members").migrated += 1
+    return project_id
 
 
 def migrate_jobs(
@@ -541,19 +624,41 @@ def migrate_audit_logs(
 # ─────────────────────────────────────────────────────────────────────────────
 # 编排
 # ─────────────────────────────────────────────────────────────────────────────
+def _has_global_datasource(rows: Sequence[Mapping[str, Any]]) -> bool:
+    """是否存在 project_id 为空的 1.x 全局数据源(决定是否新建承接项目)。"""
+    return any(not _coalesce_str(row.get("project_id")) for row in rows)
+
+
+def _resolve_global_owner(options: MigrationOptions, username_to_id: dict[str, str]) -> str:
+    """从已迁移用户按 username 解析承接项目 owner;解析不到 → MigrationConfigError(非静默)。"""
+    owner_id = username_to_id.get(options.global_datasource_owner)
+    if owner_id is None:
+        available = ", ".join(sorted(username_to_id)) or "<none migrated>"
+        raise MigrationConfigError(
+            f"--global-datasource-owner {options.global_datasource_owner!r} "
+            f"did not resolve to a migrated user; available usernames: {available}"
+        )
+    return owner_id
+
+
 def run_migration(
     *,
     source_dir: Path,
     engine: Engine,
     secret_store: SecretStore,
     v1_decryptor: V1FernetDecryptor,
+    options: MigrationOptions | None = None,
 ) -> MigrationReport:
     """执行整库迁移。返回报告。失败时 report.incomplete=True(已写入部分保留)。
 
     ★ 不在一个大事务里跑全部:secret_store.store_secret 走自己的连接/事务,
       与 PG 行写入分开。每张表用独立事务,失败保留前面已提交的表(报告标 incomplete),
       契约 §5.4.2:迁移失败保留已写入部分但明确标记不完整。
+
+    options.global_datasource_project 不为 None 且确有全局数据源时,新建承接项目挂入;
+    owner 解析失败抛 MigrationConfigError(不吞,向上传递,主流程明确报错退出)。
     """
+    options = options or MigrationOptions()
     report = MigrationReport()
     report.skipped_sources = list(_SKIPPED_SOURCES)
 
@@ -563,11 +668,42 @@ def run_migration(
 
     try:
         with engine.begin() as conn:
-            user_ids = migrate_users(conn, users_rows, secret_store, v1_decryptor, report)
+            user_ids, username_to_id = migrate_users(
+                conn, users_rows, secret_store, v1_decryptor, report
+            )
         with engine.begin() as conn:
             project_ids = migrate_projects(conn, projects_rows, user_ids, report)
+
+        # 全局数据源承接项目:仅当带旗标 且 确有全局数据源时才建(没有就不建)。
+        global_project_id: str | None = None
+        if options.global_datasource_project is not None and _has_global_datasource(
+            datasources_rows
+        ):
+            owner_id = _resolve_global_owner(options, username_to_id)
+            with engine.begin() as conn:
+                global_project_id = create_global_datasource_project(
+                    conn,
+                    project_name=options.global_datasource_project,
+                    owner_user_id=owner_id,
+                    report=report,
+                )
+
         with engine.begin() as conn:
-            migrate_datasources(conn, datasources_rows, project_ids, secret_store, report)
+            attached = migrate_datasources(
+                conn,
+                datasources_rows,
+                project_ids,
+                secret_store,
+                report,
+                global_project_id=global_project_id,
+            )
+        if global_project_id is not None:
+            logger.info(
+                "synthetic project created for 1.x global datasources",
+                project=options.global_datasource_project,
+                owner=options.global_datasource_owner,
+                attached_datasources=attached,
+            )
 
         with open_sqlite(source_dir) as sqlite_conn:
             if sqlite_conn is None:
@@ -580,6 +716,9 @@ def run_migration(
                     migrate_jobs(conn, jobs_rows, user_ids, project_ids, report)
                 with engine.begin() as conn:
                     migrate_audit_logs(conn, audit_rows, report)
+    except MigrationConfigError:
+        # 旗标语义错误(如 owner 解析失败):非静默 → 向上传递,由 main 明确报错退出。
+        raise
     except Exception as exc:
         report.incomplete = True
         report.fatal_error = type(exc).__name__
@@ -642,6 +781,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         help="2.0 新 master key 文件(.secret_master.key,重加密用)",
     )
+    parser.add_argument(
+        "--global-datasource-project",
+        default=None,
+        help=(
+            "为 1.x 全局数据源(project_id 为空)新建/复用同名承接项目并挂入。"
+            "不传 = 全局数据源跳过 + 报告(向后兼容)。仅在确有全局数据源时才建项目。"
+        ),
+    )
+    parser.add_argument(
+        "--global-datasource-owner",
+        default="admin",
+        help=(
+            "承接项目 owner 的 username,从已迁移用户按 username 解析(默认 admin)。"
+            "解析不到则报错退出(指明可用 username)。"
+        ),
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -658,15 +813,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("failed to load v1 secret key", path=str(args.v1_secret_key))
         return 2
 
+    options = MigrationOptions(
+        global_datasource_project=args.global_datasource_project,
+        global_datasource_owner=args.global_datasource_owner,
+    )
+
     engine = create_engine(args.target)
     try:
         secret_store = _build_secret_store(args.master_key_file, engine)
-        report = run_migration(
-            source_dir=source_dir,
-            engine=engine,
-            secret_store=secret_store,
-            v1_decryptor=v1_decryptor,
-        )
+        try:
+            report = run_migration(
+                source_dir=source_dir,
+                engine=engine,
+                secret_store=secret_store,
+                v1_decryptor=v1_decryptor,
+                options=options,
+            )
+        except MigrationConfigError as exc:
+            # 旗标语义错误:非静默报错退出(已写入部分保留,但配置错不能当成功)。
+            logger.error("migration flag configuration error", detail=str(exc))
+            return 2
     finally:
         engine.dispose()
 

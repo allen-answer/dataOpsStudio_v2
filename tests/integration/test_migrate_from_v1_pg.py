@@ -40,7 +40,12 @@ from app.db.models import (
 from app.domain.secret import SecretKind, SecretRef
 from app.infrastructure.secretstore.local_file import LocalFileSecretStore
 from app.infrastructure.secretstore.v1_legacy import V1FernetDecryptor
-from tools.migrate_from_v1 import _MasterKeyOnlyBootstrap, run_migration
+from tools.migrate_from_v1 import (
+    MigrationConfigError,
+    MigrationOptions,
+    _MasterKeyOnlyBootstrap,
+    run_migration,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -253,3 +258,140 @@ def test_migrate_v1_roundtrip_and_counts(tmp_path: Path) -> None:
 
     # orphan job 记 skip
     assert report.tables["jobs"].skipped_rows == 1
+
+
+def _build_global_ds_fixture(tmp_path: Path) -> Path:
+    """造迷你 1.x 实例:1 用户 + 0 项目 + 全部全局(project_id 为空)的数据源。
+
+    复刻真实演练里"4/4 数据源全局"的形态。无 SQLite(只验数据源承接)。
+    """
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    users_json = [
+        {
+            "id": "user-admin",
+            "username": "admin",
+            "password_hash": "$2b$12$abcdefghijklmnopqrstuv",
+            "role": "admin",
+        }
+    ]
+    (cfg / "users.json").write_text(json.dumps(users_json), encoding="utf-8")
+    # 没有项目 → 全局数据源唯一去处只能是承接项目。
+    (cfg / "projects.json").write_text(json.dumps([]), encoding="utf-8")
+
+    datasources_json = [
+        {
+            "id": f"ds-global-{i}",
+            "name": f"legacy-mysql-{i}",
+            "db_type": "MySQL",
+            "host": f"10.0.0.{i}",
+            "port": 3306,
+            "database": f"db{i}",
+            "username": "reader",
+            "password": f"pw-{i}",
+            "project_id": "",  # 1.x 全局可见
+            "environment": "prod",
+        }
+        for i in range(1, 5)  # 4 个,全部全局
+    ]
+    (cfg / "datasources.json").write_text(json.dumps(datasources_json), encoding="utf-8")
+    return tmp_path
+
+
+def test_migrate_global_datasources_into_synthetic_project(tmp_path: Path) -> None:
+    """带 --global-datasource-project:4/4 全局数据源迁入新建承接项目,密码往返正确。"""
+    engine = _pg_engine_or_skip()
+    _clean_db(engine)
+
+    v1_key = Fernet.generate_key()
+    master_key = Fernet.generate_key()
+    source_dir = _build_global_ds_fixture(tmp_path)
+
+    decryptor = V1FernetDecryptor.from_key_material(v1_key)
+    store = LocalFileSecretStore(engine, _MasterKeyOnlyBootstrap(master_key=master_key))
+
+    report = run_migration(
+        source_dir=source_dir,
+        engine=engine,
+        secret_store=store,
+        v1_decryptor=decryptor,
+        options=MigrationOptions(
+            global_datasource_project="Legacy Global Datasources",
+            global_datasource_owner="admin",
+        ),
+    )
+    assert not report.incomplete, report.fatal_error
+
+    # 承接项目计入 projects 报告(migrated +1);owner 进 project_members
+    assert report.tables["projects"].migrated == 1
+    assert _count(engine, projects) == 1
+    assert _count(engine, project_members) == 1
+    assert _count(engine, users) == 1
+    # 4/4 全局数据源全部迁入(对照旧行为:此前一个都迁不过去)
+    assert _count(engine, datasources) == 4
+    assert report.tables["datasources"].migrated == 4
+    assert report.tables["datasources"].skipped_rows == 0
+
+    with engine.connect() as conn:
+        synth = conn.execute(
+            select(projects.c.id, projects.c.owner_user_id, projects.c.description).where(
+                projects.c.name == "Legacy Global Datasources"
+            )
+        ).one()
+        assert synth.owner_user_id == "user-admin"
+        assert synth.description == "migrated: 1.x global datasources"
+
+        # owner membership = owner role
+        role = conn.execute(
+            select(project_members.c.role).where(
+                project_members.c.project_id == synth.id,
+                project_members.c.user_id == "user-admin",
+            )
+        ).scalar_one()
+        assert role == "owner"
+
+        # 所有数据源都挂在承接项目下
+        ds_proj_ids = conn.execute(select(datasources.c.project_id)).scalars().all()
+        assert set(ds_proj_ids) == {synth.id}
+
+        # 密码往返:reveal 回原明文(4 个各重加密)
+        refs = conn.execute(
+            select(datasources.c.id, datasources.c.password_secret_ref).order_by(datasources.c.id)
+        ).all()
+    revealed = {
+        row.id: store.reveal_secret(
+            SecretRef(ref=row.password_secret_ref, kind=SecretKind.DATASOURCE_PASSWORD)
+        )
+        for row in refs
+    }
+    assert revealed == {f"ds-global-{i}": f"pw-{i}" for i in range(1, 5)}
+
+
+def test_migrate_global_datasources_owner_unresolved_raises(tmp_path: Path) -> None:
+    """owner 解析不到已迁移用户 → MigrationConfigError(非静默),错误信息列可用 username。"""
+    engine = _pg_engine_or_skip()
+    _clean_db(engine)
+
+    v1_key = Fernet.generate_key()
+    master_key = Fernet.generate_key()
+    source_dir = _build_global_ds_fixture(tmp_path)
+
+    store = LocalFileSecretStore(engine, _MasterKeyOnlyBootstrap(master_key=master_key))
+
+    with pytest.raises(MigrationConfigError) as ei:
+        run_migration(
+            source_dir=source_dir,
+            engine=engine,
+            secret_store=store,
+            v1_decryptor=V1FernetDecryptor.from_key_material(v1_key),
+            options=MigrationOptions(
+                global_datasource_project="Legacy",
+                global_datasource_owner="nonexistent-owner",
+            ),
+        )
+    msg = str(ei.value)
+    assert "nonexistent-owner" in msg
+    assert "admin" in msg  # 列出可用 username
+
+    # owner 解析失败前没有建承接项目(只有用户已迁)
+    assert _count(engine, datasources) == 0
