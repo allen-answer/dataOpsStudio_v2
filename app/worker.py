@@ -14,6 +14,7 @@ from app.config import Settings, load_settings
 from app.db.models import datasources, jobs, result_sets
 from app.dbclients.dm_adapter import DMAdapter
 from app.dbclients.mysql_adapter import MySQLAdapter
+from app.dbclients.protocol import AdapterConnectionError
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind
 from app.domain.result import ResultRef
@@ -203,7 +204,7 @@ class WorkerRunner:
                 elapsed_seconds=_elapsed_seconds(started_at),
             )
         except Exception as exc:
-            public_error = _public_error_message(exc)
+            public_error = _public_error_message(exc, job.kind)
             error_code = _job_error_code(exc, job.kind)
             self._backend.fail(job.id, public_error)
             self._write_error_code(job.id, error_code)
@@ -623,7 +624,7 @@ def _require_operation_allowed(policy: OperationPolicy, operation: str) -> None:
         raise OperationPolicyDeniedError("explain denied by datasource operation_policy")
 
 
-def _public_error_message(exc: Exception) -> str:
+def _public_error_message(exc: Exception, kind: JobKind) -> str:
     if isinstance(exc, DatasourceConnectionTestError):
         return exc.error_code
     if isinstance(exc, OperationPolicyDeniedError):
@@ -636,7 +637,7 @@ def _public_error_message(exc: Exception) -> str:
         return "timeout"
     if _is_cancel_error(exc):
         return "cancelled"
-    return _job_error_code(exc, JobKind.SQL_QUERY).value
+    return _job_error_code(exc, kind).value
 
 
 def _job_error_code(exc: Exception, kind: JobKind) -> JobErrorCode:
@@ -649,6 +650,8 @@ def _job_error_code(exc: Exception, kind: JobKind) -> JobErrorCode:
     if _is_cancel_error(exc):
         return JobErrorCode.CANCELLED
     if kind is JobKind.TEST_CONNECTION or isinstance(exc, DatasourceConnectionTestError):
+        return JobErrorCode.CONNECTION_FAILED
+    if isinstance(exc, AdapterConnectionError):
         return JobErrorCode.CONNECTION_FAILED
     if kind is JobKind.SQL_QUERY:
         return JobErrorCode.SQL_FAILED
