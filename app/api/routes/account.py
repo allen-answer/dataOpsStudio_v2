@@ -29,7 +29,6 @@ from app.infrastructure.secretstore.totp import (
     generate_recovery_codes,
     generate_totp_seed,
     provisioning_uri,
-    verify_totp_code,
 )
 
 router = APIRouter(prefix="/account")
@@ -122,7 +121,8 @@ def verify_account_mfa(body: MfaVerifyRequest, request: Request) -> MfaVerifyRes
         seed = services.secret_store.reveal_secret(
             SecretRef(ref=pending_ref, kind=SecretKind.MFA_TOTP_SEED)
         )
-        if not verify_totp_code(secret=seed, code=body.code):
+        counter = accepted_totp_counter(secret=seed, code=body.code)
+        if counter is None:
             raise ApiError(401, "invalid_mfa_code", "Invalid MFA code")
         codes = _replace_recovery_codes(conn, services, user.id)
         conn.execute(
@@ -131,6 +131,7 @@ def verify_account_mfa(body: MfaVerifyRequest, request: Request) -> MfaVerifyRes
             .values(
                 mfa_secret_ref=pending_ref,
                 mfa_pending_secret_ref=None,
+                last_used_totp_counter=counter,
                 updated_at=datetime.now(UTC),
             )
         )

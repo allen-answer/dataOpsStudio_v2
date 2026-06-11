@@ -115,15 +115,33 @@ def test_mfa_password_and_recovery_flow_on_pg(
         == "mfa_required"
     )
 
-    totp_login = client.post(
+    enroll_code_replay_login = client.post(
         "/api/auth/login",
         json_body={"username": username, "password": changed_password, "mfa_code": totp},
+    )
+    assert enroll_code_replay_login.status_code == 401
+    assert enroll_code_replay_login.json()["error"] == "invalid_mfa_code"
+
+    login_time = base_time + 30
+    monkeypatch.setattr("app.infrastructure.secretstore.totp.time.time", lambda: login_time)
+    login_totp = totp_code_for_test(secret=secret, now=login_time)
+    totp_login = client.post(
+        "/api/auth/login",
+        json_body={
+            "username": username,
+            "password": changed_password,
+            "mfa_code": login_totp,
+        },
     )
     assert totp_login.status_code == 200
     mfa_headers = {"Authorization": f"Bearer {totp_login.json()['access_token']}"}
     replayed_totp_login = client.post(
         "/api/auth/login",
-        json_body={"username": username, "password": changed_password, "mfa_code": totp},
+        json_body={
+            "username": username,
+            "password": changed_password,
+            "mfa_code": login_totp,
+        },
     )
     assert replayed_totp_login.status_code == 401
     assert replayed_totp_login.json()["error"] == "invalid_mfa_code"
@@ -154,7 +172,7 @@ def test_mfa_password_and_recovery_flow_on_pg(
     assert status_response.json()["recovery_codes_total"] == 8
     assert status_response.json()["recovery_codes_used"] == 1
 
-    regenerate_time = base_time + 30
+    regenerate_time = base_time + 60
     monkeypatch.setattr("app.infrastructure.secretstore.totp.time.time", lambda: regenerate_time)
     regenerate_totp = totp_code_for_test(secret=secret, now=regenerate_time)
     regenerate_response = client.post(
@@ -179,7 +197,7 @@ def test_mfa_password_and_recovery_flow_on_pg(
     assert replayed_disable_response.status_code == 401
     assert replayed_disable_response.json()["error"] == "invalid_mfa_code"
 
-    disable_time = base_time + 60
+    disable_time = base_time + 90
     monkeypatch.setattr("app.infrastructure.secretstore.totp.time.time", lambda: disable_time)
     disable_totp = totp_code_for_test(secret=secret, now=disable_time)
     disable_response = client.post(
