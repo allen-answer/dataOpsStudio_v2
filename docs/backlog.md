@@ -4,35 +4,6 @@
 
 ## 来自 T4 (API + middleware) review
 
-### **可选** — 手写 JWT(HS256)→ PyJWT
-
-**位置**:`app/api/security.py`
-
-**现状**:Codex T4 手实现 HS256(hmac + hashlib + base64),`hmac.compare_digest` 用对了(时序安全),代码逻辑 OK。
-
-**为什么记录**:手写 crypto 是 audit smell。PyJWT / python-jose 是 battle-tested,有维护团队,默认更严(reject `alg: none` 等)。
-
-**修法**:`uv add pyjwt` → `security.py` 切 PyJWT API(create / decode / 处理 jwt.ExpiredSignatureError 等)。
-
-**优先级**:低,可选。当前手写实现没漏洞(看过)。如做 GA 前安全审计时被点,即换。
-
----
-
-### **可选,与手写 JWT 同类** — 手写 TOTP(RFC 6238)→ pyotp
-
-**位置**:`app/infrastructure/secretstore/totp.py`
-
-**现状**:Wave 4A PR-2 手实现 TOTP(SHA1 / 30s / 6 位 / ±1 窗口,`hmac.compare_digest`
-时序安全,实现核对无误)。不引 pyotp 的理由见 PR #40:范围内零依赖变更 +
-hashlib/hmac 留在 secretstore 红线内。
-
-**为什么记录**:与上一条手写 JWT 同性质的 audit smell。安全审计点名时与 JWT 一并换
-(pyotp + pyjwt 同一个 PR 处理)。
-
-**优先级**:低,可选。
-
----
-
 ### **GA 前安全加固** — TOTP 同窗口重放未防
 
 **位置**:`app/infrastructure/secretstore/totp.py:verify_totp_code` + 登录/验证调用方
