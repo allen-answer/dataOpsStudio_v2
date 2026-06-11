@@ -10,7 +10,7 @@
  * 后端约束:只接 readonly SELECT/WITH;非 SELECT 返 400 invalid_sql,
  * 表单里红色提示。
  */
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useQuery } from '@tanstack/vue-query'
@@ -94,6 +94,15 @@ const result = ref<JobResultResponse | null>(null)
 const resultLoading = ref(false)
 const PAGE_SIZE = 100
 
+// 结果下半区 DOM ref —— 执行进入终态后把结果面板滚进视口
+// (窄视口下 editor 占满首屏,结果在折叠线以下;UX 走查 nit)。
+const resultPanel = ref<HTMLElement | null>(null)
+function scrollResultIntoView(): void {
+  void nextTick(() => {
+    resultPanel.value?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  })
+}
+
 // 切换数据源 = 新上下文,清掉上一条执行级错误(含非 MySQL 拦截 / SQL guard / 网络)。
 watch(selectedDsId, () => {
   execError.value = null
@@ -135,6 +144,11 @@ watch(
     }
   },
 )
+
+// 执行级错误(SQL guard 400 / 非 MySQL 拦截 / 网络)也滚动到结果区提示处。
+watch(execError, (err) => {
+  if (err) scrollResultIntoView()
+})
 
 async function fetchPage(offset: number): Promise<void> {
   if (!pollState.jobId) return
@@ -179,6 +193,11 @@ const isTerminal = computed(
     pollState.status === 'cancelled' ||
     pollState.status === 'timeout',
 )
+
+// 任意终态(成功/失败/取消/超时)→ 把结果面板滚进视口。
+watch(isTerminal, (terminal) => {
+  if (terminal) scrollResultIntoView()
+})
 </script>
 
 <template>
@@ -257,7 +276,7 @@ const isTerminal = computed(
     </div>
 
     <!-- 结果下半 -->
-    <div class="flex-1 min-h-[35vh] flex flex-col">
+    <div ref="resultPanel" class="flex-1 min-h-[35vh] flex flex-col">
       <!-- 状态条 -->
       <div
         class="flex items-center justify-between px-6 py-2 border-b chrome-border-subtle text-xs"

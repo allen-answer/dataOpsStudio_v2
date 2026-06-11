@@ -226,6 +226,7 @@ export default {
     create_submit: '创建',
     create_success: '已创建',
     error_missing_field: '请填写所有必填字段',
+    field_required: '必填',
     // 权限折叠面板(8 个 allow_*;2.0.0 仅 SELECT / EXPLAIN 真生效)
     policy_title: '操作权限',
     policy_hint: '控制此数据源允许的操作。2.0.0 仅 SELECT / EXPLAIN 真生效,其余开关先落库,2.1+ 接入。',
