@@ -22,6 +22,7 @@ import pytest
 # tests/** 在 ruff TID251 豁免名单内,可直接 import Fernet 构造 1.x 测试密文。
 from cryptography.fernet import Fernet
 
+from app.domain.secret import SecretKind, SecretRef
 from app.infrastructure.secretstore.v1_legacy import V1FernetDecryptor, V1SecretDecryptError
 from tools import migrate_from_v1 as m
 from tools.v1_sources import load_json_list, open_sqlite, read_sqlite_rows
@@ -147,3 +148,113 @@ def test_skipped_sources_lists_21_plus_tables() -> None:
         assert needle in labels
     # .dataops_secret.key 是输入不是目标
     assert any(".dataops_secret.key" in label for label, _ in m._SKIPPED_SOURCES)
+
+
+# ─── 全局数据源承接项目(--global-datasource-project)──────────────────────────
+class _FakeSecretStore:
+    """记录 store_secret 调用次数,返回稳定 ref(不连 PG,纯单测用)。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def store_secret(self, plaintext: str, kind: object) -> SecretRef:
+        self.calls += 1
+        return SecretRef(ref=f"ref-{self.calls:0>4}", kind=SecretKind.DATASOURCE_PASSWORD)
+
+
+class _RecordingConn:
+    """记录 migrate_datasources 写入的 datasources 行(不连真 DB)。"""
+
+    def __init__(self) -> None:
+        self.inserts: list[dict[str, object]] = []
+
+    def execute(self, stmt: object) -> None:
+        # migrate_datasources 只对 datasources 做 insert().values(**values)
+        compiled = stmt.compile()  # type: ignore[attr-defined]
+        self.inserts.append(dict(compiled.params))
+
+
+def _global_ds_rows() -> list[dict[str, object]]:
+    return [
+        {
+            "id": "ds-global-1",
+            "name": "g1",
+            "db_type": "MySQL",
+            "host": "h1",
+            "port": 3306,
+            "username": "u",
+            "password": "pw1",
+            "project_id": "",  # 1.x 全局
+        },
+        {
+            "id": "ds-global-2",
+            "name": "g2",
+            "db_type": "oracle",
+            "host": "h2",
+            "port": 1521,
+            "username": "u",
+            "password": "pw2",
+            "project_id": "",  # 1.x 全局
+        },
+    ]
+
+
+def test_has_global_datasource_detects_empty_project_id() -> None:
+    assert m._has_global_datasource(_global_ds_rows()) is True
+    assert m._has_global_datasource([{"id": "x", "project_id": "proj-1"}]) is False
+    assert m._has_global_datasource([]) is False
+
+
+def test_migrate_datasources_without_flag_skips_global() -> None:
+    """不带旗标:全局数据源全部跳过(现行为不回归)。"""
+    report = m.MigrationReport()
+    conn = _RecordingConn()
+    store = _FakeSecretStore()
+    attached = m.migrate_datasources(
+        conn,  # type: ignore[arg-type]
+        _global_ds_rows(),
+        known_project_ids=set(),
+        secret_store=store,  # type: ignore[arg-type]
+        report=report,
+        global_project_id=None,
+    )
+    assert attached == 0
+    assert conn.inserts == []  # 没写任何行
+    assert report.table("datasources").migrated == 0
+    assert report.table("datasources").skipped_rows == 2
+    assert store.calls == 0  # 跳过的行不应重加密密码
+
+
+def test_migrate_datasources_with_flag_routes_global_to_project() -> None:
+    """带旗标:全局数据源全部挂入承接项目,密码各重加密一次。"""
+    report = m.MigrationReport()
+    conn = _RecordingConn()
+    store = _FakeSecretStore()
+    attached = m.migrate_datasources(
+        conn,  # type: ignore[arg-type]
+        _global_ds_rows(),
+        known_project_ids=set(),
+        secret_store=store,  # type: ignore[arg-type]
+        report=report,
+        global_project_id="synthetic-proj-id",
+    )
+    assert attached == 2
+    assert report.table("datasources").migrated == 2
+    assert report.table("datasources").skipped_rows == 0
+    assert store.calls == 2  # 两个全局数据源各重加密一次
+    assert {row["project_id"] for row in conn.inserts} == {"synthetic-proj-id"}
+
+
+def test_resolve_global_owner_success_and_failure() -> None:
+    opts = m.MigrationOptions(global_datasource_project="Legacy", global_datasource_owner="admin")
+    assert m._resolve_global_owner(opts, {"admin": "u-admin"}) == "u-admin"
+
+    missing = m.MigrationOptions(
+        global_datasource_project="Legacy", global_datasource_owner="ghost"
+    )
+    with pytest.raises(m.MigrationConfigError) as ei:
+        m._resolve_global_owner(missing, {"admin": "u-admin", "viewer": "u-view"})
+    # 错误信息指明可用 username
+    msg = str(ei.value)
+    assert "ghost" in msg
+    assert "admin" in msg and "viewer" in msg
