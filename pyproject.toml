@@ -1,6 +1,6 @@
 [project]
 name = "dataops-studio"
-version = "2.0.0a0"
+version = "2.0.0"
 description = "DataOpsStudio 2.0 — database workbench for data engineers & DBAs"
 requires-python = ">=3.12,<3.13"
 license = { text = "Proprietary" }
