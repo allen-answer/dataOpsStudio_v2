@@ -30,8 +30,8 @@ export const useAuthStore = defineStore('auth', () => {
 
   const isAuthenticated = computed(() => token.value !== null && user.value !== null)
 
-  async function login(username: string, password: string): Promise<void> {
-    const response = await loginRequest(username, password)
+  async function login(username: string, password: string, mfaCode?: string): Promise<void> {
+    const response = await loginRequest(username, password, mfaCode)
     token.value = response.access_token
     user.value = decodeJwt(response.access_token)
     if (user.value === null) {

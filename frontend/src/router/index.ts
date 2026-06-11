@@ -9,11 +9,13 @@ const DesignSystemPreview = () => import('../views/DesignSystemPreview.vue')
 const TokensView = () => import('../views/TokensView.vue')
 const SqlWorkspaceView = () => import('../views/SqlWorkspaceView.vue')
 const JobsView = () => import('../views/JobsView.vue')
+const AccountSecurityView = () => import('../views/AccountSecurityView.vue')
 const AdminLayout = () => import('../views/AdminLayout.vue')
 const AdminUsersView = () => import('../views/AdminUsersView.vue')
 const AdminProjectsView = () => import('../views/AdminProjectsView.vue')
 const AdminAuditLogsView = () => import('../views/AdminAuditLogsView.vue')
 const AdminLicenseView = () => import('../views/AdminLicenseView.vue')
+const AdminAiConfigView = () => import('../views/AdminAiConfigView.vue')
 
 const routes: RouteRecordRaw[] = [
   {
@@ -55,6 +57,11 @@ const routes: RouteRecordRaw[] = [
         name: 'jobs',
         component: JobsView,
       },
+      {
+        path: 'account/security',
+        name: 'account-security',
+        component: AccountSecurityView,
+      },
     ],
   },
   {
@@ -69,6 +76,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'projects', name: 'admin-projects', component: AdminProjectsView },
       { path: 'license', name: 'admin-license', component: AdminLicenseView },
       { path: 'audit-logs', name: 'admin-audit', component: AdminAuditLogsView },
+      { path: 'ai-config', name: 'admin-ai-config', component: AdminAiConfigView },
     ],
   },
   {

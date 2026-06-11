@@ -4,6 +4,10 @@
  */
 import { apiClient } from './client'
 import type {
+  AdminAiConfigResponse,
+  AdminAiConfigTestResponse,
+  AdminAiConfigUpdateRequest,
+  AdminForceLogoutResponse,
   AdminProjectCreateRequest,
   AdminProjectDeleteImpact,
   AdminProjectItem,
@@ -48,6 +52,11 @@ export function patchAdminUserRole(userId: string, role: string): Promise<AdminU
 
 export function resetAdminUserPassword(userId: string): Promise<AdminResetPasswordResponse> {
   return apiClient.post<AdminResetPasswordResponse>(`/admin/users/${userId}/reset-password`)
+}
+
+/** 强制下线:吊销该用户当前所有 JWT(revoked_after 之前签发的 token 失效)。 */
+export function forceLogoutAdminUser(userId: string): Promise<AdminForceLogoutResponse> {
+  return apiClient.post<AdminForceLogoutResponse>(`/admin/users/${userId}/force-logout`)
 }
 
 export function disableAdminUserMfa(userId: string): Promise<AdminUserItem> {
@@ -105,4 +114,20 @@ export function listAdminAuditLogs(filters: AuditLogFilters = {}): Promise<Audit
   params.set('limit', String(filters.limit ?? 100))
   params.set('offset', String(filters.offset ?? 0))
   return apiClient.get<AuditLogItem[]>(`/admin/audit-logs?${params.toString()}`)
+}
+
+// ─── AI 配置(§9)──────────────────────────────────────────────────────────
+export function getAdminAiConfig(): Promise<AdminAiConfigResponse> {
+  return apiClient.get<AdminAiConfigResponse>('/admin/ai-config')
+}
+
+export function putAdminAiConfig(
+  req: AdminAiConfigUpdateRequest,
+): Promise<AdminAiConfigResponse> {
+  return apiClient.put<AdminAiConfigResponse>('/admin/ai-config', req)
+}
+
+/** 测试连接 —— 用当前已落库配置发一次 ping。失败返结构化 error(见 type 注释)。 */
+export function testAdminAiConfig(): Promise<AdminAiConfigTestResponse> {
+  return apiClient.post<AdminAiConfigTestResponse>('/admin/ai-config/test')
 }

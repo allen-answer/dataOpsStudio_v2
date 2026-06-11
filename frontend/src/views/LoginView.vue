@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { Sparkles } from 'lucide-vue-next'
+import { Sparkles, ShieldCheck, ArrowLeft } from 'lucide-vue-next'
 import { storeToRefs } from 'pinia'
 import { useAuthStore } from '../stores/auth'
 import { useThemeStore } from '../stores/theme'
@@ -27,6 +27,17 @@ const submitting = ref(false)
 const errorMessage = ref<string | null>(null)
 const usernameRef = ref<HTMLInputElement | null>(null)
 
+/**
+ * 第二因子状态机:
+ *   step='credentials' → 用户名 + 密码;若后端 401 mfa_required → 切到 step='mfa'
+ *   step='mfa'         → 6 位 TOTP(或恢复码模式);401 invalid_mfa_code 明确报错
+ * 非 MFA 用户永远停在 step='credentials',流程不变。
+ */
+const step = ref<'credentials' | 'mfa'>('credentials')
+const mfaCode = ref('')
+const useRecoveryCode = ref(false) // false=TOTP 6 位,true=恢复码
+const mfaCodeRef = ref<HTMLInputElement | null>(null)
+
 const sessionExpired = computed(() => route.query.reason === 'expired')
 const nextPath = computed(() =>
   typeof route.query.next === 'string' ? route.query.next : null,
@@ -36,24 +47,62 @@ onMounted(() => {
   usernameRef.value?.focus()
 })
 
+function backToCredentials(): void {
+  step.value = 'credentials'
+  mfaCode.value = ''
+  useRecoveryCode.value = false
+  errorMessage.value = null
+  void nextTick(() => usernameRef.value?.focus())
+}
+
+function toggleRecoveryMode(): void {
+  useRecoveryCode.value = !useRecoveryCode.value
+  mfaCode.value = ''
+  errorMessage.value = null
+  void nextTick(() => mfaCodeRef.value?.focus())
+}
+
+async function doLogin(): Promise<void> {
+  await auth.login(
+    username.value.trim(),
+    password.value,
+    step.value === 'mfa' ? mfaCode.value.trim() : undefined,
+  )
+  await router.push(
+    nextPath.value && nextPath.value.startsWith('/') ? nextPath.value : '/projects',
+  )
+}
+
 async function onSubmit(): Promise<void> {
   errorMessage.value = null
 
-  if (!username.value.trim()) {
-    errorMessage.value = t('auth.error_empty_username')
-    return
-  }
-  if (!password.value) {
-    errorMessage.value = t('auth.error_empty_password')
+  if (step.value === 'credentials') {
+    if (!username.value.trim()) {
+      errorMessage.value = t('auth.error_empty_username')
+      return
+    }
+    if (!password.value) {
+      errorMessage.value = t('auth.error_empty_password')
+      return
+    }
+  } else if (!mfaCode.value.trim()) {
+    errorMessage.value = t('auth.error_empty_mfa')
     return
   }
 
   submitting.value = true
   try {
-    await auth.login(username.value.trim(), password.value)
-    await router.push(nextPath.value && nextPath.value.startsWith('/') ? nextPath.value : '/projects')
+    await doLogin()
   } catch (e) {
-    if (e instanceof ApiError && e.status === 401) {
+    if (e instanceof ApiError && e.code === 'mfa_required') {
+      // 密码对了,需要第二因子 → 进第二步(不报错)。
+      step.value = 'mfa'
+      errorMessage.value = null
+      void nextTick(() => mfaCodeRef.value?.focus())
+    } else if (e instanceof ApiError && e.code === 'invalid_mfa_code') {
+      errorMessage.value = t('auth.error_invalid_mfa')
+    } else if (e instanceof ApiError && e.status === 401) {
+      // invalid_credentials —— 回到第一步语义(若在第二步,密码侧也可能失效)。
       errorMessage.value = t('auth.error_invalid_credentials')
     } else if (e instanceof ApiError && e.status === 0) {
       errorMessage.value = t('common.error_network')
@@ -214,48 +263,91 @@ const accentNodes = computed(() => NODES.filter((n) => n.accent))
 
         <div class="mb-7">
           <h1 class="chrome-text-heading text-xl font-semibold tracking-tight">
-            {{ t('auth.login_title') }}
+            {{ step === 'mfa' ? t('auth.mfa_title') : t('auth.login_title') }}
           </h1>
           <div class="chrome-text-muted text-sm mt-1">
-            {{ t('auth.login_subtitle') }}
+            {{ step === 'mfa' ? t('auth.mfa_subtitle') : t('auth.login_subtitle') }}
           </div>
         </div>
 
         <form @submit.prevent="onSubmit" class="space-y-4">
           <div
-            v-if="sessionExpired"
+            v-if="sessionExpired && step === 'credentials'"
             class="px-3 py-2 rounded-input border text-xs"
             style="background-color: rgb(var(--accent) / 0.08); border-color: rgb(var(--accent) / 0.30); color: rgb(var(--accent));"
           >
             {{ t('common.error_unauthorized') }}
           </div>
 
-          <div class="space-y-1.5">
-            <label class="block text-xs uppercase tracking-wider chrome-text-muted font-medium">
-              {{ t('auth.username') }}
-            </label>
-            <input
-              ref="usernameRef"
-              v-model="username"
-              type="text"
-              class="chrome-input w-full"
-              autocomplete="username"
-              :disabled="submitting"
-            />
-          </div>
+          <!-- ── 第一步:用户名 + 密码 ── -->
+          <template v-if="step === 'credentials'">
+            <div class="space-y-1.5">
+              <label class="block text-xs uppercase tracking-wider chrome-text-muted font-medium">
+                {{ t('auth.username') }}
+              </label>
+              <input
+                ref="usernameRef"
+                v-model="username"
+                type="text"
+                class="chrome-input w-full"
+                autocomplete="username"
+                :disabled="submitting"
+              />
+            </div>
 
-          <div class="space-y-1.5">
-            <label class="block text-xs uppercase tracking-wider chrome-text-muted font-medium">
-              {{ t('auth.password') }}
-            </label>
-            <input
-              v-model="password"
-              type="password"
-              class="chrome-input w-full"
-              autocomplete="current-password"
+            <div class="space-y-1.5">
+              <label class="block text-xs uppercase tracking-wider chrome-text-muted font-medium">
+                {{ t('auth.password') }}
+              </label>
+              <input
+                v-model="password"
+                type="password"
+                class="chrome-input w-full"
+                autocomplete="current-password"
+                :disabled="submitting"
+              />
+            </div>
+          </template>
+
+          <!-- ── 第二步:TOTP / 恢复码 ── -->
+          <template v-else>
+            <div
+              class="flex items-center gap-2.5 px-3 py-2.5 rounded-input border text-xs"
+              style="background-color: rgb(var(--accent) / 0.07); border-color: rgb(var(--accent) / 0.25); color: rgb(var(--accent));"
+            >
+              <ShieldCheck class="w-4 h-4 shrink-0" />
+              <span>{{ t('auth.mfa_hint') }}</span>
+            </div>
+
+            <div class="space-y-1.5">
+              <label class="block text-xs uppercase tracking-wider chrome-text-muted font-medium">
+                {{ useRecoveryCode ? t('auth.recovery_code') : t('auth.mfa_code') }}
+              </label>
+              <input
+                ref="mfaCodeRef"
+                v-model="mfaCode"
+                type="text"
+                :inputmode="useRecoveryCode ? 'text' : 'numeric'"
+                :maxlength="useRecoveryCode ? 64 : 6"
+                :placeholder="useRecoveryCode ? t('auth.recovery_code_ph') : '••••••'"
+                class="chrome-input w-full"
+                :class="{ 'tracking-[0.4em] text-center font-mono text-lg': !useRecoveryCode }"
+                autocomplete="one-time-code"
+                :disabled="submitting"
+                data-testid="mfa-code-input"
+              />
+            </div>
+
+            <button
+              type="button"
+              class="text-xs chrome-accent hover:underline"
               :disabled="submitting"
-            />
-          </div>
+              data-testid="mfa-toggle-recovery"
+              @click="toggleRecoveryMode"
+            >
+              {{ useRecoveryCode ? t('auth.use_totp') : t('auth.use_recovery') }}
+            </button>
+          </template>
 
           <div
             v-if="errorMessage"
@@ -273,9 +365,20 @@ const accentNodes = computed(() => NODES.filter((n) => n.accent))
           >
             <template v-if="submitting">
               <LoadingDots />
-              <span>{{ t('auth.submitting') }}</span>
+              <span>{{ step === 'mfa' ? t('auth.verifying') : t('auth.submitting') }}</span>
             </template>
-            <span v-else>{{ t('auth.submit') }}</span>
+            <span v-else>{{ step === 'mfa' ? t('auth.mfa_submit') : t('auth.submit') }}</span>
+          </button>
+
+          <button
+            v-if="step === 'mfa'"
+            type="button"
+            class="w-full inline-flex items-center justify-center gap-1.5 text-xs chrome-accent hover:underline"
+            :disabled="submitting"
+            @click="backToCredentials"
+          >
+            <ArrowLeft class="w-3.5 h-3.5" />
+            {{ t('auth.mfa_back') }}
           </button>
         </form>
 

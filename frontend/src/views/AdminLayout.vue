@@ -45,8 +45,8 @@ const items = computed<AdminNavItem[]>(() => [
   { name: 'projects', routeName: 'admin-projects', icon: FolderKanban },
   { name: 'license', routeName: 'admin-license', icon: KeyRound },
   { name: 'audit', routeName: 'admin-audit', icon: ScrollText },
+  { name: 'ai_config', routeName: 'admin-ai-config', icon: Bot },
   // ─── 卡后端:无端点,不建假页面(见 PR 描述)───
-  { name: 'ai_config', icon: Bot, blockedReason: t('admin.nav_blocked_no_endpoint') },
   { name: 'scheduler', icon: CalendarClock, blockedReason: t('admin.nav_blocked_no_endpoint') },
   { name: 'aspects', icon: Tags, blockedReason: t('admin.nav_blocked_no_endpoint') },
 ])

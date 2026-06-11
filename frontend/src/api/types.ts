@@ -310,6 +310,92 @@ export interface AuditLogFilters {
   offset?: number
 }
 
+// ─── 账户安全 / MFA(Wave 4B,严格对齐 app/api/routes/account.py + schemas.py)──
+
+/** GET /api/account/security → AccountSecurityStatusResponse。 */
+export interface AccountSecurityStatus {
+  mfa_enabled: boolean
+  recovery_codes_total: number
+  recovery_codes_used: number
+}
+
+/** POST /api/account/mfa/enroll → MfaEnrollResponse(secret 文本 + otpauth URI 转 QR)。 */
+export interface MfaEnrollResponse {
+  secret: string
+  otpauth_uri: string
+}
+
+/** POST /api/account/mfa/verify → MfaVerifyResponse(开启成功,一次性回 8 个恢复码)。 */
+export interface MfaVerifyResponse {
+  enabled: boolean
+  recovery_codes: string[]
+}
+
+/** POST /api/account/recovery-codes/regenerate → RecoveryCodesResponse。 */
+export interface RecoveryCodesResponse {
+  recovery_codes: string[]
+}
+
+// ─── AI 配置(Wave 4B,严格对齐 app/api/routes/admin.py ai-config + schemas.py)──
+
+/** Ai provider 枚举。源:app/api/schemas.py AiProvider。 */
+export type AiProvider = 'off' | 'mock' | 'openai_compatible' | 'anthropic' | 'ollama'
+
+/** API key 来源标记。源:AiApiKeySource。 */
+export type AiApiKeySource = 'none' | 'stored' | 'env'
+
+/** GET /api/admin/ai-config → AdminAiConfigResponse(key 永不回显,只给 source / has_stored)。 */
+export interface AdminAiConfigResponse {
+  enabled: boolean
+  provider: AiProvider
+  model: string | null
+  base_url: string | null
+  max_auto_egress_level: number // 0..3(后端 le=3;L4 永不可经此设置)
+  l4_requires_optin: boolean // 后端恒 true,前端只读展示锁定
+  enable_inference: boolean
+  enable_auto_translation: boolean
+  api_key_source: AiApiKeySource
+  has_stored_api_key: boolean
+  updated_at: string | null
+}
+
+/**
+ * PUT /api/admin/ai-config 请求体。源:AdminAiConfigUpdateRequest。
+ * ★ api_key 与 clear_api_key 互斥(后端 400 invalid_ai_config);两者都不传 = 保持现状。
+ * ★ l4_requires_optin 必须 true(后端 400 否则)。
+ */
+export interface AdminAiConfigUpdateRequest {
+  enabled: boolean
+  provider: AiProvider
+  model?: string | null
+  base_url?: string | null
+  api_key?: string | null
+  clear_api_key?: boolean
+  max_auto_egress_level: number
+  l4_requires_optin: boolean
+  enable_inference: boolean
+  enable_auto_translation: boolean
+}
+
+/**
+ * POST /api/admin/ai-config/test → AdminAiConfigTestResponse。
+ * 失败时 error 为结构化字符串:ai_disabled / unsupported_provider / missing_provider_config
+ * / 或 AiGatewayError 子类名(后端 type(exc).__name__)。
+ */
+export interface AdminAiConfigTestResponse {
+  ok: boolean
+  provider: string
+  model: string | null
+  latency_ms: number
+  error: string | null
+}
+
+/** POST /api/admin/users/{id}/force-logout → AdminForceLogoutResponse。 */
+export interface AdminForceLogoutResponse {
+  user_id: string
+  revoked_after: string
+}
+
 /** 服务端错误响应统一形态(由 ApiError handler 产出)。 */
 export interface ApiErrorBody {
   error?: string

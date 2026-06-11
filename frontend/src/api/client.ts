@@ -25,7 +25,25 @@ export function setTokenProvider(fn: () => string | null): void {
   getToken = fn
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+/**
+ * RequestOptions.skipAuthRedirect:把这次请求的 401 当成「业务校验失败」而非
+ * 「会话失效」,不触发全局 logout + 跳 /login,只抛 ApiError 给调用方自己分支。
+ *
+ * 用于两类带 401 语义的端点:
+ *   - 登录第二因子:POST /auth/login 401 mfa_required / invalid_mfa_code(此时根本没登录)
+ *   - 账户安全二次确认:改密 401 invalid_password、关 MFA / 重生成恢复码 401 invalid_mfa_code
+ *     —— 这些 401 是「当前 TOTP / 旧密码不对」,不该把用户踢下线。
+ */
+interface RequestOptions {
+  skipAuthRedirect?: boolean
+}
+
+async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  options?: RequestOptions,
+): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   const token = getToken()
   if (token) headers.Authorization = `Bearer ${token}`
@@ -45,7 +63,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     )
   }
 
-  if (response.status === 401) {
+  if (response.status === 401 && !options?.skipAuthRedirect) {
     onUnauthenticated()
     throw new ApiError(401, 'Session expired or invalid', 'unauthenticated')
   }
@@ -66,8 +84,10 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
 export const apiClient = {
   get: <T>(path: string): Promise<T> => request<T>('GET', path),
-  post: <T>(path: string, body?: unknown): Promise<T> => request<T>('POST', path, body),
-  put: <T>(path: string, body?: unknown): Promise<T> => request<T>('PUT', path, body),
+  post: <T>(path: string, body?: unknown, options?: RequestOptions): Promise<T> =>
+    request<T>('POST', path, body, options),
+  put: <T>(path: string, body?: unknown, options?: RequestOptions): Promise<T> =>
+    request<T>('PUT', path, body, options),
   patch: <T>(path: string, body?: unknown): Promise<T> => request<T>('PATCH', path, body),
   delete: <T>(path: string): Promise<T> => request<T>('DELETE', path),
 }

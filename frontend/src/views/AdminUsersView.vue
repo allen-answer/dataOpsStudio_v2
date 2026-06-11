@@ -8,10 +8,10 @@
  *   PATCH  /admin/users/{id}                     改角色(只 role)
  *   POST   /admin/users/{id}/reset-password      重置 → 返一次性临时密码
  *   POST   /admin/users/{id}/mfa/disable         admin 关 MFA
+ *   POST   /admin/users/{id}/force-logout        强制下线(吊销该用户当前所有 JWT)
  *   DELETE /admin/users/{id}                     删除(409 user_owns_projects)
  *
  * ★ 后端 AdminUserItem 不含 last_seen_at,故"最后活跃"列不做(PRD 列了,后端无字段)。
- * ★ 强制下线(吊销 JWT)无端点,不做。
  */
 import { computed, reactive, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -26,6 +26,7 @@ import {
   Trash2,
   Copy,
   Check,
+  LogOut,
 } from 'lucide-vue-next'
 import {
   listAdminUsers,
@@ -34,9 +35,11 @@ import {
   resetAdminUserPassword,
   disableAdminUserMfa,
   deleteAdminUser,
+  forceLogoutAdminUser,
 } from '../api/admin'
 import { ApiError, type AdminUserItem, type Project } from '../api/types'
 import { useLicense } from '../composables/useLicense'
+import { useToast } from '../composables/useToast'
 import EmptyState from '../components/EmptyState.vue'
 import LoadingDots from '../components/LoadingDots.vue'
 import Modal from '../components/Modal.vue'
@@ -44,6 +47,7 @@ import Modal from '../components/Modal.vue'
 const { t } = useI18n()
 const qc = useQueryClient()
 const { writesBlocked } = useLicense()
+const toast = useToast()
 
 const ROLES = ['admin', 'editor', 'viewer'] as const
 
@@ -174,6 +178,33 @@ async function copyTemp(): Promise<void> {
     setTimeout(() => (copied.value = false), 1500)
   } catch {
     /* clipboard 不可用时静默 —— 用户仍可手动选中 */
+  }
+}
+
+// ─── 强制下线(吊销 JWT,确认弹窗 + 成功 toast)──────────────
+const forceLogoutModal = ref<AdminUserItem | null>(null)
+const forceLogoutError = ref<string | null>(null)
+
+function openForceLogout(u: AdminUserItem): void {
+  forceLogoutModal.value = u
+  forceLogoutError.value = null
+}
+
+const forceLogoutMutation = useMutation({
+  mutationFn: () => forceLogoutAdminUser(forceLogoutModal.value!.id),
+  onSuccess: (res) => {
+    const name = forceLogoutModal.value?.username ?? res.user_id.slice(0, 8)
+    forceLogoutModal.value = null
+    toast.success(t('admin.users.force_logout_ok', { name }))
+  },
+})
+
+async function submitForceLogout(): Promise<void> {
+  forceLogoutError.value = null
+  try {
+    await forceLogoutMutation.mutateAsync()
+  } catch (e) {
+    forceLogoutError.value = e instanceof ApiError ? e.message : t('common.error_unknown')
   }
 }
 
@@ -375,6 +406,15 @@ function errorMessage(): string {
                   <KeyRound class="w-3.5 h-3.5" />
                 </button>
                 <button
+                  type="button"
+                  class="chrome-btn-ghost"
+                  :title="t('admin.users.action_force_logout')"
+                  data-testid="force-logout-btn"
+                  @click="openForceLogout(u)"
+                >
+                  <LogOut class="w-3.5 h-3.5" />
+                </button>
+                <button
                   v-if="u.mfa_enabled"
                   type="button"
                   class="chrome-btn-ghost"
@@ -510,6 +550,21 @@ function errorMessage(): string {
           <button type="button" class="chrome-btn-primary chrome-btn-danger" @click="submitDelete" :disabled="deleteMutation.isPending.value">
             <template v-if="deleteMutation.isPending.value"><LoadingDots /><span>{{ t('common.submitting') }}</span></template>
             <span v-else>{{ t('common.delete') }}</span>
+          </button>
+        </div>
+      </div>
+    </Modal>
+
+    <!-- 强制下线 modal -->
+    <Modal :open="forceLogoutModal !== null" :title="t('admin.users.force_logout_title')" :subtitle="forceLogoutModal?.username" @close="forceLogoutModal = null">
+      <div class="space-y-4">
+        <p class="text-sm chrome-text-normal">{{ t('admin.users.force_logout_confirm') }}</p>
+        <div v-if="forceLogoutError" class="text-xs text-red-500">{{ forceLogoutError }}</div>
+        <div class="flex justify-end gap-2 pt-2">
+          <button type="button" class="chrome-btn-secondary" @click="forceLogoutModal = null" :disabled="forceLogoutMutation.isPending.value">{{ t('common.cancel') }}</button>
+          <button type="button" class="chrome-btn-primary chrome-btn-danger" data-testid="force-logout-confirm" @click="submitForceLogout" :disabled="forceLogoutMutation.isPending.value">
+            <template v-if="forceLogoutMutation.isPending.value"><LoadingDots /><span>{{ t('common.submitting') }}</span></template>
+            <span v-else>{{ t('admin.users.force_logout_submit') }}</span>
           </button>
         </div>
       </div>
