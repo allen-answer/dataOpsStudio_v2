@@ -5,6 +5,8 @@ export interface JobResponse {
   id: string
   kind: string
   status: JobStatus
+  created_at?: string
+  finished_at?: string | null
   result_set_id: string | null
   error: string | null
   error_code: JobErrorCode | null

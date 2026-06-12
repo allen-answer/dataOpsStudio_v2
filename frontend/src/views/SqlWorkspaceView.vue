@@ -101,6 +101,7 @@ interface ConsoleRuntime {
   resultLoading: boolean
   pageOffset: number
   startedAt: number | null
+  finishedAt: number | null
 }
 
 interface TemplateForm {
@@ -307,6 +308,7 @@ function runtimeFor(consoleId: string): ConsoleRuntime {
       resultLoading: false,
       pageOffset: 0,
       startedAt: null,
+      finishedAt: null,
     }
   }
   return runtimes[consoleId]
@@ -458,6 +460,7 @@ async function onExecute(): Promise<void> {
   resetRuntime(runtime)
   runtime.status = 'pending'
   runtime.startedAt = Date.now()
+  runtime.finishedAt = null
   try {
     const response = await executeSql({
       datasource_id: selectedDsId.value,
@@ -523,6 +526,14 @@ async function pollConsole(consoleId: string): Promise<void> {
 }
 
 function applyJob(runtime: ConsoleRuntime, job: JobResponse): void {
+  const enteringTerminal = TERMINAL.has(job.status) && !TERMINAL.has(runtime.status ?? 'pending')
+  if (ACTIVE.has(job.status) && runtime.startedAt === null) {
+    runtime.startedAt = parseTimeMs(job.created_at)
+  }
+  if (enteringTerminal) {
+    runtime.startedAt = parseTimeMs(job.created_at) ?? runtime.startedAt
+    runtime.finishedAt = parseTimeMs(job.finished_at)
+  }
   runtime.status = job.status
   runtime.resultSetId = job.result_set_id
   runtime.error = job.error
@@ -567,6 +578,7 @@ function resetRuntime(runtime: ConsoleRuntime): void {
   runtime.resultLoading = false
   runtime.pageOffset = 0
   runtime.startedAt = null
+  runtime.finishedAt = null
 }
 
 async function loadHistory(): Promise<void> {
@@ -725,7 +737,13 @@ function onEditorMount(editor: monaco.editor.IStandaloneCodeEditor): void {
 
 function elapsedSeconds(runtime: ConsoleRuntime): string {
   if (!runtime.startedAt) return '0.0'
-  return ((nowMs.value - runtime.startedAt) / 1000).toFixed(1)
+  return (((runtime.finishedAt ?? nowMs.value) - runtime.startedAt) / 1000).toFixed(1)
+}
+
+function parseTimeMs(value: string | null | undefined): number | null {
+  if (!value) return null
+  const ms = Date.parse(value)
+  return Number.isNaN(ms) ? null : ms
 }
 
 function formatDate(iso: string | null): string {

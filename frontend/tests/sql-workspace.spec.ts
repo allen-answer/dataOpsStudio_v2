@@ -71,11 +71,17 @@ function templateRow() {
 
 async function mockWorkspace(
   page: Page,
-  options: { datasource?: Record<string, unknown> } = {},
+  options: {
+    datasource?: Record<string, unknown>
+    jobCreatedAt?: string
+    jobFinishedAt?: string
+  } = {},
 ): Promise<{ patches: unknown[]; renders: unknown[] }> {
   const patches: unknown[] = []
   const renders: unknown[] = []
   let jobReads = 0
+  const jobCreatedAt = options.jobCreatedAt ?? now
+  const jobFinishedAt = options.jobFinishedAt ?? now
 
   await mockLicense(page)
   await page.route(/\/api\/datasources\?/, (r) =>
@@ -131,9 +137,9 @@ async function mockWorkspace(
       id: 'job-1',
       kind: 'sql',
       status: jobReads <= 1 ? 'running' : 'success',
-      created_at: now,
+      created_at: jobCreatedAt,
       started_at: now,
-      finished_at: jobReads <= 1 ? null : now,
+      finished_at: jobReads <= 1 ? null : jobFinishedAt,
       error: null,
       error_code: null,
       message: null,
@@ -194,5 +200,43 @@ test('DM datasource remains executable', async ({ page }) => {
   await expect(page.locator('main select')).toHaveValue('ds-1')
   await expect(page.getByText(/Execution currently supports MySQL \/ DM/)).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Run' })).toBeEnabled()
+  expectNoConsoleErrors()
+})
+
+test('completed query freezes elapsed seconds after terminal status', async ({ page }) => {
+  await page.clock.install({ time: new Date(now) })
+  await mockWorkspace(page, {
+    jobCreatedAt: '2026-06-12T06:00:00.000Z',
+    jobFinishedAt: '2026-06-12T06:00:04.200Z',
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.getByText(/Running.*loaded 2 rows/)).toBeVisible()
+
+  await page.clock.runFor(500)
+  const summary = page.getByText(/Done · \d+\.\ds · 2 rows/)
+  await expect(summary).toHaveText('Done · 4.2s · 2 rows')
+  const frozenSummary = await summary.textContent()
+
+  await page.clock.runFor(5000)
+  await expect(summary).toHaveText(frozenSummary ?? '')
+  expectNoConsoleErrors()
+})
+
+test('terminal elapsed seconds use job timestamps instead of local clock', async ({ page }) => {
+  await page.clock.install({ time: new Date('2031-01-01T00:00:00.000Z') })
+  await mockWorkspace(page, {
+    jobCreatedAt: '2026-06-12T06:00:10.000Z',
+    jobFinishedAt: '2026-06-12T06:00:12.500Z',
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await page.clock.runFor(500)
+
+  await expect(page.getByText(/Done · \d+\.\ds · 2 rows/)).toHaveText(
+    'Done · 2.5s · 2 rows',
+  )
   expectNoConsoleErrors()
 })
