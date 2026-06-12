@@ -24,9 +24,9 @@
 |---|---|---|
 | **2.0.0** | 2-2.5 月 | 骨架版,功能 ≤ 1.x 50%,架构完整即可 |
 | **2.1.0** | 2.5 月 | SQL Workspace 完整 + AI Assist 第一批(计划解释 / 错误翻译 / SQL 改写) |
-| **2.2.0** | 1.5 月 | Compare + AI Assist 第二批(字段映射简易) |
+| **2.2.0** | 1.5 月 | Compare + AI Assist 第二批(规则映射推断 + 差异归因) |
 | **2.3.0** | 1.5 月 | Scenario Lab(DSL + materialize + verify + run-all) |
-| **2.4.0** | 1.5 月 | Lineage(沿用 1.x LineageReport)+ 资产页 + AI 血缘解释 |
+| **2.4.0** | 2 月 | Lineage(沿用 1.x LineageReport)+ 子图优先 + 基础影响分析 + 资产页 + AI 血缘解释 |
 | **2.5.0** | 1 月 | Workflow(Job DAG)+ 调度 + 节点白名单 + 通知 |
 | **2.6.0** | 2.5 月 | AI Copilot MVP(C1 Schema-aware SQL + C5 Scenario 脚手架) |
 | **2.7.0** | 2.5 月 | 多租户 Hosted + RLS + OIDC + C2/C3/C4/C5 进阶 |
@@ -605,22 +605,30 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 ### 12.1 主页面 `/projects/:id/compare`
 - 任务列表(左)+ 编辑区(右)
 - 任务卡:name / source-target / 上次运行时间 / 状态点
+- 任务建议入口:选择两个数据源后展示跨源同名/规范化同名表配对清单,支持一键生成任务草稿(迁移场景优先)
+- "从血缘建议对比"仅作为 2.4.0 后增强入口占位,不进 2.2.0 第一版验收
 
-### 12.2 任务编辑 8 步骤
+### 12.2 任务编辑 8 步骤(v0.3.3:自动推断确认制)
 1. 选 source(数据源 / 文件)
 2. 选 target(数据源 / 文件)
 3. SQL 编辑(double 模式时两侧独立)
-4. 主键映射(多列复合,左右列对齐 UI)
-5. 列映射(列名不同时手动连)
+4. 主键自动推断确认(优先 information_schema 主键;其次唯一键/唯一索引;多列复合左右列对齐 UI)
+5. 列映射自动推断确认(同名/规范化相似列名 + ColumnType 兼容矩阵;规则推不出的残余列才进入手动/AI 辅助)
 6. 比较列选择(勾掉 ignore_columns)
 7. 规则配置(CompareRules + RunLimits)
 8. 跑
+
+### 12.2.1 自动推断交互
+- 页面默认展示"系统推断草稿":主键候选、字段映射候选、置信级、冲突/需确认原因
+- 用户操作是确认 / 调整 / 忽略,不是从空白表单开始手填
+- 推断来源要可解释:同名、规范化相似、类型兼容、主键、唯一键、人工指定、AI 残余建议
+- 无法推断主键时,阻止直接跑全量对比并提示用户选择主键或切换采样快检
 
 ### 12.3 CompareRules 字段
 - ignore_columns / column_mappings / numeric_tolerance / trim_strings / case_insensitive / empty_as_null / schema_policy(warn|strict)
 
 ### 12.4 RunLimits 字段
-- max_rows / export_max_rows / fetch_chunk_size / stream_compare / result_format / persist_same_bucket / query_timeout_seconds / run_disk_quota_mb
+- max_rows / export_max_rows / fetch_chunk_size / compare_batch_size / stream_compare / checksum_prefilter / sample_quick_check / result_format / persist_same_bucket / query_timeout_seconds / run_disk_quota_mb
 
 ### 12.5 结果区 4 tab(核心视觉)
 - **only_source**(左有右无,**Deleted,红**)
@@ -628,6 +636,7 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 - **diff**(同主键字段差异,**Changed,琥珀**)
 - **same**(完全相同,**灰,默认不落盘**)
 - 每 tab 标签带计数:`增 12 · 删 5 · 改 8 · 同 2034`
+- 顶部摘要显示 checksum 预筛效果:扫描块数 / 跳过块数 / 逐行块数 / 采样快检标记
 
 ### 12.6 diff tab 单元格分裂
 - 同主键有差异时,每差异单元格"分裂"成两行:
@@ -636,6 +645,12 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 - 无变化的单元格单行普通显示
 - 主键列固定左侧不滚动
 
+### 12.6.1 差异画像(diff attribution profile)
+- 结果区新增"画像"侧栏或 tab,消费 compare_run 的 `diff_profile` JSON
+- 展示每列差异率、NULL/空串/trim 后变化、数值精度/舍入差异、时间字段时区/截断差异
+- 展示系统性偏差检测:恒定偏移、比例偏移、统一大小写/空白问题
+- 缺失行按主键区间聚类,支持点击区间跳到 only_source / only_target 过滤视图
+
 ### 12.7 操作
 - "开始对比" → 异步跑(走 Job kind=compare_run)
 - 切 4 tab
@@ -643,9 +658,13 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 - "导出 Excel"(异步,4 桶分 sheet,列差异高亮)
 - 取消运行
 - "保存为模板" / "从模板新建"
+- "采样快检" → 只抽样若干主键区间,返回风险摘要,不替代正式 run
+- "生成任务草稿" → 从同名表配对清单批量创建 CompareTask 草稿
 
 ### 12.8 AI Assist(2.2.0 新)
-- 列映射阶段:"AI 推荐列映射"按钮(基于列名相似度 + 业务样本)
+- 列映射阶段:"AI 补残余映射"按钮,只处理规则推断未覆盖的列;默认输入为列名/schema 摘要(L2),不读取真实样本值
+- 差异画像阶段:"AI 解释差异画像"按钮,输入 `diff_profile` JSON(L2),输出自然语言归因和排查建议
+- 需要真实样本值 + 历史映射决策的学习型字段映射属于 C2(2.7.0,L4 opt-in),不属于 2.2.0 第一版
 
 ### 视觉锚点(★ 必须现在备好)
 - **4 色 token**(增 emerald / 删 red / 改 amber / 同 slate)
@@ -654,6 +673,8 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 - 主键列高亮视觉
 - 单元格分裂版式(垂直堆叠 / 水平箭头 → 两种都画出来选)
 - 4 tab 徽章式计数
+- 自动推断确认表:候选映射置信级、冲突标记、来源 badge
+- 差异画像面板:列差异率条形图、系统性偏差 chip、主键区间缺失聚类列表
 
 ---
 
@@ -696,6 +717,7 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 ### 14.1 设计稿 §2.4 核心策略(v0.3.2 修正)
 - 沿用 1.x LineageReport(20 字段,**不收敛**)
 - 2.4.0 先做核心 + 后续做复杂
+- v0.3.3 补充:图查询子图优先,不再默认全图;基础影响分析提前到 2.4.0;parse_errors 升级为覆盖率治理 UI
 
 ### 14.2 LineageReport 20 字段分层
 - **表/列层**:tables / columns / insert_mappings / aliases
@@ -710,8 +732,10 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 
 ### 14.3 2.4.0 第一版做的部分
 - 表级血缘(graph_edges + tables)
-- 列级血缘(insert_mappings + columns)
-- 解析错误(parse_errors)
+- **列级血缘(insert_mappings + columns,不可裁剪)**
+- 解析错误治理(parse_errors:失败语句 / 原因 / 占比 / 聚合)
+- 子图优先图查询(焦点表 N 跳邻域,默认 <=3 跳)
+- 基础影响分析(纯图 downstream 反向遍历,按深度分层)
 
 ### 14.4 2.4.x 后续
 - 存储过程深度解析(procedure_segments)
@@ -724,25 +748,51 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 - **LineageView**(批量)— 上传 .sql / .txt / .zip → 批量分析
 - **LineageReportView**(详细报告)— 20 字段分组展示
 - **AssetDetailView**(单资产)— 资产 + aspect + 上下游
+- **LineageSubgraphView**(默认图视图)— 输入/选择焦点表 → N 跳邻域子图
+- **LineageImpactView**— 选择表/列 → 下游影响清单(depth 分层 + 路径)
+- **LineageCoverageView**— 解析覆盖率、parse_errors 清单、失败原因聚合、AI 兜底状态
 
-### 14.6 图引擎(2.4.0 必有)
+### 14.6 图引擎(2.4.0 必有,子图优先)
 - 表节点 + 列节点 + 边
 - 缩放 / 平移 / 聚焦
 - 业务分组高亮(grouping rules)
 - 解析错误节点标红警
+- 默认入口是焦点表 N 跳邻域子图,按需计算、按需加载
+- 子图查询参数:focus table / direction(upstream|downstream|both) / max_depth(默认 3) / include_columns / include_inferred
+- 子图结果必须展示 depth 分层、节点/边数量、截断提示
+- **禁止**全图计算后过滤的交互或接口实现路径
+- 全景图仅作为次要视图:惰性加载 + 分层聚类 + 大图风险提示
+- 验收线:焦点子图(<=3 跳)查询 P95 < 2s
 
-### 14.7 AI Assist(2.4.0 新)
+### 14.7 解析覆盖率治理
+- 覆盖率总览:parsed / unsupported / unknown / AI inferred 占比
+- parse_errors 表:文件 / 语句序号 / SQL 摘要 / 原因 / 可操作建议
+- 失败原因聚合:方言不支持、动态 SQL、语法变体、列归属不明、权限/元数据缺失
+- AI 兜底解析开关默认关;开启后只补充 deterministic 失败项,不覆盖原始 parse_errors
+- AI 推断边前端必须显示 `inferred=true` 标志、confidence、reason/source_kind
+
+### 14.8 基础影响分析(2.4.0 新)
+- 纯图遍历,不依赖 AI / 运行频率 / owner 权重
+- 输入 focus table/column + direction + max_depth
+- 输出按 depth 分层的下游波及清单,包含路径、直接/间接依赖、截断提示
+- 2.7.0 C3 是本功能的 AI 加权增强,不是 2.4.0 的前置依赖
+
+### 14.9 AI Assist(2.4.0 新)
 - "AI 解释这段血缘"(自然语言总结)
+- "AI 兜底解析失败语句"(默认关,admin 开;L2)
 - "AI 推断动态 SQL"(默认关,admin 开)
 - "AI 补 column attribution"(默认关)
 
-### 14.8 Trace-compare
+### 14.10 Trace-compare
 - 选两次 lineage 跑结果 → 看 diff(回归)
 
 ### 视觉锚点
 - 图节点 / 边 / 高亮
 - 20 字段 envelope 设计要能撑(分组卡片 + 折叠)
 - "AI 推断"标志(区分确定结果 vs AI 推断)
+- 子图焦点态:焦点节点、depth ring/层级、截断边提示
+- 影响分析清单:depth 分组、路径展开、直接/间接依赖 badge
+- 覆盖率治理:parse_errors 比例条、失败原因 chip、AI inferred 视觉区分
 
 ---
 

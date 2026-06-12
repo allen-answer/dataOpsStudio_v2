@@ -1,13 +1,26 @@
-# DataOpsStudio 2.0 技术方案 v0.3.2
+# DataOpsStudio 2.0 技术方案 v0.3.3
 
 > **状态**:草案,接近可作为 2.0 Charter 前置技术方案
-> **最后更新**:2026-05-28
+> **最后更新**:2026-06-12
 > **作者**:[你] + Claude 协作
 > **目的**:作为 2.0 开发期间的活文档,每个架构决策落到此处。下一版应为精简版 Charter(3-4 页)+ 本文档作为技术方案主干。
 
 ---
 
 ## Changelog
+
+### v0.3.3(2026-06-12)
+
+**来源**:1.x 用户日常使用反馈 8 条,集中修订 Compare(2.2.0)与 Lineage(2.4.0)能力域。
+
+1. **Compare 映射自动推断前移到内核规则能力**:同名/规范化相似列名 + ColumnType 兼容矩阵推断字段映射,information_schema 主键/唯一键探测推断对比主键;用户确认制替代手填制。AI 字段映射降级为"规则推不出的残余列"辅助。
+2. **Compare 差异画像(diff 归因)**:compare_run 产出结构化画像(列差异率、恒定偏移/时区/精度/空串 vs NULL/trim 等系统性偏差、缺失行主键区间聚类);AI Assist 只在画像 JSON 上做 L2 自然语言归因。
+3. **Compare 分块 checksum 预筛 + 采样快检**:主键区间分块聚合哈希一致则跳过,不一致才逐行;沿用 compare_batch_size 配置,补充采样快检模式。
+4. **Compare 任务建议**:跨源同名表自动配对清单,一键生成任务草稿;从血缘建议对比标注为 2.4.0 后增强,不进 2.2.0。
+5. **Lineage 子图优先架构**:新增 ADR-0019。图引擎一等公民查询改为焦点表 N 跳邻域子图,按需计算/按需加载;禁止全图计算后过滤;全景图降为惰性 + 分层聚类的次要视图。验收线:焦点子图(<=3 跳)查询 P95 < 2s。
+6. **基础影响分析提前到 2.4.0**:纯图反向遍历输出下游波及清单(按深度分层),不依赖 AI/运行频率;C3 保留 2.7.0,改述为"基础影响分析的 AI 增强"。
+7. **解析覆盖率治理**:parse_errors 从埋在 LineageReport 字段里升级为 UI 一等公民;新增 AI 兜底解析(L2,默认可关),失败语句交 LLM 提取血缘,边标注 inferred=true + 置信级。
+8. **列级血缘不可裁剪**:维持 2.4.0 第一版承诺,明确列级血缘是首版验收项,不得滑到 2.4.x。
 
 ### v0.3.2(2026-05-28)
 
@@ -306,9 +319,46 @@ JobBackend.complete(job_id, result_ref)
 
 **核心约束 2**:业务模块不允许直接持有密码字符串,必须通过 SecretStore。CI lint 检查直接读取 `ds["password"]` → fail。
 
-### 2.4 Lineage:沿用 1.x LineageReport,实现按版本分批(v0.3.2 修正)
+### 2.3.1 Compare:规则智能化优先,AI 只补残余(v0.3.3 修订)
+
+> **v0.3.3 调整**:1.x 日常使用反馈表明,Compare 最大摩擦不是"有没有 AI 按钮",而是建任务前要手填主键/字段映射、全量逐行慢、跑完后只知道有差异不知道为什么。2.2.0 范围不滑期,但智能化重心改为**确定性规则内核优先**,AI 只在规则无法覆盖的残余问题上降级辅助。
+
+**2.2.0 必做能力**:
+
+1. **映射自动推断(规则版,非 AI 内核)**:
+   - 字段映射:同名匹配、规范化相似列名匹配(大小写/下划线/常见前后缀/中英文别名表)、ColumnType 兼容矩阵过滤。
+   - 主键推断:优先 information_schema 主键;无主键时探测唯一键/唯一索引;仍无候选时给出"需人工选择"状态。
+   - 交互原则:用户确认制,不是手填制。系统生成候选映射和主键草稿,用户只需确认/调整/忽略。
+   - AI Assist 字段映射重新定位为"只处理规则推不出的残余列",输入不包含样本值时为 L2;需要真实样本值的学习型映射仍属 C2,保留到 2.7.0 且按 L4 opt-in 管理。
+
+2. **差异画像(diff attribution profile)**:
+   - compare_run 除 4 桶结果外,额外产出结构化 `diff_profile` JSON。
+   - 指标包括:每列差异率、每列 NULL/空串/trim 后变化、数值精度/舍入差异、时间字段时区/日期截断差异、恒定偏移(如金额整体 +1、日期整体 +8h)、缺失行按主键区间聚类。
+   - AI Assist 差异归因只读取 `diff_profile` JSON,生成自然语言解释/排查建议;可降级,不能影响 compare_run 成功与否。
+
+3. **分块 checksum 预筛**:
+   - 以对比主键区间分块,两侧块内做稳定聚合哈希;hash 一致则整块跳过,hash 不一致才进入逐行比较。
+   - 分块大小沿用 `compare_batch_size`/RunLimits 体系,不得另造一套隐藏配置。
+   - 提供"采样快检"模式:只抽样若干主键区间估算差异风险,用于迁移前快速判断是否值得跑全量。
+   - checksum 是预筛优化,不是结果真值;最终差异仍以逐行比较为准。
+
+4. **对比任务建议**:
+   - 跨源同名表/规范化同名表自动配对,展示候选清单,支持一键生成 CompareTask 草稿。
+   - 迁移场景优先:source/target 数据源选择后,系统给出"可能应对比的表"列表,减少逐表新建任务成本。
+   - "从血缘建议对比"标注为 2.4.0 后增强:等 lineage 能提供可靠上下游/影响关系后再接入,不进入 2.2.0 验收。
+
+**验收线**:
+
+- 新建对比任务默认进入"自动推断结果确认"状态,不是空白手填表单。
+- 用户可以在不调用 AI 的情况下完成常见同构/迁移对比任务配置。
+- compare_run 结果必须包含 `diff_profile` 结构化摘要;AI 解释失败不能导致任务失败。
+- checksum 预筛必须可关闭,且关闭后结果与开启后一致。
+
+### 2.4 Lineage:沿用 1.x LineageReport,子图优先实现(v0.3.3 修订)
 
 > **v0.3.2 重大更正**:此前版本写"1.x 有 12 个 lineage aspect,2.0 收敛到 6 个核心 aspect"——**这个前提是错的**(经 `docs/legacy/V1_AS_IS.md` §9 核实)。1.x lineage **不存在 aspect 概念**(`grep aspect app/lineage/` 零结果)。"12 个 aspect"是 CLAUDE.md 对**代码模块数**的描述性叫法,不是数据结构。故"收敛"无的放矢,已删除。
+>
+> **v0.3.3 补充**:本次不改变 `LineageReport` 20 字段沿用、不持久化解析结果、按版本分批实现的结论;调整的是 2.4.0 图查询/展示/治理策略。1.x 的慢与不可读主要来自"先算全图再让人过滤",2.0 必须改为子图优先。
 
 **1.x 真实情况**(AS-IS §9):
 
@@ -333,13 +383,35 @@ JobBackend.complete(job_id, result_ref)
 
 2. **实现按版本分批(这才是真正该"精简"的)**:精简的是"2.0 哪个版本先做哪部分功能",不是砍数据字段。
    - 2.0.0 ~ 2.3.x:**不做 lineage**(lineage 能力域排在 2.4.0)
-   - 2.4.0:第一版做核心——表级血缘(`graph_edges` / `tables`)+ 列级血缘(`insert_mappings` / `columns`)+ 解析错误(`parse_errors`)
-   - 2.4.x / 后续:复杂部分——存储过程深度解析(`procedure_segments`)、动态 SQL 推断(`dynamic_sql_*`)、PL/SQL 变量(`variables`)、AI 推断(`ai_inferred`)
+   - 2.4.0:第一版做核心——表级血缘(`graph_edges` / `tables`)+ **列级血缘(`insert_mappings` / `columns`,不可裁剪)** + 解析错误治理(`parse_errors`)+ 子图优先图查询 + 基础影响分析
+   - 2.4.x / 后续:复杂部分——存储过程深度解析(`procedure_segments`)、动态 SQL 推断(`dynamic_sql_*`)、PL/SQL 变量(`variables`)、更复杂的 AI 推断(`ai_inferred`)
    - 字段全程保留,只是实现有先后
 
 3. **持久化策略**:沿用 1.x——lineage 解析结果不进元数据库主表,每次重算;workload 结果落 ResultStore。`migrate_from_v1.py` **不迁 lineage 解析结果**(重算即可),只迁 asset_aspects 那两张表(见 §5.4)。
 
 4. **资产分类 aspect 不变**:asset_aspects 的 6 个分类(owner/pii/sla/sensitive/tag/business_term)沿用 1.x 的动态可扩展标签机制(yml schema + SQLite KV),迁移照迁。
+
+5. **子图优先图引擎(ADR-0019)**:
+   - 一等公民查询是"焦点表 N 跳邻域子图",默认 N<=3,从焦点表按方向/深度按需遍历、按需加载。
+   - **禁止实现路径**:先计算/渲染全图,再在前端或后端过滤出焦点邻域。该路径复刻 1.x 慢和不可读的根因。
+   - 全景图降级为次要视图:惰性加载 + 分层聚类 + 明确的"可能很大"提示,不能成为默认入口。
+   - 验收线:焦点子图(<=3 跳)查询 P95 < 2s;结果需包含节点/边数量、截断提示、深度分层。
+
+6. **基础影响分析提前到 2.4.0**:
+   - 输入:焦点表/列 + 方向(默认 downstream) + 最大深度。
+   - 输出:纯图反向遍历得到的下游波及清单,按 depth=1/2/3 分层,标出路径、直接/间接依赖、是否截断。
+   - 不依赖 AI、不依赖运行频率、不依赖 owner/业务权重;这使其能随 2.4.0 图能力一起上线。
+   - C3 保留到 2.7.0,但定义改为"基础影响分析的 AI 增强":加入运行频率、负责人、历史变更/事故数据后做加权排序和自然语言建议。
+
+7. **解析覆盖率治理**:
+   - `parse_errors` 不再只是 LineageReport 里的一个字段,而是 2.4.0 UI 一等公民:展示哪些语句没解析出来、失败原因、占比、按文件/语句类型聚合。
+   - 新增 AI 兜底解析(L2,默认可关):确定性解析失败的语句可交 LLM 提取表/列血缘,写入 `ai_inferred` 或等价 envelope 透传字段。
+   - AI 推断边必须标注 `inferred=true`、`confidence`、`reason/source_kind`;前端视觉区分确定性解析结果与 AI 推断结果。
+   - AI 兜底失败不能覆盖或删除 deterministic parse_errors;只能补充。
+
+8. **列级血缘不可裁剪**:
+   - 2.4.0 第一版必须包含列级血缘 `insert_mappings` / `columns` 展示与导出,不允许以"先只做表级图"替代。
+   - 若方言/语句暂不能解析列级,必须在覆盖率治理中明确记为 parse_error / unsupported / low confidence,而不是静默降级。
 
 ### 2.5 Job 抽象(统一执行模型)
 
@@ -491,8 +563,10 @@ class ContextItem:
 | SQL 执行计划解释 | EXPLAIN 文本 | 解释 + 风险等级 | 2.1.0 | L1 |
 | SQL 改写建议 | 慢 SQL + schema 摘要 | 改写 SQL + 风险 | 2.1.0 | L3 |
 | 数据库错误翻译 | 报错信息 | 中文解释 + 排查方向 | 2.1.0 | L1 |
-| 字段映射建议(简易) | 源/目标列名列表 | 候选映射 + 置信度 | 2.2.0 | L2 |
+| Compare 残余字段映射建议 | 规则推断未覆盖的源/目标列名列表 | 候选映射 + 置信度 | 2.2.0 | L2 |
+| Compare 差异归因解释 | `diff_profile` 画像 JSON | 自然语言归因 + 排查建议 | 2.2.0 | L2 |
 | 血缘结果文字解释 | sqlglot 解析结果 | 自然语言概述 | 2.4.0 | L2 |
+| Lineage AI 兜底解析 | 确定性解析失败的 SQL 片段 | inferred 血缘边 + 置信级 + 原因 | 2.4.0 | L2 |
 
 输出永远是建议 / 解释,**不直接动数据库**。复制 / 应用必须用户显式触发。不是 hosted 卖点,是产品基础体验。
 
@@ -509,12 +583,12 @@ class ContextItem:
 | 3 | C2 Compare 字段映射学习 | 两边 schema + **20 行样本** + 历史映射决策 | **2.7.0** | **L4** | **高** |
 | 4 | C4 慢 SQL 根因诊断 | EXPLAIN + 统计 + 历史基线 → 根因排序 | **2.7.0** | L3 | 中 |
 | — | C5 进阶层 | 加入历史异常模式库(在基础版上叠加) | **2.7.0** | **L4** | **高** |
-| 5 | C3 Lineage Impact 分析 | 血缘图 + 运行频率 + 负责人 → 影响清单 | **2.7.0** | L2 | 中 |
+| 5 | C3 Lineage Impact 分析 | 2.4.0 基础影响分析 + 运行频率 + 负责人 → 加权影响清单 | **2.7.0** | L2 | 中 |
 
 **排期依据**:
 
 - **2.6.0(工具刚发布,无历史)只做"读当前状态"型**:C1(纯 schema,day-one 满血)、C5 基础版(读当前真实数据造测试数据,不依赖历史异常模式库)。避免"AI 说根据你的历史…用户说我没历史"的空壳尴尬。
-- **2.7.0(积累数月真实使用)做"读历史"型**:C2(需映射历史)、C4(需运行基线)、C5 进阶(需异常模式库)、C3(需 2.4.0 血缘能力域 + 运行频率数据)。
+- **2.7.0(积累数月真实使用)做"读历史"型**:C2(需映射历史;不同于 2.2.0 规则推断后的残余列 L2 建议)、C4(需运行基线)、C5 进阶(需异常模式库)、C3(需 2.4.0 基础影响分析 + 运行频率数据)。
 - **C3 排末位**:血缘是低频深挖场景(非天天用),价值密度低,做晚痛感小。
 
 **C2 / C5(L4)涉及真实样本数据值,标记 high-risk**:
@@ -1704,9 +1778,9 @@ dataops_worker_up{worker_id}                         gauge
 | 1.x hotfix | 安全补丁 | 明文密码加密 + 自动迁移 + gitleaks | 1-2 天 |
 | **2.0.0** | 骨架版 | 登录 / datasource / SELECT 基础 / **PG 全形态 + Portable launcher** / **API-Worker 分离 + PG queue** / SecretStore(两层)/ License skeleton + Repair Mode / AI Gateway 壳 / migrate_from_v1.py / Adapter(MySQL+DM Certified,Oracle 2.0.x 补,DB2 Preview) | 2-2.5 月 |
 | 2.1.0 | SQL Workspace 完整 + AI Assist 一批 | ResultSet spool / virtual scroll / 历史 / 模板 / **AI Assist: 计划解释 / 错误翻译 / 改写** / DB2 转 Certified | 2.5 月 |
-| 2.2.0 | Compare + AI Assist 二批 | 流式 + parquet + 异步导出 + 跨源 / **AI Assist: 字段映射(简易)** | 1.5 月 |
+| 2.2.0 | Compare + AI Assist 二批 | 流式 + parquet + 异步导出 + 跨源 / 映射自动推断 + diff_profile + checksum 预筛 + 任务建议 / **AI Assist: 残余字段映射 + 差异归因** | 1.5 月 |
 | 2.3.0 | Scenario Lab | DSL + materialize + verify + run-all | 1.5 月 |
-| 2.4.0 | Lineage(沿用 LineageReport) | 表级+列级血缘(沿用 1.x LineageReport)+ 图引擎 + 资产页 + trace-compare / **AI Assist: 血缘解释** | 1.5 月 |
+| 2.4.0 | Lineage(沿用 LineageReport) | 表级+列级血缘(沿用 1.x LineageReport)+ 子图优先图引擎 + 基础影响分析 + 解析覆盖率治理 + 资产页 + trace-compare / **AI Assist: 血缘解释 + 兜底解析** | 2 月 |
 | 2.5.0 | Workflow(Job DAG) | DAG + 调度 + 节点白名单 + 通知 | 1 月 |
 | 2.6.0 | AI Copilot MVP | Copilot Loop(自写)+ Memory + **C1(Schema-aware SQL)+ C5 基础版(Scenario 脚手架)** | 2.5 月 |
 | 2.7.0 | 多租户 Hosted + Copilot 进阶 | RLS + OIDC + 腾讯云自管部署 + **C2 + C4 + C5进阶 + C3** | 2.5 月 |
@@ -1793,7 +1867,8 @@ docs/adr/
 ├── 0015-adapter-capabilities-and-tiers.md          (v0.3.1 新)
 ├── 0016-ai-data-egress-policy.md                   (v0.3.1 新)
 ├── 0017-three-pronged-logging-runtime-audit-metrics.md  (v0.3.2 新)
-└── 0018-worker-heartbeat-timeout-slow-olap.md      (v0.3.2 新)
+├── 0018-worker-heartbeat-timeout-slow-olap.md      (v0.3.2 新)
+└── 0019-lineage-subgraph-first.md                  (v0.3.3 新)
 (废弃) 0099-DEPRECATED-portable-sqlite-default.md
 ```
 
@@ -1827,7 +1902,7 @@ Charter 3-4 页,只放:一句话定位 / 三形态对照 / 不做清单(SQLite �
 
 ---
 
-## 附录 B:决策表(v0.3.1)
+## 附录 B:决策表(v0.3.3)
 
 状态定义:**Accepted**(已敲定,charter 红线,变更需新 ADR)/ **Proposed**(方向定,细节待作者确认)/ **Deferred**(后续版本再定)/ **Open**(仍讨论)/ **Rejected**(明确不做)
 
@@ -1837,6 +1912,8 @@ Charter 3-4 页,只放:一句话定位 / 三形态对照 / 不做清单(SQLite �
 | B2 | Server State | Accepted | 新模块 TanStack Query,1.x 复用模块保留 Pinia,不专门迁移 | 2.0+ | 部分 |
 | B3 | Workflow API | Accepted | Job DAG + 节点白名单 | 2.5.0 | 否 |
 | B4 | Lineage 结构 | Accepted | 沿用 1.x LineageReport(20字段),实现按版本分批;无 aspect 收敛(伪命题已推翻) | 2.4.0 | 否 |
+| B5-L | Lineage 子图优先(任务书 B5;历史 B5 已占用) | **Accepted** | 一等公民查询为焦点表 N 跳邻域子图;按需计算/加载;禁止全图计算后过滤;全景图仅作惰性 + 分层聚类次要视图 | 2.4.0 | 否 |
+| B6-L | 基础影响分析前移(任务书 B6;历史 B6 已占用) | **Accepted** | 纯图反向遍历输出下游波及清单(按深度分层),提前到 2.4.0;C3 保留为 2.7.0 的 AI 加权增强 | 2.4.0 | 否 |
 | B5 | Hosted 云 | **Accepted** | 接口中立 + 实现单云:绑腾讯云,全程自管(CVM+Docker,复用 on-prem),AI 辅助运维 | 2.7.0+ | 否 |
 | B6 | AI Copilot Demo | **Accepted** | C1-C5 确认;优先级 1/5/2/4/3;2.6.0=C1+C5基础版,2.7.0=C2/C4/C5进阶/C3 | 2.6-2.7 | 否 |
 | B7 | 商业模式 | **Deferred** | 2.0 阶段不做;§9 已删 | GA 前 | 否 |
@@ -1854,13 +1931,13 @@ Charter 3-4 页,只放:一句话定位 / 三形态对照 / 不做清单(SQLite �
 | B19 | AI Egress | **Accepted** | L0-L5 分级,L5 永禁,L4 默认禁需 opt-in;C2/C5 high-risk | 2.0.0(Gateway 检查) | 是 |
 | B20 | 日志体系 | **Accepted** | 三管线分离:运行日志(structlog+request_id+强制脱敏)/ 审计(PG表)/ 指标(Prometheus);脱敏 processor 为安全红线 | 2.0.0 | 是 |
 
-**已全部 Accepted**:B5 / B6 / B14(本轮收敛)。
+**已全部 Accepted**:B5-L / B6-L(本轮 lineage 修订),B5 / B6 / B14(此前收敛)。
 **已 Deferred**:B1(Agent 框架)/ B7(商业模式)/ B10(AI 历史导入导出)。
 **无 Open 项**。
 
 ---
 
-**文档版本**:v0.3.2
+**文档版本**:v0.3.3
 **已决议红线**:PG 统一 / API-Worker 分离 + PG queue / ResultSet spool 不持 cursor / SecretStore 两层 / 日志强制脱敏(三管线分离)/ Workflow 白名单 / License Repair Mode / AI Egress L0-L5 / Adapter 分级(MySQL+DM GA, Oracle 2.0.x, DB2 2.1)/ Hosted 腾讯云自管 / AI Copilot C1-C5 优先级 1/5/2/4/3 / 1.x 6 个月 EOL(带前提)/ 商业模式不做
 **附录 B 全部 Accepted 或 Deferred,无 Open 项**
 **下一步**:产出精简 Charter(3-4 页)+ 本文档定稿
