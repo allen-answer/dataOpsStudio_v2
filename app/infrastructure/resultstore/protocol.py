@@ -37,6 +37,10 @@ class ResultStore(Protocol):
     def delete_run(self, run_id: str) -> None:
         raise NotImplementedError
 
+    def delete_spool(self, result_set_id: str) -> bool:
+        """删除一个 ResultSet spool,返回是否实际删除了文件。"""
+        raise NotImplementedError
+
     def gc_expired(self) -> int:
         """按 result_ttl_days / resultset_spool_ttl_days 清理,返回清理数量。"""
         raise NotImplementedError

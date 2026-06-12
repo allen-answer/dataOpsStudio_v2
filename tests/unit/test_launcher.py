@@ -72,6 +72,9 @@ def test_child_env_removes_legacy_postgres_dev_password(
         context.settings.bootstrap.master_key_file
     )
     assert env["DATAOPS_RESULT_LOCAL_ROOT"] == str(context.settings.result_store.local_root)
+    assert env["DATAOPS_WORKER_RESULT_GC_INTERVAL_SECONDS"] == str(
+        context.settings.worker.result_gc_interval_seconds
+    )
 
 
 def test_pg_up_does_not_initdb_when_pgdata_already_exists(

@@ -117,6 +117,7 @@ def test_worker_cancel_safe_point_marks_cancelled() -> None:
     backend = _FakeBackend([job])
     backend.cancel_after_checks = 4
     result_store = _FakeResultStore()
+    catalog = _FakeResultSetCatalog()
     adapter = _FakeAdapter([Row(values=[1]), Row(values=[2])])
     runner = WorkerRunner(
         backend,
@@ -128,11 +129,14 @@ def test_worker_cancel_safe_point_marks_cancelled() -> None:
             sql_spool_batch_size=1,
             cancel_check_row_interval=1,
         ),
+        catalog,
     )
 
     assert runner.run_once() is True
 
-    assert result_store.rows_by_result_set == {"rs-1": [Row(values=[1])]}
+    assert result_store.rows_by_result_set == {}
+    assert result_store.deleted_spools == ["rs-1"]
+    assert catalog.terminal == [{"result_set_id": "rs-1", "state": "closed"}]
     assert backend.cancelled == [("job-1", "cancel requested")]
     assert backend.completed == []
 
@@ -297,6 +301,23 @@ def test_worker_empty_queue_returns_false() -> None:
     assert runner.run_once() is False
 
 
+def test_worker_run_once_triggers_result_store_gc_on_interval() -> None:
+    result_store = _FakeResultStore()
+    runner = WorkerRunner(
+        _FakeBackend([]),
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is False
+    assert result_store.gc_calls == 1
+
+    assert runner.run_once() is False
+    assert result_store.gc_calls == 1
+
+
 def test_cancel_check_throttled_to_every_n_rows() -> None:
     """F3: per-row cancel check is throttled to every 5000 rows."""
 
@@ -427,6 +448,8 @@ class _FakeResultStore:
     def __init__(self) -> None:
         self.rows_by_result_set: dict[str, list[Row]] = {}
         self.columns_by_result_set: dict[str, list[Column]] = {}
+        self.deleted_spools: list[str] = []
+        self.gc_calls = 0
 
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None:
         self.rows_by_result_set.setdefault(result_set_id, []).extend(rows)
@@ -446,11 +469,26 @@ class _FakeResultStore:
     def spool_ref(self, result_set_id: str) -> ResultRef:
         return ResultRef(backend="local_fs", uri=f"spool/{result_set_id}")
 
+    def delete_spool(self, result_set_id: str) -> bool:
+        self.deleted_spools.append(result_set_id)
+        existed = (
+            result_set_id in self.rows_by_result_set or result_set_id in self.columns_by_result_set
+        )
+        self.rows_by_result_set.pop(result_set_id, None)
+        self.columns_by_result_set.pop(result_set_id, None)
+        return existed
+
+    def gc_expired(self) -> int:
+        self.gc_calls += 1
+        return 0
+
 
 class _CountingResultStore:
     def __init__(self) -> None:
         self.row_count_by_result_set: dict[str, int] = {}
         self.columns_by_result_set: dict[str, list[Column]] = {}
+        self.deleted_spools: list[str] = []
+        self.gc_calls = 0
 
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None:
         self.row_count_by_result_set[result_set_id] = self.row_count_by_result_set.get(
@@ -471,6 +509,20 @@ class _CountingResultStore:
 
     def spool_ref(self, result_set_id: str) -> ResultRef:
         return ResultRef(backend="local_fs", uri=f"spool/{result_set_id}")
+
+    def delete_spool(self, result_set_id: str) -> bool:
+        self.deleted_spools.append(result_set_id)
+        existed = (
+            result_set_id in self.row_count_by_result_set
+            or result_set_id in self.columns_by_result_set
+        )
+        self.row_count_by_result_set.pop(result_set_id, None)
+        self.columns_by_result_set.pop(result_set_id, None)
+        return existed
+
+    def gc_expired(self) -> int:
+        self.gc_calls += 1
+        return 0
 
 
 class _FakeErrorCodeWriter:

@@ -34,6 +34,7 @@ def test_load_settings_defaults() -> None:
     assert s.worker.heartbeat_timeout_seconds == 600
     assert s.worker.poll_interval_seconds == 0.1
     assert s.worker.cancel_check_row_interval == 5000
+    assert s.worker.result_gc_interval_seconds == 600.0
     # AI 默认关(R5 + 形态默认)
     assert s.ai.enabled is False
     assert s.ai.max_auto_egress_level == 0

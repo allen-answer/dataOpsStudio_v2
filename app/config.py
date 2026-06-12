@@ -113,6 +113,7 @@ class WorkerConfig(BaseSettings):
     heartbeat_timeout_seconds: int = 600  # 慢首行 OLAP 查询优先避免误杀,见 ADR-0018
     poll_interval_seconds: float = 0.1  # T6:portable 小队列优先降低首个 job 体感延迟
     cancel_check_row_interval: int = 5000  # F3:cancel 查询节流间隔
+    result_gc_interval_seconds: float = 600.0  # ResultSet spool TTL 周期清理间隔
 
 
 class ResultStoreConfig(BaseSettings):

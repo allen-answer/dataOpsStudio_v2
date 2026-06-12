@@ -85,6 +85,10 @@ class ResultStoreLike(Protocol):
 
     def spool_ref(self, result_set_id: str) -> ResultRef: ...
 
+    def delete_spool(self, result_set_id: str) -> bool: ...
+
+    def gc_expired(self) -> int: ...
+
 
 class DatabaseAdapterLike(Protocol):
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]: ...
@@ -143,6 +147,7 @@ class WorkerRunnerConfig:
     poll_interval_seconds: float = 1.0
     sql_spool_batch_size: int = 1000
     cancel_check_row_interval: int = 5000
+    result_gc_interval_seconds: float = 600.0
 
 
 @dataclass(frozen=True)
@@ -166,6 +171,8 @@ class WorkerRunner:
             raise ValueError("sql_spool_batch_size must be positive")
         if config.cancel_check_row_interval <= 0:
             raise ValueError("cancel_check_row_interval must be positive")
+        if config.result_gc_interval_seconds <= 0:
+            raise ValueError("result_gc_interval_seconds must be positive")
         self._backend = backend
         self._result_store = result_store
         self._datasource_loader = datasource_loader
@@ -174,6 +181,7 @@ class WorkerRunner:
         self._result_set_catalog = result_set_catalog
         self._job_error_code_writer = job_error_code_writer
         self._stop_requested = False
+        self._next_result_gc_at = 0.0
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -185,6 +193,7 @@ class WorkerRunner:
                 time.sleep(self._config.poll_interval_seconds)
 
     def run_once(self) -> bool:
+        self._gc_result_store_if_due()
         reap_report = self._backend.reap_stale_running_jobs(self._config.heartbeat_timeout_seconds)
         _log_reap_report(reap_report)
         job = self._backend.claim_next(self._config.worker_id)
@@ -423,15 +432,57 @@ class WorkerRunner:
         )
 
     def _write_result_set_terminal(self, job: Job, state: str) -> None:
-        if self._result_set_catalog is None or job.kind is not JobKind.SQL_QUERY:
+        if job.kind is not JobKind.SQL_QUERY:
             return
         result_set_id = _payload_optional_str(job.payload, "result_set_id")
         if result_set_id is None:
             return
-        self._result_set_catalog.write_terminal(
-            result_set_id=result_set_id,
-            state=state,
-        )
+        if self._result_set_catalog is not None:
+            self._result_set_catalog.write_terminal(
+                result_set_id=result_set_id,
+                state=state,
+            )
+        if state == "closed":
+            self._delete_result_spool(result_set_id)
+
+    def _delete_result_spool(self, result_set_id: str) -> None:
+        started_at = time.monotonic()
+        try:
+            deleted = self._result_store.delete_spool(result_set_id)
+        except Exception:
+            logger.exception(
+                "worker result spool delete failed",
+                result_set_id=result_set_id,
+                elapsed_seconds=_elapsed_seconds(started_at),
+            )
+            return
+        if deleted:
+            logger.info(
+                "worker result spool deleted",
+                result_set_id=result_set_id,
+                elapsed_seconds=_elapsed_seconds(started_at),
+            )
+
+    def _gc_result_store_if_due(self) -> None:
+        now = time.monotonic()
+        if now < self._next_result_gc_at:
+            return
+        started_at = now
+        try:
+            cleaned = self._result_store.gc_expired()
+        except Exception:
+            logger.exception(
+                "worker result spool gc failed",
+                elapsed_seconds=_elapsed_seconds(started_at),
+            )
+        else:
+            logger.info(
+                "worker result spool gc complete",
+                cleaned=cleaned,
+                elapsed_seconds=_elapsed_seconds(started_at),
+            )
+        finally:
+            self._next_result_gc_at = now + self._config.result_gc_interval_seconds
 
 
 class PostgresDatasourceLoader:
@@ -643,6 +694,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
             heartbeat_timeout_seconds=actual_settings.worker.heartbeat_timeout_seconds,
             poll_interval_seconds=actual_settings.worker.poll_interval_seconds,
             cancel_check_row_interval=actual_settings.worker.cancel_check_row_interval,
+            result_gc_interval_seconds=actual_settings.worker.result_gc_interval_seconds,
         ),
         PostgresResultSetCatalog(engine),
         PostgresJobErrorCodeWriter(engine),

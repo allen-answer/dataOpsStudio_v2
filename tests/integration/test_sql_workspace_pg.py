@@ -252,8 +252,9 @@ def test_console_resultsets_lru_eviction_keeps_three_active(tmp_path: Path) -> N
     engine = _pg_engine_or_skip()
     metadata.create_all(engine)
     _clear_metadata(engine)
+    result_store = LocalFsResultStore(tmp_path / "results")
     jwt_secret = _test_jwt_secret()
-    services = _services(engine, tmp_path, jwt_secret=jwt_secret)
+    services = _services(engine, tmp_path, result_store=result_store, jwt_secret=jwt_secret)
     client = AsgiClient(create_app(services=services))
     owner = _seed_user_project_datasource(engine, role="admin")
     headers = _headers(owner.user_id, "admin", jwt_secret)
@@ -265,7 +266,8 @@ def test_console_resultsets_lru_eviction_keeps_three_active(tmp_path: Path) -> N
     assert console_response.status_code == 201
     console_id = console_response.json()["id"]
 
-    for index in range(4):
+    result_set_ids: list[str] = []
+    for index in range(3):
         response = client.post(
             "/api/sql/execute",
             headers=headers,
@@ -277,6 +279,24 @@ def test_console_resultsets_lru_eviction_keeps_three_active(tmp_path: Path) -> N
             },
         )
         assert response.status_code == 202
+        result_set_ids.append(response.json()["result_set_id"])
+
+    evicted_result_set_id = result_set_ids[0]
+    result_store.append_spool(evicted_result_set_id, [Row(values=["old"])])
+    evicted_spool_dir = tmp_path / "results" / "resultsets" / evicted_result_set_id
+    assert evicted_spool_dir.exists()
+
+    response = client.post(
+        "/api/sql/execute",
+        headers=headers,
+        json_body={
+            "datasource_id": owner.datasource_id,
+            "console_id": console_id,
+            "sql": "SELECT 3",
+            "params": {},
+        },
+    )
+    assert response.status_code == 202
 
     with engine.connect() as conn:
         states = (
@@ -290,6 +310,7 @@ def test_console_resultsets_lru_eviction_keeps_three_active(tmp_path: Path) -> N
         )
     assert states.count("closed") == 1
     assert states.count("streaming") == 3
+    assert not evicted_spool_dir.exists()
 
 
 def test_running_sql_result_can_read_spooled_rows(tmp_path: Path) -> None:

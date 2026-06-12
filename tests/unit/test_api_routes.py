@@ -354,6 +354,10 @@ class _ResultStore:
             "truncated": False,
         }
 
+    def delete_spool(self, result_set_id: str) -> bool:
+        del result_set_id
+        return False
+
 
 class _LicenseStatusServices:
     def __init__(self, row: dict[str, Any] | None) -> None:

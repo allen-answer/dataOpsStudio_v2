@@ -817,6 +817,9 @@ def _child_env(context: LauncherContext) -> dict[str, str]:
             "DATAOPS_WORKER_POLL_INTERVAL_SECONDS": str(
                 context.settings.worker.poll_interval_seconds
             ),
+            "DATAOPS_WORKER_RESULT_GC_INTERVAL_SECONDS": str(
+                context.settings.worker.result_gc_interval_seconds
+            ),
         }
     )
     return env

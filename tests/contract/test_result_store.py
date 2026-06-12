@@ -67,3 +67,10 @@ def test_gc_expired_returns_count(result_store: ResultStore) -> None:
     n = result_store.gc_expired()
     assert isinstance(n, int)
     assert n >= 0
+
+
+def test_delete_spool_removes_result_set_files(result_store: ResultStore) -> None:
+    result_store.append_spool("rs-1", [Row(values=[1])])
+
+    assert result_store.delete_spool("rs-1") is True
+    assert result_store.delete_spool("rs-1") is False

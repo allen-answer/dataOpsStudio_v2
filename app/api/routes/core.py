@@ -1003,6 +1003,7 @@ def _create_result_set_placeholder(
 
 
 def _evict_console_resultsets(services: ApiServices, console_id: str) -> None:
+    stale_ids: list[str] = []
     with services.engine.begin() as conn:
         active_ids = (
             conn.execute(
@@ -1022,6 +1023,29 @@ def _evict_console_resultsets(services: ApiServices, console_id: str) -> None:
                 .where(result_sets.c.id.in_(stale_ids))
                 .values(state="closed", updated_at=datetime.now(UTC))
             )
+    if stale_ids:
+        _delete_closed_result_spools(services, stale_ids)
+
+
+def _delete_closed_result_spools(services: ApiServices, result_set_ids: list[str]) -> None:
+    started_at = time.monotonic()
+    deleted = 0
+    for result_set_id in result_set_ids:
+        try:
+            if services.result_store.delete_spool(result_set_id):
+                deleted += 1
+        except Exception:
+            logger.exception(
+                "closed result spool delete failed",
+                result_set_id=result_set_id,
+                elapsed_seconds=round(time.monotonic() - started_at, 3),
+            )
+    logger.info(
+        "closed result spools deleted",
+        closed_resultsets=len(result_set_ids),
+        deleted_spools=deleted,
+        elapsed_seconds=round(time.monotonic() - started_at, 3),
+    )
 
 
 def _result_set_state(services: ApiServices, result_set_id: str) -> str | None:
