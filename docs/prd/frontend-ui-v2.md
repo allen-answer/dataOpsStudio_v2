@@ -24,9 +24,9 @@
 |---|---|---|
 | **2.0.0** | 2-2.5 月 | 骨架版,功能 ≤ 1.x 50%,架构完整即可 |
 | **2.1.0** | 2.5 月 | SQL Workspace 完整 + AI Assist 第一批(计划解释 / 错误翻译 / SQL 改写) |
-| **2.2.0** | 1.5 月 | Compare + AI Assist 第二批(规则映射推断 + 差异归因) |
+| **2.2.0** | 1.5 月 | Compare + AI Assist 第二批(规则映射推断 + 递归下钻 + 差异归因) |
 | **2.3.0** | 1.5 月 | Scenario Lab(DSL + materialize + verify + run-all) |
-| **2.4.0** | 2 月 | Lineage(沿用 1.x LineageReport)+ 子图优先 + 基础影响分析 + 资产页 + AI 血缘解释 |
+| **2.4.0** | 2 月 | Lineage(沿用 1.x LineageReport)+ 边表持久化 + 子图优先 + 基础影响分析 + 资产页 + AI 血缘解释 |
 | **2.5.0** | 1 月 | Workflow(Job DAG)+ 调度 + 节点白名单 + 通知 |
 | **2.6.0** | 2.5 月 | AI Copilot MVP(C1 Schema-aware SQL + C5 Scenario 脚手架) |
 | **2.7.0** | 2.5 月 | 多租户 Hosted + RLS + OIDC + C2/C3/C4/C5 进阶 |
@@ -628,7 +628,7 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 - ignore_columns / column_mappings / numeric_tolerance / trim_strings / case_insensitive / empty_as_null / schema_policy(warn|strict)
 
 ### 12.4 RunLimits 字段
-- max_rows / export_max_rows / fetch_chunk_size / compare_batch_size / stream_compare / checksum_prefilter / sample_quick_check / result_format / persist_same_bucket / query_timeout_seconds / run_disk_quota_mb
+- max_rows / export_max_rows / fetch_chunk_size / compare_batch_size / stream_compare / recursive_checksum / bisection_factor / bisection_threshold / max_bisection_depth / sample_quick_check / result_format / persist_same_bucket / query_timeout_seconds / run_disk_quota_mb
 
 ### 12.5 结果区 4 tab(核心视觉)
 - **only_source**(左有右无,**Deleted,红**)
@@ -636,7 +636,7 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 - **diff**(同主键字段差异,**Changed,琥珀**)
 - **same**(完全相同,**灰,默认不落盘**)
 - 每 tab 标签带计数:`增 12 · 删 5 · 改 8 · 同 2034`
-- 顶部摘要显示 checksum 预筛效果:扫描块数 / 跳过块数 / 逐行块数 / 采样快检标记
+- 顶部摘要显示递归下钻进度:扫描段数 / 跳过段数 / 递归下钻段数 / 当前最大深度 / 切逐行段数 / 采样快检标记
 
 ### 12.6 diff tab 单元格分裂
 - 同主键有差异时,每差异单元格"分裂"成两行:
@@ -658,7 +658,7 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 - "导出 Excel"(异步,4 桶分 sheet,列差异高亮)
 - 取消运行
 - "保存为模板" / "从模板新建"
-- "采样快检" → 只抽样若干主键区间,返回风险摘要,不替代正式 run
+- "采样快检" → 用 PK 随机锚点抽样,返回"X% 置信度下差异率上界 < p"风险摘要,不承诺全等,不替代正式 run
 - "生成任务草稿" → 从同名表配对清单批量创建 CompareTask 草稿
 
 ### 12.8 AI Assist(2.2.0 新)
@@ -675,6 +675,8 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 - 4 tab 徽章式计数
 - 自动推断确认表:候选映射置信级、冲突标记、来源 badge
 - 差异画像面板:列差异率条形图、系统性偏差 chip、主键区间缺失聚类列表
+- 递归下钻进度:树状/分层段列表,展示跳过、继续下钻、切逐行三种状态
+- 采样快检结果卡:置信度、差异率上界、样本量 n、明确"不等于全量一致"提示
 
 ---
 
@@ -729,6 +731,7 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 - **警告**:parse_errors / warnings
 - **详情**:statements / semantic_lineage / report
 - **AI 字段**:ai_enrichment / ai_inferred
+- `insert_mappings` 展示 `transformation` badge:DIRECT / INDIRECT + subtype(AGGREGATION / FILTER / JOIN / CAST / EXPRESSION 等)
 
 ### 14.3 2.4.0 第一版做的部分
 - 表级血缘(graph_edges + tables)
@@ -736,9 +739,11 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 - 解析错误治理(parse_errors:失败语句 / 原因 / 占比 / 聚合)
 - 子图优先图查询(焦点表 N 跳邻域,默认 <=3 跳)
 - 基础影响分析(纯图 downstream 反向遍历,按深度分层)
+- lineage_edges / lineage_column_edges 边表持久化 + sql_hash 缓存(ADR-0020)
+- schema-aware 解析:从 PG 元数据库注入表结构给 sqlglot qualify,支持 SELECT * 展开和多表裸列归属
 
 ### 14.4 2.4.x 后续
-- 存储过程深度解析(procedure_segments)
+- 存储过程深度解析(procedure_segments):先按语句切分提取 DML 逐条解析,残片才进 AI 兜底
 - 动态 SQL 推断(dynamic_sql_*)
 - PL/SQL 变量(variables)
 - AI 推断(ai_inferred)
@@ -753,6 +758,7 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 - **LineageCoverageView**— 解析覆盖率、parse_errors 清单、失败原因聚合、AI 兜底状态
 
 ### 14.6 图引擎(2.4.0 必有,子图优先)
+- 渲染选型:AntV G6 v5(千节点性能 + 内置邻域展开,框架无关)
 - 表节点 + 列节点 + 边
 - 缩放 / 平移 / 聚焦
 - 业务分组高亮(grouping rules)
@@ -766,10 +772,11 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 
 ### 14.7 解析覆盖率治理
 - 覆盖率总览:parsed / unsupported / unknown / AI inferred 占比
-- parse_errors 表:文件 / 语句序号 / SQL 摘要 / 原因 / 可操作建议
+- parse_errors 表:文件 / 语句序号 / SQL 摘要 / 原因 / 可操作建议 / AI 状态(inferred / confirmed / rejected)
 - 失败原因聚合:方言不支持、动态 SQL、语法变体、列归属不明、权限/元数据缺失
 - AI 兜底解析开关默认关;开启后只补充 deterministic 失败项,不覆盖原始 parse_errors
 - AI 推断边前端必须显示 `inferred=true` 标志、confidence、reason/source_kind
+- AI inferred 边提供"确认" / "驳回"操作;confirmed 前不得与确定性结果同权重参与影响分析
 
 ### 14.8 基础影响分析(2.4.0 新)
 - 纯图遍历,不依赖 AI / 运行频率 / owner 权重
@@ -792,7 +799,8 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 - "AI 推断"标志(区分确定结果 vs AI 推断)
 - 子图焦点态:焦点节点、depth ring/层级、截断边提示
 - 影响分析清单:depth 分组、路径展开、直接/间接依赖 badge
-- 覆盖率治理:parse_errors 比例条、失败原因 chip、AI inferred 视觉区分
+- transformation badge:DIRECT / INDIRECT + subtype,用于列级血缘边和详情面板
+- 覆盖率治理:parse_errors 比例条、失败原因 chip、AI inferred 视觉区分、确认/驳回按钮
 
 ---
 
