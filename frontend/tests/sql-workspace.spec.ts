@@ -3,7 +3,7 @@ import { json, mockLicense, seedAdminAuth, trackConsoleErrors } from './helpers'
 
 const now = '2026-06-12T06:00:00Z'
 
-function datasource() {
+function datasource(overrides: Record<string, unknown> = {}) {
   return {
     id: 'ds-1',
     name: 'warehouse',
@@ -24,6 +24,7 @@ function datasource() {
       allow_record_task: false,
     },
     created_at: now,
+    ...overrides,
   }
 }
 
@@ -68,13 +69,18 @@ function templateRow() {
   }
 }
 
-async function mockWorkspace(page: Page): Promise<{ patches: unknown[]; renders: unknown[] }> {
+async function mockWorkspace(
+  page: Page,
+  options: { datasource?: Record<string, unknown> } = {},
+): Promise<{ patches: unknown[]; renders: unknown[] }> {
   const patches: unknown[] = []
   const renders: unknown[] = []
   let jobReads = 0
 
   await mockLicense(page)
-  await page.route(/\/api\/datasources\?/, (r) => json(r, 200, [datasource()]))
+  await page.route(/\/api\/datasources\?/, (r) =>
+    json(r, 200, [datasource(options.datasource)]),
+  )
   await page.route('**/api/sql/consoles', async (r: Route) => {
     if (r.request().method() === 'GET') return json(r, 200, [consoleRow()])
     if (r.request().method() === 'POST') return json(r, 201, consoleRow({ id: 'console-2', name: 'query_2.sql' }))
@@ -177,5 +183,16 @@ test('SQL workspace tabs, history, templates, and progressive result render', as
   await expect(page.getByText(/loaded 2 rows/)).toBeVisible()
   await expect(page.getByText('Ada')).toBeVisible()
   await expect(page.getByText('Lin')).toBeVisible()
+  expectNoConsoleErrors()
+})
+
+test('DM datasource remains executable', async ({ page }) => {
+  await mockWorkspace(page, { datasource: { db_type: 'dm' } })
+
+  await page.goto('/projects/project-1/sql')
+  await expect(page.getByText('SQL workspace')).toBeVisible()
+  await expect(page.locator('main select')).toHaveValue('ds-1')
+  await expect(page.getByText(/Execution currently supports MySQL \/ DM/)).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Run' })).toBeEnabled()
   expectNoConsoleErrors()
 })

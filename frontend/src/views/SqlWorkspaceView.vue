@@ -85,6 +85,7 @@ const ACTIVE: ReadonlySet<JobStatus> = new Set<JobStatus>(['pending', 'running']
 const PAGE_SIZE = 1000
 const POLL_MS = 500
 const SAVE_DEBOUNCE_MS = 650
+const SUPPORTED_EXECUTION_DB_TYPES = new Set(['mysql', 'dm'])
 
 type SidebarTab = 'consoles' | 'history' | 'templates' | 'metadata'
 type HistoryRange = 'all' | 'today' | '7d'
@@ -188,7 +189,7 @@ const selectedDs = computed<DatasourceListItem | undefined>(() =>
 )
 const unsupportedDb = computed<string | null>(() => {
   const ds = selectedDs.value
-  return ds && ds.db_type !== 'mysql' ? ds.db_type : null
+  return ds && !SUPPORTED_EXECUTION_DB_TYPES.has(ds.db_type) ? ds.db_type : null
 })
 const editorTheme = computed(() => {
   const v = variant.value
