@@ -7,7 +7,7 @@ Date: 2026-06-12
 
 DataOpsStudio 1.x lineage can produce rich `LineageReport` output, but daily use exposed a product and performance problem: large lineage graphs are slow to compute, hard to read, and often require users to manually find the one table they care about inside a full graph.
 
-The v0.3.2 design already decided to reuse the 1.x `LineageReport` 20-field envelope and not persist lineage parse results as primary metadata tables. This ADR does not change that decision. It only defines the graph query and UI loading strategy for the 2.4.0 lineage capability.
+The v0.3.2 design already decided to reuse the 1.x `LineageReport` 20-field envelope. This ADR does not change that envelope decision. It only defines the graph query and UI loading strategy for the 2.4.0 lineage capability. Persistence of lineage edges is decided separately in ADR 0020.
 
 The user-facing task is usually local: "what is upstream/downstream of this table or column?" A whole-graph view is useful for exploration, but it should not be the default execution path.
 
@@ -34,7 +34,7 @@ Acceptance target: focused subgraph queries with max depth <= 3 should have P95 
 - Backend APIs and indexes should be shaped around adjacency traversal, depth limits, truncation markers, and node/edge counts.
 - Basic impact analysis can ship in 2.4.0 as pure graph traversal over the same subgraph primitives.
 - Whole-graph rendering becomes a deliberate user action, not an accidental default.
-- The existing `LineageReport` envelope remains intact; graph query strategy does not require changing or persisting lineage parse results as primary metadata tables.
+- The existing `LineageReport` envelope remains intact; persistence of graph edges and SQL-hash caching is governed by ADR 0020.
 
 ## Non-Goals
 
