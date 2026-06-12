@@ -89,6 +89,24 @@ PostgreSQL / Oracle / DB2 数据源跑 SQL 仍直接 `UnsupportedDbTypeError`。
 
 ---
 
+## 来自 1.x 切换后 dogfood(2026-06-12)
+
+### **2.0.x 应修** — 终态 test_connection job 不应阻塞数据源删除
+
+**位置**:`app/api/routes/core.py:_datasource_job_references`
+
+**现状**:DELETE /datasources/{id} 的 409 引用检查把**所有** kind 的 job 计入引用,
+包括已终态(failed/success)的 test_connection。后果:任何被"测试连接"过一次的
+数据源永远无法删除 —— 测连本身就会创建 job。真机实锤:删除两个废弃 DM 数据源时
+被各自的一条失败测连 job 挡死,只能人工授权清 job 行后才删掉。
+
+**修法**:引用检查排除 `kind='test_connection'` 的终态 job(或仅统计
+sql_query 等业务 job);保留对业务 job 的保护语义。补单测:测过连的数据源可删,
+有 sql_query 历史的仍 409。
+
+**触发条件**:下一个 2.0.x 补丁窗口。**优先级**:中(影响日常管理操作)。
+
+---
 ## Backlog 维护规则
 
 1. **每个 review 反馈**判断三类:
