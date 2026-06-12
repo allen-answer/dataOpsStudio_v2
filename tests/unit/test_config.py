@@ -48,9 +48,9 @@ def test_bootstrap_paths_are_paths_only_no_values() -> None:
     assert isinstance(bp.jwt_secret_file, Path)
     assert isinstance(bp.license_file, Path)
     # 默认路径在 config/ 下,这些在 .gitignore 精确忽略
-    assert str(bp.master_key_file).startswith("config/")
-    assert str(bp.pg_app_password_file).startswith("config/secrets/")
-    assert str(bp.jwt_secret_file).startswith("config/secrets/")
+    assert bp.master_key_file.as_posix().startswith("config/")
+    assert bp.pg_app_password_file.as_posix().startswith("config/secrets/")
+    assert bp.jwt_secret_file.as_posix().startswith("config/secrets/")
 
 
 def test_metadata_db_config_no_password_field() -> None:

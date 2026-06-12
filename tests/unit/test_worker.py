@@ -61,8 +61,33 @@ def test_worker_persists_columns_to_spool_and_catalog() -> None:
             "columns": columns,
             "loaded_rows": 2,
             "truncated": False,
+            "console_id": None,
         }
     ]
+    assert catalog.streaming[-1]["loaded_rows"] == 2
+
+
+def test_worker_updates_catalog_while_streaming_batches() -> None:
+    job = _make_job(payload={"sql": "SELECT n", "result_set_id": "rs-1", "console_id": "console-1"})
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    catalog = _FakeResultSetCatalog()
+    adapter = _FakeAdapter([Row(values=[1]), Row(values=[2]), Row(values=[3])])
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=1),
+        catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert [entry["loaded_rows"] for entry in catalog.streaming] == [0, 1, 2, 3]
+    assert {entry["console_id"] for entry in catalog.streaming} == {"console-1"}
+    assert catalog.completed[-1]["loaded_rows"] == 3
+    assert catalog.completed[-1]["console_id"] == "console-1"
 
 
 def test_worker_fails_if_adapter_emits_columns_twice() -> None:
@@ -412,7 +437,7 @@ class _FakeResultStore:
     def get_spool_manifest(self, result_set_id: str) -> dict[str, object]:
         return {
             "columns": [
-                column.model_dump() for column in self.columns_by_result_set[result_set_id]
+                column.model_dump() for column in self.columns_by_result_set.get(result_set_id, [])
             ],
             "loaded_rows": len(self.rows_by_result_set.get(result_set_id, [])),
             "truncated": False,
@@ -438,7 +463,7 @@ class _CountingResultStore:
     def get_spool_manifest(self, result_set_id: str) -> dict[str, object]:
         return {
             "columns": [
-                column.model_dump() for column in self.columns_by_result_set[result_set_id]
+                column.model_dump() for column in self.columns_by_result_set.get(result_set_id, [])
             ],
             "loaded_rows": self.row_count_by_result_set.get(result_set_id, 0),
             "truncated": False,
@@ -574,7 +599,30 @@ def _adapter_factory(
 
 class _FakeResultSetCatalog:
     def __init__(self) -> None:
+        self.streaming: list[dict[str, object]] = []
         self.completed: list[dict[str, object]] = []
+        self.terminal: list[dict[str, object]] = []
+
+    def write_streaming(
+        self,
+        *,
+        result_set_id: str,
+        execution_id: str,
+        storage_ref: ResultRef,
+        columns: list[Column],
+        loaded_rows: int,
+        console_id: str | None,
+    ) -> None:
+        self.streaming.append(
+            {
+                "result_set_id": result_set_id,
+                "execution_id": execution_id,
+                "storage_ref": storage_ref,
+                "columns": list(columns),
+                "loaded_rows": loaded_rows,
+                "console_id": console_id,
+            }
+        )
 
     def write_complete(
         self,
@@ -585,6 +633,7 @@ class _FakeResultSetCatalog:
         columns: list[Column],
         loaded_rows: int,
         truncated: bool,
+        console_id: str | None,
     ) -> None:
         self.completed.append(
             {
@@ -594,5 +643,9 @@ class _FakeResultSetCatalog:
                 "columns": list(columns),
                 "loaded_rows": loaded_rows,
                 "truncated": truncated,
+                "console_id": console_id,
             }
         )
+
+    def write_terminal(self, *, result_set_id: str, state: str) -> None:
+        self.terminal.append({"result_set_id": result_set_id, "state": state})

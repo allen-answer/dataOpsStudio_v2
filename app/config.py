@@ -131,6 +131,7 @@ class ResultStoreConfig(BaseSettings):
     spool_max_bytes: int = 512 * 1024 * 1024  # 512MB
     cursor_max_hold_seconds: int = 300
     result_ttl_days: int = 7
+    max_active_resultsets_per_console: int = 3
 
 
 class AiGatewayConfig(BaseSettings):

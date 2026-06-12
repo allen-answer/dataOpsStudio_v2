@@ -100,6 +100,9 @@ def test_get_job_result_returns_columns_and_positional_rows() -> None:
     payload = response.json()
     assert payload["columns"][0]["name"] == "r"
     assert payload["rows"][0]["values"][0] == 2
+    assert payload["loaded_rows"] == 1
+    assert payload["total_rows"] == 1
+    assert payload["state"] == "complete"
 
 
 def test_get_license_status_without_license_row_returns_trial_countdown() -> None:
@@ -208,6 +211,13 @@ class _FakeResult:
     def one_or_none(self) -> dict[str, Any] | None:
         return self._row
 
+    def scalar_one_or_none(self) -> object:
+        if self._row is None:
+            return None
+        if len(self._row) == 1:
+            return next(iter(self._row.values()))
+        return self._row
+
 
 class _AlwaysRunningJobBackend:
     def __init__(self) -> None:
@@ -296,22 +306,32 @@ class _ResultServices:
 
 
 class _ResultEngine:
+    def __init__(self) -> None:
+        self._connect_count = 0
+
     def connect(self) -> _ResultConnection:
-        return _ResultConnection()
+        self._connect_count += 1
+        if self._connect_count == 1:
+            return _ResultConnection(
+                [
+                    {
+                        "id": "job-1",
+                        "kind": "sql_query",
+                        "status": "success",
+                        "project_id": "project-1",
+                        "payload": {"result_set_id": "rs-1"},
+                    },
+                    {"id": "project-1"},
+                ]
+            )
+        if self._connect_count == 2:
+            return _ResultConnection([{"total_rows": 1}])
+        return _ResultConnection([{"state": "complete"}])
 
 
 class _ResultConnection:
-    def __init__(self) -> None:
-        self._rows: list[dict[str, Any] | None] = [
-            {
-                "id": "job-1",
-                "kind": "sql_query",
-                "status": "success",
-                "project_id": "project-1",
-                "payload": {"result_set_id": "rs-1"},
-            },
-            {"id": "project-1"},
-        ]
+    def __init__(self, rows: list[dict[str, Any] | None]) -> None:
+        self._rows = rows
 
     def __enter__(self) -> _ResultConnection:
         return self

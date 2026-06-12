@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import time
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Any
 
 import structlog
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy import and_, delete, insert, or_, select, update
+from sqlalchemy import and_, delete, func, insert, or_, select, update
 from sqlalchemy.engine import Connection, RowMapping
 
 from app.api.dependencies import current_user_from, request_id_from, services_from
@@ -30,13 +31,32 @@ from app.api.schemas import (
     LoginRequest,
     ProjectResponse,
     RowResponse,
+    SqlConsoleCreateRequest,
+    SqlConsoleResponse,
+    SqlConsoleUpdateRequest,
     SqlExecuteRequest,
     SqlExecuteResponse,
+    SqlHistoryItem,
+    SqlTemplateCreateRequest,
+    SqlTemplateRenderRequest,
+    SqlTemplateRenderResponse,
+    SqlTemplateResponse,
+    SqlTemplateUpdateRequest,
     TokenResponse,
 )
 from app.api.security import create_access_token
 from app.api.services import ApiServices, new_id
-from app.db.models import datasources, jobs, license_state, project_members, projects, users
+from app.db.models import (
+    datasources,
+    jobs,
+    license_state,
+    project_members,
+    projects,
+    result_sets,
+    sql_consoles,
+    sql_templates,
+    users,
+)
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.datasource import DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
@@ -400,6 +420,9 @@ def execute_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse
     services = services_from(request)
     user = current_user_from(request)
     row = _datasource_for_current_user(request, body.datasource_id)
+    console_id = body.console_id
+    if console_id is not None:
+        _console_for_current_user(request, console_id)
     try:
         sql = validate_readonly_sql(body.sql)
     except SqlGuardError as exc:
@@ -412,6 +435,7 @@ def execute_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse
 
     job_id = new_id()
     result_set_id = new_id()
+    sql_hash = _sql_hash(sql)
     job = Job(
         id=job_id,
         kind=JobKind.SQL_QUERY,
@@ -426,10 +450,20 @@ def execute_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse
         payload={
             "datasource_id": body.datasource_id,
             "sql": sql,
+            "sql_hash": sql_hash,
             "params": body.params,
             "result_set_id": result_set_id,
+            "console_id": console_id,
         },
     )
+    _create_result_set_placeholder(
+        services,
+        result_set_id=result_set_id,
+        job_id=job_id,
+        console_id=console_id,
+    )
+    if console_id is not None:
+        _evict_console_resultsets(services, console_id)
     services.job_backend.enqueue(job)
     _audit_business(
         services,
@@ -443,6 +477,376 @@ def execute_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse
         detail={"datasource_id": body.datasource_id},
     )
     return SqlExecuteResponse(job_id=job_id, result_set_id=result_set_id)
+
+
+@router.get("/sql/consoles", response_model=list[SqlConsoleResponse])
+def list_sql_consoles(request: Request) -> list[SqlConsoleResponse]:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        rows = (
+            conn.execute(
+                select(sql_consoles)
+                .where(sql_consoles.c.owner_user_id == user.id)
+                .order_by(
+                    sql_consoles.c.pinned.desc(),
+                    sql_consoles.c.updated_at.desc(),
+                    sql_consoles.c.created_at.desc(),
+                )
+            )
+            .mappings()
+            .all()
+        )
+    return [_sql_console_response(row) for row in rows]
+
+
+@router.post("/sql/consoles", response_model=SqlConsoleResponse, status_code=201)
+def create_sql_console(
+    body: SqlConsoleCreateRequest,
+    request: Request,
+) -> SqlConsoleResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    if body.datasource_id is not None:
+        _datasource_for_current_user(request, body.datasource_id)
+    now = datetime.now(UTC)
+    console_id = new_id()
+    with services.engine.begin() as conn:
+        count = conn.execute(
+            select(func.count())
+            .select_from(sql_consoles)
+            .where(sql_consoles.c.owner_user_id == user.id)
+        ).scalar_one()
+        if int(count) >= 20:
+            raise ApiError(
+                409,
+                "console_limit_exceeded",
+                "A user can have at most 20 SQL consoles",
+            )
+        conn.execute(
+            insert(sql_consoles).values(
+                id=console_id,
+                owner_user_id=user.id,
+                datasource_id=body.datasource_id,
+                name=body.name,
+                sql=body.sql,
+                pinned=body.pinned,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        row = (
+            conn.execute(select(sql_consoles).where(sql_consoles.c.id == console_id))
+            .mappings()
+            .one()
+        )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=None,
+        action="sql_console_create",
+        resource_type="sql_console",
+        resource_id=console_id,
+        result="success",
+    )
+    return _sql_console_response(row)
+
+
+@router.patch("/sql/consoles/{console_id}", response_model=SqlConsoleResponse)
+def update_sql_console(
+    console_id: str,
+    body: SqlConsoleUpdateRequest,
+    request: Request,
+) -> SqlConsoleResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    _console_for_current_user(request, console_id)
+    values: dict[str, object] = {"updated_at": datetime.now(UTC)}
+    if "name" in body.model_fields_set:
+        values["name"] = body.name
+    if "datasource_id" in body.model_fields_set:
+        if body.datasource_id is not None:
+            _datasource_for_current_user(request, body.datasource_id)
+        values["datasource_id"] = body.datasource_id
+    if "sql" in body.model_fields_set:
+        values["sql"] = body.sql
+    if "pinned" in body.model_fields_set:
+        values["pinned"] = body.pinned
+    with services.engine.begin() as conn:
+        conn.execute(update(sql_consoles).where(sql_consoles.c.id == console_id).values(**values))
+        row = (
+            conn.execute(select(sql_consoles).where(sql_consoles.c.id == console_id))
+            .mappings()
+            .one()
+        )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=None,
+        action="sql_console_update",
+        resource_type="sql_console",
+        resource_id=console_id,
+        result="success",
+    )
+    return _sql_console_response(row)
+
+
+@router.delete("/sql/consoles/{console_id}", status_code=204)
+def delete_sql_console(console_id: str, request: Request) -> Response:
+    services = services_from(request)
+    user = current_user_from(request)
+    _console_for_current_user(request, console_id)
+    with services.engine.begin() as conn:
+        conn.execute(delete(sql_consoles).where(sql_consoles.c.id == console_id))
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=None,
+        action="sql_console_delete",
+        resource_type="sql_console",
+        resource_id=console_id,
+        result="success",
+    )
+    return Response(status_code=204)
+
+
+@router.get("/sql/history", response_model=list[SqlHistoryItem])
+def list_sql_history(
+    request: Request,
+    datasource_id: str | None = None,
+    created_after: datetime | None = None,
+    created_before: datetime | None = None,
+    limit: int = Query(default=100, ge=1, le=100),
+) -> list[SqlHistoryItem]:
+    services = services_from(request)
+    user = current_user_from(request)
+    filters = [jobs.c.owner_user_id == user.id, jobs.c.kind == JobKind.SQL_QUERY.value]
+    if datasource_id is not None:
+        filters.append(jobs.c.datasource_ids.any(datasource_id))
+    if created_after is not None:
+        filters.append(jobs.c.created_at >= created_after)
+    if created_before is not None:
+        filters.append(jobs.c.created_at <= created_before)
+    with services.engine.connect() as conn:
+        rows = (
+            conn.execute(
+                select(
+                    jobs.c.id,
+                    jobs.c.status,
+                    jobs.c.datasource_ids,
+                    jobs.c.payload,
+                    jobs.c.created_at,
+                    jobs.c.finished_at,
+                )
+                .where(and_(*filters))
+                .order_by(jobs.c.created_at.desc(), jobs.c.id.desc())
+                .limit(500)
+            )
+            .mappings()
+            .all()
+        )
+        datasource_ids = {
+            item for row in rows for item in (row["datasource_ids"] or []) if isinstance(item, str)
+        }
+        datasource_names = _datasource_names(conn, datasource_ids)
+    out: list[SqlHistoryItem] = []
+    seen: set[str] = set()
+    for row in rows:
+        payload = row["payload"] if isinstance(row["payload"], dict) else {}
+        sql = payload.get("sql")
+        if not isinstance(sql, str) or not sql.strip():
+            continue
+        digest = payload.get("sql_hash")
+        sql_hash = digest if isinstance(digest, str) else _sql_hash(sql)
+        if sql_hash in seen:
+            continue
+        seen.add(sql_hash)
+        row_datasource_id = _history_datasource_id(row, payload)
+        row_datasource_name = (
+            datasource_names.get(row_datasource_id) if row_datasource_id is not None else None
+        )
+        out.append(
+            SqlHistoryItem(
+                job_id=str(row["id"]),
+                datasource_id=row_datasource_id,
+                datasource_name=row_datasource_name,
+                sql=sql,
+                sql_hash=sql_hash,
+                status=JobStatus(str(row["status"])),
+                created_at=row["created_at"],
+                finished_at=row["finished_at"],
+                result_set_id=_result_set_id_from_payload(row),
+            )
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
+@router.get("/sql/templates", response_model=list[SqlTemplateResponse])
+def list_sql_templates(
+    request: Request,
+    category: str | None = None,
+    project_id: str | None = None,
+    q: str | None = None,
+) -> list[SqlTemplateResponse]:
+    services = services_from(request)
+    current_user_from(request)
+    filters = []
+    if category is not None:
+        filters.append(sql_templates.c.category == category)
+    if project_id is not None:
+        filters.append(sql_templates.c.project_id == project_id)
+    if q is not None and q.strip():
+        pattern = f"%{q.strip()}%"
+        filters.append(
+            or_(
+                sql_templates.c.name.ilike(pattern),
+                sql_templates.c.description.ilike(pattern),
+                sql_templates.c.sql_text.ilike(pattern),
+            )
+        )
+    with services.engine.connect() as conn:
+        statement = select(sql_templates).order_by(
+            sql_templates.c.category.asc(),
+            sql_templates.c.name.asc(),
+        )
+        if filters:
+            statement = statement.where(and_(*filters))
+        rows = conn.execute(statement).mappings().all()
+    return [_sql_template_response(row) for row in rows]
+
+
+@router.post("/sql/templates", response_model=SqlTemplateResponse, status_code=201)
+def create_sql_template(
+    body: SqlTemplateCreateRequest,
+    request: Request,
+) -> SqlTemplateResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    _require_admin(user.role)
+    template_id = new_id()
+    now = datetime.now(UTC)
+    variables = _normalize_variables(body.variables)
+    with services.engine.begin() as conn:
+        if body.project_id is not None:
+            _require_project_exists(conn, body.project_id)
+        conn.execute(
+            insert(sql_templates).values(
+                id=template_id,
+                name=body.name,
+                description=body.description,
+                sql_text=body.sql_text,
+                variables=variables,
+                category=body.category,
+                project_id=body.project_id,
+                created_by=user.id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        row = (
+            conn.execute(select(sql_templates).where(sql_templates.c.id == template_id))
+            .mappings()
+            .one()
+        )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=body.project_id,
+        action="sql_template_create",
+        resource_type="sql_template",
+        resource_id=template_id,
+        result="success",
+    )
+    return _sql_template_response(row)
+
+
+@router.patch("/sql/templates/{template_id}", response_model=SqlTemplateResponse)
+def update_sql_template(
+    template_id: str,
+    body: SqlTemplateUpdateRequest,
+    request: Request,
+) -> SqlTemplateResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    _require_admin(user.role)
+    _template_for_read(services, template_id)
+    values: dict[str, object] = {"updated_at": datetime.now(UTC)}
+    if "name" in body.model_fields_set:
+        values["name"] = body.name
+    if "description" in body.model_fields_set:
+        values["description"] = body.description
+    if "sql_text" in body.model_fields_set:
+        values["sql_text"] = body.sql_text
+    if "variables" in body.model_fields_set:
+        values["variables"] = _normalize_variables(body.variables or [])
+    if "category" in body.model_fields_set:
+        values["category"] = body.category
+    if "project_id" in body.model_fields_set:
+        values["project_id"] = body.project_id
+    with services.engine.begin() as conn:
+        if body.project_id is not None:
+            _require_project_exists(conn, body.project_id)
+        conn.execute(
+            update(sql_templates).where(sql_templates.c.id == template_id).values(**values)
+        )
+        row = (
+            conn.execute(select(sql_templates).where(sql_templates.c.id == template_id))
+            .mappings()
+            .one()
+        )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=_optional_str(row["project_id"]),
+        action="sql_template_update",
+        resource_type="sql_template",
+        resource_id=template_id,
+        result="success",
+    )
+    return _sql_template_response(row)
+
+
+@router.delete("/sql/templates/{template_id}", status_code=204)
+def delete_sql_template(template_id: str, request: Request) -> Response:
+    services = services_from(request)
+    user = current_user_from(request)
+    _require_admin(user.role)
+    row = _template_for_read(services, template_id)
+    with services.engine.begin() as conn:
+        conn.execute(delete(sql_templates).where(sql_templates.c.id == template_id))
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=_optional_str(row["project_id"]),
+        action="sql_template_delete",
+        resource_type="sql_template",
+        resource_id=template_id,
+        result="success",
+    )
+    return Response(status_code=204)
+
+
+@router.post("/sql/templates/{template_id}/render", response_model=SqlTemplateRenderResponse)
+def render_sql_template(
+    template_id: str,
+    body: SqlTemplateRenderRequest,
+    request: Request,
+) -> SqlTemplateRenderResponse:
+    services = services_from(request)
+    current_user_from(request)
+    row = _template_for_read(services, template_id)
+    rendered = str(row["sql_text"])
+    for name, value in body.values.items():
+        rendered = rendered.replace("{{" + name + "}}", value)
+    return SqlTemplateRenderResponse(sql_text=rendered)
 
 
 @router.get("/jobs", response_model=list[JobListItem])
@@ -506,7 +910,7 @@ def get_job_result(
     services = services_from(request)
     row = _job_for_current_user(request, job_id)
     status = JobStatus(str(row["status"]))
-    if status is not JobStatus.SUCCESS:
+    if status not in {JobStatus.PENDING, JobStatus.RUNNING, JobStatus.SUCCESS}:
         raise ApiError(409, "job_not_successful", "Job result is not ready")
     result_set_id = _result_set_id_from_payload(row)
     if result_set_id is None:
@@ -521,6 +925,8 @@ def get_job_result(
         columns=_columns_from_manifest(manifest),
         rows=[RowResponse(values=row.values) for row in rows],
         loaded_rows=_int_from_manifest(manifest, "loaded_rows"),
+        total_rows=_result_set_total_rows(services, result_set_id),
+        state=_result_set_state(services, result_set_id),
         truncated=_bool_from_manifest(manifest, "truncated"),
     )
 
@@ -563,6 +969,185 @@ def _user_by_username(services: ApiServices, username: str) -> RowMapping | None
         return (
             conn.execute(select(users).where(users.c.username == username)).mappings().one_or_none()
         )
+
+
+def _sql_hash(sql: str) -> str:
+    digest = sha256(sql.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _create_result_set_placeholder(
+    services: ApiServices,
+    *,
+    result_set_id: str,
+    job_id: str,
+    console_id: str | None,
+) -> None:
+    now = datetime.now(UTC)
+    result_ref = services.result_store.spool_ref(result_set_id)
+    with services.engine.begin() as conn:
+        conn.execute(
+            insert(result_sets).values(
+                id=result_set_id,
+                execution_id=job_id,
+                console_id=console_id,
+                storage_ref=result_ref.model_dump(),
+                columns=[],
+                loaded_rows=0,
+                total_rows=None,
+                state="streaming",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+
+def _evict_console_resultsets(services: ApiServices, console_id: str) -> None:
+    with services.engine.begin() as conn:
+        active_ids = (
+            conn.execute(
+                select(result_sets.c.id)
+                .where(result_sets.c.console_id == console_id)
+                .where(result_sets.c.state != "closed")
+                .order_by(result_sets.c.updated_at.desc(), result_sets.c.created_at.desc())
+            )
+            .scalars()
+            .all()
+        )
+        max_active = max(1, services.max_active_resultsets_per_console)
+        stale_ids = [str(value) for value in active_ids[max_active:]]
+        if stale_ids:
+            conn.execute(
+                update(result_sets)
+                .where(result_sets.c.id.in_(stale_ids))
+                .values(state="closed", updated_at=datetime.now(UTC))
+            )
+
+
+def _result_set_state(services: ApiServices, result_set_id: str) -> str | None:
+    with services.engine.connect() as conn:
+        return conn.execute(
+            select(result_sets.c.state).where(result_sets.c.id == result_set_id)
+        ).scalar_one_or_none()
+
+
+def _result_set_total_rows(services: ApiServices, result_set_id: str) -> int | None:
+    with services.engine.connect() as conn:
+        value = conn.execute(
+            select(result_sets.c.total_rows).where(result_sets.c.id == result_set_id)
+        ).scalar_one_or_none()
+    return int(value) if value is not None else None
+
+
+def _console_for_current_user(request: Request, console_id: str) -> RowMapping:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        row = (
+            conn.execute(
+                select(sql_consoles)
+                .where(sql_consoles.c.id == console_id)
+                .where(sql_consoles.c.owner_user_id == user.id)
+            )
+            .mappings()
+            .one_or_none()
+        )
+    if row is None:
+        raise ApiError(404, "not_found", "SQL console not found")
+    return row
+
+
+def _sql_console_response(row: RowMapping) -> SqlConsoleResponse:
+    return SqlConsoleResponse(
+        id=str(row["id"]),
+        name=str(row["name"]),
+        datasource_id=_optional_str(row["datasource_id"]),
+        sql=str(row["sql"]),
+        pinned=bool(row["pinned"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _require_admin(role: str) -> None:
+    if role != "admin":
+        raise ApiError(403, "forbidden", "Admin role required")
+
+
+def _require_project_exists(conn: Connection, project_id: str) -> None:
+    row = (
+        conn.execute(select(projects.c.id).where(projects.c.id == project_id))
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        raise ApiError(404, "not_found", "Project not found")
+
+
+def _template_for_read(services: ApiServices, template_id: str) -> RowMapping:
+    with services.engine.connect() as conn:
+        row = (
+            conn.execute(select(sql_templates).where(sql_templates.c.id == template_id))
+            .mappings()
+            .one_or_none()
+        )
+    if row is None:
+        raise ApiError(404, "not_found", "SQL template not found")
+    return row
+
+
+def _sql_template_response(row: RowMapping) -> SqlTemplateResponse:
+    return SqlTemplateResponse(
+        id=str(row["id"]),
+        name=str(row["name"]),
+        description=_optional_str(row["description"]),
+        sql_text=str(row["sql_text"]),
+        variables=_normalize_variables(row["variables"] or []),
+        category=str(row["category"]),
+        project_id=_optional_str(row["project_id"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _normalize_variables(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        name = item.strip()
+        if not name or name in seen:
+            continue
+        out.append(name)
+        seen.add(name)
+    return out
+
+
+def _datasource_names(conn: Connection, datasource_ids: set[str]) -> dict[str, str]:
+    if not datasource_ids:
+        return {}
+    rows = (
+        conn.execute(
+            select(datasources.c.id, datasources.c.name).where(datasources.c.id.in_(datasource_ids))
+        )
+        .mappings()
+        .all()
+    )
+    return {str(row["id"]): str(row["name"]) for row in rows}
+
+
+def _history_datasource_id(row: RowMapping, payload: dict[str, object]) -> str | None:
+    value = payload.get("datasource_id")
+    if isinstance(value, str):
+        return value
+    datasource_ids = row["datasource_ids"]
+    if isinstance(datasource_ids, list) and datasource_ids:
+        first = datasource_ids[0]
+        return first if isinstance(first, str) else None
+    return None
 
 
 def _datasource_for_current_user(request: Request, datasource_id: str) -> RowMapping:
