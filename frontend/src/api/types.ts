@@ -207,6 +207,8 @@ export interface JobResultResponse {
   columns: Column[]
   rows: RowResponse[]
   loaded_rows: number | null
+  total_rows: number | null
+  state: string | null
   truncated: boolean | null
 }
 

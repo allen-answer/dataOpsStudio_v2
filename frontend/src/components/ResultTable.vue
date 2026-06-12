@@ -4,7 +4,7 @@
  *
  * Props:
  *   columns / rows  —— 后端 /jobs/{id}/result 返回的形状
- *   offset / limit / loadedRows  —— 当前分页 + 总行数(可能 null)
+ *   offset / limit / loadedRows / totalRows  —— 当前分页 + 总行数(可能 null)
  *   truncated       —— 后端截断了(超过 spool 上限)
  *
  * Emits:
@@ -77,9 +77,10 @@ const props = withDefaults(
     offset: number
     limit: number
     loadedRows?: number | null
+    totalRows?: number | null
     truncated?: boolean | null
   }>(),
-  { loadedRows: null, truncated: null },
+  { loadedRows: null, totalRows: null, truncated: null },
 )
 
 const emit = defineEmits<{
@@ -92,7 +93,7 @@ const MAX_ROWS = 1000
 const tooMany = computed(() => props.rows.length > MAX_ROWS)
 const displayRows = computed(() => (tooMany.value ? props.rows.slice(0, MAX_ROWS) : props.rows))
 
-const total = computed(() => props.loadedRows ?? null)
+const total = computed(() => props.totalRows ?? props.loadedRows ?? null)
 const hasNext = computed(() => {
   if (total.value === null) return props.rows.length === props.limit
   return props.offset + props.rows.length < total.value

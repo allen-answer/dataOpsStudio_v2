@@ -1333,6 +1333,8 @@ def _job_response(row: RowMapping) -> JobResponse:
         id=str(row["id"]),
         kind=str(row["kind"]),
         status=status,
+        created_at=row["created_at"],
+        finished_at=row["finished_at"],
         result_set_id=_result_set_id_from_payload(row),
         error=error_code if status is JobStatus.FAILED else None,
         error_code=error_code,
