@@ -740,10 +740,10 @@ admin 查 mutating 行为流水(谁在什么时候改了什么)。
 - 子图优先图查询(焦点表 N 跳邻域,默认 <=3 跳)
 - 基础影响分析(纯图 downstream 反向遍历,按深度分层)
 - lineage_edges / lineage_column_edges 边表持久化 + sql_hash 缓存(ADR-0020)
-- schema-aware 解析:从 PG 元数据库注入表结构给 sqlglot qualify,支持 SELECT * 展开和多表裸列归属
+- schema-aware 解析:从 PG 元数据库注入表结构给 sqlglot qualify,支持 SELECT * 展开和多表裸列归属;DataHub 类实践精度锚点约 schema-aware 90% vs naive 50%
 
 ### 14.4 2.4.x 后续
-- 存储过程深度解析(procedure_segments):先按语句切分提取 DML 逐条解析,残片才进 AI 兜底
+- 存储过程深度解析(procedure_segments):sqlglot 不能完整解析 PL/SQL 过程体(上游 issue #1356),先按语句切分提取 DML 逐条解析,残片才进 AI 兜底
 - 动态 SQL 推断(dynamic_sql_*)
 - PL/SQL 变量(variables)
 - AI 推断(ai_inferred)

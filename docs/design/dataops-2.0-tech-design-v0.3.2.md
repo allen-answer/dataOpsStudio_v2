@@ -361,7 +361,7 @@ JobBackend.complete(job_id, result_ref)
    - 跨库规范化失败时,任务必须显式降级到 client 侧哈希/逐行模式,不能静默混用引擎默认 hash。
 
 5. **聚合哈希统一为"逐行 MD5 截 8 字节 → SUM"**:
-   - 每行先基于规范化列值计算 MD5,取高/低 8 字节转整数,段级聚合使用 `SUM(row_hash64)`;SUM 是可交换聚合,三库均可表达。
+   - 每行先基于规范化列值计算 MD5,按 spec 固定截取 8 字节转无符号整数,段级聚合使用 `SUM(row_hash64)`;SUM 是可交换聚合,三库均可表达。
    - 明确禁止用 ORA_HASH、CRC32+BIT_XOR、CHECKSUM_AGG 等引擎私有或弱哈希做跨库真值:ORA_HASH 跨库不可复现,CRC32 碰撞率高,CHECKSUM_AGG 语义/碰撞不可控。
    - DM8 路径优先评估 `DBMS_CRYPTO.HASH(MD5)`;标注性能 PoC 为 2.2.0 前置项。若过慢,DM 端降级为 client 侧流式哈希。
 
@@ -416,7 +416,7 @@ JobBackend.complete(job_id, result_ref)
 2. **实现按版本分批(这才是真正该"精简"的)**:精简的是"2.0 哪个版本先做哪部分功能",不是砍数据字段。
    - 2.0.0 ~ 2.3.x:**不做 lineage**(lineage 能力域排在 2.4.0)
    - 2.4.0:第一版做核心——表级血缘(`graph_edges` / `tables`)+ **列级血缘(`insert_mappings` / `columns`,不可裁剪)** + 解析错误治理(`parse_errors`)+ 子图优先图查询 + 基础影响分析 + 边表持久化
-   - 2.4.x / 后续:复杂部分——存储过程深度解析(`procedure_segments`)、动态 SQL 推断(`dynamic_sql_*`)、PL/SQL 变量(`variables`)、更复杂的 AI 推断(`ai_inferred`)。存储过程优先做"语句级切分抢救":PL/SQL 过程体按语句切分提取 DML 逐条交 sqlglot 解析,只有无法切分/无法解析的残片才进入 AI 兜底,降低 LLM 调用量。
+   - 2.4.x / 后续:复杂部分——存储过程深度解析(`procedure_segments`)、动态 SQL 推断(`dynamic_sql_*`)、PL/SQL 变量(`variables`)、更复杂的 AI 推断(`ai_inferred`)。存储过程优先做"语句级切分抢救":sqlglot 不能完整解析 PL/SQL 过程体(上游 issue #1356),因此过程体先按语句切分提取 DML 逐条交 sqlglot 解析,只有无法切分/无法解析的残片才进入 AI 兜底,降低 LLM 调用量。
    - 字段全程保留,只是实现有先后
 
 3. **持久化策略(v0.3.3 反转,ADR-0020)**:
@@ -450,7 +450,7 @@ JobBackend.complete(job_id, result_ref)
 8. **列级血缘不可裁剪**:
    - 2.4.0 第一版必须包含列级血缘 `insert_mappings` / `columns` 展示与导出,不允许以"先只做表级图"替代。
    - 若方言/语句暂不能解析列级,必须在覆盖率治理中明确记为 parse_error / unsupported / low confidence,而不是静默降级。
-   - 解析必须 schema-aware:从 PG 元数据库注入表结构给 sqlglot qualify,用于 `SELECT *` 展开与多表裸列归属。DataHub 类实践显示 schema-aware 列级精度显著高于 naive 解析,因此这是 2.4.0 验收项而非优化项。
+   - 解析必须 schema-aware:从 PG 元数据库注入表结构给 sqlglot qualify,用于 `SELECT *` 展开与多表裸列归属。DataHub 类实践显示 schema-aware 列级精度可接近 90%,naive 解析约 50%,因此这是 2.4.0 验收项而非优化项。
 
 ### 2.5 Job 抽象(统一执行模型)
 
