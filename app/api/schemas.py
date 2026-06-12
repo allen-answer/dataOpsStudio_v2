@@ -117,6 +117,7 @@ class SqlExecuteRequest(BaseModel):
     datasource_id: str
     sql: str = Field(min_length=1)
     params: dict[str, Any] = Field(default_factory=dict)
+    console_id: str | None = None
 
 
 class SqlExecuteResponse(BaseModel):
@@ -157,11 +158,87 @@ class JobResultResponse(BaseModel):
     columns: list[Column] = Field(default_factory=list)
     rows: list[RowResponse]
     loaded_rows: int | None = None
+    total_rows: int | None = None
+    state: str | None = None
     truncated: bool | None = None
 
 
 class CancelResponse(BaseModel):
     cancelled: bool
+
+
+class SqlConsoleCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    datasource_id: str | None = None
+    sql: str = ""
+    pinned: bool = False
+
+
+class SqlConsoleUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    datasource_id: str | None = None
+    sql: str | None = None
+    pinned: bool | None = None
+
+
+class SqlConsoleResponse(BaseModel):
+    id: str
+    name: str
+    datasource_id: str | None = None
+    sql: str
+    pinned: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class SqlHistoryItem(BaseModel):
+    job_id: str
+    datasource_id: str | None = None
+    datasource_name: str | None = None
+    sql: str
+    sql_hash: str
+    status: JobStatus
+    created_at: datetime
+    finished_at: datetime | None = None
+    result_set_id: str | None = None
+
+
+class SqlTemplateCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    description: str | None = None
+    sql_text: str = Field(min_length=1)
+    variables: list[str] = Field(default_factory=list)
+    category: str = Field(default="general", min_length=1, max_length=64)
+    project_id: str | None = None
+
+
+class SqlTemplateUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    description: str | None = None
+    sql_text: str | None = Field(default=None, min_length=1)
+    variables: list[str] | None = None
+    category: str | None = Field(default=None, min_length=1, max_length=64)
+    project_id: str | None = None
+
+
+class SqlTemplateResponse(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    sql_text: str
+    variables: list[str] = Field(default_factory=list)
+    category: str
+    project_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class SqlTemplateRenderRequest(BaseModel):
+    values: dict[str, str] = Field(default_factory=dict)
+
+
+class SqlTemplateRenderResponse(BaseModel):
+    sql_text: str
 
 
 class LicenseStatusResponse(BaseModel):

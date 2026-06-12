@@ -372,6 +372,65 @@ audit_logs = Table(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# sql_consoles —— SQL Workspace 2.1 多 Console
+# ─────────────────────────────────────────────────────────────────────────────
+sql_consoles = Table(
+    "sql_consoles",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column(
+        "owner_user_id",
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "datasource_id",
+        String(36),
+        ForeignKey("datasources.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    Column("name", String(128), nullable=False),
+    Column("sql", Text(), nullable=False, server_default=""),
+    Column("pinned", Boolean(), nullable=False, server_default=text("false")),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Index("ix_sql_consoles_owner_updated", "owner_user_id", "updated_at"),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# sql_templates —— SQL Workspace 2.1 模板(admin 写,所有人读)
+# ─────────────────────────────────────────────────────────────────────────────
+sql_templates = Table(
+    "sql_templates",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column("name", String(128), nullable=False),
+    Column("description", Text(), nullable=True),
+    Column("sql_text", Text(), nullable=False),
+    Column("variables", JSONB(), nullable=False, server_default=text("'[]'::jsonb")),
+    Column("category", String(64), nullable=False, server_default="general"),
+    Column(
+        "project_id",
+        String(36),
+        ForeignKey("projects.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    Column(
+        "created_by",
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Index("ix_sql_templates_category_name", "category", "name"),
+    Index("ix_sql_templates_project_id", "project_id"),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # result_sets —— ★ R6 红线 DB 层:无 cursor 字段
 # ─────────────────────────────────────────────────────────────────────────────
 result_sets = Table(
@@ -379,6 +438,12 @@ result_sets = Table(
     metadata,
     Column("id", String(36), primary_key=True),
     Column("execution_id", String(36), nullable=False),
+    Column(
+        "console_id",
+        String(36),
+        ForeignKey("sql_consoles.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
     # storage_ref:JSONB(backend + uri),指向 spool;不是 cursor 引用
     Column("storage_ref", JSONB(), nullable=False),
     Column("columns", JSONB(), nullable=False),
@@ -386,6 +451,8 @@ result_sets = Table(
     Column("total_rows", Integer(), nullable=True),
     Column("state", String(32), nullable=False, server_default="streaming"),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Index("ix_result_sets_console_updated", "console_id", "updated_at"),
     Index("ix_result_sets_execution_id", "execution_id"),
     CheckConstraint(
         "state IN ('streaming', 'complete', 'failed', 'closed')",
@@ -461,5 +528,7 @@ __all__ = [
     "result_sets",
     "revoked_tokens",
     "secret_refs",
+    "sql_consoles",
+    "sql_templates",
     "users",
 ]

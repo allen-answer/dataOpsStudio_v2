@@ -34,6 +34,7 @@ def test_load_settings_defaults() -> None:
     assert s.worker.heartbeat_timeout_seconds == 600
     assert s.worker.poll_interval_seconds == 0.1
     assert s.worker.cancel_check_row_interval == 5000
+    assert s.worker.result_gc_interval_seconds == 600.0
     # AI 默认关(R5 + 形态默认)
     assert s.ai.enabled is False
     assert s.ai.max_auto_egress_level == 0
@@ -48,9 +49,9 @@ def test_bootstrap_paths_are_paths_only_no_values() -> None:
     assert isinstance(bp.jwt_secret_file, Path)
     assert isinstance(bp.license_file, Path)
     # 默认路径在 config/ 下,这些在 .gitignore 精确忽略
-    assert str(bp.master_key_file).startswith("config/")
-    assert str(bp.pg_app_password_file).startswith("config/secrets/")
-    assert str(bp.jwt_secret_file).startswith("config/secrets/")
+    assert bp.master_key_file.as_posix().startswith("config/")
+    assert bp.pg_app_password_file.as_posix().startswith("config/secrets/")
+    assert bp.jwt_secret_file.as_posix().startswith("config/secrets/")
 
 
 def test_metadata_db_config_no_password_field() -> None:
