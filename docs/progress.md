@@ -11,14 +11,20 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| migrate_from_v1:全局数据源(空 project_id)迁入指定项目(`--global-datasource-project` / `--global-datasource-owner`,默认跳过=向后兼容) | Claude 4.8 | — | PR 待审 | `feat/migrate-global-datasources` |
-| API 进程伺服前端 SPA dist(前后端同机同进程零反代;`DATAOPS_FRONTEND_DIST` 设置且 dist 存在→挂载静态+SPA fallback,未设置→API-only 行为不变) | Claude Opus 4.8 | — | PR 待审 | `feat/serve-frontend-dist` |
+| (暂无活动开发项) | — | — | — | — |
 
 > **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
 > 安全项全闭环/落档)。**DM 已 Certified**:真实例验证 8/8 + 修复 3 个 adapter bug,
 > 见 `docs/acceptance-dm-certified.md`([#53](https://github.com/allen-answer/dataOpsStudio_v2/pull/53))。
+> **1.x 已割接停运(2026-06-12)**:真实数据迁入生产 2.0(演练→割接),1.x 容器已停
+> (数据留盘可回滚),2.0 全栈由 API 进程单端口伺服。
 >
-> **后续候选(待人拍板,均无 owner/未排期)**:Oracle adapter(2.0.x)、外部安全审计
+> **设计基线**:技术方案 **v0.3.3**(2026-06-12,[#60](https://github.com/allen-answer/dataOpsStudio_v2/pull/60))——
+> Compare(2.2.0)/ Lineage(2.4.0)按 1.x 使用反馈 8 条 + 业界调研修订;
+> 新增 ADR-0019(子图优先)、ADR-0020(血缘边表持久化 + sql_hash 缓存)。
+>
+> **后续候选(待人拍板,均无 owner/未排期)**:test_connection 终态 job 不阻塞数据源
+> 删除(`docs/backlog.md`,2.0.x patch)、Oracle adapter(2.0.x)、外部安全审计
 > 触发项(密码进 body 改造)、正式 license 签发(首个商业交付前)、worker DM 加密库
 > 部署文档(首个 DM 客户前)、2.1.0 完整 SQL Workspace。
 
@@ -39,6 +45,15 @@
 
 ## 已完成归档
 
+> **GA 后生产化 + 设计期(2026-06-12 全部合并)**:
+> migrate_from_v1 全局数据源迁入指定项目([#57](https://github.com/allen-answer/dataOpsStudio_v2/pull/57),Codex);
+> API 进程伺服前端 SPA dist([#58](https://github.com/allen-answer/dataOpsStudio_v2/pull/58),Claude Opus 4.8);
+> 数据源删除策略缺陷立项 backlog([#59](https://github.com/allen-answer/dataOpsStudio_v2/pull/59));
+> 设计稿 v0.3.3 — Compare/Lineage 智能化修订 + 调研增补 + ADR-0019/0020
+> ([#60](https://github.com/allen-answer/dataOpsStudio_v2/pull/60),Codex 落稿 / Fable 5 复核)。
+> 同期非代码事项:1.x 数据迁移演练 + 生产割接 + 1.x 停运;DM 真连通验证经反向隧道
+> 跑通;服务器旧备份清理。
+>
 > **Wave 5 — 2.0.0 GA 准备(2026-06-11 全部合并)**:
 > 5A 后端加固(Codex):pyjwt+pyotp 替换([#49](https://github.com/allen-answer/dataOpsStudio_v2/pull/49))、
 > TOTP 同窗重放防护([#50](https://github.com/allen-answer/dataOpsStudio_v2/pull/50))、
