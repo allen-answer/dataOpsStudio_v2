@@ -1,9 +1,5 @@
 import { apiClient } from './client'
-import type {
-  JobErrorCode,
-  JobListItem,
-  JobStatus,
-} from './types'
+import type { Column, JobErrorCode, JobListItem, JobStatus, RowResponse } from './types'
 
 export interface JobResponse {
   id: string
@@ -20,9 +16,11 @@ export interface JobResultResponse {
   result_set_id: string
   offset: number
   limit: number
-  columns: Array<{ name: string; type: string; nullable: boolean; primary_key: boolean }>
-  rows: Array<{ values: unknown[] }>
+  columns: Column[]
+  rows: RowResponse[]
   loaded_rows: number | null
+  total_rows: number | null
+  state: string | null
   truncated: boolean | null
 }
 
@@ -47,7 +45,7 @@ export function getJob(jobId: string): Promise<JobResponse> {
 }
 
 /**
- * GET /jobs/{id}/result —— 只在 success 时可拉;其他状态后端返 409。
+ * GET /jobs/{id}/result —— pending/running/success 均可拉;用于边拉边看。
  */
 export function getJobResult(
   jobId: string,
