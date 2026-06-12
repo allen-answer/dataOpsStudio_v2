@@ -96,7 +96,7 @@ def test_sql_console_owner_scope_crud_and_limit(tmp_path: Path) -> None:
         json_body={"name": "overflow", "sql": "SELECT 1"},
     )
     assert overflow.status_code == 409
-    assert overflow.json()["error"]["code"] == "console_limit_exceeded"
+    assert overflow.json()["error"] == "console_limit_exceeded"
 
 
 def test_sql_templates_are_public_read_admin_write_and_rendered_without_eval(
