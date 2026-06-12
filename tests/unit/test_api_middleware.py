@@ -51,6 +51,30 @@ def test_crosscutting_middleware_authenticates_and_audits_success() -> None:
     assert response.headers["x-request-id"]
 
 
+def test_crosscutting_middleware_bounds_long_http_audit_resource_id() -> None:
+    services = _FakeServices()
+    app = _app_with_services(services)
+    token = create_access_token(
+        user_id="user-1",
+        role="admin",
+        secret=services.jwt_secret,
+        jti="jti-1",
+    )
+
+    response = AsgiClient(app).post(
+        "/api/sql/templates/12345678-1234-1234-1234-123456789012/render",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    resource_ids = [cast(str, item["resource_id"]) for item in services.audits]
+    assert len(resource_ids) == 2
+    assert resource_ids[0] == resource_ids[1]
+    assert resource_ids[0].startswith("POST /api/sql/templates/")
+    assert "#" in resource_ids[0]
+    assert all(len(resource_id) <= 64 for resource_id in resource_ids)
+
+
 def test_crosscutting_middleware_rejects_revoked_token() -> None:
     services = _FakeServices()
     services.token_revoked = True
@@ -184,6 +208,10 @@ def _app_with_services(services: _FakeServices) -> FastAPI:
     @app.post("/api/admin/backups")
     def create_backup() -> dict[str, str]:
         return {"status": "accepted"}
+
+    @app.post("/api/sql/templates/{template_id}/render")
+    def render_sql_template(template_id: str) -> dict[str, str]:
+        return {"template_id": template_id}
 
     return app
 

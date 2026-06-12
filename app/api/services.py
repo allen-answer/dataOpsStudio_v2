@@ -48,6 +48,7 @@ class ApiServices:
     jwt_secret: str
     rate_limiter: RateLimiter = field(default_factory=RateLimiter)
     job_wait_timeout_seconds: float = 10.0
+    max_active_resultsets_per_console: int = 3
 
     def current_license_mode(self) -> LicenseMode:
         with self.engine.connect() as conn:
@@ -169,6 +170,9 @@ def build_api_services(settings: Settings | None = None) -> ApiServices:
             result_ttl_days=actual_settings.result_store.result_ttl_days,
         ),
         jwt_secret=bootstrap.get_jwt_secret(),
+        max_active_resultsets_per_console=(
+            actual_settings.result_store.max_active_resultsets_per_console
+        ),
     )
 
 

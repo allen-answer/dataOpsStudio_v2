@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
@@ -21,6 +22,8 @@ _LICENSE_UPDATE_PATHS = frozenset({"/api/admin/license", "/api/admin/license/upl
 _DIAGNOSTIC_EXPORT_PATHS = frozenset({"/api/admin/diagnostics", "/api/admin/diagnostics/export"})
 _BACKUP_PATHS = frozenset({"/api/admin/backups", "/api/admin/backups/export"})
 _RESTORE_PATHS = frozenset({"/api/admin/backups/restore"})
+_AUDIT_RESOURCE_ID_MAX_LENGTH = 64
+_AUDIT_RESOURCE_ID_HASH_LENGTH = 12
 
 
 class CrossCuttingMiddleware(BaseHTTPMiddleware):
@@ -73,12 +76,13 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
         user = _request_user(request)
         client_ip = request.client.host if request.client else None
         user_agent = request.headers.get("user-agent")
+        http_resource_id = _http_resource_id(request.method, path)
         self._services.write_audit(
             user_id=user.id if user else None,
             project_id=None,
             action="api_request_start",
             resource_type="http",
-            resource_id=f"{request.method} {path}",
+            resource_id=http_resource_id,
             result="started",
             request_id=request_id,
             ip=client_ip,
@@ -93,7 +97,7 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
                 project_id=None,
                 action="api_request_end",
                 resource_type="http",
-                resource_id=f"{request.method} {path}",
+                resource_id=http_resource_id,
                 result="error",
                 request_id=request_id,
                 ip=client_ip,
@@ -108,7 +112,7 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
             project_id=None,
             action="api_request_end",
             resource_type="http",
-            resource_id=f"{request.method} {path}",
+            resource_id=http_resource_id,
             result=result,
             request_id=request_id,
             ip=client_ip,
@@ -221,3 +225,13 @@ def _is_diagnostic_export(method: str, path: str) -> bool:
 def _request_user(request: Request) -> CurrentUser | None:
     user = getattr(request.state, "user", None)
     return user if isinstance(user, CurrentUser) else None
+
+
+def _http_resource_id(method: str, path: str) -> str:
+    value = f"{method} {path}"
+    if len(value) <= _AUDIT_RESOURCE_ID_MAX_LENGTH:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:_AUDIT_RESOURCE_ID_HASH_LENGTH]
+    suffix = f"#{digest}"
+    prefix_length = _AUDIT_RESOURCE_ID_MAX_LENGTH - len(suffix)
+    return f"{value[:prefix_length]}{suffix}"

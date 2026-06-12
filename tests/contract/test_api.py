@@ -34,6 +34,16 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("DELETE", "/api/datasources/{datasource_id}") in routes
     assert ("POST", "/api/datasources/{datasource_id}/test") in routes
     assert ("POST", "/api/sql/execute") in routes
+    assert ("GET", "/api/sql/consoles") in routes
+    assert ("POST", "/api/sql/consoles") in routes
+    assert ("PATCH", "/api/sql/consoles/{console_id}") in routes
+    assert ("DELETE", "/api/sql/consoles/{console_id}") in routes
+    assert ("GET", "/api/sql/history") in routes
+    assert ("GET", "/api/sql/templates") in routes
+    assert ("POST", "/api/sql/templates") in routes
+    assert ("PATCH", "/api/sql/templates/{template_id}") in routes
+    assert ("DELETE", "/api/sql/templates/{template_id}") in routes
+    assert ("POST", "/api/sql/templates/{template_id}/render") in routes
     assert ("GET", "/api/jobs") in routes
     assert ("GET", "/api/jobs/{job_id}") in routes
     assert ("GET", "/api/jobs/{job_id}/result") in routes

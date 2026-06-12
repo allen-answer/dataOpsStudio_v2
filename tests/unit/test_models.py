@@ -23,6 +23,8 @@ from app.db.models import (
     result_sets,
     revoked_tokens,
     secret_refs,
+    sql_consoles,
+    sql_templates,
     users,
 )
 
@@ -71,7 +73,7 @@ def test_all_alembic_revision_ids_under_32_chars() -> None:
     assert not violations, f"revision ID 超 32 字符: {violations}"
 
 
-def test_metadata_has_13_tables() -> None:
+def test_metadata_has_15_tables() -> None:
     expected = {
         "ai_configs",
         "users",
@@ -85,9 +87,44 @@ def test_metadata_has_13_tables() -> None:
         "secret_refs",
         "audit_logs",
         "result_sets",
+        "sql_consoles",
+        "sql_templates",
         "license_state",
     }
     assert set(metadata.tables.keys()) == expected
+
+
+def test_sql_workspace_tables_support_console_and_templates() -> None:
+    console_cols = set(sql_consoles.columns.keys())
+    template_cols = set(sql_templates.columns.keys())
+    console_indexes = {idx.name for idx in sql_consoles.indexes}
+    template_indexes = {idx.name for idx in sql_templates.indexes}
+
+    assert console_cols == {
+        "id",
+        "owner_user_id",
+        "datasource_id",
+        "name",
+        "sql",
+        "pinned",
+        "created_at",
+        "updated_at",
+    }
+    assert template_cols == {
+        "id",
+        "name",
+        "description",
+        "sql_text",
+        "variables",
+        "category",
+        "project_id",
+        "created_by",
+        "created_at",
+        "updated_at",
+    }
+    assert "ix_sql_consoles_owner_updated" in console_indexes
+    assert "ix_sql_templates_category_name" in template_indexes
+    assert "ix_sql_templates_project_id" in template_indexes
 
 
 def test_revoked_tokens_schema_supports_jti_denylist_and_user_cutoff() -> None:

@@ -4,10 +4,11 @@ import signal
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 import structlog
-from sqlalchemy import URL, create_engine, delete, insert, select, update
+from sqlalchemy import URL, create_engine, insert, select, update
 from sqlalchemy.engine import Engine
 
 from app.config import Settings, load_settings
@@ -84,6 +85,10 @@ class ResultStoreLike(Protocol):
 
     def spool_ref(self, result_set_id: str) -> ResultRef: ...
 
+    def delete_spool(self, result_set_id: str) -> bool: ...
+
+    def gc_expired(self) -> int: ...
+
 
 class DatabaseAdapterLike(Protocol):
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]: ...
@@ -92,6 +97,17 @@ class DatabaseAdapterLike(Protocol):
 
 
 class ResultSetCatalogLike(Protocol):
+    def write_streaming(
+        self,
+        *,
+        result_set_id: str,
+        execution_id: str,
+        storage_ref: ResultRef,
+        columns: list[Column],
+        loaded_rows: int,
+        console_id: str | None,
+    ) -> None: ...
+
     def write_complete(
         self,
         *,
@@ -101,6 +117,14 @@ class ResultSetCatalogLike(Protocol):
         columns: list[Column],
         loaded_rows: int,
         truncated: bool,
+        console_id: str | None,
+    ) -> None: ...
+
+    def write_terminal(
+        self,
+        *,
+        result_set_id: str,
+        state: str,
     ) -> None: ...
 
 
@@ -123,6 +147,7 @@ class WorkerRunnerConfig:
     poll_interval_seconds: float = 1.0
     sql_spool_batch_size: int = 1000
     cancel_check_row_interval: int = 5000
+    result_gc_interval_seconds: float = 600.0
 
 
 @dataclass(frozen=True)
@@ -146,6 +171,8 @@ class WorkerRunner:
             raise ValueError("sql_spool_batch_size must be positive")
         if config.cancel_check_row_interval <= 0:
             raise ValueError("cancel_check_row_interval must be positive")
+        if config.result_gc_interval_seconds <= 0:
+            raise ValueError("result_gc_interval_seconds must be positive")
         self._backend = backend
         self._result_store = result_store
         self._datasource_loader = datasource_loader
@@ -154,6 +181,7 @@ class WorkerRunner:
         self._result_set_catalog = result_set_catalog
         self._job_error_code_writer = job_error_code_writer
         self._stop_requested = False
+        self._next_result_gc_at = 0.0
 
     def request_stop(self) -> None:
         self._stop_requested = True
@@ -165,6 +193,7 @@ class WorkerRunner:
                 time.sleep(self._config.poll_interval_seconds)
 
     def run_once(self) -> bool:
+        self._gc_result_store_if_due()
         reap_report = self._backend.reap_stale_running_jobs(self._config.heartbeat_timeout_seconds)
         _log_reap_report(reap_report)
         job = self._backend.claim_next(self._config.worker_id)
@@ -197,6 +226,7 @@ class WorkerRunner:
                 raise UnsupportedJobKindError(f"Unsupported job kind: {job.kind.value}")
         except JobCancelled as exc:
             self._backend.mark_cancelled(job.id, str(exc))
+            self._write_result_set_terminal(job, "closed")
             logger.info(
                 "worker job cancelled",
                 job_id=job.id,
@@ -208,6 +238,7 @@ class WorkerRunner:
             error_code = _job_error_code(exc, job.kind)
             self._backend.fail(job.id, public_error)
             self._write_error_code(job.id, error_code)
+            self._write_result_set_terminal(job, "failed")
             logger.exception(
                 "worker job failed",
                 job_id=job.id,
@@ -232,9 +263,11 @@ class WorkerRunner:
         params = _payload_params(payload)
         datasource_id = _payload_datasource_id(job)
         result_set_id = str(payload.get("result_set_id") or job.id)
+        console_id = _payload_optional_str(payload, "console_id")
         datasource = self._datasource_loader(datasource_id)
         _require_operation_allowed(datasource.operation_policy, "select")
         columns: list[Column] | None = None
+        self._write_result_set_streaming(job, result_set_id, [], 0, console_id)
 
         def capture_columns(emitted_columns: list[Column]) -> None:
             nonlocal columns
@@ -260,6 +293,13 @@ class WorkerRunner:
             batch.append(row)
             if len(batch) >= self._config.sql_spool_batch_size:
                 self._flush_batch(job.id, result_set_id, batch)
+                self._write_result_set_streaming(
+                    job,
+                    result_set_id,
+                    columns or [],
+                    _spool_loaded_rows(self._result_store, result_set_id),
+                    console_id,
+                )
                 batch = []
                 last_heartbeat = self._heartbeat_if_due(job.id, last_heartbeat, force=True)
             else:
@@ -267,9 +307,16 @@ class WorkerRunner:
 
         if batch:
             self._flush_batch(job.id, result_set_id, batch)
+            self._write_result_set_streaming(
+                job,
+                result_set_id,
+                columns or [],
+                _spool_loaded_rows(self._result_store, result_set_id),
+                console_id,
+            )
         self._heartbeat(job.id)
         result_ref = self._result_store.spool_ref(result_set_id)
-        self._write_result_set_catalog(job, result_set_id, result_ref, columns or [])
+        self._write_result_set_catalog(job, result_set_id, result_ref, columns or [], console_id)
         manifest = self._result_store.get_spool_manifest(result_set_id)
         return _ExecutionOutcome(
             result_ref=result_ref,
@@ -350,6 +397,7 @@ class WorkerRunner:
         result_set_id: str,
         result_ref: ResultRef,
         columns: list[Column],
+        console_id: str | None,
     ) -> None:
         if self._result_set_catalog is None:
             return
@@ -361,7 +409,80 @@ class WorkerRunner:
             columns=columns,
             loaded_rows=_manifest_int(manifest, "loaded_rows"),
             truncated=_manifest_bool(manifest, "truncated"),
+            console_id=console_id,
         )
+
+    def _write_result_set_streaming(
+        self,
+        job: Job,
+        result_set_id: str,
+        columns: list[Column],
+        loaded_rows: int,
+        console_id: str | None,
+    ) -> None:
+        if self._result_set_catalog is None:
+            return
+        self._result_set_catalog.write_streaming(
+            result_set_id=result_set_id,
+            execution_id=job.id,
+            storage_ref=self._result_store.spool_ref(result_set_id),
+            columns=columns,
+            loaded_rows=loaded_rows,
+            console_id=console_id,
+        )
+
+    def _write_result_set_terminal(self, job: Job, state: str) -> None:
+        if job.kind is not JobKind.SQL_QUERY:
+            return
+        result_set_id = _payload_optional_str(job.payload, "result_set_id")
+        if result_set_id is None:
+            return
+        if self._result_set_catalog is not None:
+            self._result_set_catalog.write_terminal(
+                result_set_id=result_set_id,
+                state=state,
+            )
+        if state == "closed":
+            self._delete_result_spool(result_set_id)
+
+    def _delete_result_spool(self, result_set_id: str) -> None:
+        started_at = time.monotonic()
+        try:
+            deleted = self._result_store.delete_spool(result_set_id)
+        except Exception:
+            logger.exception(
+                "worker result spool delete failed",
+                result_set_id=result_set_id,
+                elapsed_seconds=_elapsed_seconds(started_at),
+            )
+            return
+        if deleted:
+            logger.info(
+                "worker result spool deleted",
+                result_set_id=result_set_id,
+                elapsed_seconds=_elapsed_seconds(started_at),
+            )
+
+    def _gc_result_store_if_due(self) -> None:
+        now = time.monotonic()
+        if now < self._next_result_gc_at:
+            return
+        started_at = now
+        try:
+            cleaned = self._result_store.gc_expired()
+        except Exception:
+            logger.exception(
+                "worker result spool gc failed",
+                elapsed_seconds=_elapsed_seconds(started_at),
+            )
+        else:
+            logger.info(
+                "worker result spool gc complete",
+                cleaned=cleaned,
+                elapsed_seconds=_elapsed_seconds(started_at),
+            )
+        finally:
+            self._next_result_gc_at = now + self._config.result_gc_interval_seconds
 
 
 class PostgresDatasourceLoader:
@@ -401,6 +522,40 @@ class PostgresResultSetCatalog:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
 
+    def write_streaming(
+        self,
+        *,
+        result_set_id: str,
+        execution_id: str,
+        storage_ref: ResultRef,
+        columns: list[Column],
+        loaded_rows: int,
+        console_id: str | None,
+    ) -> None:
+        now = datetime.now(UTC)
+        values = {
+            "execution_id": execution_id,
+            "console_id": console_id,
+            "storage_ref": storage_ref.model_dump(),
+            "columns": [column.model_dump() for column in columns],
+            "loaded_rows": loaded_rows,
+            "total_rows": None,
+            "state": "streaming",
+            "updated_at": now,
+        }
+        with self._engine.begin() as conn:
+            result = conn.execute(
+                update(result_sets).where(result_sets.c.id == result_set_id).values(**values)
+            )
+            if result.rowcount == 0:
+                conn.execute(
+                    insert(result_sets).values(
+                        id=result_set_id,
+                        created_at=now,
+                        **values,
+                    )
+                )
+
     def write_complete(
         self,
         *,
@@ -410,19 +565,38 @@ class PostgresResultSetCatalog:
         columns: list[Column],
         loaded_rows: int,
         truncated: bool,
+        console_id: str | None,
     ) -> None:
+        now = datetime.now(UTC)
+        values = {
+            "execution_id": execution_id,
+            "console_id": console_id,
+            "storage_ref": storage_ref.model_dump(),
+            "columns": [column.model_dump() for column in columns],
+            "loaded_rows": loaded_rows,
+            "total_rows": None if truncated else loaded_rows,
+            "state": "complete",
+            "updated_at": now,
+        }
         with self._engine.begin() as conn:
-            conn.execute(delete(result_sets).where(result_sets.c.id == result_set_id))
-            conn.execute(
-                insert(result_sets).values(
-                    id=result_set_id,
-                    execution_id=execution_id,
-                    storage_ref=storage_ref.model_dump(),
-                    columns=[column.model_dump() for column in columns],
-                    loaded_rows=loaded_rows,
-                    total_rows=None if truncated else loaded_rows,
-                    state="complete",
+            result = conn.execute(
+                update(result_sets).where(result_sets.c.id == result_set_id).values(**values)
+            )
+            if result.rowcount == 0:
+                conn.execute(
+                    insert(result_sets).values(
+                        id=result_set_id,
+                        created_at=now,
+                        **values,
+                    )
                 )
+
+    def write_terminal(self, *, result_set_id: str, state: str) -> None:
+        with self._engine.begin() as conn:
+            conn.execute(
+                update(result_sets)
+                .where(result_sets.c.id == result_set_id)
+                .values(state=state, updated_at=datetime.now(UTC))
             )
 
 
@@ -520,6 +694,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
             heartbeat_timeout_seconds=actual_settings.worker.heartbeat_timeout_seconds,
             poll_interval_seconds=actual_settings.worker.poll_interval_seconds,
             cancel_check_row_interval=actual_settings.worker.cancel_check_row_interval,
+            result_gc_interval_seconds=actual_settings.worker.result_gc_interval_seconds,
         ),
         PostgresResultSetCatalog(engine),
         PostgresJobErrorCodeWriter(engine),
@@ -582,6 +757,15 @@ def _payload_datasource_id(job: Job) -> str:
     if job.datasource_ids:
         return job.datasource_ids[0]
     raise ValueError("Job payload requires datasource_id or job.datasource_ids")
+
+
+def _payload_optional_str(payload: dict[str, object], key: str) -> str | None:
+    value = payload.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _spool_loaded_rows(result_store: ResultStoreLike, result_set_id: str) -> int:
+    return _manifest_int(result_store.get_spool_manifest(result_set_id), "loaded_rows")
 
 
 def _copy_columns(columns: list[Column]) -> list[Column]:

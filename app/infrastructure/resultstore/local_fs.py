@@ -193,6 +193,13 @@ class LocalFsResultStore(ResultStore):
     def delete_run(self, run_id: str) -> None:
         shutil.rmtree(self._run_dir(run_id), ignore_errors=True)
 
+    def delete_spool(self, result_set_id: str) -> bool:
+        path = self._spool_dir(result_set_id)
+        if not path.exists():
+            return False
+        shutil.rmtree(path)
+        return True
+
     def gc_expired(self) -> int:
         if self._result_ttl_days < 0:
             return 0
