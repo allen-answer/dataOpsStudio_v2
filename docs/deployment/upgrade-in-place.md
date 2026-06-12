@@ -128,6 +128,47 @@ curl -sS -X POST http://127.0.0.1:8020/api/auth/login \
 A real `access_token` in the response confirms the metadata DB, secrets, and API
 all came back up against the existing data.
 
+## 6. Operational pitfalls (learned in production, 2026-06-12)
+
+Each of these cost real downtime once. Read before every upgrade; do not operate
+from memory.
+
+1. **Non-interactive SSH shells don't have `uv` on PATH.** Piping a script via
+   `ssh host "bash -s"` skips `.bashrc`/`.profile`, so `uv` (installed under
+   `~/.local/bin`) is not found and every `$LAUNCHER` step fails *after* you have
+   already stopped the service. Use `ssh host "bash -ls"` (login shell) or put
+   `export PATH="$HOME/.local/bin:$PATH"` at the top of the script.
+2. **`up` must carry the instance's full environment.** The generic
+   `tmux new -s dataops -d "$LAUNCHER up"` is not enough for an instance that
+   serves the SPA and talks to DM. The production launch line carries (paths
+   only, no secrets):
+   ```bash
+   DATAOPS_FRONTEND_DIST=$PWD/frontend/dist \
+   DM_HOME=$HOME/dm-client \
+   LD_LIBRARY_PATH=$HOME/dm-client/bin:$HOME/dm-client/bin/external_crypto_libs \
+   DATAOPS_PG_PORT=<your-pg-port> \
+   PATH=$HOME/.local/bin:$PATH \
+   $LAUNCHER up
+   ```
+   Record your instance's exact line somewhere durable; a wrong/missing env var
+   here silently degrades (no SPA, DM `-70089`, wrong PG port).
+3. **`tmux kill-session` kills PG too.** In the portable form PG runs as a
+   launcher child inside the same session. After any session kill, bring PG back
+   with `$LAUNCHER pg-up` before `alembic-up`, or `alembic-up` fails with
+   connection refused.
+4. **GitHub fetch from the server can flake (GnuTLS errors).** Fallback: build a
+   bundle locally from a commit the server already has, transfer, fast-forward:
+   ```bash
+   # locally
+   git bundle create w.bundle <server-head>..main && scp w.bundle <host>:/tmp/
+   # on the server
+   git fetch /tmp/w.bundle main:refs/heads/mb && git merge --ff-only mb && git branch -D mb
+   ```
+5. **Frontend dist is deployed, not built on the server.** Build locally
+   (`npm ci && npm run build` in `frontend/`), `tar -czf` the `dist/` directory,
+   `scp` it over, extract into `frontend/` before restarting — the API serves it
+   via `DATAOPS_FRONTEND_DIST`.
+
 ## Rollback
 
 If the new version misbehaves and the migration is reversible:

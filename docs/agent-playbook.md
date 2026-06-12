@@ -159,6 +159,53 @@ npm run dev
 
 ---
 
+### SQL 耗时显示三连修:mock 撒谎,契约测试才是锚(2.1.0 W1,PR #63)
+
+**症状**
+- 完成态的耗时数字随挂钟持续上涨(16.5s → 40.5s →∞);且初值远大于真实执行时间
+  (服务端 job created==finished 同秒,UI 却显示 16.5s)
+
+**根因(三层,逐层揭开)**
+1. 前端 `elapsedSeconds = nowMs - startedAt`,`nowMs` 是 setInterval 挂钟,终态无人冻结
+2. 一修(本地 finishedAt 冻结)仍依赖本地时钟语义,起点漂移照样虚高
+3. 二修(改用服务端 created_at/finished_at)前端 e2e 全绿但真机无效——
+   **后端 `GET /jobs/{id}` 根本不返回这两个字段,e2e 的 mock 里却有**。
+   mock 与真实 API 契约脱节,测试自证了一个不存在的接口
+
+**修法**
+- 后端 JobResponse 补 created_at/finished_at(纯透传)
+- **契约测试锚定字段与 ISO 格式**(tests/contract/test_api.py),防 mock 再次漂移
+- 终态耗时 = 服务端差值(顺带免疫本地与服务器时钟偏差);运行中才用本地挂钟
+
+**教训**
+- 前端 mock 响应里的每个字段,必须有一条**后端契约测试**背书,否则 mock 会撒谎
+- 凡是"完成后界面还在动"类 bug,优先查全局 interval 的消费方有没有终态出口
+- 真机走查(宪法 §4)不是仪式:本案 e2e 4/4 全绿 + CI 全绿,bug 只在真后端暴露
+
+---
+
+### 凭过期记忆做生产升级:15 分钟停机(2026-06-12)
+
+**症状**
+- 例行升级触发生产停机约 15 分钟:停服后 `uv: command not found`、
+  alembic 连不上 PG、重启的 tmux 会话秒死
+
+**根因**
+- 操作前没读 `docs/deployment/upgrade-in-place.md`,凭会话记忆写脚本:
+  会话名记错、漏 `--root` / `--pg-bin-dir`、不知道非交互 SSH shell 没有 uv 的 PATH、
+  不知道 portable 形态 PG 是 tmux 会话子进程(kill session 连 PG 一起带走)
+
+**修法**
+- 全部坑写进 upgrade-in-place.md §6(Operational pitfalls),含完整生产启动行模板
+- 升级脚本一律 `bash -ls` / 顶部 export PATH,健康检查必须出现在脚本末尾
+
+**教训**
+- **runbook 存在就必须先读全文再动手**,"我上次就是这么部署的"不算依据
+- 任何改运行状态的脚本,第一步先核实"现在到底是什么在跑"(tmux ls + ss -tlnp),
+  而不是假设拓扑与记忆一致
+
+---
+
 ## 3. 设计背景
 
 ### 1.x DataOpsStudio 的定位(原 contract §9 内容)
