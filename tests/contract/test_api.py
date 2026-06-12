@@ -250,6 +250,38 @@ def test_list_jobs_classifies_cancelled_without_leaking_reason() -> None:
     assert "SELECT cancelled_should_not_return" not in body
 
 
+def test_get_job_response_includes_timestamps_for_terminal_jobs() -> None:
+    engine = _FakeEngine(
+        [
+            {
+                "id": "job-success",
+                "project_id": "project-1",
+                "kind": "sql_query",
+                "status": "success",
+                "created_at": _dt(1),
+                "started_at": _dt(2),
+                "finished_at": _dt(9),
+                "error": None,
+                "error_code": None,
+                "payload": {"result_set_id": "rs-1", "sql": "SELECT should_not_return"},
+            },
+            {"id": "project-1"},
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/jobs/job-success",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["created_at"] == "2026-01-01T00:00:01Z"
+    assert payload["finished_at"] == "2026-01-01T00:00:09Z"
+    assert "SELECT should_not_return" not in response.body.decode("utf-8")
+
+
 def test_list_jobs_project_filter_requires_authz() -> None:
     engine = _FakeEngine([None])
     app = create_app(services=cast(ApiServices, _Services(engine)))

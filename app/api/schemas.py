@@ -129,6 +129,8 @@ class JobResponse(BaseModel):
     id: str
     kind: str
     status: JobStatus
+    created_at: datetime
+    finished_at: datetime | None = None
     result_set_id: str | None = None
     error: str | None = None
     error_code: JobErrorCode | None = None
