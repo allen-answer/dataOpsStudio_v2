@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any
 
+import sqlglot
 import structlog
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import and_, delete, func, insert, or_, select, update
 from sqlalchemy.engine import Connection, RowMapping
+from sqlglot import exp
+from sqlglot.errors import ParseError
 
 from app.api.dependencies import current_user_from, request_id_from, services_from
 from app.api.errors import ApiError
@@ -29,6 +33,9 @@ from app.api.schemas import (
     JobResultResponse,
     LicenseStatusResponse,
     LoginRequest,
+    MetadataColumnItem,
+    MetadataSchemaItem,
+    MetadataTableItem,
     ProjectResponse,
     RowResponse,
     SqlConsoleCreateRequest,
@@ -36,6 +43,10 @@ from app.api.schemas import (
     SqlConsoleUpdateRequest,
     SqlExecuteRequest,
     SqlExecuteResponse,
+    SqlExpandStarRequest,
+    SqlExpandStarResponse,
+    SqlFormatRequest,
+    SqlFormatResponse,
     SqlHistoryItem,
     SqlTemplateCreateRequest,
     SqlTemplateRenderRequest,
@@ -50,6 +61,7 @@ from app.db.models import (
     datasources,
     jobs,
     license_state,
+    metadata_caches,
     project_members,
     projects,
     result_sets,
@@ -57,8 +69,10 @@ from app.db.models import (
     sql_templates,
     users,
 )
+from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
+from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
-from app.domain.datasource import DbType, OperationPolicy
+from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.resource import ResourceProfile
 from app.domain.schema import Column
@@ -73,6 +87,10 @@ _DATASOURCE_TEST_ERROR_CODES: tuple[DatasourceTestErrorCode, ...] = (
     "permission_denied",
     "unknown",
 )
+_METADATA_CACHE_TTL = timedelta(days=7)
+_METADATA_LEVEL_SCHEMAS = "schemas"
+_METADATA_LEVEL_TABLES = "tables"
+_METADATA_LEVEL_COLUMNS = "columns"
 
 router = APIRouter()
 
@@ -477,6 +495,212 @@ def execute_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse
         detail={"datasource_id": body.datasource_id},
     )
     return SqlExecuteResponse(job_id=job_id, result_set_id=result_set_id)
+
+
+@router.post("/sql/explain", response_model=SqlExecuteResponse, status_code=202)
+def explain_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    row = _datasource_for_current_user(request, body.datasource_id)
+    console_id = body.console_id
+    if console_id is not None:
+        _console_for_current_user(request, console_id)
+    try:
+        sql = validate_readonly_sql(body.sql)
+    except SqlGuardError as exc:
+        logger.info(
+            "sql guard rejected explain statement",
+            request_id=request_id_from(request),
+            reason=str(exc),
+        )
+        raise ApiError(
+            400,
+            "invalid_sql",
+            "Only read-only SELECT/WITH SQL can be explained",
+        ) from exc
+    if body.params:
+        raise ApiError(400, "unsupported_sql_params", "SQL EXPLAIN does not support parameters")
+
+    job_id = new_id()
+    result_set_id = new_id()
+    job = Job(
+        id=job_id,
+        kind=JobKind.SQL_EXPLAIN,
+        status=JobStatus.PENDING,
+        owner_user_id=user.id,
+        project_id=str(row["project_id"]),
+        datasource_ids=[body.datasource_id],
+        priority=0,
+        timeout_seconds=300,
+        resource_profile=ResourceProfile(),
+        audit_id=new_id(),
+        payload={
+            "datasource_id": body.datasource_id,
+            "sql": sql,
+            "sql_hash": _sql_hash(sql),
+            "result_set_id": result_set_id,
+            "console_id": console_id,
+        },
+    )
+    _create_result_set_placeholder(
+        services,
+        result_set_id=result_set_id,
+        job_id=job_id,
+        console_id=console_id,
+    )
+    if console_id is not None:
+        _evict_console_resultsets(services, console_id)
+    services.job_backend.enqueue(job)
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=str(row["project_id"]),
+        action="sql_explain",
+        resource_type="job",
+        resource_id=job_id,
+        result="accepted",
+        detail={"datasource_id": body.datasource_id},
+    )
+    return SqlExecuteResponse(job_id=job_id, result_set_id=result_set_id)
+
+
+@router.get(
+    "/datasources/{datasource_id}/metadata/schemas",
+    response_model=list[MetadataSchemaItem],
+)
+def list_datasource_metadata_schemas(
+    datasource_id: str,
+    request: Request,
+    refresh: bool = Query(default=False),
+) -> list[MetadataSchemaItem]:
+    row = _datasource_for_current_user(request, datasource_id)
+    services = services_from(request)
+    payload = _metadata_payload(
+        services,
+        row,
+        _METADATA_LEVEL_SCHEMAS,
+        schema_name="",
+        table_name="",
+        refresh=refresh,
+        load=lambda: [
+            MetadataSchemaItem(name=item.name).model_dump(mode="json")
+            for item in _metadata_adapter(services, row).list_schemas()
+        ],
+    )
+    _audit_metadata(request, services, row, "metadata_schemas_list", datasource_id, refresh)
+    return [MetadataSchemaItem.model_validate(item) for item in payload]
+
+
+@router.get(
+    "/datasources/{datasource_id}/metadata/tables",
+    response_model=list[MetadataTableItem],
+)
+def list_datasource_metadata_tables(
+    datasource_id: str,
+    request: Request,
+    schema: str = Query(min_length=1),
+    refresh: bool = Query(default=False),
+) -> list[MetadataTableItem]:
+    row = _datasource_for_current_user(request, datasource_id)
+    services = services_from(request)
+    payload = _metadata_payload(
+        services,
+        row,
+        _METADATA_LEVEL_TABLES,
+        schema_name=schema,
+        table_name="",
+        refresh=refresh,
+        load=lambda: [
+            MetadataTableItem(
+                schema_name=item.schema_name,
+                name=item.name,
+                table_type=item.table_type,
+            ).model_dump(mode="json")
+            for item in _metadata_adapter(services, row).list_tables(schema)
+        ],
+    )
+    _audit_metadata(request, services, row, "metadata_tables_list", datasource_id, refresh)
+    return [MetadataTableItem.model_validate(item) for item in payload]
+
+
+@router.get(
+    "/datasources/{datasource_id}/metadata/columns",
+    response_model=list[MetadataColumnItem],
+)
+def list_datasource_metadata_columns(
+    datasource_id: str,
+    request: Request,
+    schema: str = Query(min_length=1),
+    table: str = Query(min_length=1),
+    refresh: bool = Query(default=False),
+) -> list[MetadataColumnItem]:
+    row = _datasource_for_current_user(request, datasource_id)
+    services = services_from(request)
+    payload = _metadata_payload(
+        services,
+        row,
+        _METADATA_LEVEL_COLUMNS,
+        schema_name=schema,
+        table_name=table,
+        refresh=refresh,
+        load=lambda: [
+            _metadata_column_item(column).model_dump(mode="json")
+            for column in _metadata_adapter(services, row).list_columns(schema, table)
+        ],
+    )
+    _audit_metadata(request, services, row, "metadata_columns_list", datasource_id, refresh)
+    return [MetadataColumnItem.model_validate(item) for item in payload]
+
+
+@router.post("/sql/format", response_model=SqlFormatResponse)
+def format_sql(body: SqlFormatRequest, request: Request) -> SqlFormatResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    try:
+        formatted = sqlglot.transpile(
+            body.sql,
+            read=_sqlglot_dialect(body.dialect),
+            write=_sqlglot_dialect(body.dialect),
+            pretty=True,
+        )[0]
+    except (ParseError, IndexError, ValueError) as exc:
+        raise ApiError(400, "invalid_sql", "SQL could not be formatted") from exc
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=None,
+        action="sql_format",
+        resource_type="sql",
+        resource_id=None,
+        result="success",
+        detail={"dialect": body.dialect, "sql_len": len(body.sql)},
+    )
+    return SqlFormatResponse(formatted_sql=formatted)
+
+
+@router.post("/sql/expand-star", response_model=SqlExpandStarResponse)
+def expand_sql_star(body: SqlExpandStarRequest, request: Request) -> SqlExpandStarResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    row = _datasource_for_current_user(request, body.datasource_id)
+    try:
+        expanded = _expand_star_sql(services, row, body.sql)
+    except ParseError as exc:
+        raise ApiError(400, "invalid_sql", "SQL could not be parsed") from exc
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=str(row["project_id"]),
+        action="sql_expand_star",
+        resource_type="datasource",
+        resource_id=body.datasource_id,
+        result="success",
+        detail={"sql_len": len(body.sql)},
+    )
+    return SqlExpandStarResponse(expanded_sql=expanded)
 
 
 @router.get("/sql/consoles", response_model=list[SqlConsoleResponse])
@@ -1061,6 +1285,316 @@ def _result_set_total_rows(services: ApiServices, result_set_id: str) -> int | N
             select(result_sets.c.total_rows).where(result_sets.c.id == result_set_id)
         ).scalar_one_or_none()
     return int(value) if value is not None else None
+
+
+def _metadata_payload(
+    services: ApiServices,
+    datasource_row: RowMapping,
+    cache_level: str,
+    *,
+    schema_name: str,
+    table_name: str,
+    refresh: bool,
+    load: Callable[[], list[dict[str, object]]],
+) -> list[dict[str, object]]:
+    datasource_id = str(datasource_row["id"])
+    now = datetime.now(UTC)
+    if not refresh:
+        cached = _read_metadata_cache(
+            services,
+            datasource_id,
+            cache_level,
+            schema_name=schema_name,
+            table_name=table_name,
+            now=now,
+        )
+        if cached is not None:
+            return cached
+    try:
+        payload = load()
+    except UnsupportedDbTypeError as exc:
+        raise ApiError(
+            400,
+            "unsupported_db_type",
+            "Metadata introspection supports MySQL and DM datasources",
+        ) from exc
+    except AdapterConnectionError as exc:
+        raise ApiError(
+            503,
+            "metadata_probe_failed",
+            "Datasource metadata probe failed",
+        ) from exc
+    except ValueError as exc:
+        raise ApiError(400, "invalid_metadata_request", "Invalid metadata object name") from exc
+    _write_metadata_cache(
+        services,
+        datasource_id,
+        cache_level,
+        schema_name=schema_name,
+        table_name=table_name,
+        payload=payload,
+        now=now,
+    )
+    return payload
+
+
+def _read_metadata_cache(
+    services: ApiServices,
+    datasource_id: str,
+    cache_level: str,
+    *,
+    schema_name: str,
+    table_name: str,
+    now: datetime,
+) -> list[dict[str, object]] | None:
+    with services.engine.connect() as conn:
+        row = (
+            conn.execute(
+                select(metadata_caches.c.payload, metadata_caches.c.expires_at).where(
+                    and_(
+                        metadata_caches.c.datasource_id == datasource_id,
+                        metadata_caches.c.cache_level == cache_level,
+                        metadata_caches.c.schema_name == schema_name,
+                        metadata_caches.c.table_name == table_name,
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    if row is None:
+        return None
+    expires_at = row["expires_at"]
+    if isinstance(expires_at, datetime):
+        normalized = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=UTC)
+        if normalized <= now:
+            return None
+    payload = row["payload"]
+    if not isinstance(payload, list):
+        return None
+    return [dict(item) for item in payload if isinstance(item, dict)]
+
+
+def _write_metadata_cache(
+    services: ApiServices,
+    datasource_id: str,
+    cache_level: str,
+    *,
+    schema_name: str,
+    table_name: str,
+    payload: list[dict[str, object]],
+    now: datetime,
+) -> None:
+    with services.engine.begin() as conn:
+        conn.execute(
+            delete(metadata_caches).where(
+                and_(
+                    metadata_caches.c.datasource_id == datasource_id,
+                    metadata_caches.c.cache_level == cache_level,
+                    metadata_caches.c.schema_name == schema_name,
+                    metadata_caches.c.table_name == table_name,
+                )
+            )
+        )
+        conn.execute(
+            insert(metadata_caches).values(
+                id=new_id(),
+                datasource_id=datasource_id,
+                cache_level=cache_level,
+                schema_name=schema_name,
+                table_name=table_name,
+                payload=payload,
+                refreshed_at=now,
+                expires_at=now + _METADATA_CACHE_TTL,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+
+def _metadata_adapter(services: ApiServices, datasource_row: RowMapping) -> DatabaseAdapter:
+    timeout_seconds = services.metadata_probe_timeout_seconds
+    return build_database_adapter(
+        _datasource_conn_info(datasource_row),
+        services.secret_store,
+        connect_timeout_seconds=timeout_seconds,
+        statement_timeout_seconds=timeout_seconds,
+    )
+
+
+def _datasource_conn_info(row: RowMapping) -> DatasourceConnInfo:
+    database_name = row["database_name"]
+    if database_name is None:
+        raise ApiError(400, "invalid_datasource", "Datasource database is required")
+    return DatasourceConnInfo(
+        host=str(row["host"]),
+        port=int(row["port"]),
+        username=str(row["username"]),
+        database=str(database_name),
+        password_ref=SecretRef(
+            ref=str(row["password_secret_ref"]),
+            kind=SecretKind.DATASOURCE_PASSWORD,
+        ),
+        db_type=DbType(str(row["db_type"])),
+        extra=dict(row["capability_profile"] or {}),
+        operation_policy=OperationPolicy.model_validate(row["operation_policy"] or {}),
+    )
+
+
+def _metadata_column_item(column: Column) -> MetadataColumnItem:
+    return MetadataColumnItem(
+        name=column.name,
+        type=column.type.value,
+        driver_type=column.driver_type,
+        nullable=column.nullable,
+        primary_key=column.primary_key,
+        comment=column.comment,
+    )
+
+
+def _audit_metadata(
+    request: Request,
+    services: ApiServices,
+    datasource_row: RowMapping,
+    action: str,
+    datasource_id: str,
+    refresh: bool,
+) -> None:
+    user = current_user_from(request)
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=str(datasource_row["project_id"]),
+        action=action,
+        resource_type="datasource",
+        resource_id=datasource_id,
+        result="success",
+        detail={"refresh": refresh},
+    )
+
+
+def _sqlglot_dialect(dialect: str) -> str:
+    normalized = dialect.lower()
+    if normalized in {"mysql", "oracle", "postgres", "postgresql"}:
+        return "postgres" if normalized == "postgresql" else normalized
+    if normalized == "dm":
+        return "oracle"
+    raise ApiError(
+        400,
+        "unsupported_dialect",
+        "SQL formatting supports MySQL, DM, Oracle and PostgreSQL",
+    )
+
+
+def _expand_star_sql(
+    services: ApiServices,
+    datasource_row: RowMapping,
+    sql: str,
+) -> str:
+    dialect = _sqlglot_dialect(str(datasource_row["db_type"]))
+    expression = sqlglot.parse_one(sql, read=dialect)
+    select_expr = expression.find(exp.Select)
+    if select_expr is None:
+        raise ApiError(400, "invalid_sql", "Only SELECT SQL can be expanded")
+    table_refs = _select_table_refs(datasource_row, select_expr)
+    if not table_refs:
+        raise ApiError(400, "invalid_sql", "SELECT must reference at least one table")
+
+    changed = False
+    expanded_selects: list[exp.Expression] = []
+    for item in list(select_expr.expressions):
+        if isinstance(item, exp.Star):
+            changed = True
+            for table_ref in table_refs:
+                expanded_selects.extend(_column_expressions_for_ref(services, table_ref, None))
+            continue
+        if isinstance(item, exp.Column) and isinstance(item.this, exp.Star):
+            table_name = item.table
+            matched_table_ref = _table_ref_by_qualifier(table_refs, table_name)
+            if matched_table_ref is None:
+                raise ApiError(400, "unknown_table", "SELECT star qualifier does not match a table")
+            changed = True
+            expanded_selects.extend(
+                _column_expressions_for_ref(services, matched_table_ref, table_name)
+            )
+            continue
+        expanded_selects.append(item)
+    if not changed:
+        raise ApiError(400, "no_star", "SQL does not contain SELECT *")
+    select_expr.set("expressions", expanded_selects)
+    return expression.sql(dialect=dialect, pretty=True)
+
+
+def _select_table_refs(
+    datasource_row: RowMapping,
+    select_expr: exp.Select,
+) -> list[dict[str, str]]:
+    default_schema = str(datasource_row["database_name"] or "")
+    refs: list[dict[str, str]] = []
+    for table in select_expr.find_all(exp.Table):
+        schema = table.db or default_schema
+        name = table.name
+        if not schema or not name:
+            continue
+        refs.append(
+            {
+                "datasource_id": str(datasource_row["id"]),
+                "schema": schema,
+                "table": name,
+                "alias": table.alias_or_name,
+            }
+        )
+    return refs
+
+
+def _table_ref_by_qualifier(
+    refs: list[dict[str, str]],
+    qualifier: str,
+) -> dict[str, str] | None:
+    for ref in refs:
+        if qualifier in {ref["alias"], ref["table"]}:
+            return ref
+    return None
+
+
+def _column_expressions_for_ref(
+    services: ApiServices,
+    table_ref: dict[str, str],
+    qualifier: str | None,
+) -> list[exp.Column]:
+    columns = _metadata_columns_from_cache(
+        services,
+        table_ref["datasource_id"],
+        schema_name=table_ref["schema"],
+        table_name=table_ref["table"],
+    )
+    table_name = qualifier or table_ref["alias"]
+    return [exp.column(str(column["name"]), table=table_name, quoted=True) for column in columns]
+
+
+def _metadata_columns_from_cache(
+    services: ApiServices,
+    datasource_id: str,
+    *,
+    schema_name: str,
+    table_name: str,
+) -> list[dict[str, object]]:
+    payload = _read_metadata_cache(
+        services,
+        datasource_id,
+        _METADATA_LEVEL_COLUMNS,
+        schema_name=schema_name,
+        table_name=table_name,
+        now=datetime.now(UTC),
+    )
+    if payload is None:
+        raise ApiError(
+            409,
+            "metadata_cache_missing",
+            "Column metadata cache is missing; refresh metadata first",
+        )
+    return payload
 
 
 def _console_for_current_user(request: Request, console_id: str) -> RowMapping:

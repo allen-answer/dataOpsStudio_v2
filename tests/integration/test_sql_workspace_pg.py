@@ -19,6 +19,7 @@ from app.api.services import ApiServices, RateLimiter
 from app.db.models import datasources, jobs, metadata, projects, result_sets, users
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.job import JobKind, JobStatus
+from app.domain.plan import PlanNode
 from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import SecretKind, SecretRef
@@ -539,6 +540,13 @@ class _SlowAdapter:
         yield Row(values=[1])
         assert self._release_second_row.wait(timeout=5)
         yield Row(values=[2])
+
+    def explain(self, sql: str) -> PlanNode:
+        del sql
+        return PlanNode(
+            operation="EXPLAIN",
+            details={"rows": [{"operation": "EXPLAIN"}]},
+        )
 
     def test_connection(self) -> bool:
         return True

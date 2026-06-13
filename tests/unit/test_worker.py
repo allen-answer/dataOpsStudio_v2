@@ -3,14 +3,16 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from typing import Protocol
 
+from app.dbclients.factory import UnsupportedDbTypeError
 from app.dbclients.protocol import AdapterConnectionError
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
+from app.domain.plan import PlanNode
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import SecretKind, SecretRef
-from app.worker import UnsupportedDbTypeError, WorkerRunner, WorkerRunnerConfig
+from app.worker import WorkerRunner, WorkerRunnerConfig
 
 
 def test_worker_runs_sql_query_to_spool_and_completes() -> None:
@@ -65,6 +67,40 @@ def test_worker_persists_columns_to_spool_and_catalog() -> None:
         }
     ]
     assert catalog.streaming[-1]["loaded_rows"] == 2
+
+
+def test_worker_runs_sql_explain_to_spool_and_completes() -> None:
+    columns = [
+        Column(name="id", type=ColumnType.UNKNOWN),
+        Column(name="select_type", type=ColumnType.UNKNOWN),
+    ]
+    job = _make_job(
+        kind=JobKind.SQL_EXPLAIN,
+        payload={"sql": "SELECT 1", "result_set_id": "rs-1", "console_id": "console-1"},
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    catalog = _FakeResultSetCatalog()
+    adapter = _FakeAdapter([], explain_rows=[{"id": 1, "select_type": "SIMPLE"}])
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(
+            datasource_id,
+            operation_policy=OperationPolicy(allow_explain=True),
+        ),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=10),
+        catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert result_store.columns_by_result_set == {"rs-1": columns}
+    assert result_store.rows_by_result_set == {"rs-1": [Row(values=[1, "SIMPLE"])]}
+    assert backend.completed == [("job-1", ResultRef(backend="local_fs", uri="spool/rs-1"))]
+    assert catalog.completed[-1]["loaded_rows"] == 1
+    assert catalog.completed[-1]["console_id"] == "console-1"
 
 
 def test_worker_updates_catalog_while_streaming_batches() -> None:
@@ -542,15 +578,18 @@ class _FakeAdapter:
         connection_error: str | None = None,
         columns: list[Column] | None = None,
         emit_columns_twice: bool = False,
+        explain_rows: list[dict[str, object]] | None = None,
     ) -> None:
         self._rows = rows
         self._test_connection_ok = test_connection_ok
         self.last_connection_error = connection_error
         self._columns = columns or [Column(name="n", type=ColumnType.UNKNOWN)]
         self._emit_columns_twice = emit_columns_twice
+        self._explain_rows = explain_rows or [{"operation": "EXPLAIN"}]
         self._column_sink: Callable[[list[Column]], None] | None = None
         self.test_connection_calls = 0
         self.execute_select_calls = 0
+        self.explain_calls = 0
         self.last_server_version = "MySQL 8.0.test"
 
     def with_column_sink(self, column_sink: Callable[[list[Column]], None]) -> _FakeAdapter:
@@ -564,6 +603,10 @@ class _FakeAdapter:
             if self._emit_columns_twice:
                 self._column_sink(self._columns)
         yield from self._rows
+
+    def explain(self, sql: str) -> PlanNode:
+        self.explain_calls += 1
+        return PlanNode(operation="EXPLAIN", details={"rows": self._explain_rows})
 
     def test_connection(self) -> bool:
         self.test_connection_calls += 1
@@ -586,6 +629,9 @@ class _RangeAdapter:
         for index in range(self._row_count):
             self.rows_yielded += 1
             yield Row(values=[index])
+
+    def explain(self, sql: str) -> PlanNode:
+        return PlanNode(operation="EXPLAIN", details={"rows": [{"rows": self._row_count}]})
 
     def test_connection(self) -> bool:
         return True
@@ -611,7 +657,11 @@ def _make_job(
     )
 
 
-def _conn_info(datasource_id: str) -> DatasourceConnInfo:
+def _conn_info(
+    datasource_id: str,
+    *,
+    operation_policy: OperationPolicy | None = None,
+) -> DatasourceConnInfo:
     return DatasourceConnInfo(
         host="127.0.0.1",
         port=3306,
@@ -619,11 +669,14 @@ def _conn_info(datasource_id: str) -> DatasourceConnInfo:
         database="app",
         password_ref=SecretRef(ref="secret-1", kind=SecretKind.DATASOURCE_PASSWORD),
         db_type=DbType.MYSQL,
+        operation_policy=operation_policy or OperationPolicy(),
     )
 
 
 class _ColumnSinkAdapter(Protocol):
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]: ...
+
+    def explain(self, sql: str) -> PlanNode: ...
 
     def test_connection(self) -> bool: ...
 

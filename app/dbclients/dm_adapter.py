@@ -197,8 +197,13 @@ class DMAdapter(DatabaseAdapter):
             SELECT
                 c.COLUMN_NAME AS name,
                 c.DATA_TYPE AS data_type,
-                c.NULLABLE AS nullable
+                c.NULLABLE AS nullable,
+                cc.COMMENTS AS comment
             FROM ALL_TAB_COLUMNS c
+            LEFT JOIN ALL_COL_COMMENTS cc
+              ON cc.OWNER = c.OWNER
+             AND cc.TABLE_NAME = c.TABLE_NAME
+             AND cc.COLUMN_NAME = c.COLUMN_NAME
             WHERE c.OWNER = UPPER(?) AND c.TABLE_NAME = UPPER(?)
             ORDER BY c.COLUMN_ID
             """,
@@ -213,6 +218,7 @@ class DMAdapter(DatabaseAdapter):
                 # Oracle/DM NULLABLE 编码 'Y'/'N'(V1_AS_IS §2.4)
                 nullable=str(row["nullable"]).upper() == "Y",
                 primary_key=str(row["name"]) in primary_keys,
+                comment=_optional_str(row.get("comment")),
             )
             for row in rows
         ]
@@ -494,6 +500,13 @@ def _first_cell(row: object) -> object | None:
     if isinstance(row, Sequence) and not isinstance(row, (str, bytes, bytearray)):
         return row[0] if row else None
     return row
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
 
 
 def _connection_error_summary(exc: Exception) -> str:
