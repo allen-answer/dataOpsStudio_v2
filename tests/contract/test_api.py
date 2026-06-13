@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import io
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import pytest
@@ -58,6 +59,8 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("GET", "/api/jobs") in routes
     assert ("GET", "/api/jobs/{job_id}") in routes
     assert ("GET", "/api/jobs/{job_id}/result") in routes
+    assert ("POST", "/api/jobs/{job_id}/export") in routes
+    assert ("GET", "/api/exports/{token}") in routes
     assert ("POST", "/api/jobs/{job_id}/cancel") in routes
     assert ("GET", "/api/account/security") in routes
     assert ("POST", "/api/account/password") in routes
@@ -640,6 +643,112 @@ def test_sql_explain_rejects_params_instead_of_ignoring_them() -> None:
     assert services.job_backend.enqueued == []
 
 
+def test_create_export_enqueues_result_export_job_and_returns_one_time_token() -> None:
+    engine = _FakeEngine(
+        [
+            _source_job_row(),
+            {"id": "project-1"},
+            0,
+            {"db_type": "mysql"},
+        ]
+    )
+    job_backend = _JobBackend()
+    services = _Services(engine, job_backend=job_backend)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/jobs/job-source/export",
+        headers=_auth_headers(),
+        json_body={"format": "csv"},
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["job_id"]
+    assert payload["download_token"]
+    assert payload["format"] == "csv"
+    assert payload["filename"] == "job-source.csv"
+    job = job_backend.enqueued[0]
+    assert job.kind is JobKind.RESULT_EXPORT
+    assert job.payload["source_job_id"] == "job-source"
+    assert job.payload["source_result_set_id"] == "rs-source"
+    assert job.payload["format"] == "csv"
+    assert job.payload["source_db_type"] == "mysql"
+    assert services.audits[-1]["action"] == "sql_export"
+    assert "download_token" not in str(services.audits[-1])
+
+
+def test_create_export_rate_limit_returns_429_without_enqueue() -> None:
+    engine = _FakeEngine(
+        [
+            _source_job_row(),
+            {"id": "project-1"},
+            10,
+        ]
+    )
+    job_backend = _JobBackend()
+    services = _Services(engine, job_backend=job_backend)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/jobs/job-source/export",
+        headers=_auth_headers(),
+        json_body={"format": "json"},
+    )
+
+    assert response.status_code == 429
+    assert response.json()["error"] == "export_rate_limited"
+    assert job_backend.enqueued == []
+
+
+def test_create_export_requires_source_spool_to_still_exist() -> None:
+    engine = _FakeEngine([_source_job_row(), {"id": "project-1"}])
+    job_backend = _JobBackend()
+    result_store = _ResultStore(spool_exists=False)
+    services = _Services(engine, job_backend=job_backend, result_store=result_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/jobs/job-source/export",
+        headers=_auth_headers(),
+        json_body={"format": "csv"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "not_found"
+    assert job_backend.enqueued == []
+
+
+def test_export_download_token_is_one_time() -> None:
+    token_row = {
+        "token_hash": "not-read-by-fake-engine",
+        "owner_user_id": "user-1",
+        "filename": "job-source.csv",
+        "content_type": "text/csv; charset=utf-8",
+        "expires_at": datetime.now(UTC) + timedelta(minutes=5),
+        "consumed_at": None,
+        "job_id": "job-export",
+        "status": "success",
+        "result_ref": {
+            "backend": "local_fs",
+            "uri": "exports/job-export/job-source.csv",
+            "metadata": {},
+        },
+    }
+    engine = _FakeEngine([token_row, token_row | {"consumed_at": _dt(1)}])
+    result_store = _ResultStore(downloads={"exports/job-export/job-source.csv": b"value\n1\n"})
+    app = create_app(services=cast(ApiServices, _Services(engine, result_store=result_store)))
+
+    first = AsgiClient(app).get("/api/exports/download-token", headers=_auth_headers())
+    second = AsgiClient(app).get("/api/exports/download-token", headers=_auth_headers())
+
+    assert first.status_code == 200
+    assert first.body == b"value\n1\n"
+    assert first.headers["content-disposition"] == 'attachment; filename="job-source.csv"'
+    assert second.status_code == 410
+    assert second.json()["error"] == "download_token_consumed"
+
+
 def _auth_headers(user_id: str = "user-1") -> dict[str, str]:
     token = create_access_token(user_id=user_id, role="admin", secret=_Services.jwt_secret)
     return {"Authorization": f"Bearer {token}"}
@@ -688,6 +797,23 @@ def _datasource_row(
     }
 
 
+def _source_job_row() -> dict[str, object]:
+    return {
+        "id": "job-source",
+        "kind": "sql_query",
+        "status": "success",
+        "owner_user_id": "user-1",
+        "project_id": "project-1",
+        "datasource_ids": ["ds-1"],
+        "created_at": _dt(1),
+        "started_at": _dt(2),
+        "finished_at": _dt(3),
+        "error": None,
+        "error_code": None,
+        "payload": {"result_set_id": "rs-source"},
+    }
+
+
 class _NoopServices:
     pass
 
@@ -702,6 +828,8 @@ class _Services:
         job_backend: _JobBackend | None = None,
         result_store: _ResultStore | None = None,
         metadata_probe_timeout_seconds: int = 5,
+        export_per_user_per_hour: int = 10,
+        download_url_ttl_seconds: int = 300,
     ) -> None:
         self.engine = engine
         self.rate_limiter = _RateLimiter()
@@ -709,6 +837,8 @@ class _Services:
         self.job_backend = job_backend or _JobBackend()
         self.result_store = result_store or _ResultStore()
         self.metadata_probe_timeout_seconds = metadata_probe_timeout_seconds
+        self.export_per_user_per_hour = export_per_user_per_hour
+        self.download_url_ttl_seconds = download_url_ttl_seconds
         self.audits: list[dict[str, object]] = []
 
     def current_license_mode(self) -> LicenseMode:
@@ -767,6 +897,7 @@ class _FakeConnection:
 class _FakeResult:
     def __init__(self, result: object) -> None:
         self._result = result
+        self.rowcount = 1
 
     def mappings(self) -> _FakeResult:
         return self
@@ -783,6 +914,11 @@ class _FakeResult:
             return dict(self._result)
         raise AssertionError(f"expected single row result, got {type(self._result).__name__}")
 
+    def scalar_one(self) -> object:
+        if isinstance(self._result, int):
+            return self._result
+        raise AssertionError(f"expected scalar result, got {type(self._result).__name__}")
+
 
 class _JobBackend:
     def __init__(self) -> None:
@@ -793,8 +929,33 @@ class _JobBackend:
 
 
 class _ResultStore:
+    def __init__(
+        self,
+        downloads: dict[str, bytes] | None = None,
+        spool_exists: bool = True,
+    ) -> None:
+        self._downloads = downloads or {}
+        self._spool_exists = spool_exists
+
     def spool_ref(self, result_set_id: str) -> ResultRef:
         return ResultRef(backend="local_fs", uri=f"spool/{result_set_id}")
+
+    def spool_exists(self, result_set_id: str) -> bool:
+        del result_set_id
+        return self._spool_exists
+
+    def get_spool_manifest(self, result_set_id: str) -> dict[str, object]:
+        del result_set_id
+        return {
+            "columns": [{"name": "value", "type": "string"}],
+            "loaded_rows": 1,
+            "truncated": False,
+        }
+
+    def open_download(self, ref: ResultRef) -> io.BytesIO:
+        if ref.uri not in self._downloads:
+            raise FileNotFoundError(ref.uri)
+        return io.BytesIO(self._downloads[ref.uri])
 
 
 class _MetadataAdapter:
