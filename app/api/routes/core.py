@@ -1511,11 +1511,11 @@ def _expand_star_sql(
             continue
         if isinstance(item, exp.Column) and isinstance(item.this, exp.Star):
             table_name = item.table
-            table_ref = _table_ref_by_qualifier(table_refs, table_name)
-            if table_ref is None:
+            matched_table_ref = _table_ref_by_qualifier(table_refs, table_name)
+            if matched_table_ref is None:
                 raise ApiError(400, "unknown_table", "SELECT star qualifier does not match a table")
             changed = True
-            expanded_selects.extend(_column_expressions_for_ref(services, table_ref, table_name))
+            expanded_selects.extend(_column_expressions_for_ref(services, matched_table_ref, table_name))
             continue
         expanded_selects.append(item)
     if not changed:

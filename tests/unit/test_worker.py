@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from typing import Protocol
 
+from app.dbclients.factory import UnsupportedDbTypeError
 from app.dbclients.protocol import AdapterConnectionError
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
@@ -11,7 +12,7 @@ from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import SecretKind, SecretRef
-from app.worker import UnsupportedDbTypeError, WorkerRunner, WorkerRunnerConfig
+from app.worker import WorkerRunner, WorkerRunnerConfig
 
 
 def test_worker_runs_sql_query_to_spool_and_completes() -> None:
