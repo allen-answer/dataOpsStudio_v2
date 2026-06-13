@@ -452,7 +452,7 @@ export_download_tokens = Table(
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
     CheckConstraint(
         "format IN ('csv', 'excel', 'json', 'sql')",
-        name="ck_export_download_tokens_format_is_supported",
+        name="format_is_supported",
     ),
     Index("ix_export_download_tokens_owner_created", "owner_user_id", "created_at"),
     Index("ix_export_download_tokens_expires_at", "expires_at"),

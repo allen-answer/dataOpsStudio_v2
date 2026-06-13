@@ -230,7 +230,7 @@ def test_worker_runs_result_export_from_spool_and_completes() -> None:
                 metadata={
                     "format": "csv",
                     "filename": "result.csv",
-                    "bytes": len("formula,n\n'=SUM(A1:A2),7\n".encode("utf-8")),
+                    "bytes": len(b"formula,n\n'=SUM(A1:A2),7\n"),
                     "source_result_set_id": "rs-source",
                 },
             ),
