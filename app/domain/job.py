@@ -24,6 +24,7 @@ class JobKind(StrEnum):
     TEST_CONNECTION = "test_connection"
     SQL_EXPLAIN = "sql_explain"
     COMPARE_RUN = "compare_run"
+    RESULT_EXPORT = "result_export"
     EXPORT_EXCEL = "export_excel"
     SCENARIO_MATERIALIZE = "scenario_materialize"
     SCENARIO_RUN_ALL = "scenario_run_all"
@@ -49,6 +50,8 @@ class JobErrorCode(StrEnum):
     CANCELLED = "cancelled"
     PERMISSION_DENIED = "permission_denied"
     UNSUPPORTED_DB_TYPE = "unsupported_db_type"
+    EXPORT_FAILED = "export_failed"
+    EXPORT_LIMIT_EXCEEDED = "export_limit_exceeded"
     INTERNAL = "internal"
 
 

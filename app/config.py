@@ -14,10 +14,12 @@
 - DATAOPS_BOOTSTRAP_MASTER_KEY_FILE / DATAOPS_BOOTSTRAP_PG_APP_PASSWORD_FILE / ...
 - DATAOPS_PG_HOST / DATAOPS_PG_PORT / DATAOPS_PG_USER / DATAOPS_PG_DATABASE / ...
 - DATAOPS_API_HOST / DATAOPS_API_PORT / DATAOPS_API_METRICS_PORT / DATAOPS_API_ENABLE_DOCS /
-  DATAOPS_API_METADATA_PROBE_TIMEOUT_SECONDS
+  DATAOPS_API_METADATA_PROBE_TIMEOUT_SECONDS / DATAOPS_API_EXPORT_PER_USER_PER_HOUR /
+  DATAOPS_API_DOWNLOAD_URL_TTL_SECONDS
 - DATAOPS_FRONTEND_DIST(前端 dist 目录;设置即 API 进程伺服 SPA,默认 API-only)
 - DATAOPS_WORKER_WORKER_ID / DATAOPS_WORKER_MAX_CONCURRENT_JOBS / ...
-- DATAOPS_RESULT_BACKEND / DATAOPS_RESULT_LOCAL_ROOT / ...
+- DATAOPS_RESULT_BACKEND / DATAOPS_RESULT_LOCAL_ROOT / DATAOPS_RESULT_SQL_EXPORT_TTL_HOURS /
+  DATAOPS_RESULT_EXPORT_LIMIT_MB / ...
 - DATAOPS_AI_ENABLED / DATAOPS_AI_PROVIDER / DATAOPS_AI_MAX_AUTO_EGRESS_LEVEL / ...
 - DATAOPS_LOG_LEVEL
 """
@@ -102,6 +104,8 @@ class ApiConfig(BaseSettings):
     # env: DATAOPS_FRONTEND_DIST(非 DATAOPS_API_ 前缀,故用 validation_alias)。
     frontend_dist: Path | None = Field(default=None, validation_alias="DATAOPS_FRONTEND_DIST")
     metadata_probe_timeout_seconds: int = Field(default=5, ge=1, le=60)
+    export_per_user_per_hour: int = Field(default=10, ge=1, le=1000)
+    download_url_ttl_seconds: int = Field(default=300, ge=30, le=3600)
 
 
 class WorkerConfig(BaseSettings):
@@ -134,6 +138,8 @@ class ResultStoreConfig(BaseSettings):
     spool_max_bytes: int = 512 * 1024 * 1024  # 512MB
     cursor_max_hold_seconds: int = 300
     result_ttl_days: int = 7
+    sql_export_ttl_hours: int = 24
+    export_limit_mb: int = 1024
     max_active_resultsets_per_console: int = 3
 
 

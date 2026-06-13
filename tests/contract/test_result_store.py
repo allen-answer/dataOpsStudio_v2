@@ -7,6 +7,8 @@ Codex T2 实现 LocalFsResultStore 后:
 
 from __future__ import annotations
 
+import os
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -35,6 +37,14 @@ def test_append_spool_then_fetch_range(result_store: ResultStore) -> None:
     ]
 
 
+def test_spool_exists_reflects_manifest_presence(result_store: ResultStore) -> None:
+    assert result_store.spool_exists("rs-missing") is False
+
+    result_store.append_spool("rs-present", [Row(values=[1])])
+
+    assert result_store.spool_exists("rs-present") is True
+
+
 def test_put_artifact_returns_result_ref(result_store: ResultStore) -> None:
     """一次性写入(导出场景)返回 ResultRef。"""
     ref = result_store.put_artifact("run-1", "out.txt", BytesIO(b"hello"))
@@ -50,6 +60,27 @@ def test_open_download_returns_binary_io(result_store: ResultStore) -> None:
 
     with result_store.open_download(ref) as stream:
         assert stream.read() == b"hello"
+
+
+def test_put_export_artifact_uses_export_ttl_namespace(result_store: ResultStore) -> None:
+    ref = result_store.put_export_artifact("export-1", "out.csv", BytesIO(b"value\n1\n"))
+
+    assert ref.backend == "local_fs"
+    assert ref.uri == "exports/export-1/out.csv"
+    with result_store.open_download(ref) as stream:
+        assert stream.read() == b"value\n1\n"
+
+
+def test_gc_expired_removes_old_export_artifacts(tmp_path: Path) -> None:
+    store = LocalFsResultStore(tmp_path, sql_export_ttl_hours=1)
+    ref = store.put_export_artifact("export-old", "out.csv", BytesIO(b"value\n1\n"))
+    export_dir = tmp_path / "exports" / "export-old"
+    old = time.time() - 2 * 60 * 60
+    os.utime(export_dir, (old, old))
+
+    assert store.gc_expired() == 1
+    with pytest.raises(FileNotFoundError):
+        store.open_download(ref)
 
 
 def test_no_cursor_held_after_append(result_store: ResultStore) -> None:

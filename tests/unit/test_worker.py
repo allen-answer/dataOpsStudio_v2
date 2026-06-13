@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 from app.dbclients.factory import UnsupportedDbTypeError
 from app.dbclients.protocol import AdapterConnectionError
@@ -178,7 +178,7 @@ def test_worker_cancel_safe_point_marks_cancelled() -> None:
 
 
 def test_worker_unsupported_kind_fails_job() -> None:
-    job = _make_job(kind=JobKind.EXPORT_EXCEL)
+    job = _make_job(kind=JobKind.COMPARE_RUN)
     backend = _FakeBackend([job])
     runner = WorkerRunner(
         backend,
@@ -191,6 +191,55 @@ def test_worker_unsupported_kind_fails_job() -> None:
     assert runner.run_once() is True
 
     assert backend.failed == [("job-1", "internal")]
+
+
+def test_worker_runs_result_export_from_spool_and_completes() -> None:
+    job = _make_job(
+        kind=JobKind.RESULT_EXPORT,
+        payload={
+            "source_result_set_id": "rs-source",
+            "format": "csv",
+            "filename": "result.csv",
+            "table_name": "exported_result",
+            "source_db_type": "mysql",
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    result_store.columns_by_result_set["rs-source"] = [
+        Column(name="formula", type=ColumnType.STRING),
+        Column(name="n", type=ColumnType.INTEGER),
+    ]
+    result_store.rows_by_result_set["rs-source"] = [Row(values=["=SUM(A1:A2)", 7])]
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.completed == [
+        (
+            "job-1",
+            ResultRef(
+                backend="local_fs",
+                uri="exports/job-1/result.csv",
+                metadata={
+                    "format": "csv",
+                    "filename": "result.csv",
+                    "bytes": len("formula,n\n'=SUM(A1:A2),7\n".encode("utf-8")),
+                    "source_result_set_id": "rs-source",
+                },
+            ),
+        )
+    ]
+    assert result_store.export_artifacts[("job-1", "result.csv")] == (
+        b"formula,n\n'=SUM(A1:A2),7\n"
+    )
+    assert backend.failed == []
 
 
 def test_worker_unsupported_db_type_fails_with_precise_message() -> None:
@@ -484,11 +533,20 @@ class _FakeResultStore:
     def __init__(self) -> None:
         self.rows_by_result_set: dict[str, list[Row]] = {}
         self.columns_by_result_set: dict[str, list[Column]] = {}
+        self.export_artifacts: dict[tuple[str, str], bytes] = {}
         self.deleted_spools: list[str] = []
         self.gc_calls = 0
 
+    def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]:
+        return list(self.rows_by_result_set.get(result_set_id, [])[offset : offset + limit])
+
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None:
         self.rows_by_result_set.setdefault(result_set_id, []).extend(rows)
+
+    def put_export_artifact(self, export_id: str, name: str, stream: BinaryIO) -> ResultRef:
+        data = stream.read()
+        self.export_artifacts[(export_id, name)] = data
+        return ResultRef(backend="local_fs", uri=f"exports/{export_id}/{name}")
 
     def set_spool_columns(self, result_set_id: str, columns: list[Column]) -> None:
         self.columns_by_result_set[result_set_id] = list(columns)
@@ -526,6 +584,10 @@ class _CountingResultStore:
         self.deleted_spools: list[str] = []
         self.gc_calls = 0
 
+    def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]:
+        del result_set_id, offset, limit
+        return []
+
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None:
         self.row_count_by_result_set[result_set_id] = self.row_count_by_result_set.get(
             result_set_id, 0
@@ -533,6 +595,10 @@ class _CountingResultStore:
 
     def set_spool_columns(self, result_set_id: str, columns: list[Column]) -> None:
         self.columns_by_result_set[result_set_id] = list(columns)
+
+    def put_export_artifact(self, export_id: str, name: str, stream: BinaryIO) -> ResultRef:
+        del stream
+        return ResultRef(backend="local_fs", uri=f"exports/{export_id}/{name}")
 
     def get_spool_manifest(self, result_set_id: str) -> dict[str, object]:
         return {

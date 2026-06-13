@@ -165,6 +165,22 @@ class JobResultResponse(BaseModel):
     truncated: bool | None = None
 
 
+ExportFormat = Literal["csv", "excel", "json", "sql"]
+
+
+class ExportCreateRequest(BaseModel):
+    format: ExportFormat
+    table_name: str = Field(default="exported_result", min_length=1, max_length=128)
+
+
+class ExportCreateResponse(BaseModel):
+    job_id: str
+    download_token: str
+    expires_at: datetime
+    format: ExportFormat
+    filename: str
+
+
 class CancelResponse(BaseModel):
     cancelled: bool
 

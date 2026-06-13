@@ -431,6 +431,35 @@ sql_templates = Table(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# export_download_tokens —— SQL Workspace 导出一次性下载令牌(只存 token hash)
+# ─────────────────────────────────────────────────────────────────────────────
+export_download_tokens = Table(
+    "export_download_tokens",
+    metadata,
+    Column("token_hash", String(64), primary_key=True),
+    Column("job_id", String(36), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False),
+    Column(
+        "owner_user_id",
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("format", String(16), nullable=False),
+    Column("filename", String(255), nullable=False),
+    Column("content_type", String(128), nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("consumed_at", DateTime(timezone=True), nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    CheckConstraint(
+        "format IN ('csv', 'excel', 'json', 'sql')",
+        name="ck_export_download_tokens_format_is_supported",
+    ),
+    Index("ix_export_download_tokens_owner_created", "owner_user_id", "created_at"),
+    Index("ix_export_download_tokens_expires_at", "expires_at"),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # metadata_caches —— SQL Workspace metadata browser cache(2.1 W2)
 # ─────────────────────────────────────────────────────────────────────────────
 metadata_caches = Table(
@@ -555,6 +584,7 @@ __all__ = [
     "ai_configs",
     "audit_logs",
     "datasources",
+    "export_download_tokens",
     "job_events",
     "jobs",
     "license_state",

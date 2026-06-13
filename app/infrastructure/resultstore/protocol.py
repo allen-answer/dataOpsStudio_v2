@@ -20,6 +20,10 @@ class ResultStore(Protocol):
         """一次性写入(如 export_excel 的 xlsx 文件)。"""
         raise NotImplementedError
 
+    def put_export_artifact(self, export_id: str, name: str, stream: BinaryIO) -> ResultRef:
+        """写入 SQL Workspace 导出文件,由 sql_export_ttl_hours 单独清理。"""
+        raise NotImplementedError
+
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None:
         """流式追加 spool(配合 ResultSet 实现 streaming)。"""
         raise NotImplementedError
@@ -29,6 +33,14 @@ class ResultStore(Protocol):
 
     def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]:
         """从 spool 读 [offset, offset+limit);ResultSet.fetch_range 委托到这里。"""
+        raise NotImplementedError
+
+    def spool_exists(self, result_set_id: str) -> bool:
+        """返回 ResultSet spool manifest 是否仍存在。"""
+        raise NotImplementedError
+
+    def get_spool_manifest(self, result_set_id: str) -> dict[str, object]:
+        """读取 ResultSet spool manifest。"""
         raise NotImplementedError
 
     def open_download(self, ref: ResultRef) -> BinaryIO:
@@ -42,5 +54,5 @@ class ResultStore(Protocol):
         raise NotImplementedError
 
     def gc_expired(self) -> int:
-        """按 result_ttl_days / resultset_spool_ttl_days 清理,返回清理数量。"""
+        """按 result_ttl_days / resultset_spool_ttl_days / sql_export_ttl_hours 清理。"""
         raise NotImplementedError
