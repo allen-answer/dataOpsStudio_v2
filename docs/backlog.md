@@ -53,22 +53,33 @@
 > 能支撑的全部范围**。下列 PRD 功能**全部卡在后端缺端点 / 缺字段**,不是前端漏做 ——
 > 前端侧已用 `★ 后补` 注释在对应位置标好,后端补齐即可直接接上(多数无需前端二次改)。
 
+### **DM 列头 driver_type 显示原始 Python 类名** — dm_adapter 美化
+
+**位置**:`app/dbclients/dm_adapter.py`(Column.driver_type 赋值处)
+
+**现状**:DM 查询结果列头的 driver_type 显示为 `<class 'dmPython.STRING'>` 原始 repr
+(2.1.0 W1 真机走查发现,PR #63 评论已记)。归一化 ColumnType(string/datetime)正确,
+仅 driver_type 原样透传了 dmPython 类型对象的 repr。
+
+**修法**:dm_adapter 侧把 dmPython 类型对象映射为干净名(STRING / TIMESTAMP / NUMBER …),
+对齐 MySQL adapter 的 driver_type 风格。
+
+**触发条件**:2.1.x 任意顺手窗口。**优先级**:低(纯显示,不影响功能)。
+
+---
+
 ### **T7 §4 SQL 跑非 MySQL/DM 需要** — worker 仅支持 MySQL / DM
 
 **位置**:`app/worker.py:build_database_adapter`(MySQL / DM 分发,其余 raise UnsupportedDbTypeError)
 
-**现状**:worker 实现 **MySQL + DM adapter**(DM 自 feat/dm-adapter-columntype);
-PostgreSQL / Oracle / DB2 数据源跑 SQL 仍直接 `UnsupportedDbTypeError`。
+**现状(2.1.0 W1 更新)**:worker 实现 **MySQL + DM adapter**;前端 warn 兜底已落地且升级为
+白名单 `{mysql, dm}`(PR #63,DM Certified 后解除其封锁)。PostgreSQL / Oracle / DB2
+数据源跑 SQL 仍直接 `UnsupportedDbTypeError`,前端对这三类显示"暂不支持"提示。
 
-**卡住的前端**:SQL 工作台(§4)对非 MySQL 数据源执行 → 任务必 failed。前端**行为正确**
-(正常提交 → 轮询 → 显示 failed),但用户体验是"建了 PG 数据源却跑不了"。
+**修法**:后端补 PostgreSQL / Oracle / DB2 worker adapter,每补一个方言,前端白名单
+`SUPPORTED_EXECUTION_DB_TYPES`(SqlWorkspaceView.vue)同步加一项。
 
-**修法(二选一)**:
-- 后端:补 PostgreSQL(及其它方言)worker adapter
-- 前端兜底(轻量先行):SQL 工作台选到非 MySQL 数据源时,执行按钮旁提示"当前仅支持 MySQL 执行",
-  避免用户提交后才看到 failed(**此项前端可独立做,不阻塞后端**)
-
-**触发条件**:多方言执行上线前 / 或先做前端 warn 兜底。**优先级**:中(2γ e2e 已实锤此限制)。
+**触发条件**:多方言执行上线(Oracle 2.0.x / DB2 2.1.x)。**优先级**:中。
 
 **GA 决策(2026-06-11,人拍板)**:Oracle adapter **滑出 GA,进 2.0.x 后续版本**
 (契约本就允许"Oracle 可滑 2.0.x");DB2 维持 Preview。

@@ -11,7 +11,7 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| (暂无活动开发项) | — | — | — | — |
+| 2.1.0 W2:元数据浏览器 + SQL 工具(format/expand-star/EXPLAIN)+ 4 格式导出 | Codex(任务书待发) | W1 已合并 | 未开工 | — |
 
 > **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
 > 安全项全闭环/落档)。**DM 已 Certified**:真实例验证 8/8 + 修复 3 个 adapter bug,
@@ -45,6 +45,16 @@
 
 ## 已完成归档
 
+> **2.1.0 Wave 1 — SQL Workspace 地基(2026-06-13 全部合并 + 已上生产)**:
+> W1-PR1 后端(Codex):Console 持久化 / SQL 历史(jobs 推导)/ 模板 CRUD /
+> ResultSet 完整版(边拉边看 + 限额 + LRU + TTL 周期 GC)
+> ([#62](https://github.com/allen-answer/dataOpsStudio_v2/pull/62))。
+> W1-PR2 前端(Codex):多 Console / 历史灌回 / 模板变量插入 / 渐进结果展示
+> ([#63](https://github.com/allen-answer/dataOpsStudio_v2/pull/63);走查发现并修复:
+> DM 执行封锁过期 → 白名单、终态耗时随挂钟上涨 → 服务端真值 + 契约测试锚定,
+> 踩坑案例见 playbook §2)。两 PR 均 Fable 5 真机走查(真生产后端,证据在 PR 评论)。
+> 生产部署 9b7f32e,终验:DM 0.4s 冻结、零 console error。
+>
 > **GA 后生产化 + 设计期(2026-06-12 全部合并)**:
 > migrate_from_v1 全局数据源迁入指定项目([#57](https://github.com/allen-answer/dataOpsStudio_v2/pull/57),Codex);
 > API 进程伺服前端 SPA dist([#58](https://github.com/allen-answer/dataOpsStudio_v2/pull/58),Claude Opus 4.8);
