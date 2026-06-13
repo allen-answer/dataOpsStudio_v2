@@ -169,6 +169,43 @@ class CancelResponse(BaseModel):
     cancelled: bool
 
 
+class MetadataSchemaItem(BaseModel):
+    name: str
+
+
+class MetadataTableItem(BaseModel):
+    schema_name: str
+    name: str
+    table_type: str | None = None
+
+
+class MetadataColumnItem(BaseModel):
+    name: str
+    type: str
+    driver_type: str | None = None
+    nullable: bool
+    primary_key: bool
+    comment: str | None = None
+
+
+class SqlFormatRequest(BaseModel):
+    sql: str = Field(min_length=1)
+    dialect: str = Field(min_length=1)
+
+
+class SqlFormatResponse(BaseModel):
+    formatted_sql: str
+
+
+class SqlExpandStarRequest(BaseModel):
+    sql: str = Field(min_length=1)
+    datasource_id: str
+
+
+class SqlExpandStarResponse(BaseModel):
+    expanded_sql: str
+
+
 class SqlConsoleCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     datasource_id: str | None = None

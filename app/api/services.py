@@ -49,6 +49,7 @@ class ApiServices:
     rate_limiter: RateLimiter = field(default_factory=RateLimiter)
     job_wait_timeout_seconds: float = 10.0
     max_active_resultsets_per_console: int = 3
+    metadata_probe_timeout_seconds: int = 5
 
     def current_license_mode(self) -> LicenseMode:
         with self.engine.connect() as conn:
@@ -173,6 +174,7 @@ def build_api_services(settings: Settings | None = None) -> ApiServices:
         max_active_resultsets_per_console=(
             actual_settings.result_store.max_active_resultsets_per_console
         ),
+        metadata_probe_timeout_seconds=actual_settings.api.metadata_probe_timeout_seconds,
     )
 
 

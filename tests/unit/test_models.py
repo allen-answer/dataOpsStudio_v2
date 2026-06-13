@@ -19,6 +19,7 @@ from app.db.models import (
     jobs,
     license_state,
     metadata,
+    metadata_caches,
     mfa_recovery_codes,
     result_sets,
     revoked_tokens,
@@ -73,7 +74,7 @@ def test_all_alembic_revision_ids_under_32_chars() -> None:
     assert not violations, f"revision ID 超 32 字符: {violations}"
 
 
-def test_metadata_has_15_tables() -> None:
+def test_metadata_has_16_tables() -> None:
     expected = {
         "ai_configs",
         "users",
@@ -89,6 +90,7 @@ def test_metadata_has_15_tables() -> None:
         "result_sets",
         "sql_consoles",
         "sql_templates",
+        "metadata_caches",
         "license_state",
     }
     assert set(metadata.tables.keys()) == expected
@@ -125,6 +127,31 @@ def test_sql_workspace_tables_support_console_and_templates() -> None:
     assert "ix_sql_consoles_owner_updated" in console_indexes
     assert "ix_sql_templates_category_name" in template_indexes
     assert "ix_sql_templates_project_id" in template_indexes
+
+
+def test_metadata_caches_schema_supports_ttl_and_object_keys() -> None:
+    cols = set(metadata_caches.columns.keys())
+    indexes = {idx.name for idx in metadata_caches.indexes}
+    check_names = {c.name for c in metadata_caches.constraints if c.name is not None}
+
+    assert cols == {
+        "id",
+        "datasource_id",
+        "cache_level",
+        "schema_name",
+        "table_name",
+        "payload",
+        "refreshed_at",
+        "expires_at",
+        "created_at",
+        "updated_at",
+    }
+    assert metadata_caches.columns["payload"].nullable is False
+    assert metadata_caches.columns["expires_at"].nullable is False
+    assert "uq_metadata_caches_key" in check_names
+    assert "ck_metadata_caches_cache_level_is_supported" in check_names
+    assert "ix_metadata_caches_datasource_level" in indexes
+    assert "ix_metadata_caches_expires_at" in indexes
 
 
 def test_revoked_tokens_schema_supports_jti_denylist_and_user_cutoff() -> None:
