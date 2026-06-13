@@ -212,6 +212,9 @@ export interface JobResultResponse {
   truncated: boolean | null
 }
 
+/** W2 导出格式 —— 源:app/api/schemas.py ExportFormat = Literal["csv","excel","json","sql"]。 */
+export type ExportFormat = 'csv' | 'excel' | 'json' | 'sql'
+
 // ─── Admin / License(T7 Part B,严格对齐 app/api/schemas.py)─────────────
 
 /** License 5 态 —— 后端 mode 是自由字符串,枚举锚定在前端。 */
