@@ -185,6 +185,29 @@ def test_crosscutting_middleware_allows_in_grace_read_and_backup() -> None:
     assert backup_response.status_code == 200
 
 
+def test_crosscutting_middleware_blocks_business_export_download_in_restricted_modes() -> None:
+    token = create_access_token(user_id="user-1", role="admin", secret=_FakeServices().jwt_secret)
+
+    repair_services = _FakeServices()
+    repair_services.mode = LicenseMode.REPAIR
+    repair_response = AsgiClient(_app_with_services(repair_services)).get(
+        "/api/exports/download-token",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    grace_services = _FakeServices()
+    grace_services.mode = LicenseMode.IN_GRACE
+    grace_response = AsgiClient(_app_with_services(grace_services)).get(
+        "/api/exports/download-token",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert repair_response.status_code == 403
+    assert repair_response.json()["error"] == "license_repair_mode"
+    assert grace_response.status_code == 403
+    assert grace_response.json()["error"] == "license_in_grace"
+
+
 def _app_with_services(services: _FakeServices) -> FastAPI:
     app = FastAPI()
     app.add_middleware(CrossCuttingMiddleware, services=cast(ApiServices, services))
@@ -208,6 +231,10 @@ def _app_with_services(services: _FakeServices) -> FastAPI:
     @app.post("/api/admin/backups")
     def create_backup() -> dict[str, str]:
         return {"status": "accepted"}
+
+    @app.get("/api/exports/{token}")
+    def download_export(token: str) -> dict[str, str]:
+        return {"token": token}
 
     @app.post("/api/sql/templates/{template_id}/render")
     def render_sql_template(template_id: str) -> dict[str, str]:

@@ -4,16 +4,18 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from secrets import token_urlsafe
 from typing import Any
 
 import sqlglot
 import structlog
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import and_, delete, func, insert, or_, select, update
 from sqlalchemy.engine import Connection, RowMapping
 from sqlglot import exp
 from sqlglot.errors import ParseError
+from starlette.background import BackgroundTask
 
 from app.api.dependencies import current_user_from, request_id_from, services_from
 from app.api.errors import ApiError
@@ -28,6 +30,9 @@ from app.api.schemas import (
     DatasourceTestErrorCode,
     DatasourceTestResponse,
     DatasourceUpdateRequest,
+    ExportCreateRequest,
+    ExportCreateResponse,
+    ExportFormat,
     JobListItem,
     JobResponse,
     JobResultResponse,
@@ -59,6 +64,7 @@ from app.api.security import create_access_token
 from app.api.services import ApiServices, new_id
 from app.db.models import (
     datasources,
+    export_download_tokens,
     jobs,
     license_state,
     metadata_caches,
@@ -75,8 +81,10 @@ from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.resource import ResourceProfile
+from app.domain.result import ResultRef
 from app.domain.schema import Column
 from app.domain.secret import HashedRef, SecretKind, SecretRef
+from app.infrastructure.result_export import export_content_type, export_extension
 
 logger = structlog.get_logger(__name__)
 
@@ -91,6 +99,7 @@ _METADATA_CACHE_TTL = timedelta(days=7)
 _METADATA_LEVEL_SCHEMAS = "schemas"
 _METADATA_LEVEL_TABLES = "tables"
 _METADATA_LEVEL_COLUMNS = "columns"
+_EXPORT_FORMATS = frozenset({"csv", "excel", "json", "sql"})
 
 router = APIRouter()
 
@@ -1155,6 +1164,155 @@ def get_job_result(
     )
 
 
+@router.post("/jobs/{job_id}/export", response_model=ExportCreateResponse, status_code=202)
+def create_job_export(
+    job_id: str,
+    body: ExportCreateRequest,
+    request: Request,
+) -> ExportCreateResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    source_row = _job_for_current_user(request, job_id)
+    _require_exportable_source(source_row)
+    source_result_set_id = _result_set_id_from_payload(source_row)
+    if source_result_set_id is None:
+        raise ApiError(404, "not_found", "Source job result not found")
+    manifest = _spool_manifest_or_none(services, source_result_set_id)
+    if manifest is None:
+        raise ApiError(404, "not_found", "Source job result not found")
+    _enforce_export_rate_limit(services, user.id)
+
+    export_job_id = new_id()
+    filename = _export_filename(job_id, body.format)
+    content_type = export_content_type(body.format)
+    download_token = token_urlsafe(32)
+    token_hash = _download_token_hash(download_token)
+    expires_at = datetime.now(UTC) + timedelta(seconds=services.download_url_ttl_seconds)
+    source_db_type = _source_job_db_type(services, source_row)
+    job = Job(
+        id=export_job_id,
+        kind=JobKind.RESULT_EXPORT,
+        status=JobStatus.PENDING,
+        owner_user_id=user.id,
+        project_id=str(source_row["project_id"]),
+        datasource_ids=_datasource_ids_from_row(source_row),
+        priority=0,
+        timeout_seconds=300,
+        resource_profile=ResourceProfile(),
+        audit_id=new_id(),
+        payload={
+            "source_job_id": job_id,
+            "source_result_set_id": source_result_set_id,
+            "format": body.format,
+            "filename": filename,
+            "table_name": body.table_name,
+            "source_db_type": source_db_type,
+        },
+    )
+    services.job_backend.enqueue(job)
+    with services.engine.begin() as conn:
+        conn.execute(
+            insert(export_download_tokens).values(
+                token_hash=token_hash,
+                job_id=export_job_id,
+                owner_user_id=user.id,
+                format=body.format,
+                filename=filename,
+                content_type=content_type,
+                expires_at=expires_at,
+            )
+        )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=str(source_row["project_id"]),
+        action="sql_export",
+        resource_type="job",
+        resource_id=export_job_id,
+        result="accepted",
+        detail={"source_job_id": job_id, "format": body.format},
+    )
+    return ExportCreateResponse(
+        job_id=export_job_id,
+        download_token=download_token,
+        expires_at=expires_at,
+        format=body.format,
+        filename=filename,
+    )
+
+
+@router.get("/exports/{token}")
+def download_export(token: str, request: Request) -> StreamingResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    now = datetime.now(UTC)
+    token_hash = _download_token_hash(token)
+    with services.engine.begin() as conn:
+        row = (
+            conn.execute(
+                select(
+                    export_download_tokens.c.token_hash,
+                    export_download_tokens.c.owner_user_id,
+                    export_download_tokens.c.filename,
+                    export_download_tokens.c.content_type,
+                    export_download_tokens.c.expires_at,
+                    export_download_tokens.c.consumed_at,
+                    jobs.c.id.label("job_id"),
+                    jobs.c.status,
+                    jobs.c.result_ref,
+                )
+                .select_from(
+                    export_download_tokens.join(
+                        jobs,
+                        export_download_tokens.c.job_id == jobs.c.id,
+                    )
+                )
+                .where(export_download_tokens.c.token_hash == token_hash)
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None or str(row["owner_user_id"]) != user.id:
+            raise ApiError(404, "not_found", "Export not found")
+        if row["consumed_at"] is not None:
+            raise ApiError(410, "download_token_consumed", "Download token has been used")
+        expires_at = row["expires_at"]
+        if not isinstance(expires_at, datetime) or _as_utc(expires_at) <= now:
+            raise ApiError(410, "download_token_expired", "Download token has expired")
+        status = JobStatus(str(row["status"]))
+        if status in {JobStatus.PENDING, JobStatus.RUNNING}:
+            raise ApiError(409, "export_not_ready", "Export job is not ready")
+        if status is not JobStatus.SUCCESS:
+            raise ApiError(409, "export_failed", "Export job did not complete successfully")
+        result_ref_payload = row["result_ref"]
+        if not isinstance(result_ref_payload, dict):
+            raise ApiError(404, "not_found", "Export file not found")
+        result_ref = ResultRef.model_validate(result_ref_payload)
+        try:
+            stream = services.result_store.open_download(result_ref)
+        except FileNotFoundError as exc:
+            raise ApiError(404, "not_found", "Export file not found") from exc
+        result = conn.execute(
+            update(export_download_tokens)
+            .where(export_download_tokens.c.token_hash == token_hash)
+            .where(export_download_tokens.c.consumed_at.is_(None))
+            .values(consumed_at=now)
+        )
+        if result.rowcount == 0:
+            stream.close()
+            raise ApiError(410, "download_token_consumed", "Download token has been used")
+
+    filename = str(row["filename"])
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(
+        stream,
+        media_type=str(row["content_type"]),
+        headers=headers,
+        background=BackgroundTask(stream.close),
+    )
+
+
 @router.post("/jobs/{job_id}/cancel", response_model=CancelResponse)
 def cancel_job(job_id: str, request: Request) -> CancelResponse:
     services = services_from(request)
@@ -1876,6 +2034,63 @@ def _job_response(row: RowMapping) -> JobResponse:
     )
 
 
+def _require_exportable_source(row: RowMapping) -> None:
+    if str(row["kind"]) != JobKind.SQL_QUERY.value:
+        raise ApiError(409, "unsupported_export_source", "Only SQL query jobs can be exported")
+    if JobStatus(str(row["status"])) is not JobStatus.SUCCESS:
+        raise ApiError(409, "job_not_successful", "Source job must complete before export")
+
+
+def _enforce_export_rate_limit(services: ApiServices, user_id: str) -> None:
+    since = datetime.now(UTC) - timedelta(hours=1)
+    with services.engine.connect() as conn:
+        count = conn.execute(
+            select(func.count())
+            .select_from(jobs)
+            .where(jobs.c.owner_user_id == user_id)
+            .where(jobs.c.kind == JobKind.RESULT_EXPORT.value)
+            .where(jobs.c.created_at >= since)
+        ).scalar_one()
+    if int(count) >= services.export_per_user_per_hour:
+        raise ApiError(429, "export_rate_limited", "Export rate limit exceeded")
+
+
+def _download_token_hash(token: str) -> str:
+    return sha256(token.encode("utf-8")).hexdigest()
+
+
+def _export_filename(source_job_id: str, export_format: ExportFormat) -> str:
+    if export_format not in _EXPORT_FORMATS:
+        raise ApiError(400, "unsupported_export_format", "Unsupported export format")
+    return f"{source_job_id}.{export_extension(export_format)}"
+
+
+def _datasource_ids_from_row(row: RowMapping) -> list[str]:
+    value = row["datasource_ids"] if "datasource_ids" in row else []
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if item is not None]
+    return []
+
+
+def _source_job_db_type(services: ApiServices, row: RowMapping) -> str:
+    datasource_ids = _datasource_ids_from_row(row)
+    if not datasource_ids:
+        return DbType.MYSQL.value
+    with services.engine.connect() as conn:
+        ds_row = (
+            conn.execute(select(datasources.c.db_type).where(datasources.c.id == datasource_ids[0]))
+            .mappings()
+            .one_or_none()
+        )
+    if ds_row is None:
+        return DbType.MYSQL.value
+    return str(ds_row["db_type"])
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 def _job_list_item(row: RowMapping) -> JobListItem:
     status = JobStatus(str(row["status"]))
     return JobListItem(
@@ -1907,6 +2122,8 @@ def _safe_job_error(*, status: JobStatus, kind: str, row: RowMapping) -> str | N
         return "datasource_connection_failed"
     if kind == JobKind.SQL_QUERY.value:
         return "sql_execution_failed"
+    if kind == JobKind.RESULT_EXPORT.value:
+        return "export_failed"
     return "job_failed"
 
 
@@ -1952,6 +2169,8 @@ def _spool_manifest_or_none(
     result_set_id: str,
 ) -> dict[str, Any] | None:
     try:
+        if not services.result_store.spool_exists(result_set_id):
+            return None
         return services.result_store.get_spool_manifest(result_set_id)
     except Exception:
         logger.info("spool manifest unavailable", result_set_id=result_set_id, exc_info=True)

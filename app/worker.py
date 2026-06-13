@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import signal
+import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, BinaryIO, Protocol, cast
 
 import structlog
 from sqlalchemy import URL, create_engine, insert, select, update
@@ -23,6 +24,11 @@ from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import SecretKind, SecretRef
 from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
+from app.infrastructure.result_export import (
+    ExportFormat,
+    ExportSizeLimitExceeded,
+    write_result_export,
+)
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
 from app.infrastructure.secretstore.local_file import LocalFileSecretStore
 from app.observability.logging import configure_logging
@@ -72,7 +78,11 @@ class BackendLike(Protocol):
 
 
 class ResultStoreLike(Protocol):
+    def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]: ...
+
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None: ...
+
+    def put_export_artifact(self, export_id: str, name: str, stream: BinaryIO) -> ResultRef: ...
 
     def set_spool_columns(self, result_set_id: str, columns: list[Column]) -> None: ...
 
@@ -145,6 +155,7 @@ class WorkerRunnerConfig:
     sql_spool_batch_size: int = 1000
     cancel_check_row_interval: int = 5000
     result_gc_interval_seconds: float = 600.0
+    export_limit_mb: int = 1024
 
 
 @dataclass(frozen=True)
@@ -170,6 +181,8 @@ class WorkerRunner:
             raise ValueError("cancel_check_row_interval must be positive")
         if config.result_gc_interval_seconds <= 0:
             raise ValueError("result_gc_interval_seconds must be positive")
+        if config.export_limit_mb <= 0:
+            raise ValueError("export_limit_mb must be positive")
         self._backend = backend
         self._result_store = result_store
         self._datasource_loader = datasource_loader
@@ -221,6 +234,8 @@ class WorkerRunner:
                 outcome = self._execute_sql_query(job)
             elif job.kind is JobKind.SQL_EXPLAIN:
                 outcome = self._execute_sql_explain(job)
+            elif job.kind is JobKind.RESULT_EXPORT:
+                outcome = self._execute_result_export(job)
             else:
                 raise UnsupportedJobKindError(f"Unsupported job kind: {job.kind.value}")
         except JobCancelled as exc:
@@ -391,6 +406,61 @@ class WorkerRunner:
                 metadata=metadata,
             )
         )
+
+    def _execute_result_export(self, job: Job) -> _ExecutionOutcome:
+        payload = job.payload
+        source_result_set_id = _required_payload_str(payload, "source_result_set_id")
+        export_format = _payload_export_format(payload)
+        filename = _required_payload_str(payload, "filename")
+        table_name = _payload_optional_str(payload, "table_name") or "exported_result"
+        db_type = _payload_optional_str(payload, "source_db_type") or "mysql"
+        manifest = self._result_store.get_spool_manifest(source_result_set_id)
+        columns = _columns_from_manifest(manifest)
+        limit_bytes = self._config.export_limit_mb * 1024 * 1024
+        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as stream:
+            binary_stream = cast(BinaryIO, stream)
+            exported_bytes = write_result_export(
+                stream=binary_stream,
+                export_format=export_format,
+                columns=columns,
+                rows=self._iter_spool_rows(job.id, source_result_set_id),
+                table_name=table_name,
+                db_type=db_type,
+                limit_bytes=limit_bytes,
+            )
+            binary_stream.seek(0)
+            result_ref = self._result_store.put_export_artifact(job.id, filename, binary_stream)
+        self._heartbeat(job.id)
+        result_ref = result_ref.model_copy(
+            update={
+                "metadata": {
+                    "format": export_format,
+                    "filename": filename,
+                    "bytes": exported_bytes,
+                    "source_result_set_id": source_result_set_id,
+                }
+            }
+        )
+        return _ExecutionOutcome(
+            result_ref=result_ref,
+            loaded_rows=_manifest_int(manifest, "loaded_rows"),
+        )
+
+    def _iter_spool_rows(self, job_id: str, result_set_id: str) -> Iterable[Row]:
+        offset = 0
+        last_heartbeat = time.monotonic()
+        while True:
+            self._check_cancel(job_id)
+            batch = self._result_store.fetch_range(
+                result_set_id,
+                offset,
+                self._config.sql_spool_batch_size,
+            )
+            if not batch:
+                return
+            yield from batch
+            offset += len(batch)
+            last_heartbeat = self._heartbeat_if_due(job_id, last_heartbeat, force=True)
 
     def _flush_batch(self, job_id: str, result_set_id: str, batch: list[Row]) -> None:
         # Cancel during append_spool is caught at the next batch or row interval.
@@ -667,6 +737,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
         spool_max_rows=actual_settings.result_store.spool_max_rows,
         spool_max_bytes=actual_settings.result_store.spool_max_bytes,
         result_ttl_days=actual_settings.result_store.result_ttl_days,
+        sql_export_ttl_hours=actual_settings.result_store.sql_export_ttl_hours,
     )
     datasource_loader = PostgresDatasourceLoader(engine)
 
@@ -696,6 +767,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
             poll_interval_seconds=actual_settings.worker.poll_interval_seconds,
             cancel_check_row_interval=actual_settings.worker.cancel_check_row_interval,
             result_gc_interval_seconds=actual_settings.worker.result_gc_interval_seconds,
+            export_limit_mb=actual_settings.result_store.export_limit_mb,
         ),
         PostgresResultSetCatalog(engine),
         PostgresJobErrorCodeWriter(engine),
@@ -765,6 +837,13 @@ def _payload_optional_str(payload: dict[str, object], key: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _payload_export_format(payload: dict[str, object]) -> ExportFormat:
+    value = _required_payload_str(payload, "format")
+    if value not in {"csv", "excel", "json", "sql"}:
+        raise ValueError(f"Unsupported export format: {value}")
+    return cast(ExportFormat, value)
+
+
 def _spool_loaded_rows(result_store: ResultStoreLike, result_set_id: str) -> int:
     return _manifest_int(result_store.get_spool_manifest(result_set_id), "loaded_rows")
 
@@ -800,6 +879,13 @@ def _manifest_int(manifest: dict[str, Any], key: str) -> int:
 def _manifest_bool(manifest: dict[str, Any], key: str) -> bool:
     value = manifest.get(key, False)
     return value if isinstance(value, bool) else False
+
+
+def _columns_from_manifest(manifest: dict[str, Any]) -> list[Column]:
+    raw_columns = manifest.get("columns")
+    if not isinstance(raw_columns, list):
+        return []
+    return [Column.model_validate(column) for column in raw_columns if isinstance(column, dict)]
 
 
 def _plan_result_rows(plan: PlanNode) -> tuple[list[Column], list[Row]]:
@@ -849,6 +935,8 @@ def _public_error_message(exc: Exception, kind: JobKind) -> str:
         return "permission_denied"
     if isinstance(exc, UnsupportedDbTypeError):
         return "unsupported_db_type"
+    if isinstance(exc, ExportSizeLimitExceeded):
+        return "export_limit_exceeded"
     if isinstance(exc, UnsupportedJobKindError):
         return "internal"
     if _is_timeout_error(exc):
@@ -863,6 +951,8 @@ def _job_error_code(exc: Exception, kind: JobKind) -> JobErrorCode:
         return JobErrorCode.PERMISSION_DENIED
     if isinstance(exc, UnsupportedDbTypeError):
         return JobErrorCode.UNSUPPORTED_DB_TYPE
+    if isinstance(exc, ExportSizeLimitExceeded):
+        return JobErrorCode.EXPORT_LIMIT_EXCEEDED
     if _is_timeout_error(exc):
         return JobErrorCode.TIMEOUT
     if _is_cancel_error(exc):
@@ -873,6 +963,8 @@ def _job_error_code(exc: Exception, kind: JobKind) -> JobErrorCode:
         return JobErrorCode.CONNECTION_FAILED
     if kind in {JobKind.SQL_QUERY, JobKind.SQL_EXPLAIN}:
         return JobErrorCode.SQL_FAILED
+    if kind is JobKind.RESULT_EXPORT:
+        return JobErrorCode.EXPORT_FAILED
     return JobErrorCode.INTERNAL
 
 

@@ -347,6 +347,10 @@ class _ResultStore:
     def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]:
         return [Row(values=[2])]
 
+    def spool_exists(self, result_set_id: str) -> bool:
+        del result_set_id
+        return True
+
     def get_spool_manifest(self, result_set_id: str) -> dict[str, object]:
         return {
             "columns": [Column(name="r", type=ColumnType.UNKNOWN).model_dump()],

@@ -60,18 +60,23 @@ class LocalFsResultStore(ResultStore):
         spool_max_rows: int = 1_000_000,
         spool_max_bytes: int = 512 * 1024 * 1024,
         result_ttl_days: int = 7,
+        sql_export_ttl_hours: int = 24,
     ) -> None:
         if spool_max_rows <= 0:
             raise ValueError("spool_max_rows must be positive")
         if spool_max_bytes <= 0:
             raise ValueError("spool_max_bytes must be positive")
+        if sql_export_ttl_hours <= 0:
+            raise ValueError("sql_export_ttl_hours must be positive")
         self._root = Path(root)
         self._spool_max_rows = spool_max_rows
         self._spool_max_bytes = spool_max_bytes
         self._result_ttl_days = result_ttl_days
+        self._sql_export_ttl_hours = sql_export_ttl_hours
         self._root.mkdir(parents=True, exist_ok=True)
         self._resultsets_dir.mkdir(parents=True, exist_ok=True)
         self._runs_dir.mkdir(parents=True, exist_ok=True)
+        self._exports_dir.mkdir(parents=True, exist_ok=True)
 
     def put_artifact(self, run_id: str, name: str, stream: BinaryIO) -> ResultRef:
         safe_name = _safe_artifact_name(name)
@@ -86,6 +91,15 @@ class LocalFsResultStore(ResultStore):
         manifest.artifacts.append(ref)
         self._write_run_manifest(manifest)
         return ref
+
+    def put_export_artifact(self, export_id: str, name: str, stream: BinaryIO) -> ResultRef:
+        safe_name = _safe_artifact_name(name)
+        export_dir = self._export_dir(export_id)
+        export_dir.mkdir(parents=True, exist_ok=True)
+        target = export_dir / safe_name
+        with target.open("wb") as out:
+            shutil.copyfileobj(stream, out)
+        return self._ref_for_path(target)
 
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None:
         if not rows:
@@ -201,25 +215,20 @@ class LocalFsResultStore(ResultStore):
         return True
 
     def gc_expired(self) -> int:
-        if self._result_ttl_days < 0:
-            return 0
-        cutoff = time.time() - (self._result_ttl_days * 24 * 60 * 60)
         removed = 0
-        for base in (self._runs_dir, self._resultsets_dir):
-            if not base.exists():
-                continue
-            for child in base.iterdir():
-                if child.stat().st_mtime >= cutoff:
-                    continue
-                if child.is_dir():
-                    shutil.rmtree(child)
-                else:
-                    child.unlink()
-                removed += 1
+        if self._result_ttl_days >= 0:
+            cutoff = time.time() - (self._result_ttl_days * 24 * 60 * 60)
+            removed += self._gc_children_older_than(self._runs_dir, cutoff)
+            removed += self._gc_children_older_than(self._resultsets_dir, cutoff)
+        export_cutoff = time.time() - (self._sql_export_ttl_hours * 60 * 60)
+        removed += self._gc_children_older_than(self._exports_dir, export_cutoff)
         return removed
 
     def spool_ref(self, result_set_id: str) -> ResultRef:
         return self._ref_for_path(self._spool_manifest_path(result_set_id))
+
+    def spool_exists(self, result_set_id: str) -> bool:
+        return (self._resultsets_dir / _safe_segment(result_set_id) / "manifest.json").exists()
 
     def get_spool_manifest(self, result_set_id: str) -> dict[str, Any]:
         return _spool_manifest_to_dict(self._read_spool_manifest(result_set_id))
@@ -232,11 +241,18 @@ class LocalFsResultStore(ResultStore):
     def _resultsets_dir(self) -> Path:
         return self._root / "resultsets"
 
+    @property
+    def _exports_dir(self) -> Path:
+        return self._root / "exports"
+
     def _run_dir(self, run_id: str) -> Path:
         return self._runs_dir / _safe_segment(run_id)
 
     def _run_artifacts_dir(self, run_id: str) -> Path:
         return self._run_dir(run_id) / "artifacts"
+
+    def _export_dir(self, export_id: str) -> Path:
+        return self._exports_dir / _safe_segment(export_id)
 
     def _run_manifest_path(self, run_id: str) -> Path:
         return self._run_dir(run_id) / "manifest.json"
@@ -278,6 +294,20 @@ class LocalFsResultStore(ResultStore):
             json.dumps(_spool_manifest_to_dict(manifest), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+    def _gc_children_older_than(self, base: Path, cutoff: float) -> int:
+        if not base.exists():
+            return 0
+        removed = 0
+        for child in base.iterdir():
+            if child.stat().st_mtime >= cutoff:
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+            removed += 1
+        return removed
 
     def _fit_rows_to_remaining_bytes(
         self,

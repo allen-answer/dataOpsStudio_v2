@@ -35,6 +35,10 @@ def test_load_settings_defaults() -> None:
     assert s.worker.poll_interval_seconds == 0.1
     assert s.worker.cancel_check_row_interval == 5000
     assert s.worker.result_gc_interval_seconds == 600.0
+    assert s.api.export_per_user_per_hour == 10
+    assert s.api.download_url_ttl_seconds == 300
+    assert s.result_store.sql_export_ttl_hours == 24
+    assert s.result_store.export_limit_mb == 1024
     # AI 默认关(R5 + 形态默认)
     assert s.ai.enabled is False
     assert s.ai.max_auto_egress_level == 0

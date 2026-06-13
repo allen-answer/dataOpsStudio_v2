@@ -22,6 +22,7 @@ _LICENSE_UPDATE_PATHS = frozenset({"/api/admin/license", "/api/admin/license/upl
 _DIAGNOSTIC_EXPORT_PATHS = frozenset({"/api/admin/diagnostics", "/api/admin/diagnostics/export"})
 _BACKUP_PATHS = frozenset({"/api/admin/backups", "/api/admin/backups/export"})
 _RESTORE_PATHS = frozenset({"/api/admin/backups/restore"})
+_BUSINESS_EXPORT_PREFIX = "/api/exports/"
 _AUDIT_RESOURCE_ID_MAX_LENGTH = 64
 _AUDIT_RESOURCE_ID_HASH_LENGTH = 12
 
@@ -181,6 +182,8 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
 def _is_repair_restricted(request: Request) -> bool:
     method = request.method.upper()
     path = request.url.path
+    if _is_business_export_download(method, path):
+        return True
     if method in _SAFE_METHODS:
         return False
     if _is_license_update(method, path):
@@ -197,6 +200,8 @@ def _is_repair_restricted(request: Request) -> bool:
 def _is_in_grace_restricted(request: Request) -> bool:
     method = request.method.upper()
     path = request.url.path
+    if _is_business_export_download(method, path):
+        return True
     if method in _SAFE_METHODS:
         return False
     if _is_license_update(method, path):
@@ -220,6 +225,10 @@ def _is_restore_operation(method: str, path: str) -> bool:
 
 def _is_diagnostic_export(method: str, path: str) -> bool:
     return method == "POST" and path in _DIAGNOSTIC_EXPORT_PATHS
+
+
+def _is_business_export_download(method: str, path: str) -> bool:
+    return method == "GET" and path.startswith(_BUSINESS_EXPORT_PREFIX)
 
 
 def _request_user(request: Request) -> CurrentUser | None:

@@ -16,6 +16,7 @@ from app.db.models import (
     ai_configs,
     audit_logs,
     datasources,
+    export_download_tokens,
     jobs,
     license_state,
     metadata,
@@ -74,9 +75,10 @@ def test_all_alembic_revision_ids_under_32_chars() -> None:
     assert not violations, f"revision ID 超 32 字符: {violations}"
 
 
-def test_metadata_has_16_tables() -> None:
+def test_metadata_has_17_tables() -> None:
     expected = {
         "ai_configs",
+        "export_download_tokens",
         "users",
         "mfa_recovery_codes",
         "revoked_tokens",
@@ -94,6 +96,31 @@ def test_metadata_has_16_tables() -> None:
         "license_state",
     }
     assert set(metadata.tables.keys()) == expected
+
+
+def test_export_download_tokens_schema_is_one_time_and_ttl_indexed() -> None:
+    cols = set(export_download_tokens.columns.keys())
+    indexes = {idx.name for idx in export_download_tokens.indexes}
+    check_names = {c.name for c in export_download_tokens.constraints if c.name is not None}
+
+    assert cols == {
+        "token_hash",
+        "job_id",
+        "owner_user_id",
+        "format",
+        "filename",
+        "content_type",
+        "expires_at",
+        "consumed_at",
+        "created_at",
+    }
+    assert export_download_tokens.columns["token_hash"].primary_key is True
+    assert export_download_tokens.columns["expires_at"].nullable is False
+    assert export_download_tokens.columns["consumed_at"].nullable is True
+    assert "token" not in cols
+    assert "ck_export_download_tokens_format_is_supported" in check_names
+    assert "ix_export_download_tokens_owner_created" in indexes
+    assert "ix_export_download_tokens_expires_at" in indexes
 
 
 def test_sql_workspace_tables_support_console_and_templates() -> None:
