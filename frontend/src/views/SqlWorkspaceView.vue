@@ -15,18 +15,29 @@ import { useQuery } from '@tanstack/vue-query'
 import { storeToRefs } from 'pinia'
 import {
   AlertTriangle,
+  AlignLeft,
+  Asterisk,
   BookOpen,
+  ChevronDown,
+  ChevronRight,
   Database,
+  Download,
   FileText,
+  Gauge,
   History,
+  Key,
+  ListTree,
+  Network,
   Pencil,
   Pin,
   PinOff,
   Play,
   Plus,
+  RefreshCw,
   Save,
   Search,
   Square,
+  Table2,
   Trash2,
   X,
 } from 'lucide-vue-next'
@@ -61,7 +72,20 @@ import {
   type JobResponse,
   type JobResultResponse,
 } from '../api/jobs'
-import { ApiError, type DatasourceListItem, type JobStatus } from '../api/types'
+import {
+  createExport,
+  downloadExport,
+  expandSqlStar,
+  formatSql,
+  listMetadataColumns,
+  listMetadataSchemas,
+  listMetadataTables,
+  type MetadataColumnItem,
+  type MetadataSchemaItem,
+  type MetadataTableItem,
+} from '../api/metadata'
+import { explainSql } from '../api/sql'
+import { ApiError, type DatasourceListItem, type ExportFormat, type JobStatus } from '../api/types'
 import { useThemeStore } from '../stores/theme'
 import { useAuthStore } from '../stores/auth'
 import JobStatusBadge from '../components/JobStatusBadge.vue'
@@ -86,9 +110,13 @@ const PAGE_SIZE = 1000
 const POLL_MS = 500
 const SAVE_DEBOUNCE_MS = 650
 const SUPPORTED_EXECUTION_DB_TYPES = new Set(['mysql', 'dm'])
+// EXPLAIN / expand-star 依赖 sqlglot 方言 + 元数据缓存,与执行同口径(mysql / dm)。
+const SUPPORTED_TOOL_DB_TYPES = new Set(['mysql', 'dm'])
+const EXPORT_FORMATS: ExportFormat[] = ['csv', 'excel', 'json', 'sql']
 
 type SidebarTab = 'consoles' | 'history' | 'templates' | 'metadata'
 type HistoryRange = 'all' | 'today' | '7d'
+type ResultTab = 'result' | 'plan' | 'stats'
 
 interface ConsoleRuntime {
   jobId: string | null
@@ -102,6 +130,29 @@ interface ConsoleRuntime {
   pageOffset: number
   startedAt: number | null
   finishedAt: number | null
+  // EXPLAIN 计划态(独立于普通查询,落 Plan tab)
+  planJobId: string | null
+  planStatus: JobStatus | null
+  planResult: JobResultResponse | null
+  planError: string | null
+  resultTab: ResultTab
+}
+
+// 元数据树节点态:数据源 -> schema -> 表 -> 列
+interface MetadataTableNode {
+  table: MetadataTableItem
+  expanded: boolean
+  loading: boolean
+  error: string | null
+  columns: MetadataColumnItem[]
+}
+
+interface MetadataSchemaNode {
+  schema: MetadataSchemaItem
+  expanded: boolean
+  loading: boolean
+  error: string | null
+  tables: MetadataTableNode[]
 }
 
 interface TemplateForm {
@@ -179,6 +230,23 @@ const renameConsoleDraft = ref('')
 const execError = ref<string | null>(null)
 const resultPanel = ref<HTMLElement | null>(null)
 
+// ── 元数据浏览器(左侧第四 tab)─────────────────────────────────────
+const metadataDsId = ref('')
+const metadataSchemas = ref<MetadataSchemaNode[]>([])
+const metadataLoading = ref(false)
+const metadataError = ref<string | null>(null)
+
+// ── 编辑器工具栏(format / expand-star / explain)─────────────────
+const toolError = ref<string | null>(null)
+const toolBusy = ref<'' | 'format' | 'expand' | 'explain'>('')
+
+// ── 导出(4 格式 → 一次性 token → 下载)────────────────────────────
+const exportMenuOpen = ref(false)
+const exportBusy = ref(false)
+const exportError = ref<string | null>(null)
+const exportReady = ref<{ token: string; filename: string } | null>(null)
+const exportPollTimers = new Set<ReturnType<typeof setTimeout>>()
+
 const activeConsole = computed<SqlConsole | null>(
   () => consoles.value.find((item) => item.id === activeConsoleId.value) ?? null,
 )
@@ -191,6 +259,26 @@ const selectedDs = computed<DatasourceListItem | undefined>(() =>
 const unsupportedDb = computed<string | null>(() => {
   const ds = selectedDs.value
   return ds && !SUPPORTED_EXECUTION_DB_TYPES.has(ds.db_type) ? ds.db_type : null
+})
+// 工具能力门:db_type 在白名单内 + (EXPLAIN 还需 operation_policy.allow_explain)。
+const toolsSupported = computed<boolean>(() => {
+  const ds = selectedDs.value
+  return Boolean(ds && SUPPORTED_TOOL_DB_TYPES.has(ds.db_type))
+})
+const explainSupported = computed<boolean>(
+  () => toolsSupported.value && Boolean(selectedDs.value?.operation_policy.allow_explain),
+)
+const metadataDs = computed<DatasourceListItem | undefined>(() =>
+  datasources.value.find((d) => d.id === metadataDsId.value),
+)
+const metadataToolsSupported = computed<boolean>(() => {
+  const ds = metadataDs.value
+  return Boolean(ds && SUPPORTED_TOOL_DB_TYPES.has(ds.db_type))
+})
+const exportableJobId = computed<string | null>(() => {
+  const rt = activeRuntime.value
+  // 仅成功的普通查询 job 可导出(后端 _require_exportable_source 仅 SQL_QUERY 且 success)。
+  return rt && rt.status === 'success' && rt.jobId ? rt.jobId : null
 })
 const editorTheme = computed(() => {
   const v = variant.value
@@ -243,6 +331,38 @@ const shouldShowResultTable = computed(() => {
   if (rt.status && TERMINAL.has(rt.status)) return true
   return rt.result.rows.length > 0 || rt.result.columns.length > 0
 })
+const planActive = computed<boolean>(() => {
+  const s = activeRuntime.value?.planStatus
+  return s ? ACTIVE.has(s) : false
+})
+// Stats tab:从已加载的 ResultSet manifest 字段汇总(行数 / 截断 / 耗时 / 列数)。
+interface StatRow {
+  label: string
+  value: string
+}
+const statRows = computed<StatRow[]>(() => {
+  const rt = activeRuntime.value
+  if (!rt) return []
+  const res = rt.result
+  const rows: StatRow[] = []
+  rows.push({ label: t('sql.stats_status'), value: rt.status ?? '-' })
+  rows.push({ label: t('sql.stats_elapsed'), value: `${elapsedSeconds(rt)}s` })
+  rows.push({
+    label: t('sql.stats_loaded_rows'),
+    value: res?.loaded_rows != null ? String(res.loaded_rows) : '-',
+  })
+  rows.push({
+    label: t('sql.stats_total_rows'),
+    value: res?.total_rows != null ? String(res.total_rows) : '-',
+  })
+  rows.push({ label: t('sql.stats_columns'), value: res ? String(res.columns.length) : '-' })
+  rows.push({
+    label: t('sql.stats_truncated'),
+    value: res?.truncated ? t('sql.stats_yes') : t('sql.stats_no'),
+  })
+  if (rt.jobId) rows.push({ label: t('sql.stats_job_id'), value: rt.jobId })
+  return rows
+})
 
 watch(datasources, (list) => {
   if (!selectedDsId.value && list.length > 0) selectedDsId.value = list[0].id
@@ -274,12 +394,21 @@ watch(selectedDsId, (value) => {
 watch(sidebarTab, (tab) => {
   if (tab === 'history') void loadHistory()
   if (tab === 'templates') void loadTemplates()
+  if (tab === 'metadata') {
+    if (!metadataDsId.value) metadataDsId.value = selectedDsId.value || datasources.value[0]?.id || ''
+    if (metadataDsId.value && metadataSchemas.value.length === 0) void loadMetadataSchemas(false)
+  }
 })
 watch([historyDatasourceId, historyRange], () => {
   if (sidebarTab.value === 'history') void loadHistory()
 })
 watch(templateSearch, () => {
   if (sidebarTab.value === 'templates') void loadTemplates()
+})
+watch(metadataDsId, () => {
+  metadataSchemas.value = []
+  metadataError.value = null
+  if (sidebarTab.value === 'metadata' && metadataDsId.value) void loadMetadataSchemas(false)
 })
 
 onMounted(async () => {
@@ -292,6 +421,7 @@ onMounted(async () => {
 onUnmounted(() => {
   for (const timer of pollTimers.values()) clearTimeout(timer)
   for (const timer of saveTimers.values()) clearTimeout(timer)
+  for (const timer of exportPollTimers) clearTimeout(timer)
   if (nowTimer !== null) clearInterval(nowTimer)
 })
 
@@ -309,6 +439,11 @@ function runtimeFor(consoleId: string): ConsoleRuntime {
       pageOffset: 0,
       startedAt: null,
       finishedAt: null,
+      planJobId: null,
+      planStatus: null,
+      planResult: null,
+      planError: null,
+      resultTab: 'result',
     }
   }
   return runtimes[consoleId]
@@ -723,6 +858,251 @@ function applySqlToActiveConsole(sqlText: string, datasourceId: string | null): 
   })
 }
 
+// ── 元数据浏览器 ────────────────────────────────────────────────
+async function loadMetadataSchemas(refresh: boolean): Promise<void> {
+  if (!metadataDsId.value) return
+  metadataLoading.value = true
+  metadataError.value = null
+  try {
+    const items = await listMetadataSchemas(metadataDsId.value, refresh)
+    metadataSchemas.value = items.map((schema) => ({
+      schema,
+      expanded: false,
+      loading: false,
+      error: null,
+      tables: [],
+    }))
+  } catch (e) {
+    metadataError.value = errorMessage(e)
+  } finally {
+    metadataLoading.value = false
+  }
+}
+
+async function toggleSchema(node: MetadataSchemaNode, refresh = false): Promise<void> {
+  if (node.expanded && !refresh) {
+    node.expanded = false
+    return
+  }
+  node.expanded = true
+  if (node.tables.length > 0 && !refresh) return
+  node.loading = true
+  node.error = null
+  try {
+    const items = await listMetadataTables(metadataDsId.value, node.schema.name, refresh)
+    node.tables = items.map((table) => ({
+      table,
+      expanded: false,
+      loading: false,
+      error: null,
+      columns: [],
+    }))
+  } catch (e) {
+    node.error = errorMessage(e)
+  } finally {
+    node.loading = false
+  }
+}
+
+async function toggleTable(
+  schemaName: string,
+  node: MetadataTableNode,
+  refresh = false,
+): Promise<void> {
+  if (node.expanded && !refresh) {
+    node.expanded = false
+    return
+  }
+  node.expanded = true
+  if (node.columns.length > 0 && !refresh) return
+  node.loading = true
+  node.error = null
+  try {
+    node.columns = await listMetadataColumns(
+      metadataDsId.value,
+      schemaName,
+      node.table.name,
+      refresh,
+    )
+  } catch (e) {
+    node.error = errorMessage(e)
+  } finally {
+    node.loading = false
+  }
+}
+
+// 点表名:把 SELECT * FROM <schema>.<table> LIMIT 100 写进当前 console,并切到该数据源。
+function selectTableIntoConsole(schemaName: string, node: MetadataTableNode): void {
+  const qualified = schemaName ? `${schemaName}.${node.table.name}` : node.table.name
+  applySqlToActiveConsole(`SELECT * FROM ${qualified} LIMIT 100`, metadataDsId.value || null)
+  sidebarTab.value = 'consoles'
+}
+
+// ── 编辑器工具栏 ────────────────────────────────────────────────
+async function onFormatSql(): Promise<void> {
+  if (!editorSql.value.trim() || !selectedDs.value) return
+  toolError.value = null
+  toolBusy.value = 'format'
+  try {
+    const res = await formatSql(editorSql.value, selectedDs.value.db_type)
+    editorSql.value = res.formatted_sql
+  } catch (e) {
+    toolError.value = errorMessage(e)
+  } finally {
+    toolBusy.value = ''
+  }
+}
+
+async function onExpandStar(): Promise<void> {
+  if (!editorSql.value.trim() || !selectedDsId.value) return
+  toolError.value = null
+  toolBusy.value = 'expand'
+  try {
+    const res = await expandSqlStar(editorSql.value, selectedDsId.value)
+    editorSql.value = res.expanded_sql
+  } catch (e) {
+    // 缓存缺失(409 metadata_cache_missing)→ 提示先刷新元数据。
+    if (e instanceof ApiError && e.code === 'metadata_cache_missing') {
+      toolError.value = t('sql.expand_needs_metadata')
+    } else {
+      toolError.value = errorMessage(e)
+    }
+  } finally {
+    toolBusy.value = ''
+  }
+}
+
+async function onExplain(): Promise<void> {
+  const consoleRow = activeConsole.value
+  if (!consoleRow || !selectedDsId.value || !editorSql.value.trim()) return
+  if (!explainSupported.value) return
+  toolError.value = null
+  toolBusy.value = 'explain'
+  const runtime = runtimeFor(consoleRow.id)
+  runtime.planError = null
+  runtime.planResult = null
+  runtime.planStatus = 'pending'
+  runtime.resultTab = 'plan'
+  await flushConsolePatch(consoleRow.id)
+  try {
+    const response = await explainSql({
+      datasource_id: selectedDsId.value,
+      console_id: consoleRow.id,
+      sql: editorSql.value,
+    })
+    runtime.planJobId = response.job_id
+    startPlanPoll(consoleRow.id)
+    scrollResultIntoView()
+  } catch (e) {
+    runtime.planStatus = null
+    runtime.planError = errorMessage(e)
+  } finally {
+    toolBusy.value = ''
+  }
+}
+
+function startPlanPoll(consoleId: string): void {
+  void pollPlan(consoleId)
+}
+
+async function pollPlan(consoleId: string): Promise<void> {
+  const runtime = runtimeFor(consoleId)
+  if (!runtime.planJobId) return
+  try {
+    const job = await getJob(runtime.planJobId)
+    runtime.planStatus = job.status
+    if (job.status === 'success') {
+      runtime.planResult = await getJobResult(runtime.planJobId, 0, PAGE_SIZE)
+    }
+    if (TERMINAL.has(job.status)) {
+      if (job.status !== 'success') {
+        runtime.planError = job.error || t('jobs.error.sql_failed')
+      }
+      return
+    }
+  } catch (e) {
+    runtime.planError = errorMessage(e)
+    return
+  }
+  const timer = setTimeout(() => {
+    void pollPlan(consoleId)
+  }, POLL_MS)
+  pollTimers.set(`plan:${consoleId}`, timer)
+}
+
+// ── 导出 ────────────────────────────────────────────────────────
+function resetExportState(): void {
+  exportError.value = null
+  exportReady.value = null
+}
+
+async function onCreateExport(format: ExportFormat): Promise<void> {
+  const jobId = exportableJobId.value
+  exportMenuOpen.value = false
+  if (!jobId || exportBusy.value) return
+  resetExportState()
+  exportBusy.value = true
+  try {
+    const res = await createExport(jobId, format)
+    await pollExportJob(res.job_id, res.download_token, res.filename)
+  } catch (e) {
+    exportBusy.value = false
+    if (e instanceof ApiError && e.status === 429) {
+      exportError.value = t('sql.export_rate_limited')
+    } else if (e instanceof ApiError && (e.status === 404 || e.status === 409)) {
+      exportError.value = t('sql.export_source_gone')
+    } else {
+      exportError.value = errorMessage(e)
+    }
+  }
+}
+
+async function pollExportJob(
+  exportJobId: string,
+  token: string,
+  filename: string,
+): Promise<void> {
+  try {
+    const job = await getJob(exportJobId)
+    if (job.status === 'success') {
+      exportBusy.value = false
+      exportReady.value = { token, filename }
+      return
+    }
+    if (TERMINAL.has(job.status)) {
+      exportBusy.value = false
+      exportError.value = job.error || t('sql.export_failed')
+      return
+    }
+  } catch (e) {
+    exportBusy.value = false
+    exportError.value = errorMessage(e)
+    return
+  }
+  const timer = setTimeout(() => {
+    exportPollTimers.delete(timer)
+    void pollExportJob(exportJobId, token, filename)
+  }, POLL_MS)
+  exportPollTimers.add(timer)
+}
+
+async function onDownloadExport(): Promise<void> {
+  if (!exportReady.value) return
+  const { token, filename } = exportReady.value
+  try {
+    await downloadExport(token, filename)
+    exportReady.value = null
+  } catch (e) {
+    // 一次性 token 用过/过期 → 410;提示重新导出。
+    exportReady.value = null
+    if (e instanceof ApiError && e.status === 410) {
+      exportError.value = t('sql.export_token_spent')
+    } else {
+      exportError.value = errorMessage(e)
+    }
+  }
+}
+
 function scrollResultIntoView(): void {
   void nextTick(() => {
     resultPanel.value?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
@@ -816,9 +1196,10 @@ function parseVariables(value: string): string[] {
         </button>
         <button
           type="button"
-          class="chrome-btn-ghost w-full opacity-50"
-          disabled
-          :title="t('sql.tab_metadata_disabled')"
+          class="chrome-btn-ghost w-full"
+          :class="sidebarTab === 'metadata' && 'chrome-accent-light-bg chrome-accent'"
+          :title="t('sql.tab_metadata')"
+          @click="sidebarTab = 'metadata'"
         >
           <Database class="w-4 h-4" />
         </button>
@@ -1011,6 +1392,126 @@ function parseVariables(value: string): string[] {
           </button>
         </div>
       </div>
+
+      <div v-else-if="sidebarTab === 'metadata'" class="flex-1 min-h-0 flex flex-col">
+        <div class="p-3 border-b chrome-border-subtle space-y-2">
+          <div class="flex items-center gap-2">
+            <select v-model="metadataDsId" class="chrome-input flex-1 text-xs">
+              <option v-if="datasources.length === 0" disabled value="">
+                {{ t('sql.no_datasource') }}
+              </option>
+              <option v-for="ds in datasources" :key="ds.id" :value="ds.id">
+                {{ ds.name }} ({{ ds.db_type }})
+              </option>
+            </select>
+            <button
+              type="button"
+              class="chrome-btn-ghost"
+              :title="t('sql.metadata_refresh')"
+              :disabled="!metadataDsId || metadataLoading"
+              @click="loadMetadataSchemas(true)"
+            >
+              <RefreshCw class="w-4 h-4" :class="metadataLoading && 'animate-spin'" />
+            </button>
+          </div>
+          <div
+            v-if="!metadataToolsSupported && metadataDsId"
+            class="text-[11px] chrome-text-muted"
+          >
+            {{ t('sql.metadata_unsupported_db') }}
+          </div>
+        </div>
+        <div v-if="metadataError" class="px-3 py-2 text-xs text-red-600 dark:text-red-400">
+          {{ metadataError }}
+        </div>
+        <div v-if="metadataLoading && metadataSchemas.length === 0" class="p-4 chrome-text-muted text-sm">
+          <LoadingDots />
+        </div>
+        <div v-else class="flex-1 min-h-0 overflow-auto p-2 text-sm">
+          <div v-if="!metadataDsId" class="p-4 chrome-text-muted">
+            {{ t('sql.metadata_pick_ds') }}
+          </div>
+          <div v-else-if="metadataSchemas.length === 0 && !metadataError" class="p-4 chrome-text-muted">
+            {{ t('sql.metadata_empty') }}
+          </div>
+          <div v-for="schemaNode in metadataSchemas" :key="schemaNode.schema.name">
+            <button
+              type="button"
+              class="w-full flex items-center gap-1.5 px-2 py-1.5 rounded-card hover:chrome-bg-elevated text-left"
+              @click="toggleSchema(schemaNode)"
+            >
+              <ChevronDown v-if="schemaNode.expanded" class="w-3.5 h-3.5 chrome-text-muted shrink-0" />
+              <ChevronRight v-else class="w-3.5 h-3.5 chrome-text-muted shrink-0" />
+              <Database class="w-3.5 h-3.5 chrome-text-muted shrink-0" />
+              <span class="truncate chrome-text-heading">{{ schemaNode.schema.name }}</span>
+            </button>
+            <div v-if="schemaNode.expanded" class="pl-4">
+              <div v-if="schemaNode.loading" class="px-2 py-1 chrome-text-muted">
+                <LoadingDots />
+              </div>
+              <div v-else-if="schemaNode.error" class="px-2 py-1 text-xs text-red-600 dark:text-red-400">
+                {{ schemaNode.error }}
+              </div>
+              <div
+                v-else-if="schemaNode.tables.length === 0"
+                class="px-2 py-1 text-xs chrome-text-muted"
+              >
+                {{ t('sql.metadata_no_tables') }}
+              </div>
+              <div v-for="tableNode in schemaNode.tables" :key="tableNode.table.name">
+                <div class="group flex items-center gap-1.5 px-2 py-1.5 rounded-card hover:chrome-bg-elevated">
+                  <button
+                    type="button"
+                    class="shrink-0"
+                    :title="t('sql.metadata_expand_columns')"
+                    @click="toggleTable(schemaNode.schema.name, tableNode)"
+                  >
+                    <ChevronDown v-if="tableNode.expanded" class="w-3.5 h-3.5 chrome-text-muted" />
+                    <ChevronRight v-else class="w-3.5 h-3.5 chrome-text-muted" />
+                  </button>
+                  <Table2 class="w-3.5 h-3.5 chrome-text-muted shrink-0" />
+                  <button
+                    type="button"
+                    class="flex-1 min-w-0 text-left truncate chrome-text-heading"
+                    :title="t('sql.metadata_select_table')"
+                    @click="selectTableIntoConsole(schemaNode.schema.name, tableNode)"
+                  >
+                    {{ tableNode.table.name }}
+                  </button>
+                  <span
+                    v-if="tableNode.table.table_type && tableNode.table.table_type !== 'BASE TABLE'"
+                    class="text-[10px] chrome-text-muted uppercase shrink-0"
+                  >
+                    {{ tableNode.table.table_type }}
+                  </span>
+                </div>
+                <div v-if="tableNode.expanded" class="pl-6">
+                  <div v-if="tableNode.loading" class="px-2 py-1 chrome-text-muted">
+                    <LoadingDots />
+                  </div>
+                  <div v-else-if="tableNode.error" class="px-2 py-1 text-xs text-red-600 dark:text-red-400">
+                    {{ tableNode.error }}
+                  </div>
+                  <div
+                    v-for="column in tableNode.columns"
+                    :key="column.name"
+                    class="flex items-center gap-1.5 px-2 py-1 text-xs"
+                  >
+                    <Key v-if="column.primary_key" class="w-3 h-3 chrome-accent shrink-0" :title="t('sql.metadata_pk')" />
+                    <span v-else class="w-3 shrink-0" />
+                    <span class="chrome-text-heading truncate" :title="column.comment ?? ''">
+                      {{ column.name }}
+                    </span>
+                    <span class="chrome-text-muted font-mono">{{ column.type }}</span>
+                    <span v-if="column.nullable" class="text-[10px] chrome-text-muted">NULL</span>
+                    <span v-else class="text-[10px] chrome-text-muted">NOT NULL</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
     </aside>
 
     <main class="flex-1 min-w-0 flex flex-col h-full">
@@ -1089,47 +1590,205 @@ function parseVariables(value: string): string[] {
           />
         </div>
 
+        <div class="flex items-center gap-2 px-5 py-2 border-b chrome-border-subtle">
+          <button
+            type="button"
+            class="chrome-btn-secondary"
+            :disabled="!editorSql.trim() || !toolsSupported || editorReadOnly || toolBusy !== ''"
+            :title="!toolsSupported ? t('sql.tools_unsupported_db') : t('sql.tool_format_hint')"
+            @click="onFormatSql"
+          >
+            <AlignLeft class="w-3.5 h-3.5" />
+            {{ toolBusy === 'format' ? t('common.submitting') : t('sql.tool_format') }}
+          </button>
+          <button
+            type="button"
+            class="chrome-btn-secondary"
+            :disabled="!editorSql.trim() || !toolsSupported || editorReadOnly || toolBusy !== ''"
+            :title="!toolsSupported ? t('sql.tools_unsupported_db') : t('sql.tool_expand_hint')"
+            @click="onExpandStar"
+          >
+            <Asterisk class="w-3.5 h-3.5" />
+            {{ toolBusy === 'expand' ? t('common.submitting') : t('sql.tool_expand') }}
+          </button>
+          <button
+            type="button"
+            class="chrome-btn-secondary"
+            :disabled="!editorSql.trim() || !explainSupported || editorReadOnly || toolBusy !== ''"
+            :title="
+              !toolsSupported
+                ? t('sql.tools_unsupported_db')
+                : !explainSupported
+                  ? t('sql.explain_not_allowed')
+                  : t('sql.tool_explain_hint')
+            "
+            @click="onExplain"
+          >
+            <Network class="w-3.5 h-3.5" />
+            {{ toolBusy === 'explain' ? t('common.submitting') : t('sql.tool_explain') }}
+          </button>
+          <div class="flex-1" />
+          <span v-if="toolError" class="text-xs text-red-600 dark:text-red-400 truncate max-w-[24rem]" :title="toolError">
+            {{ toolError }}
+          </span>
+        </div>
+
         <div ref="resultPanel" class="flex-1 min-h-[35vh] flex flex-col">
           <div class="flex items-center justify-between px-5 py-2 border-b chrome-border-subtle text-xs">
-            <div class="flex items-center gap-3 min-w-0">
-              <span class="chrome-text-muted uppercase tracking-wider font-medium">
+            <div class="flex items-center gap-1">
+              <button
+                type="button"
+                class="chrome-btn-ghost px-3"
+                :class="(activeRuntime?.resultTab ?? 'result') === 'result' && 'chrome-accent-light-bg chrome-accent'"
+                @click="activeRuntime && (activeRuntime.resultTab = 'result')"
+              >
+                <ListTree class="w-3.5 h-3.5" />
                 {{ t('sql.result') }}
-              </span>
-              <JobStatusBadge v-if="activeRuntime?.status" :status="activeRuntime.status" />
-              <span class="chrome-text-muted truncate">{{ statusSummary }}</span>
+              </button>
+              <button
+                type="button"
+                class="chrome-btn-ghost px-3"
+                :class="activeRuntime?.resultTab === 'plan' && 'chrome-accent-light-bg chrome-accent'"
+                @click="activeRuntime && (activeRuntime.resultTab = 'plan')"
+              >
+                <Network class="w-3.5 h-3.5" />
+                {{ t('sql.tab_plan') }}
+              </button>
+              <button
+                type="button"
+                class="chrome-btn-ghost px-3"
+                :class="activeRuntime?.resultTab === 'stats' && 'chrome-accent-light-bg chrome-accent'"
+                @click="activeRuntime && (activeRuntime.resultTab = 'stats')"
+              >
+                <Gauge class="w-3.5 h-3.5" />
+                {{ t('sql.tab_stats') }}
+              </button>
             </div>
-            <span v-if="activeRuntime?.jobId" class="chrome-text-muted font-mono text-[10px]">
-              job: {{ activeRuntime.jobId.slice(0, 8) }}
-            </span>
+            <div class="flex items-center gap-3">
+              <span class="chrome-text-muted truncate">{{ statusSummary }}</span>
+              <div class="relative">
+                <button
+                  type="button"
+                  class="chrome-btn-secondary"
+                  :disabled="!exportableJobId || exportBusy"
+                  :title="!exportableJobId ? t('sql.export_needs_success') : t('sql.export')"
+                  @click="exportMenuOpen = !exportMenuOpen"
+                >
+                  <Download class="w-3.5 h-3.5" />
+                  {{ exportBusy ? t('sql.export_running') : t('sql.export') }}
+                </button>
+                <div
+                  v-if="exportMenuOpen && exportableJobId"
+                  class="absolute right-0 mt-1 z-20 w-32 rounded-card border chrome-border chrome-bg-panel shadow-lg py-1"
+                >
+                  <button
+                    v-for="fmt in EXPORT_FORMATS"
+                    :key="fmt"
+                    type="button"
+                    class="w-full text-left px-3 py-1.5 text-sm hover:chrome-bg-elevated chrome-text-heading uppercase"
+                    @click="onCreateExport(fmt)"
+                  >
+                    {{ fmt }}
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
 
           <div
-            v-if="execError || activeRuntime?.error"
-            class="flex items-start gap-2 px-5 py-3 border-b chrome-border-subtle text-sm"
+            v-if="exportError"
+            class="flex items-center gap-2 px-5 py-2 border-b chrome-border-subtle text-xs"
             style="background-color: rgb(239 68 68 / 0.08); color: rgb(185 28 28);"
           >
-            <AlertTriangle class="w-4 h-4 shrink-0 mt-0.5" />
-            <span class="font-mono whitespace-pre-wrap">{{ execError || activeRuntime?.error }}</span>
+            <AlertTriangle class="w-3.5 h-3.5 shrink-0" />
+            <span class="flex-1">{{ exportError }}</span>
+          </div>
+          <div
+            v-if="exportReady"
+            class="flex items-center gap-2 px-5 py-2 border-b chrome-border-subtle text-xs chrome-accent-light-bg"
+          >
+            <Download class="w-3.5 h-3.5 shrink-0 chrome-accent" />
+            <span class="flex-1 chrome-text-heading">{{ t('sql.export_ready', { file: exportReady.filename }) }}</span>
+            <button type="button" class="chrome-btn-primary py-1" @click="onDownloadExport">
+              {{ t('sql.export_download') }}
+            </button>
           </div>
 
-          <div class="flex-1 min-h-0">
-            <ResultTable
-              v-if="shouldShowResultTable && activeRuntime?.result"
-              :columns="activeRuntime.result.columns"
-              :rows="activeRuntime.result.rows"
-              :offset="activeRuntime.result.offset"
-              :limit="activeRuntime.result.limit"
-              :loaded-rows="activeRuntime.result.loaded_rows"
-              :total-rows="activeRuntime.result.total_rows"
-              :truncated="activeRuntime.result.truncated"
-              @change-page="onChangePage"
-            />
-            <div v-else class="h-full grid place-items-center chrome-text-muted text-sm">
-              <div v-if="activeRuntime?.status && ACTIVE.has(activeRuntime.status)" class="flex items-center gap-2">
-                <LoadingDots />
-                <span>{{ statusSummary }}</span>
+          <!-- Result tab -->
+          <div v-show="(activeRuntime?.resultTab ?? 'result') === 'result'" class="flex-1 min-h-0 flex flex-col">
+            <div
+              v-if="execError || activeRuntime?.error"
+              class="flex items-start gap-2 px-5 py-3 border-b chrome-border-subtle text-sm"
+              style="background-color: rgb(239 68 68 / 0.08); color: rgb(185 28 28);"
+            >
+              <AlertTriangle class="w-4 h-4 shrink-0 mt-0.5" />
+              <span class="font-mono whitespace-pre-wrap">{{ execError || activeRuntime?.error }}</span>
+            </div>
+            <div class="flex-1 min-h-0">
+              <ResultTable
+                v-if="shouldShowResultTable && activeRuntime?.result"
+                :columns="activeRuntime.result.columns"
+                :rows="activeRuntime.result.rows"
+                :offset="activeRuntime.result.offset"
+                :limit="activeRuntime.result.limit"
+                :loaded-rows="activeRuntime.result.loaded_rows"
+                :total-rows="activeRuntime.result.total_rows"
+                :truncated="activeRuntime.result.truncated"
+                @change-page="onChangePage"
+              />
+              <div v-else class="h-full grid place-items-center chrome-text-muted text-sm">
+                <div v-if="activeRuntime?.status && ACTIVE.has(activeRuntime.status)" class="flex items-center gap-2">
+                  <LoadingDots />
+                  <span>{{ statusSummary }}</span>
+                </div>
+                <span v-else>{{ t('sql.run_to_see_result') }}</span>
               </div>
-              <span v-else>{{ t('sql.run_to_see_result') }}</span>
+            </div>
+          </div>
+
+          <!-- Plan tab -->
+          <div v-show="activeRuntime?.resultTab === 'plan'" class="flex-1 min-h-0 flex flex-col">
+            <div
+              v-if="activeRuntime?.planError"
+              class="flex items-start gap-2 px-5 py-3 border-b chrome-border-subtle text-sm"
+              style="background-color: rgb(239 68 68 / 0.08); color: rgb(185 28 28);"
+            >
+              <AlertTriangle class="w-4 h-4 shrink-0 mt-0.5" />
+              <span class="font-mono whitespace-pre-wrap">{{ activeRuntime.planError }}</span>
+            </div>
+            <div class="flex-1 min-h-0">
+              <ResultTable
+                v-if="activeRuntime?.planResult && activeRuntime.planResult.columns.length > 0"
+                :columns="activeRuntime.planResult.columns"
+                :rows="activeRuntime.planResult.rows"
+                :offset="activeRuntime.planResult.offset"
+                :limit="activeRuntime.planResult.limit"
+                :loaded-rows="activeRuntime.planResult.loaded_rows"
+                :total-rows="activeRuntime.planResult.total_rows"
+                :truncated="activeRuntime.planResult.truncated"
+              />
+              <div v-else class="h-full grid place-items-center chrome-text-muted text-sm">
+                <div v-if="planActive" class="flex items-center gap-2">
+                  <LoadingDots />
+                  <span>{{ t('sql.plan_running') }}</span>
+                </div>
+                <span v-else>{{ t('sql.plan_empty') }}</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Stats tab -->
+          <div v-show="activeRuntime?.resultTab === 'stats'" class="flex-1 min-h-0 overflow-auto">
+            <table v-if="activeRuntime?.status" class="w-full text-sm">
+              <tbody>
+                <tr v-for="row in statRows" :key="row.label" class="border-b chrome-border-subtle">
+                  <td class="px-5 py-2 chrome-text-muted w-48">{{ row.label }}</td>
+                  <td class="px-5 py-2 chrome-text-heading font-mono break-all">{{ row.value }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-else class="h-full grid place-items-center chrome-text-muted text-sm">
+              {{ t('sql.run_to_see_result') }}
             </div>
           </div>
         </div>

@@ -105,6 +105,20 @@ export function executeSql(req: SqlExecuteRequest): Promise<SqlExecuteResponse> 
   })
 }
 
+/**
+ * POST /sql/explain —— 202 异步入队 EXPLAIN job,返回 job_id + result_set_id。
+ * 与 execute 同 readonly 守卫;但不接 params(后端 400 unsupported_sql_params)。
+ * 计划结果作为普通 ResultSet 落库,前端轮 job 后用 GET /jobs/{id}/result 读取。
+ * 源:app/api/routes/core.py explain_sql + tests/contract/test_api.py test_sql_explain_*。
+ */
+export function explainSql(req: SqlExecuteRequest): Promise<SqlExecuteResponse> {
+  return apiClient.post<SqlExecuteResponse>('/sql/explain', {
+    datasource_id: req.datasource_id,
+    sql: req.sql,
+    console_id: req.console_id ?? null,
+  })
+}
+
 export function listSqlConsoles(): Promise<SqlConsole[]> {
   return apiClient.get<SqlConsole[]>('/sql/consoles')
 }
