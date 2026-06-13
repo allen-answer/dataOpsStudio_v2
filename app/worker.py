@@ -418,8 +418,9 @@ class WorkerRunner:
         columns = _columns_from_manifest(manifest)
         limit_bytes = self._config.export_limit_mb * 1024 * 1024
         with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as stream:
+            binary_stream = cast(BinaryIO, stream)
             exported_bytes = write_result_export(
-                stream=stream,
+                stream=binary_stream,
                 export_format=export_format,
                 columns=columns,
                 rows=self._iter_spool_rows(job.id, source_result_set_id),
@@ -427,8 +428,8 @@ class WorkerRunner:
                 db_type=db_type,
                 limit_bytes=limit_bytes,
             )
-            stream.seek(0)
-            result_ref = self._result_store.put_export_artifact(job.id, filename, stream)
+            binary_stream.seek(0)
+            result_ref = self._result_store.put_export_artifact(job.id, filename, binary_stream)
         self._heartbeat(job.id)
         result_ref = result_ref.model_copy(
             update={

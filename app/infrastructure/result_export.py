@@ -9,7 +9,7 @@ from datetime import date, datetime
 from datetime import time as dt_time
 from decimal import Decimal
 from itertools import chain
-from typing import Any, BinaryIO, Literal, cast
+from typing import IO, Any, BinaryIO, Literal, cast
 from xml.sax.saxutils import escape
 
 from app.domain.schema import Column, Row
@@ -160,7 +160,7 @@ def _write_xlsx(
             sheet.write(b"</sheetData></worksheet>")
 
 
-def _write_xlsx_row(sheet: BinaryIO, row_number: int, values: list[object]) -> None:
+def _write_xlsx_row(sheet: IO[bytes], row_number: int, values: list[object]) -> None:
     sheet.write(f'<row r="{row_number}">'.encode())
     for index, value in enumerate(values, start=1):
         ref = f"{_column_letter(index)}{row_number}"
