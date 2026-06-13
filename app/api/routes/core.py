@@ -1515,7 +1515,9 @@ def _expand_star_sql(
             if matched_table_ref is None:
                 raise ApiError(400, "unknown_table", "SELECT star qualifier does not match a table")
             changed = True
-            expanded_selects.extend(_column_expressions_for_ref(services, matched_table_ref, table_name))
+            expanded_selects.extend(
+                _column_expressions_for_ref(services, matched_table_ref, table_name)
+            )
             continue
         expanded_selects.append(item)
     if not changed:
