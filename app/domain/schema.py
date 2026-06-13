@@ -46,6 +46,7 @@ class Column(BaseModel):
     driver_type: str | None = None  # 原始 driver 类型,如 "VARCHAR(64)" / "NUMBER(10,2)"
     nullable: bool = True
     primary_key: bool = False
+    comment: str | None = None
 
 
 class Schema(BaseModel):

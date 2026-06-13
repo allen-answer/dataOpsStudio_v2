@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import signal
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -13,19 +13,18 @@ from sqlalchemy.engine import Engine
 
 from app.config import Settings, load_settings
 from app.db.models import datasources, jobs, result_sets
-from app.dbclients.dm_adapter import DMAdapter
-from app.dbclients.mysql_adapter import MySQLAdapter
+from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.protocol import AdapterConnectionError
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind
+from app.domain.plan import PlanNode
 from app.domain.result import ResultRef
-from app.domain.schema import Column, Row
+from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import SecretKind, SecretRef
 from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
 from app.infrastructure.secretstore.local_file import LocalFileSecretStore
-from app.infrastructure.secretstore.protocol import SecretStore
 from app.observability.logging import configure_logging
 
 logger = structlog.get_logger(__name__)
@@ -37,10 +36,6 @@ class JobCancelled(RuntimeError):
 
 class UnsupportedJobKindError(RuntimeError):
     """2.0.0 worker supports only the job kinds wired in this module."""
-
-
-class UnsupportedDbTypeError(RuntimeError):
-    """2.0.0 worker supports only datasource db types with registered adapters."""
 
 
 class OperationPolicyDeniedError(RuntimeError):
@@ -92,6 +87,8 @@ class ResultStoreLike(Protocol):
 
 class DatabaseAdapterLike(Protocol):
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]: ...
+
+    def explain(self, sql: str) -> PlanNode: ...
 
     def test_connection(self) -> bool: ...
 
@@ -222,6 +219,8 @@ class WorkerRunner:
                 outcome = self._execute_test_connection(job)
             elif job.kind is JobKind.SQL_QUERY:
                 outcome = self._execute_sql_query(job)
+            elif job.kind is JobKind.SQL_EXPLAIN:
+                outcome = self._execute_sql_explain(job)
             else:
                 raise UnsupportedJobKindError(f"Unsupported job kind: {job.kind.value}")
         except JobCancelled as exc:
@@ -317,6 +316,43 @@ class WorkerRunner:
         self._heartbeat(job.id)
         result_ref = self._result_store.spool_ref(result_set_id)
         self._write_result_set_catalog(job, result_set_id, result_ref, columns or [], console_id)
+        manifest = self._result_store.get_spool_manifest(result_set_id)
+        return _ExecutionOutcome(
+            result_ref=result_ref,
+            loaded_rows=_manifest_int(manifest, "loaded_rows"),
+        )
+
+    def _execute_sql_explain(self, job: Job) -> _ExecutionOutcome:
+        payload = job.payload
+        sql = _required_payload_str(payload, "sql")
+        datasource_id = _payload_datasource_id(job)
+        result_set_id = str(payload.get("result_set_id") or job.id)
+        console_id = _payload_optional_str(payload, "console_id")
+        datasource = self._datasource_loader(datasource_id)
+        _require_operation_allowed(datasource.operation_policy, "explain")
+        self._write_result_set_streaming(job, result_set_id, [], 0, console_id)
+        adapter = self._adapter_factory(
+            datasource,
+            lambda: self._backend.is_cancel_requested(job.id),
+            lambda columns: None,
+        )
+
+        self._check_cancel(job.id)
+        plan = adapter.explain(sql)
+        columns, rows = _plan_result_rows(plan)
+        self._result_store.set_spool_columns(result_set_id, columns)
+        if rows:
+            self._flush_batch(job.id, result_set_id, rows)
+        self._write_result_set_streaming(
+            job,
+            result_set_id,
+            columns,
+            _spool_loaded_rows(self._result_store, result_set_id),
+            console_id,
+        )
+        self._heartbeat(job.id)
+        result_ref = self._result_store.spool_ref(result_set_id)
+        self._write_result_set_catalog(job, result_set_id, result_ref, columns, console_id)
         manifest = self._result_store.get_spool_manifest(result_set_id)
         return _ExecutionOutcome(
             result_ref=result_ref,
@@ -432,7 +468,7 @@ class WorkerRunner:
         )
 
     def _write_result_set_terminal(self, job: Job, state: str) -> None:
-        if job.kind is not JobKind.SQL_QUERY:
+        if job.kind not in {JobKind.SQL_QUERY, JobKind.SQL_EXPLAIN}:
             return
         result_set_id = _payload_optional_str(job.payload, "result_set_id")
         if result_set_id is None:
@@ -614,41 +650,6 @@ class PostgresJobErrorCodeWriter:
             )
 
 
-def build_database_adapter(
-    conn_info: DatasourceConnInfo,
-    secret_store: SecretStore,
-    *,
-    cancel_check: Callable[[], bool] | None = None,
-    column_sink: Callable[[list[Column]], None] | None = None,
-    cursor_max_hold_seconds: int = 300,
-    statement_timeout_seconds: int = 300,
-) -> DatabaseAdapterLike:
-    """db_type → DatabaseAdapter 分发(2.0.0 Certified:MySQL + DM)。
-
-    其余方言尚无 adapter → UnsupportedDbTypeError(调用方按此 fail job)。
-    抽成模块级纯函数,便于单测 dispatch 而无需起 bootstrap/PG。
-    """
-    if conn_info.db_type is DbType.MYSQL:
-        return MySQLAdapter(
-            conn_info,
-            secret_store,
-            cancel_check=cancel_check,
-            column_sink=column_sink,
-            cursor_max_hold_seconds=cursor_max_hold_seconds,
-            statement_timeout_seconds=statement_timeout_seconds,
-        )
-    if conn_info.db_type is DbType.DM:
-        return DMAdapter(
-            conn_info,
-            secret_store,
-            cancel_check=cancel_check,
-            column_sink=column_sink,
-            cursor_max_hold_seconds=cursor_max_hold_seconds,
-            statement_timeout_seconds=statement_timeout_seconds,
-        )
-    raise UnsupportedDbTypeError(f"Unsupported datasource db_type: {conn_info.db_type.value}")
-
-
 def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
     actual_settings = settings or load_settings()
     configure_logging(actual_settings.logging.level)
@@ -801,6 +802,39 @@ def _manifest_bool(manifest: dict[str, Any], key: str) -> bool:
     return value if isinstance(value, bool) else False
 
 
+def _plan_result_rows(plan: PlanNode) -> tuple[list[Column], list[Row]]:
+    raw_rows = plan.details.get("rows")
+    if isinstance(raw_rows, list):
+        normalized_rows = [_normalize_plan_row(item) for item in raw_rows]
+        if normalized_rows:
+            column_names = _plan_column_names(normalized_rows)
+            columns = [Column(name=name, type=ColumnType.UNKNOWN) for name in column_names]
+            rows = [Row(values=[row.get(name) for name in column_names]) for row in normalized_rows]
+            return columns, rows
+    columns = [
+        Column(name="operation", type=ColumnType.UNKNOWN),
+        Column(name="details", type=ColumnType.UNKNOWN),
+    ]
+    return columns, [Row(values=[plan.operation, plan.details])]
+
+
+def _normalize_plan_row(item: object) -> dict[str, object]:
+    if isinstance(item, Mapping):
+        return {str(key): value for key, value in item.items()}
+    return {"value": item}
+
+
+def _plan_column_names(rows: list[dict[str, object]]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                names.append(key)
+    return names
+
+
 def _require_operation_allowed(policy: OperationPolicy, operation: str) -> None:
     if operation == "select" and not policy.allow_select:
         raise OperationPolicyDeniedError("select denied by datasource operation_policy")
@@ -837,7 +871,7 @@ def _job_error_code(exc: Exception, kind: JobKind) -> JobErrorCode:
         return JobErrorCode.CONNECTION_FAILED
     if isinstance(exc, AdapterConnectionError):
         return JobErrorCode.CONNECTION_FAILED
-    if kind is JobKind.SQL_QUERY:
+    if kind in {JobKind.SQL_QUERY, JobKind.SQL_EXPLAIN}:
         return JobErrorCode.SQL_FAILED
     return JobErrorCode.INTERNAL
 

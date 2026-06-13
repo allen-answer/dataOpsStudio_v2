@@ -11,11 +11,11 @@ from typing import cast
 import pytest
 
 from app.dbclients.dm_adapter import DMAdapter
+from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.mysql_adapter import MySQLAdapter
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.secret import HashedRef, RotationReport, SecretKind, SecretRef
 from app.infrastructure.secretstore.protocol import SecretStore
-from app.worker import UnsupportedDbTypeError, build_database_adapter
 
 
 def test_dispatch_mysql_builds_mysql_adapter() -> None:

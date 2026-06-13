@@ -13,7 +13,8 @@
 - DATAOPS_FORM / DATAOPS_JOB_BACKEND
 - DATAOPS_BOOTSTRAP_MASTER_KEY_FILE / DATAOPS_BOOTSTRAP_PG_APP_PASSWORD_FILE / ...
 - DATAOPS_PG_HOST / DATAOPS_PG_PORT / DATAOPS_PG_USER / DATAOPS_PG_DATABASE / ...
-- DATAOPS_API_HOST / DATAOPS_API_PORT / DATAOPS_API_METRICS_PORT / DATAOPS_API_ENABLE_DOCS
+- DATAOPS_API_HOST / DATAOPS_API_PORT / DATAOPS_API_METRICS_PORT / DATAOPS_API_ENABLE_DOCS /
+  DATAOPS_API_METADATA_PROBE_TIMEOUT_SECONDS
 - DATAOPS_FRONTEND_DIST(前端 dist 目录;设置即 API 进程伺服 SPA,默认 API-only)
 - DATAOPS_WORKER_WORKER_ID / DATAOPS_WORKER_MAX_CONCURRENT_JOBS / ...
 - DATAOPS_RESULT_BACKEND / DATAOPS_RESULT_LOCAL_ROOT / ...
@@ -100,6 +101,7 @@ class ApiConfig(BaseSettings):
     # docs/deployment/quickstart.md)。默认 None = API-only,行为与现状完全一致。
     # env: DATAOPS_FRONTEND_DIST(非 DATAOPS_API_ 前缀,故用 validation_alias)。
     frontend_dist: Path | None = Field(default=None, validation_alias="DATAOPS_FRONTEND_DIST")
+    metadata_probe_timeout_seconds: int = Field(default=5, ge=1, le=60)
 
 
 class WorkerConfig(BaseSettings):

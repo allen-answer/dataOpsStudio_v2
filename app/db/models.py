@@ -1,4 +1,4 @@
-"""SQLAlchemy 2 Core 元数据 —— 13 张表(契约 §5、设计稿 §5.1)。
+"""SQLAlchemy 2 Core 元数据(契约 §5、设计稿 §5.1)。
 
 ★ R4 红线 DB 层防御(secret_refs CHECK):
   kind 限定为 Application Secret 6 种,Bootstrap kind(master_key /
@@ -431,6 +431,43 @@ sql_templates = Table(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# metadata_caches —— SQL Workspace metadata browser cache(2.1 W2)
+# ─────────────────────────────────────────────────────────────────────────────
+metadata_caches = Table(
+    "metadata_caches",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column(
+        "datasource_id",
+        String(36),
+        ForeignKey("datasources.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("cache_level", String(32), nullable=False),  # schemas / tables / columns
+    Column("schema_name", String(128), nullable=False, server_default=""),
+    Column("table_name", String(128), nullable=False, server_default=""),
+    Column("payload", JSONB(), nullable=False, server_default=text("'[]'::jsonb")),
+    Column("refreshed_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    UniqueConstraint(
+        "datasource_id",
+        "cache_level",
+        "schema_name",
+        "table_name",
+        name="uq_metadata_caches_key",
+    ),
+    Index("ix_metadata_caches_datasource_level", "datasource_id", "cache_level"),
+    Index("ix_metadata_caches_expires_at", "expires_at"),
+    CheckConstraint(
+        "cache_level IN ('schemas', 'tables', 'columns')",
+        name="cache_level_is_supported",
+    ),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # result_sets —— ★ R6 红线 DB 层:无 cursor 字段
 # ─────────────────────────────────────────────────────────────────────────────
 result_sets = Table(
@@ -522,6 +559,7 @@ __all__ = [
     "jobs",
     "license_state",
     "metadata",
+    "metadata_caches",
     "mfa_recovery_codes",
     "project_members",
     "projects",

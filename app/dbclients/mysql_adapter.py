@@ -171,7 +171,8 @@ class MySQLAdapter(DatabaseAdapter):
                 COLUMN_NAME AS name,
                 COLUMN_TYPE AS type,
                 IS_NULLABLE AS nullable,
-                COLUMN_KEY AS column_key
+                COLUMN_KEY AS column_key,
+                COLUMN_COMMENT AS comment
             FROM information_schema.COLUMNS
             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
             ORDER BY ORDINAL_POSITION
@@ -185,6 +186,7 @@ class MySQLAdapter(DatabaseAdapter):
                 driver_type=str(row["type"]) if row["type"] is not None else None,
                 nullable=str(row["nullable"]).upper() == "YES",
                 primary_key=str(row["column_key"]).upper() == "PRI",
+                comment=_optional_str(row.get("comment")),
             )
             for row in rows
         ]
@@ -420,6 +422,13 @@ def _first_cell(row: object) -> object | None:
     if isinstance(row, Sequence) and not isinstance(row, (str, bytes, bytearray)):
         return row[0] if row else None
     return row
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
 
 
 def _connection_error_summary(exc: Exception) -> str:

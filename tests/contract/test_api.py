@@ -7,9 +7,14 @@ import pytest
 from fastapi.routing import APIRoute
 
 from app.api.app import create_app
+from app.api.routes import core as core_routes
 from app.api.security import create_access_token
 from app.api.services import ApiServices
+from app.dbclients.protocol import AdapterConnectionError
+from app.domain.job import Job, JobKind
 from app.domain.license import LicenseMode
+from app.domain.result import ResultRef
+from app.domain.schema import Column, ColumnType, Schema, Table
 from tests._asgi_client import AsgiClient
 
 pytestmark = pytest.mark.contract
@@ -44,6 +49,12 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("PATCH", "/api/sql/templates/{template_id}") in routes
     assert ("DELETE", "/api/sql/templates/{template_id}") in routes
     assert ("POST", "/api/sql/templates/{template_id}/render") in routes
+    assert ("POST", "/api/sql/explain") in routes
+    assert ("POST", "/api/sql/format") in routes
+    assert ("POST", "/api/sql/expand-star") in routes
+    assert ("GET", "/api/datasources/{datasource_id}/metadata/schemas") in routes
+    assert ("GET", "/api/datasources/{datasource_id}/metadata/tables") in routes
+    assert ("GET", "/api/datasources/{datasource_id}/metadata/columns") in routes
     assert ("GET", "/api/jobs") in routes
     assert ("GET", "/api/jobs/{job_id}") in routes
     assert ("GET", "/api/jobs/{job_id}/result") in routes
@@ -397,6 +408,238 @@ def test_delete_datasource_returns_409_with_job_references() -> None:
     assert not any("DELETE FROM datasources" in statement for statement in engine.statements)
 
 
+def test_metadata_endpoints_return_cached_contract_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = _MetadataAdapter()
+    adapter_kwargs: list[dict[str, object]] = []
+
+    def build_adapter(
+        conn_info: object,
+        secret_store: object,
+        **kwargs: object,
+    ) -> _MetadataAdapter:
+        del conn_info, secret_store
+        adapter_kwargs.append(kwargs)
+        return adapter
+
+    monkeypatch.setattr(
+        core_routes,
+        "build_database_adapter",
+        build_adapter,
+    )
+    engine = _FakeEngine(
+        [
+            _datasource_row(),
+            {"id": "project-1"},
+            _datasource_row(),
+            {"id": "project-1"},
+            _datasource_row(),
+            {"id": "project-1"},
+        ]
+    )
+    services = _Services(engine, metadata_probe_timeout_seconds=6)
+    app = create_app(services=cast(ApiServices, services))
+    client = AsgiClient(app)
+
+    schemas_response = client.get(
+        "/api/datasources/ds-1/metadata/schemas",
+        headers=_auth_headers(),
+        params={"refresh": "1"},
+    )
+    tables_response = client.get(
+        "/api/datasources/ds-1/metadata/tables",
+        headers=_auth_headers(),
+        params={"schema": "app", "refresh": "1"},
+    )
+    columns_response = client.get(
+        "/api/datasources/ds-1/metadata/columns",
+        headers=_auth_headers(),
+        params={"schema": "app", "table": "users", "refresh": "1"},
+    )
+
+    assert schemas_response.status_code == 200
+    assert schemas_response.json() == [{"name": "app"}]
+    assert tables_response.status_code == 200
+    assert tables_response.json() == [
+        {"schema_name": "app", "name": "users", "table_type": "BASE TABLE"}
+    ]
+    assert columns_response.status_code == 200
+    assert columns_response.json() == [
+        {
+            "name": "id",
+            "type": "integer",
+            "driver_type": "INT",
+            "nullable": False,
+            "primary_key": True,
+            "comment": "primary key",
+        },
+        {
+            "name": "name",
+            "type": "string",
+            "driver_type": "VARCHAR(64)",
+            "nullable": True,
+            "primary_key": False,
+            "comment": None,
+        },
+    ]
+    assert {audit["action"] for audit in services.audits} >= {
+        "metadata_schemas_list",
+        "metadata_tables_list",
+        "metadata_columns_list",
+    }
+    assert adapter_kwargs == [
+        {"connect_timeout_seconds": 6, "statement_timeout_seconds": 6},
+        {"connect_timeout_seconds": 6, "statement_timeout_seconds": 6},
+        {"connect_timeout_seconds": 6, "statement_timeout_seconds": 6},
+    ]
+
+
+def test_metadata_probe_connection_failure_is_structured_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        core_routes,
+        "build_database_adapter",
+        lambda conn_info, secret_store, **kwargs: _FailingMetadataAdapter(),
+    )
+    engine = _FakeEngine([_datasource_row(), {"id": "project-1"}])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/datasources/ds-1/metadata/schemas",
+        headers=_auth_headers(),
+        params={"refresh": "1"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "metadata_probe_failed"
+
+
+def test_sql_format_endpoint_returns_formatted_sql() -> None:
+    app = create_app(services=cast(ApiServices, _Services(_FakeEngine([]))))
+
+    response = AsgiClient(app).post(
+        "/api/sql/format",
+        headers=_auth_headers(),
+        json_body={"sql": "select 1 as n", "dialect": "mysql"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert set(payload) == {"formatted_sql"}
+    assert "SELECT" in payload["formatted_sql"]
+    assert "select 1 as n" not in payload["formatted_sql"]
+
+
+def test_sql_expand_star_uses_metadata_cache_contract_fields() -> None:
+    engine = _FakeEngine(
+        [
+            _datasource_row(),
+            {"id": "project-1"},
+            {
+                "payload": [
+                    {
+                        "name": "id",
+                        "type": "integer",
+                        "driver_type": "INT",
+                        "nullable": False,
+                        "primary_key": True,
+                        "comment": "primary key",
+                    },
+                    {
+                        "name": "name",
+                        "type": "string",
+                        "driver_type": "VARCHAR(64)",
+                        "nullable": True,
+                        "primary_key": False,
+                        "comment": None,
+                    },
+                ],
+                "expires_at": _dt(30),
+            },
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/sql/expand-star",
+        headers=_auth_headers(),
+        json_body={"sql": "SELECT * FROM users", "datasource_id": "ds-1"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert set(payload) == {"expanded_sql"}
+    assert "id" in payload["expanded_sql"]
+    assert "name" in payload["expanded_sql"]
+    assert "*" not in payload["expanded_sql"]
+
+
+def test_sql_expand_star_cache_miss_is_structured_error() -> None:
+    engine = _FakeEngine([_datasource_row(), {"id": "project-1"}, None])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/sql/expand-star",
+        headers=_auth_headers(),
+        json_body={"sql": "SELECT * FROM users", "datasource_id": "ds-1"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "metadata_cache_missing"
+
+
+def test_sql_explain_enqueues_explain_job_with_result_set() -> None:
+    engine = _FakeEngine(
+        [
+            _datasource_row(operation_policy=_policy(allow_explain=True)),
+            {"id": "project-1"},
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/sql/explain",
+        headers=_auth_headers(),
+        json_body={"sql": "SELECT * FROM users", "datasource_id": "ds-1"},
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert set(payload) == {"job_id", "result_set_id"}
+    job = services.job_backend.enqueued[0]
+    assert job.kind is JobKind.SQL_EXPLAIN
+    assert job.payload["result_set_id"] == payload["result_set_id"]
+    assert job.payload["datasource_id"] == "ds-1"
+    assert "params" not in job.payload
+    assert any(audit["action"] == "sql_explain" for audit in services.audits)
+
+
+def test_sql_explain_rejects_params_instead_of_ignoring_them() -> None:
+    engine = _FakeEngine(
+        [
+            _datasource_row(operation_policy=_policy(allow_explain=True)),
+            {"id": "project-1"},
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/sql/explain",
+        headers=_auth_headers(),
+        json_body={
+            "sql": "SELECT * FROM users",
+            "datasource_id": "ds-1",
+            "params": {"id": 1},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "unsupported_sql_params"
+    assert services.job_backend.enqueued == []
+
+
 def _auth_headers(user_id: str = "user-1") -> dict[str, str]:
     token = create_access_token(user_id=user_id, role="admin", secret=_Services.jwt_secret)
     return {"Authorization": f"Bearer {token}"}
@@ -452,10 +695,20 @@ class _NoopServices:
 class _Services:
     jwt_secret = "jwt-secret"
 
-    def __init__(self, engine: _FakeEngine, secret_store: _SecretStore | None = None) -> None:
+    def __init__(
+        self,
+        engine: _FakeEngine,
+        secret_store: _SecretStore | None = None,
+        job_backend: _JobBackend | None = None,
+        result_store: _ResultStore | None = None,
+        metadata_probe_timeout_seconds: int = 5,
+    ) -> None:
         self.engine = engine
         self.rate_limiter = _RateLimiter()
         self.secret_store = secret_store or _SecretStore()
+        self.job_backend = job_backend or _JobBackend()
+        self.result_store = result_store or _ResultStore()
+        self.metadata_probe_timeout_seconds = metadata_probe_timeout_seconds
         self.audits: list[dict[str, object]] = []
 
     def current_license_mode(self) -> LicenseMode:
@@ -529,6 +782,52 @@ class _FakeResult:
         if isinstance(self._result, dict):
             return dict(self._result)
         raise AssertionError(f"expected single row result, got {type(self._result).__name__}")
+
+
+class _JobBackend:
+    def __init__(self) -> None:
+        self.enqueued: list[Job] = []
+
+    def enqueue(self, job: Job) -> None:
+        self.enqueued.append(job)
+
+
+class _ResultStore:
+    def spool_ref(self, result_set_id: str) -> ResultRef:
+        return ResultRef(backend="local_fs", uri=f"spool/{result_set_id}")
+
+
+class _MetadataAdapter:
+    def list_schemas(self) -> list[Schema]:
+        return [Schema(name="app")]
+
+    def list_tables(self, schema: str) -> list[Table]:
+        return [Table(schema_name=schema, name="users", table_type="BASE TABLE")]
+
+    def list_columns(self, schema: str, table: str) -> list[Column]:
+        del schema, table
+        return [
+            Column(
+                name="id",
+                type=ColumnType.INTEGER,
+                driver_type="INT",
+                nullable=False,
+                primary_key=True,
+                comment="primary key",
+            ),
+            Column(
+                name="name",
+                type=ColumnType.STRING,
+                driver_type="VARCHAR(64)",
+                nullable=True,
+                primary_key=False,
+            ),
+        ]
+
+
+class _FailingMetadataAdapter:
+    def list_schemas(self) -> list[Schema]:
+        raise AdapterConnectionError("adapter connection failed")
 
 
 class _SecretStore:
