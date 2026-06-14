@@ -20,6 +20,7 @@ from app.domain.compare import (
     RunLimits,
     SegmentFingerprint,
     compare_row_hash64,
+    normalized_compare_payload,
     recursive_hashdiff,
 )
 from app.domain.schema import ColumnType
@@ -114,6 +115,24 @@ def test_golden_normalized_hash_matches_mysql_and_dm_logical_rows() -> None:
         dm_row,
         rules,
     )
+
+
+def test_empty_as_null_affects_null_bitmap_after_normalization() -> None:
+    columns = [
+        CompareColumn(name="id", type=ColumnType.INTEGER),
+        CompareColumn(name="memo", type=ColumnType.STRING),
+        CompareColumn(name="enabled", type=ColumnType.BOOLEAN),
+    ]
+    rules = CompareRules(empty_as_null=True)
+
+    assert compare_row_hash64(columns, [1, "", None], rules) == compare_row_hash64(
+        columns,
+        [1, None, None],
+        rules,
+    )
+    payload = normalized_compare_payload(columns, [1, "", None], rules)
+    parts = payload.split(rules.field_separator)
+    assert parts[:3] == ["0", "1", "1"]
 
 
 def test_recursive_hashdiff_skips_identical_segments_without_row_fetch() -> None:

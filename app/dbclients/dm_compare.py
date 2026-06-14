@@ -79,18 +79,15 @@ def _degrade_reasons(columns: list[CompareColumn]) -> list[str]:
 
 def _row_payload_expression(request: CompareHashRequest) -> str:
     rules = request.rules
-    null_bits = [
-        f"CASE WHEN {_quote_identifier(column.name)} IS NULL THEN '1' ELSE '0' END"
-        for column in request.columns
-    ]
-    normalized_values = [_coalesced_value(column, request) for column in request.columns]
+    normalized_exprs = [_normalized_value_expression(column, request) for column in request.columns]
+    null_bits = [f"CASE WHEN ({expr}) IS NULL THEN '1' ELSE '0' END" for expr in normalized_exprs]
+    normalized_values = [_coalesced_value(expr, request) for expr in normalized_exprs]
     parts = [*null_bits, *normalized_values]
     separator = _sql_string(rules.field_separator)
     return "(" + f" || {separator} || ".join(parts) + ")"
 
 
-def _coalesced_value(column: CompareColumn, request: CompareHashRequest) -> str:
-    value_expr = _normalized_value_expression(column, request)
+def _coalesced_value(value_expr: str, request: CompareHashRequest) -> str:
     return f"COALESCE({value_expr}, {_sql_string(request.rules.null_sentinel)})"
 
 
@@ -104,7 +101,10 @@ def _normalized_value_expression(column: CompareColumn, request: CompareHashRequ
             "'NLS_NUMERIC_CHARACTERS=''.,''')"
         )
     if column.type is ColumnType.BOOLEAN:
-        return f"CASE WHEN {quoted} IN (1, '1', 'Y', 'y', 'TRUE', 'true') THEN '1' ELSE '0' END"
+        return (
+            f"CASE WHEN {quoted} IS NULL THEN NULL "
+            f"WHEN {quoted} IN (1, '1', 'Y', 'y', 'TRUE', 'true') THEN '1' ELSE '0' END"
+        )
     if column.type is ColumnType.DATE:
         return f"TO_CHAR({quoted}, 'YYYY-MM-DD')"
     if column.type is ColumnType.TIME:

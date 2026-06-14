@@ -355,12 +355,15 @@ def normalized_compare_payload(
     actual_rules = rules or CompareRules()
     if len(columns) != len(values):
         raise ValueError("columns and values length mismatch")
-    null_bits = ["1" if value is None else "0" for value in values]
     normalized = [
-        _normalize_value(column, value, actual_rules) or actual_rules.null_sentinel
+        _normalize_value(column, value, actual_rules)
         for column, value in zip(columns, values, strict=True)
     ]
-    return actual_rules.field_separator.join([*null_bits, *normalized])
+    null_bits = ["1" if value is None else "0" for value in normalized]
+    normalized_values = [
+        value if value is not None else actual_rules.null_sentinel for value in normalized
+    ]
+    return actual_rules.field_separator.join([*null_bits, *normalized_values])
 
 
 def compare_row_hash64(
