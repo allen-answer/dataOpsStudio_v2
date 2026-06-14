@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -137,7 +137,13 @@ def test_dm_dbms_crypto_hash_poc_100k_rows() -> None:
     )
 
 
-def _mysql_env_or_skip() -> dict[str, str]:
+class _RedactedEnv(dict[str, str]):
+    def __repr__(self) -> str:
+        keys = ", ".join(sorted(self.keys()))
+        return f"_RedactedEnv(keys=[{keys}])"
+
+
+def _mysql_env_or_skip() -> _RedactedEnv:
     return _env_or_skip(
         {
             "host": "DATAOPS_TEST_MYSQL_HOST",
@@ -150,7 +156,7 @@ def _mysql_env_or_skip() -> dict[str, str]:
     )
 
 
-def _dm_env_or_skip() -> dict[str, str]:
+def _dm_env_or_skip() -> _RedactedEnv:
     values = _env_or_skip(
         {
             "host": "DATAOPS_TEST_DM_HOST",
@@ -164,15 +170,15 @@ def _dm_env_or_skip() -> dict[str, str]:
     return values
 
 
-def _env_or_skip(mapping: dict[str, str], label: str) -> dict[str, str]:
+def _env_or_skip(mapping: dict[str, str], label: str) -> _RedactedEnv:
     values = {name: os.environ.get(env_name) for name, env_name in mapping.items()}
     missing = [mapping[name] for name, value in values.items() if not value]
     if missing:
         pytest.skip(f"{label} integration env not set: {', '.join(missing)}")
-    return {name: str(value) for name, value in values.items()}
+    return _RedactedEnv({name: str(value) for name, value in values.items()})
 
 
-def _mysql_conn_info(env: dict[str, str]) -> DatasourceConnInfo:
+def _mysql_conn_info(env: _RedactedEnv) -> DatasourceConnInfo:
     return DatasourceConnInfo(
         host=env["host"],
         port=int(env["port"]),
@@ -186,7 +192,7 @@ def _mysql_conn_info(env: dict[str, str]) -> DatasourceConnInfo:
     )
 
 
-def _dm_conn_info(env: dict[str, str]) -> DatasourceConnInfo:
+def _dm_conn_info(env: _RedactedEnv) -> DatasourceConnInfo:
     return DatasourceConnInfo(
         host=env["host"],
         port=int(env["port"]),
@@ -248,15 +254,7 @@ def _expected_row_hashes(
 @contextmanager
 def _seed_mysql_table(env: dict[str, str]) -> Iterator[None]:
     pymysql = importlib.import_module("pymysql")
-    conn = pymysql.connect(
-        host=env["host"],
-        port=int(env["port"]),
-        user=env["user"],
-        password=env["password"],
-        database=env["database"],
-        charset="utf8mb4",
-        connect_timeout=10,
-    )
+    conn = _connect_mysql(pymysql, env)
     cursor = conn.cursor()
     try:
         cursor.execute(f"DROP TABLE IF EXISTS `{_MYSQL_TABLE}`")
@@ -290,13 +288,7 @@ def _seed_mysql_table(env: dict[str, str]) -> Iterator[None]:
 @contextmanager
 def _seed_dm_table(env: dict[str, str]) -> Iterator[None]:
     dm = importlib.import_module("dmPython")
-    conn = dm.connect(
-        user=env["user"],
-        password=env["password"],
-        server=env["host"],
-        port=int(env["port"]),
-        schema=env["database"],
-    )
+    conn = _connect_dm(dm, env)
     cursor = conn.cursor()
     try:
         _ignore_error(lambda: cursor.execute(f"DROP TABLE {_DM_TABLE}"))
@@ -330,13 +322,7 @@ def _seed_dm_table(env: dict[str, str]) -> Iterator[None]:
 @contextmanager
 def _seed_dm_poc_table(env: dict[str, str], row_count: int) -> Iterator[None]:
     dm = importlib.import_module("dmPython")
-    conn = dm.connect(
-        user=env["user"],
-        password=env["password"],
-        server=env["host"],
-        port=int(env["port"]),
-        schema=env["database"],
-    )
+    conn = _connect_dm(dm, env)
     cursor = conn.cursor()
     try:
         _ignore_error(lambda: cursor.execute(f"DROP TABLE {_DM_POC_TABLE}"))
@@ -377,15 +363,7 @@ def _seed_dm_poc_table(env: dict[str, str], row_count: int) -> Iterator[None]:
 
 def _mysql_rows(env: dict[str, str], plan: CompareHashPlan) -> dict[int, int]:
     pymysql = importlib.import_module("pymysql")
-    conn = pymysql.connect(
-        host=env["host"],
-        port=int(env["port"]),
-        user=env["user"],
-        password=env["password"],
-        database=env["database"],
-        charset="utf8mb4",
-        connect_timeout=10,
-    )
+    conn = _connect_mysql(pymysql, env)
     cursor = conn.cursor()
     try:
         assert plan.sql is not None
@@ -398,13 +376,7 @@ def _mysql_rows(env: dict[str, str], plan: CompareHashPlan) -> dict[int, int]:
 
 def _dm_rows(env: dict[str, str], plan: CompareHashPlan) -> dict[int, int]:
     dm = importlib.import_module("dmPython")
-    conn = dm.connect(
-        user=env["user"],
-        password=env["password"],
-        server=env["host"],
-        port=int(env["port"]),
-        schema=env["database"],
-    )
+    conn = _connect_dm(dm, env)
     cursor = conn.cursor()
     try:
         assert plan.sql is not None
@@ -417,15 +389,7 @@ def _dm_rows(env: dict[str, str], plan: CompareHashPlan) -> dict[int, int]:
 
 def _mysql_aggregate(env: dict[str, str], plan: CompareHashPlan) -> tuple[int, int]:
     pymysql = importlib.import_module("pymysql")
-    conn = pymysql.connect(
-        host=env["host"],
-        port=int(env["port"]),
-        user=env["user"],
-        password=env["password"],
-        database=env["database"],
-        charset="utf8mb4",
-        connect_timeout=10,
-    )
+    conn = _connect_mysql(pymysql, env)
     cursor = conn.cursor()
     try:
         assert plan.sql is not None
@@ -439,13 +403,7 @@ def _mysql_aggregate(env: dict[str, str], plan: CompareHashPlan) -> tuple[int, i
 
 def _dm_aggregate(env: dict[str, str], plan: CompareHashPlan) -> tuple[int, int]:
     dm = importlib.import_module("dmPython")
-    conn = dm.connect(
-        user=env["user"],
-        password=env["password"],
-        server=env["host"],
-        port=int(env["port"]),
-        schema=env["database"],
-    )
+    conn = _connect_dm(dm, env)
     cursor = conn.cursor()
     try:
         assert plan.sql is not None
@@ -455,6 +413,34 @@ def _dm_aggregate(env: dict[str, str], plan: CompareHashPlan) -> tuple[int, int]
     finally:
         cursor.close()
         conn.close()
+
+
+def _connect_mysql(pymysql: Any, env: dict[str, str]) -> Any:
+    try:
+        return pymysql.connect(
+            host=env["host"],
+            port=int(env["port"]),
+            user=env["user"],
+            password=env["password"],
+            database=env["database"],
+            charset="utf8mb4",
+            connect_timeout=10,
+        )
+    except Exception:
+        raise RuntimeError("MySQL compare golden connection failed; details redacted") from None
+
+
+def _connect_dm(dm: Any, env: dict[str, str]) -> Any:
+    try:
+        return dm.connect(
+            user=env["user"],
+            password=env["password"],
+            server=env["host"],
+            port=int(env["port"]),
+            schema=env["database"],
+        )
+    except Exception:
+        raise RuntimeError("DM compare golden connection failed; details redacted") from None
 
 
 def _ignore_error(fn: Callable[[], object]) -> None:
