@@ -23,6 +23,7 @@ _SUPPORTED_DB_HASH_TYPES = {
     ColumnType.DATE,
     ColumnType.TIME,
 }
+_HASH_DECIMAL_TYPE = "DECIMAL(38,0)"
 
 
 def build_dm_compare_hash_plan(request: CompareHashRequest) -> CompareHashPlan:
@@ -164,7 +165,10 @@ def _dm_timestamp_expr(expr: str, precision: int) -> str:
 def _hex_prefix_to_uint64(hex_expr: str) -> str:
     high32 = _hex_chunk_to_decimal(hex_expr, start=1)
     low32 = _hex_chunk_to_decimal(hex_expr, start=9)
-    return f"CAST(({high32} * CAST(4294967296 AS DECIMAL(20,0)) + {low32}) AS DECIMAL(20,0))"
+    return (
+        f"CAST(({high32} * CAST(4294967296 AS {_HASH_DECIMAL_TYPE}) + {low32}) "
+        f"AS {_HASH_DECIMAL_TYPE})"
+    )
 
 
 def _hex_chunk_to_decimal(hex_expr: str, *, start: int) -> str:
@@ -173,7 +177,7 @@ def _hex_chunk_to_decimal(hex_expr: str, *, start: int) -> str:
         f"(INSTR('0123456789ABCDEF', SUBSTR({hex_expr}, {start + offset}, 1)) - 1) * {power}"
         for offset, power in enumerate(powers)
     ]
-    return "CAST((" + " + ".join(terms) + ") AS DECIMAL(20,0))"
+    return "CAST((" + " + ".join(terms) + f") AS {_HASH_DECIMAL_TYPE})"
 
 
 def _where_clause(request: CompareHashRequest) -> str:
