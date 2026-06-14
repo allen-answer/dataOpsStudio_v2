@@ -206,6 +206,34 @@ npm run dev
 
 ---
 
+### a11y 快照走查漏掉 CSS 竖排;chrome-btn-ghost 是图标专用类(2.1.0 W2,PR #67→#69)
+
+**症状**
+- W2-PR3 合并并上生产后,用户截图发现结果区三个 tab(结果/执行计划/统计)的中文标签
+  被挤成竖排单字(每字一行)。Fable 真机走查时没发现。
+
+**根因(两层)**
+1. 视觉 bug 本身:`.chrome-btn-ghost` 是**固定 1.75rem 方块的纯图标按钮**
+   (`width/height:1.75rem` + `justify-content:center`,无 `white-space:nowrap`);
+   W2-PR3 把它误用在"图标 + 中文文字"的 tab 上,28px 方块把多字中文压成竖排。
+   `px-3` 改不动它——`[data-variant] .chrome-btn-ghost` 特异性高过 Tailwind 工具类。
+   (此前 Wave 4「登录第二步按钮塌缩」是同一个类的同类误用,属复发。)
+2. 走查方法缺陷:复核用的是**无障碍快照(a11y snapshot)**,它读按钮的可访问名
+   ("结果"/"统计"),**不反映 CSS 布局**,所以竖排 bug 在快照里看不出来。
+
+**修法**
+- 新增语义化 `.chrome-tab`(auto 宽 + `white-space:nowrap` + h-2rem)替代误用;
+  tab 组加 `shrink-0`、右侧状态/导出组加 `min-w-0`(让占位长文本截断而非挤压 tab)。
+- 全仓 grep `chrome-btn-ghost` 自查,揪出并修了另一处同类误用(AdminAiConfig「清除 Key」)。
+
+**教训**
+- **前端走查必须看真截图**(browser_take_screenshot),不能只靠 a11y 快照——
+  快照能验"元素在/可点/可访问名对",但验不了"长得对"。布局/换行/挤压/溢出只有像素能证。
+- `chrome-btn-ghost` = 纯图标按钮(28px 方块);**带文字的分段控件/ tab 用 `.chrome-tab`**,
+  别再误用 ghost 类放文字。CJK 文字按钮尤其要 `white-space:nowrap`。
+
+---
+
 ## 3. 设计背景
 
 ### 1.x DataOpsStudio 的定位(原 contract §9 内容)

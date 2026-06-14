@@ -11,7 +11,7 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| 2.1.0 W2:元数据浏览器 + SQL 工具(format/expand-star/EXPLAIN)+ 4 格式导出 | Codex(任务书待发) | W1 已合并 | 未开工 | — |
+| (暂无活动开发项) | — | — | — | — |
 
 > **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
 > 安全项全闭环/落档)。**DM 已 Certified**:真实例验证 8/8 + 修复 3 个 adapter bug,
@@ -23,10 +23,16 @@
 > Compare(2.2.0)/ Lineage(2.4.0)按 1.x 使用反馈 8 条 + 业界调研修订;
 > 新增 ADR-0019(子图优先)、ADR-0020(血缘边表持久化 + sql_hash 缓存)。
 >
+> **2.1.0 SQL Workspace 完整版已上线生产(2026-06-14)**:W1 地基 + W2(元数据浏览器
+> / format / expand-star / EXPLAIN / 4 格式导出)全部合并,服务器已部署到 07624ef
+> 并经 Fable 5 真机走查。下一能力域为 2.2.0 Compare(设计 v0.3.3)。
+>
 > **后续候选(待人拍板,均无 owner/未排期)**:test_connection 终态 job 不阻塞数据源
 > 删除(`docs/backlog.md`,2.0.x patch)、Oracle adapter(2.0.x)、外部安全审计
 > 触发项(密码进 body 改造)、正式 license 签发(首个商业交付前)、worker DM 加密库
-> 部署文档(首个 DM 客户前)、2.1.0 完整 SQL Workspace。
+> 部署文档(首个 DM 客户前)、DM 列头 driver_type 美化(`docs/backlog.md`,2.1.x)、
+> **2.2.0 Compare 能力域**(设计 v0.3.3 已就绪:递归 checksum 下钻 + 跨库规范化层 +
+> 差异画像 + 任务建议)。
 
 ---
 
@@ -45,6 +51,18 @@
 
 ## 已完成归档
 
+> **2.1.0 Wave 2 — SQL Workspace 工具链(2026-06-14 全部合并 + 已上生产)**:
+> W2-PR1 元数据浏览器 + SQL 工具后端(Codex,[#65](https://github.com/allen-answer/dataOpsStudio_v2/pull/65)):
+> metadata schemas/tables/columns(MySQL+DM,7 天缓存 + 探测超时 503)/ format /
+> expand-star / EXPLAIN(走 job 队列)。
+> W2-PR2 4 格式导出后端(Codex,[#66](https://github.com/allen-answer/dataOpsStudio_v2/pull/66)):
+> csv/excel/json/sql + 公式注入防御 + 一次性下载 token(原子消费 + 哈希存储 + 属主校验)+
+> 每小时限额 + 24h 文件 GC。
+> W2-PR3 前端(**Claude Opus 子代理**,[#67](https://github.com/allen-answer/dataOpsStudio_v2/pull/67)):
+> 元数据树 + 工具栏 + Result/Plan/Stats 三 tab + 导出 UI。三 PR 均 Fable 5 复核 +
+> 真机走查(证据在 PR 评论)。生产部署 07624ef。分工:后端 Codex / 前端 Opus 子代理 /
+> Fable 复核(2026-06-13 起)。
+>
 > **2.1.0 Wave 1 — SQL Workspace 地基(2026-06-13 全部合并 + 已上生产)**:
 > W1-PR1 后端(Codex):Console 持久化 / SQL 历史(jobs 推导)/ 模板 CRUD /
 > ResultSet 完整版(边拉边看 + 限额 + LRU + TTL 周期 GC)
