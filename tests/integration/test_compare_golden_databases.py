@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
@@ -37,6 +38,8 @@ pytestmark = pytest.mark.integration
 
 _MYSQL_TABLE = "dosv2_compare_golden_mysql"
 _DM_TABLE = "DOSV2_COMPARE_GOLDEN_DM"
+_DM_POC_TABLE = "DOSV2_COMPARE_HASH_POC"
+_DM_POC_ROWS = 100_000
 
 
 def test_compare_golden_row_and_aggregate_hashes_match_mysql_and_dm() -> None:
@@ -101,6 +104,37 @@ def test_compare_golden_row_and_aggregate_hashes_match_mysql_and_dm() -> None:
             len(expected),
             sum(expected.values()),
         )
+
+
+@pytest.mark.slow
+def test_dm_dbms_crypto_hash_poc_100k_rows() -> None:
+    dm_env = _dm_env_or_skip()
+    rules = _rules()
+    columns = _columns()
+
+    with _seed_dm_poc_table(dm_env, _DM_POC_ROWS):
+        dm_adapter = DMAdapter(
+            _dm_conn_info(dm_env),
+            cast(SecretStore, _EnvSecretStore(dm_env["password"])),
+        )
+        aggregate_plan = dm_adapter.build_compare_hash_query(
+            _request(
+                table=CompareTableRef(schema_name=dm_env["database"], name=_DM_POC_TABLE),
+                columns=columns,
+                rules=rules,
+                level=CompareHashLevel.AGGREGATE,
+            )
+        )
+        started_at = time.perf_counter()
+        row_count, aggregate_hash = _dm_aggregate(dm_env, aggregate_plan)
+        elapsed_seconds = time.perf_counter() - started_at
+
+    assert row_count == _DM_POC_ROWS
+    assert aggregate_hash > 0
+    print(
+        "\n[evidence] DM DBMS_CRYPTO.HASH compare aggregate "
+        f"rows={row_count} elapsed_seconds={elapsed_seconds:.3f} mode=db_hash"
+    )
 
 
 def _mysql_env_or_skip() -> dict[str, str]:
@@ -287,6 +321,54 @@ def _seed_dm_table(env: dict[str, str]) -> Iterator[None]:
     finally:
         try:
             _ignore_error(lambda: cursor.execute(f"DROP TABLE {_DM_TABLE}"))
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+
+@contextmanager
+def _seed_dm_poc_table(env: dict[str, str], row_count: int) -> Iterator[None]:
+    dm = importlib.import_module("dmPython")
+    conn = dm.connect(
+        user=env["user"],
+        password=env["password"],
+        server=env["host"],
+        port=int(env["port"]),
+        schema=env["database"],
+    )
+    cursor = conn.cursor()
+    try:
+        _ignore_error(lambda: cursor.execute(f"DROP TABLE {_DM_POC_TABLE}"))
+        cursor.execute(
+            f"CREATE TABLE {_DM_POC_TABLE} ("
+            "ID INT PRIMARY KEY, "
+            "AMOUNT DECIMAL(18,6), "
+            "UPDATED_AT TIMESTAMP(6), "
+            "NAME VARCHAR(128), "
+            "MEMO VARCHAR(128) NULL)"
+        )
+        batch_size = 1000
+        for start in range(1, row_count + 1, batch_size):
+            end = min(row_count + 1, start + batch_size)
+            cursor.executemany(
+                f"INSERT INTO {_DM_POC_TABLE} VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        idx,
+                        f"{idx / 100:.6f}",
+                        "2026-06-14 12:13:14.123456",
+                        f"row-{idx % 997}",
+                        None if idx % 10 == 0 else f"memo-{idx % 17}",
+                    )
+                    for idx in range(start, end)
+                ],
+            )
+        conn.commit()
+        yield
+    finally:
+        try:
+            _ignore_error(lambda: cursor.execute(f"DROP TABLE {_DM_POC_TABLE}"))
             conn.commit()
         finally:
             cursor.close()
