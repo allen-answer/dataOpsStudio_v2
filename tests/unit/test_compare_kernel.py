@@ -57,21 +57,25 @@ def test_compare_hash_sql_contains_normalization_rules_and_segment_params() -> N
     dm_plan = build_dm_compare_hash_plan(request)
 
     assert mysql_plan.sql is not None
-    assert "CONCAT_WS" in mysql_plan.normalized_payload_expression
-    assert "CHARACTER SET utf8mb4" in mysql_plan.normalized_payload_expression
-    assert "COLLATE utf8mb4_bin" in mysql_plan.normalized_payload_expression
-    assert "TRIM(" in mysql_plan.normalized_payload_expression
-    assert "LOWER(" in mysql_plan.normalized_payload_expression
-    assert "IF((NULLIF(" in mysql_plan.normalized_payload_expression
-    assert "CHAR_LENGTH(" in mysql_plan.normalized_payload_expression
+    mysql_payload = mysql_plan.normalized_payload_expression
+    assert mysql_payload is not None
+    assert "CONCAT_WS" in mysql_payload
+    assert "CHARACTER SET utf8mb4" in mysql_payload
+    assert "COLLATE utf8mb4_bin" in mysql_payload
+    assert "TRIM(" in mysql_payload
+    assert "LOWER(" in mysql_payload
+    assert "IF((NULLIF(" in mysql_payload
+    assert "CHAR_LENGTH(" in mysql_payload
     assert "%(segment_start)s" in mysql_plan.sql
     assert mysql_plan.params == {"segment_start": 0, "segment_end": 32_000}
 
     assert dm_plan.sql is not None
-    assert " || " in dm_plan.normalized_payload_expression
-    assert "CONVERT(" in dm_plan.normalized_payload_expression
-    assert "CASE WHEN (NULLIF(" in dm_plan.normalized_payload_expression
-    assert "LENGTH(" in dm_plan.normalized_payload_expression
+    dm_payload = dm_plan.normalized_payload_expression
+    assert dm_payload is not None
+    assert " || " in dm_payload
+    assert "CONVERT(" in dm_payload
+    assert "CASE WHEN (NULLIF(" in dm_payload
+    assert "LENGTH(" in dm_payload
     assert ":segment_start" in dm_plan.sql
     assert dm_plan.params == {"segment_start": 0, "segment_end": 32_000}
 
