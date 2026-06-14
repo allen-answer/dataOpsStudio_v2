@@ -19,8 +19,8 @@ For a compare segment, each side builds the same normalized row payload:
 String columns apply trim, case-folding and empty-as-null rules before sentinel
 replacement. Numeric columns use fixed decimal scale. Date/time columns use configured
 timestamp precision. MySQL expressions specify charset/collation per expression; DM uses
-UTF8 conversion for text expressions and must degrade to client row hashing if the target
-deployment cannot express the requested normalization safely.
+`TO_CHAR` for text normalization and must degrade to client row hashing unless the
+requested normalization charset is UTF-8 compatible.
 
 The length prefix is part of the canonical payload so values that contain the separator or
 the sentinel cannot collide with different column boundaries.
@@ -32,7 +32,13 @@ The database-side aggregate hash is:
 1. Normalize one row payload.
 2. Compute MD5 over the payload.
 3. Take the first 8 bytes of the MD5 digest as an unsigned integer.
-4. Sum the row integers for the segment.
+4. Sum the row integers for the segment with exact decimal/integer arithmetic.
+
+MySQL expresses step 3 with `CONV(..., 16, 10)` cast to `DECIMAL(20,0)`. DM must avoid
+floating conversion for the 64-bit value: split the 16 hex characters into high and low
+32-bit chunks, expand each chunk with integer weights, then compute
+`high * 4294967296 + low` as `DECIMAL(20,0)`. Segment aggregation must promote row hashes
+to a wider exact decimal, such as `DECIMAL(38,0)`, before `SUM`.
 
 The aggregate result is a prefilter only. Equal aggregate hashes let the engine skip a
 segment; mismatches recurse or switch to row-level comparison. Final truth remains the
