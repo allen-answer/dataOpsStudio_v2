@@ -341,6 +341,29 @@
   cursor: not-allowed;
 }
 
+/* tab(图标 + 文字的分段控件:结果 / 执行计划 / 统计)—— 内容自适应、单行不换行 */
+[data-variant] .chrome-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  height: 2rem;
+  padding-inline: 0.75rem;
+  color: rgb(var(--text-muted));
+  background-color: transparent;
+  border-radius: var(--radius-input);
+  white-space: nowrap;
+  user-select: none;
+  transition: background-color 120ms, color 120ms;
+}
+[data-variant] .chrome-tab:hover:not(:disabled) {
+  background-color: rgb(var(--bg-panel-elevated));
+  color: rgb(var(--text-heading));
+}
+[data-variant] .chrome-tab:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 @layer utilities {
   /* 等宽数字 —— 数据表格列对齐用 */
   .tabular-mono {
