@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable, Sequence
 from datetime import datetime
 from decimal import Decimal
@@ -59,12 +60,14 @@ def test_compare_hash_sql_contains_normalization_rules_and_segment_params() -> N
     assert "COLLATE utf8mb4_bin" in mysql_plan.normalized_payload_expression
     assert "TRIM(" in mysql_plan.normalized_payload_expression
     assert "LOWER(" in mysql_plan.normalized_payload_expression
+    assert "IF((NULLIF(" in mysql_plan.normalized_payload_expression
     assert "%(segment_start)s" in mysql_plan.sql
     assert mysql_plan.params == {"segment_start": 0, "segment_end": 32_000}
 
     assert dm_plan.sql is not None
     assert " || " in dm_plan.normalized_payload_expression
     assert "CONVERT(" in dm_plan.normalized_payload_expression
+    assert "CASE WHEN (NULLIF(" in dm_plan.normalized_payload_expression
     assert ":segment_start" in dm_plan.sql
     assert dm_plan.params == {"segment_start": 0, "segment_end": 32_000}
 
@@ -114,6 +117,24 @@ def test_golden_normalized_hash_matches_mysql_and_dm_logical_rows() -> None:
         columns,
         dm_row,
         rules,
+    )
+
+
+def test_compare_row_hash64_uses_first_8_md5_bytes_big_endian() -> None:
+    columns = [CompareColumn(name="payload", type=ColumnType.STRING)]
+    values = ["abc"]
+    payload = normalized_compare_payload(columns, values)
+    digest = hashlib.md5(payload.encode("utf-8"), usedforsecurity=False).digest()
+
+    assert compare_row_hash64(columns, values) == int.from_bytes(
+        digest[:8],
+        "big",
+        signed=False,
+    )
+    assert compare_row_hash64(columns, values) != int.from_bytes(
+        digest[-8:],
+        "big",
+        signed=False,
     )
 
 
