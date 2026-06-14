@@ -285,7 +285,7 @@ function errorMessage(): string {
                 <KeyRound class="w-3.5 h-3.5 chrome-accent" />
                 {{ t('ai.key_stored', { source: apiKeySource }) }}
               </span>
-              <button type="button" class="chrome-btn-ghost hover:!text-red-500 text-xs" :disabled="fieldsDisabled" data-testid="ai-key-clear" @click="toggleClearKey">
+              <button type="button" class="inline-flex items-center gap-1.5 px-2 h-7 rounded-md whitespace-nowrap chrome-text-muted hover:chrome-bg-elevated hover:!text-red-500 transition-colors text-xs disabled:opacity-50 disabled:cursor-not-allowed" :disabled="fieldsDisabled" data-testid="ai-key-clear" @click="toggleClearKey">
                 <Trash2 class="w-3.5 h-3.5" /> {{ t('ai.key_clear') }}
               </button>
             </div>

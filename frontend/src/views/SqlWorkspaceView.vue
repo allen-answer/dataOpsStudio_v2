@@ -1634,11 +1634,11 @@ function parseVariables(value: string): string[] {
         </div>
 
         <div ref="resultPanel" class="flex-1 min-h-[35vh] flex flex-col">
-          <div class="flex items-center justify-between px-5 py-2 border-b chrome-border-subtle text-xs">
-            <div class="flex items-center gap-1">
+          <div class="flex items-center justify-between gap-3 px-5 py-2 border-b chrome-border-subtle text-xs">
+            <div class="flex items-center gap-1 shrink-0">
               <button
                 type="button"
-                class="chrome-btn-ghost px-3"
+                class="chrome-tab"
                 :class="(activeRuntime?.resultTab ?? 'result') === 'result' && 'chrome-accent-light-bg chrome-accent'"
                 @click="activeRuntime && (activeRuntime.resultTab = 'result')"
               >
@@ -1647,7 +1647,7 @@ function parseVariables(value: string): string[] {
               </button>
               <button
                 type="button"
-                class="chrome-btn-ghost px-3"
+                class="chrome-tab"
                 :class="activeRuntime?.resultTab === 'plan' && 'chrome-accent-light-bg chrome-accent'"
                 @click="activeRuntime && (activeRuntime.resultTab = 'plan')"
               >
@@ -1656,7 +1656,7 @@ function parseVariables(value: string): string[] {
               </button>
               <button
                 type="button"
-                class="chrome-btn-ghost px-3"
+                class="chrome-tab"
                 :class="activeRuntime?.resultTab === 'stats' && 'chrome-accent-light-bg chrome-accent'"
                 @click="activeRuntime && (activeRuntime.resultTab = 'stats')"
               >
@@ -1664,7 +1664,7 @@ function parseVariables(value: string): string[] {
                 {{ t('sql.tab_stats') }}
               </button>
             </div>
-            <div class="flex items-center gap-3">
+            <div class="flex items-center gap-3 min-w-0">
               <span class="chrome-text-muted truncate">{{ statusSummary }}</span>
               <div class="relative">
                 <button
