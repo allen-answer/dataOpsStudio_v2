@@ -21,6 +21,8 @@ from app.domain.compare import (
     RunLimits,
     SegmentFingerprint,
     compare_row_hash64,
+    compare_rows_without_prefilter,
+    normalized_compare_identity,
     normalized_compare_payload,
     recursive_hashdiff,
 )
@@ -156,12 +158,43 @@ def test_empty_as_null_affects_null_bitmap_after_normalization() -> None:
     assert parts[:3] == ["0", "1", "1"]
 
 
+def test_normalized_identity_preserves_null_bitmap_truth() -> None:
+    columns = [CompareColumn(name="memo", type=ColumnType.STRING)]
+    rules = CompareRules(empty_as_null=True)
+
+    assert normalized_compare_identity(columns, [""], rules) == ((True, rules.null_sentinel),)
+    assert normalized_compare_identity(columns, [rules.null_sentinel], rules) == (
+        (False, rules.null_sentinel),
+    )
+
+
 def test_python_string_normalization_matches_sql_lower_and_space_trim() -> None:
     columns = [CompareColumn(name="name", type=ColumnType.STRING)]
     rules = CompareRules(trim_strings=True, case_insensitive=True)
 
     assert normalized_compare_payload(columns, ["  Alpha  "], rules).endswith("alpha")
     assert normalized_compare_payload(columns, ["\tAlpha\t"], rules).endswith("\talpha\t")
+
+
+def test_fallback_row_compare_uses_normalized_identity_when_columns_given() -> None:
+    columns = [
+        CompareColumn(name="id", type=ColumnType.INTEGER),
+        CompareColumn(name="amount", type=ColumnType.DECIMAL),
+        CompareColumn(name="name", type=ColumnType.STRING),
+        CompareColumn(name="memo", type=ColumnType.STRING),
+    ]
+    rules = CompareRules(trim_strings=True, case_insensitive=True, empty_as_null=True)
+    source_rows = [CompareRow(pk=(1,), values=(1, "12.3400", "  Alpha  ", ""))]
+    target_rows = [CompareRow(pk=(1,), values=(1, Decimal("12.34"), "alpha", None))]
+
+    result = compare_rows_without_prefilter(
+        source_rows,
+        target_rows,
+        columns=columns,
+        rules=rules,
+    )
+
+    assert [(event.bucket, event.pk) for event in result.events] == [(CompareDiffBucket.SAME, (1,))]
 
 
 def test_recursive_hashdiff_skips_identical_segments_without_row_fetch() -> None:

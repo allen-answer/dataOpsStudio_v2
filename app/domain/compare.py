@@ -328,21 +328,39 @@ def compare_rows_without_prefilter(
     source_rows: Sequence[CompareRow],
     target_rows: Sequence[CompareRow],
     key_column: str = "id",
+    *,
+    columns: Sequence[CompareColumn] | None = None,
+    rules: CompareRules | None = None,
 ) -> HashdiffResult:
     """Small helper for tests and fallback callers that already hold row batches."""
 
+    actual_source_rows = _normalize_compare_rows(source_rows, columns, rules)
+    actual_target_rows = _normalize_compare_rows(target_rows, columns, rules)
     if not source_rows and not target_rows:
         root = CompareSegment(key_column=key_column, start=0, end=0)
     else:
         keys = [
             int(row.pk[0])
-            for row in [*source_rows, *target_rows]
+            for row in [*actual_source_rows, *actual_target_rows]
             if row.pk and isinstance(row.pk[0], int)
         ]
         root = CompareSegment(key_column=key_column, start=min(keys), end=max(keys) + 1)
-    reader = _StaticRowReader(source_rows)
-    other = _StaticRowReader(target_rows)
+    reader = _StaticRowReader(actual_source_rows)
+    other = _StaticRowReader(actual_target_rows)
     return recursive_hashdiff(reader, other, root, RunLimits(recursive_checksum=False))
+
+
+def normalized_compare_identity(
+    columns: Sequence[CompareColumn],
+    values: Sequence[Any],
+    rules: CompareRules | None = None,
+) -> tuple[tuple[bool, str], ...]:
+    actual_rules = rules or CompareRules()
+    normalized = _normalized_values(columns, values, actual_rules)
+    return tuple(
+        (value is None, value if value is not None else actual_rules.null_sentinel)
+        for value in normalized
+    )
 
 
 def normalized_compare_payload(
@@ -351,17 +369,43 @@ def normalized_compare_payload(
     rules: CompareRules | None = None,
 ) -> str:
     actual_rules = rules or CompareRules()
+    identity = normalized_compare_identity(columns, values, actual_rules)
+    null_bits = ["1" if is_null else "0" for is_null, _value in identity]
+    normalized_values = [value for _is_null, value in identity]
+    return actual_rules.field_separator.join([*null_bits, *normalized_values])
+
+
+def _normalized_values(
+    columns: Sequence[CompareColumn],
+    values: Sequence[Any],
+    rules: CompareRules,
+) -> list[str | None]:
     if len(columns) != len(values):
         raise ValueError("columns and values length mismatch")
-    normalized = [
-        _normalize_value(column, value, actual_rules)
+    return [
+        _normalize_value(column, value, rules)
         for column, value in zip(columns, values, strict=True)
     ]
-    null_bits = ["1" if value is None else "0" for value in normalized]
-    normalized_values = [
-        value if value is not None else actual_rules.null_sentinel for value in normalized
+
+
+def _normalize_compare_rows(
+    rows: Sequence[CompareRow],
+    columns: Sequence[CompareColumn] | None,
+    rules: CompareRules | None,
+) -> list[CompareRow]:
+    if columns is None:
+        return list(rows)
+    return [
+        row.model_copy(
+            update={
+                "values": normalized_compare_identity(columns, row.values, rules),
+                "row_hash64": row.row_hash64
+                if row.row_hash64 is not None
+                else compare_row_hash64(columns, row.values, rules),
+            }
+        )
+        for row in rows
     ]
-    return actual_rules.field_separator.join([*null_bits, *normalized_values])
 
 
 def compare_row_hash64(
@@ -498,6 +542,7 @@ __all__ = [
     "SegmentFingerprint",
     "compare_row_hash64",
     "compare_rows_without_prefilter",
+    "normalized_compare_identity",
     "normalized_compare_payload",
     "recursive_hashdiff",
 ]
