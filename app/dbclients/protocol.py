@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from typing import Any, Protocol
 
 from app.domain.capabilities import AdapterCapabilities
+from app.domain.compare import CompareHashPlan, CompareHashRequest
 from app.domain.plan import PlanNode
 from app.domain.schema import Column, Index, Row, Schema, Table
 
@@ -57,6 +58,10 @@ class DatabaseAdapter(Protocol):
         raise NotImplementedError
 
     def get_table_ddl(self, schema: str, table: str) -> str:
+        raise NotImplementedError
+
+    def build_compare_hash_query(self, request: CompareHashRequest) -> CompareHashPlan:
+        """Build dialect-specific normalized MD5/SUM hash SQL, or explicit client fallback."""
         raise NotImplementedError
 
     def kill_query(self, connection_id: str) -> bool:

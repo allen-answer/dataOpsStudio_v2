@@ -15,7 +15,9 @@ import pytest
 from app.dbclients.dm_adapter import DMAdapter
 from app.dbclients.mysql_adapter import MySQLAdapter
 from app.dbclients.protocol import DatabaseAdapter
+from app.domain.compare import CompareColumn, CompareHashRequest, CompareTableRef
 from app.domain.datasource import DatasourceConnInfo, DbType
+from app.domain.schema import ColumnType
 from app.domain.secret import HashedRef, RotationReport, SecretKind, SecretRef
 from app.infrastructure.secretstore.protocol import SecretStore
 
@@ -50,6 +52,7 @@ def test_capabilities_declared(adapter: DatabaseAdapter) -> None:
     assert hasattr(caps, "list_columns")
     assert hasattr(caps, "list_indexes")
     assert hasattr(caps, "get_table_ddl")
+    assert hasattr(caps, "compare_db_hash")
 
 
 def test_test_connection_returns_bool(adapter: DatabaseAdapter) -> None:
@@ -97,6 +100,23 @@ def test_explain_returns_plan_node(adapter: DatabaseAdapter) -> None:
     if adapter.capabilities.explain:
         plan = adapter.explain("SELECT 1")
         assert plan.operation is not None
+
+
+def test_compare_hash_query_builds_without_connecting(adapter: DatabaseAdapter) -> None:
+    request = CompareHashRequest(
+        table=CompareTableRef(schema_name="app", name="users"),
+        columns=[
+            CompareColumn(name="id", type=ColumnType.INTEGER),
+            CompareColumn(name="name", type=ColumnType.STRING),
+        ],
+        key_columns=[CompareColumn(name="id", type=ColumnType.INTEGER)],
+    )
+
+    plan = adapter.build_compare_hash_query(request)
+
+    assert adapter.capabilities.compare_db_hash is True
+    assert plan.uses_database_hash is True
+    assert plan.sql is not None
 
 
 def _conn_info(db_type: DbType) -> DatasourceConnInfo:

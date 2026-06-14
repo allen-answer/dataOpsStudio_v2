@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
+from app.dbclients.dm_compare import build_dm_compare_hash_plan
 from app.dbclients.dm_types import (
     data_type_string_to_column_type,
     description_item_to_column_type,
@@ -13,6 +14,7 @@ from app.dbclients.dm_types import (
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.capabilities import AdapterCapabilities
+from app.domain.compare import CompareHashPlan, CompareHashRequest
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.plan import PlanNode
 from app.domain.schema import Column, Index, Row, Schema, Table
@@ -75,6 +77,7 @@ class DMAdapter(DatabaseAdapter):
         list_columns=True,
         list_indexes=True,
         get_table_ddl=True,
+        compare_db_hash=True,
     )
 
     def __init__(
@@ -276,6 +279,9 @@ class DMAdapter(DatabaseAdapter):
         if not rows or not rows[0]:
             raise DMAdapterError("DBMS_METADATA.GET_DDL returned no DDL")
         return str(rows[0][0])
+
+    def build_compare_hash_query(self, request: CompareHashRequest) -> CompareHashPlan:
+        return build_dm_compare_hash_plan(request)
 
     def kill_query(self, connection_id: str) -> bool:
         # DM 无 driver-level cancel(V1_AS_IS §2.8);走软取消,这里恒 False。
