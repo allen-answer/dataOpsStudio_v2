@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
+from app.dbclients.mysql_compare import build_mysql_compare_hash_plan
 from app.dbclients.mysql_types import (
     column_type_string_to_column_type,
     field_type_to_column_type,
@@ -13,6 +14,7 @@ from app.dbclients.mysql_types import (
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.capabilities import AdapterCapabilities
+from app.domain.compare import CompareHashPlan, CompareHashRequest
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.plan import PlanNode
 from app.domain.schema import Column, Index, Row, Schema, Table
@@ -56,6 +58,7 @@ class MySQLAdapter(DatabaseAdapter):
         list_columns=True,
         list_indexes=True,
         get_table_ddl=True,
+        compare_db_hash=True,
     )
 
     def __init__(
@@ -238,6 +241,9 @@ class MySQLAdapter(DatabaseAdapter):
         if not rows or len(rows[0]) < 2:
             raise MySQLAdapterError("SHOW CREATE TABLE returned no DDL")
         return str(rows[0][1])
+
+    def build_compare_hash_query(self, request: CompareHashRequest) -> CompareHashPlan:
+        return build_mysql_compare_hash_plan(request)
 
     def kill_query(self, connection_id: str) -> bool:
         return False

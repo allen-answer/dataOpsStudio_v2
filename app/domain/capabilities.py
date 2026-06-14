@@ -23,3 +23,4 @@ class AdapterCapabilities(BaseModel):
     list_columns: bool
     list_indexes: bool
     get_table_ddl: bool
+    compare_db_hash: bool = False
