@@ -156,6 +156,14 @@ def test_empty_as_null_affects_null_bitmap_after_normalization() -> None:
     assert parts[:3] == ["0", "1", "1"]
 
 
+def test_python_string_normalization_matches_sql_lower_and_space_trim() -> None:
+    columns = [CompareColumn(name="name", type=ColumnType.STRING)]
+    rules = CompareRules(trim_strings=True, case_insensitive=True)
+
+    assert normalized_compare_payload(columns, ["  Alpha  "], rules).endswith("alpha")
+    assert normalized_compare_payload(columns, ["\tAlpha\t"], rules).endswith("\talpha\t")
+
+
 def test_recursive_hashdiff_skips_identical_segments_without_row_fetch() -> None:
     rows = [CompareRow(pk=(idx,), values=(idx,), row_hash64=idx) for idx in range(64_000)]
     source = _MemorySegmentReader(rows)
@@ -196,6 +204,20 @@ def test_recursive_hashdiff_sparse_diff_avoids_full_row_scan() -> None:
     assert len(same_events) < len(source_rows)
     assert sum(end - start for start, end in source.fetch_calls) < len(source_rows)
     assert result.progress.recursed_segments > 0
+
+
+def test_row_level_diff_does_not_use_hash_as_final_truth() -> None:
+    source = _MemorySegmentReader([CompareRow(pk=(1,), values=("old",), row_hash64=123)])
+    target = _MemorySegmentReader([CompareRow(pk=(1,), values=("new",), row_hash64=123)])
+
+    result = recursive_hashdiff(
+        source,
+        target,
+        CompareSegment(key_column="id", start=1, end=2),
+        RunLimits(recursive_checksum=False),
+    )
+
+    assert [(event.bucket, event.pk) for event in result.events] == [(CompareDiffBucket.DIFF, (1,))]
 
 
 def test_recursive_and_disabled_prefilter_return_same_diff_set() -> None:

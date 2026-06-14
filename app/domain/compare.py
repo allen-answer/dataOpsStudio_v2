@@ -321,8 +321,6 @@ def _row_map(rows: Iterable[CompareRow]) -> dict[tuple[Any, ...], CompareRow]:
 
 
 def _rows_equivalent(source: CompareRow, target: CompareRow) -> bool:
-    if source.row_hash64 is not None and target.row_hash64 is not None:
-        return source.row_hash64 == target.row_hash64
     return source.values == target.values
 
 
@@ -391,9 +389,9 @@ def _normalize_value(column: CompareColumn, value: Any, rules: CompareRules) -> 
         return _normalize_datetime(value, rules.timestamp_precision)
     text = str(value)
     if rules.trim_strings:
-        text = text.strip()
+        text = text.strip(" ")
     if rules.case_insensitive:
-        text = text.casefold()
+        text = text.lower()
     if rules.empty_as_null and text == "":
         return None
     return text
@@ -461,7 +459,10 @@ class _StaticRowReader:
         rows = list(self.fetch_rows(segment))
         return SegmentFingerprint(
             row_count=len(rows),
-            aggregate_hash=sum(row.row_hash64 or hash(row.values) for row in rows),
+            aggregate_hash=sum(
+                row.row_hash64 if row.row_hash64 is not None else _stable_tuple_hash(row.values)
+                for row in rows
+            ),
         )
 
     def fetch_rows(self, segment: CompareSegment) -> Iterable[CompareRow]:
@@ -470,6 +471,12 @@ class _StaticRowReader:
             for row in self._rows
             if row.pk and isinstance(row.pk[0], int) and segment.start <= row.pk[0] < segment.end
         ]
+
+
+def _stable_tuple_hash(values: tuple[Any, ...]) -> int:
+    payload = repr(values).encode("utf-8")
+    digest = hashlib.md5(payload, usedforsecurity=False).digest()
+    return int.from_bytes(digest[:8], "big", signed=False)
 
 
 __all__ = [
