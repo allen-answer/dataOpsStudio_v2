@@ -63,6 +63,7 @@ def test_compare_hash_sql_contains_normalization_rules_and_segment_params() -> N
     assert "TRIM(" in mysql_plan.normalized_payload_expression
     assert "LOWER(" in mysql_plan.normalized_payload_expression
     assert "IF((NULLIF(" in mysql_plan.normalized_payload_expression
+    assert "CHAR_LENGTH(" in mysql_plan.normalized_payload_expression
     assert "%(segment_start)s" in mysql_plan.sql
     assert mysql_plan.params == {"segment_start": 0, "segment_end": 32_000}
 
@@ -70,6 +71,7 @@ def test_compare_hash_sql_contains_normalization_rules_and_segment_params() -> N
     assert " || " in dm_plan.normalized_payload_expression
     assert "CONVERT(" in dm_plan.normalized_payload_expression
     assert "CASE WHEN (NULLIF(" in dm_plan.normalized_payload_expression
+    assert "LENGTH(" in dm_plan.normalized_payload_expression
     assert ":segment_start" in dm_plan.sql
     assert dm_plan.params == {"segment_start": 0, "segment_end": 32_000}
 
@@ -166,6 +168,21 @@ def test_normalized_identity_preserves_null_bitmap_truth() -> None:
     assert normalized_compare_identity(columns, [rules.null_sentinel], rules) == (
         (False, rules.null_sentinel),
     )
+
+
+def test_payload_length_prefix_prevents_separator_boundary_collision() -> None:
+    separator = CompareRules().field_separator
+    columns = [
+        CompareColumn(name="left", type=ColumnType.STRING),
+        CompareColumn(name="right", type=ColumnType.STRING),
+    ]
+
+    first = normalized_compare_payload(columns, [f"a{separator}b", "c"])
+    second = normalized_compare_payload(columns, ["a", f"b{separator}c"])
+
+    assert first != second
+    assert first.split(separator)[:4] == ["0", "0", "3", "a"]
+    assert second.split(separator)[:4] == ["0", "0", "1", "a"]
 
 
 def test_python_string_normalization_matches_sql_lower_and_space_trim() -> None:

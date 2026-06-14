@@ -79,7 +79,12 @@ def _row_payload_expression(request: CompareHashRequest) -> str:
     normalized_exprs = [_normalized_value_expression(column, request) for column in request.columns]
     null_bits = [f"IF(({expr}) IS NULL, '1', '0')" for expr in normalized_exprs]
     normalized_values = [_coalesced_value(expr, request) for expr in normalized_exprs]
-    parts = [*null_bits, *normalized_values]
+    length_prefixed_values = [
+        item
+        for value_expr in normalized_values
+        for item in (f"CAST(CHAR_LENGTH({value_expr}) AS CHAR)", value_expr)
+    ]
+    parts = [*null_bits, *length_prefixed_values]
     separator = _sql_string(rules.field_separator)
     return f"CONCAT_WS({separator}, {', '.join(parts)})"
 

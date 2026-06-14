@@ -11,15 +11,19 @@ protection.
 For a compare segment, each side builds the same normalized row payload:
 
 1. Emit a NULL bitmap bit for every compared column, in compare column order.
-2. Emit each normalized column value, using the same column order.
-3. Join bitmap bits and values with the configured field separator.
-4. Replace SQL NULL values with the configured NULL sentinel before joining.
+2. Replace normalized SQL NULL values with the configured NULL sentinel.
+3. Emit each normalized value as `character_length`, then the value, using the same
+   column order.
+4. Join bitmap bits, lengths and values with the configured field separator.
 
 String columns apply trim, case-folding and empty-as-null rules before sentinel
 replacement. Numeric columns use fixed decimal scale. Date/time columns use configured
 timestamp precision. MySQL expressions specify charset/collation per expression; DM uses
 UTF8 conversion for text expressions and must degrade to client row hashing if the target
 deployment cannot express the requested normalization safely.
+
+The length prefix is part of the canonical payload so values that contain the separator or
+the sentinel cannot collide with different column boundaries.
 
 ## Aggregate Hash
 

@@ -371,8 +371,8 @@ def normalized_compare_payload(
     actual_rules = rules or CompareRules()
     identity = normalized_compare_identity(columns, values, actual_rules)
     null_bits = ["1" if is_null else "0" for is_null, _value in identity]
-    normalized_values = [value for _is_null, value in identity]
-    return actual_rules.field_separator.join([*null_bits, *normalized_values])
+    normalized_parts = [item for _is_null, value in identity for item in (str(len(value)), value)]
+    return actual_rules.field_separator.join([*null_bits, *normalized_parts])
 
 
 def _normalized_values(
