@@ -42,7 +42,8 @@ def test_compare_hash_sql_uses_md5_sum_and_not_weak_engine_hashes() -> None:
     assert "MD5(" in mysql_plan.sql
     assert "SUM(__row_hash64)" in mysql_plan.sql
     assert "DBMS_CRYPTO.HASH" in dm_plan.sql
-    assert 'SUM("__ROW_HASH64")' in dm_plan.sql
+    assert 'SUM(CAST("__ROW_HASH64" AS DECIMAL(38,0)))' in dm_plan.sql
+    assert "CAST(0 AS DECIMAL(38,0))" in dm_plan.sql
     combined_sql = f"{mysql_plan.sql} {dm_plan.sql}".upper()
     assert "ORA_HASH" not in combined_sql
     assert "CRC32" not in combined_sql
@@ -81,7 +82,10 @@ def test_compare_hash_sql_contains_normalization_rules_and_segment_params() -> N
     assert "LENGTH(" in dm_payload
     assert dm_plan.row_hash_expression is not None
     assert "TO_NUMBER(" not in dm_plan.row_hash_expression
+    assert "POWER(" not in dm_plan.row_hash_expression
     assert "INSTR('0123456789ABCDEF'" in dm_plan.row_hash_expression
+    assert "CAST(4294967296 AS DECIMAL(20,0))" in dm_plan.row_hash_expression
+    assert dm_plan.row_hash_expression.count("DECIMAL(20,0)") >= 3
     assert ":segment_start" in dm_plan.sql
     assert dm_plan.params == {"segment_start": 0, "segment_end": 32_000}
 

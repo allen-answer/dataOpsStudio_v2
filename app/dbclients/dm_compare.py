@@ -64,7 +64,8 @@ def build_dm_compare_hash_plan(request: CompareHashRequest) -> CompareHashPlan:
     else:
         sql = (
             'SELECT COUNT(*) AS "ROW_COUNT", '
-            'NVL(SUM("__ROW_HASH64"), 0) AS "AGGREGATE_HASH" '
+            'NVL(SUM(CAST("__ROW_HASH64" AS DECIMAL(38,0))), '
+            'CAST(0 AS DECIMAL(38,0))) AS "AGGREGATE_HASH" '
             f'FROM (SELECT {row_hash_expr} AS "__ROW_HASH64" '
             f"FROM (SELECT {hash_hex_expr} AS {hash_hex_alias} FROM {table_expr}{where_clause}) "
             "DATAOPS_COMPARE_HEX) "
@@ -161,12 +162,18 @@ def _dm_timestamp_expr(expr: str, precision: int) -> str:
 
 
 def _hex_prefix_to_uint64(hex_expr: str) -> str:
+    high32 = _hex_chunk_to_decimal(hex_expr, start=1)
+    low32 = _hex_chunk_to_decimal(hex_expr, start=9)
+    return f"CAST(({high32} * CAST(4294967296 AS DECIMAL(20,0)) + {low32}) AS DECIMAL(20,0))"
+
+
+def _hex_chunk_to_decimal(hex_expr: str, *, start: int) -> str:
+    powers = (268435456, 16777216, 1048576, 65536, 4096, 256, 16, 1)
     terms = [
-        f"(INSTR('0123456789ABCDEF', SUBSTR({hex_expr}, {idx}, 1)) - 1) * POWER(16, {16 - idx})"
-        for idx in range(1, 16)
+        f"(INSTR('0123456789ABCDEF', SUBSTR({hex_expr}, {start + offset}, 1)) - 1) * {power}"
+        for offset, power in enumerate(powers)
     ]
-    terms.append(f"(INSTR('0123456789ABCDEF', SUBSTR({hex_expr}, 16, 1)) - 1)")
-    return "(" + " + ".join(terms) + ")"
+    return "CAST((" + " + ".join(terms) + ") AS DECIMAL(20,0))"
 
 
 def _where_clause(request: CompareHashRequest) -> str:
