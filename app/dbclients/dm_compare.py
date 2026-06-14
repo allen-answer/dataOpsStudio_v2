@@ -163,21 +163,19 @@ def _dm_timestamp_expr(expr: str, precision: int) -> str:
 
 
 def _hex_prefix_to_uint64(hex_expr: str) -> str:
-    high32 = _hex_chunk_to_decimal(hex_expr, start=1)
-    low32 = _hex_chunk_to_decimal(hex_expr, start=9)
-    return (
-        f"CAST(({high32} * CAST(4294967296 AS {_HASH_DECIMAL_TYPE}) + {low32}) "
-        f"AS {_HASH_DECIMAL_TYPE})"
-    )
+    expr = f"CAST(0 AS {_HASH_DECIMAL_TYPE})"
+    multiplier = f"CAST(16 AS {_HASH_DECIMAL_TYPE})"
+    for idx in range(1, 17):
+        expr = (
+            f"CAST((({expr} * {multiplier}) + {_hex_digit_to_decimal(hex_expr, idx)}) "
+            f"AS {_HASH_DECIMAL_TYPE})"
+        )
+    return expr
 
 
-def _hex_chunk_to_decimal(hex_expr: str, *, start: int) -> str:
-    powers = (268435456, 16777216, 1048576, 65536, 4096, 256, 16, 1)
-    terms = [
-        f"(INSTR('0123456789ABCDEF', SUBSTR({hex_expr}, {start + offset}, 1)) - 1) * {power}"
-        for offset, power in enumerate(powers)
-    ]
-    return "CAST((" + " + ".join(terms) + f") AS {_HASH_DECIMAL_TYPE})"
+def _hex_digit_to_decimal(hex_expr: str, idx: int) -> str:
+    digit = f"(INSTR('0123456789ABCDEF', SUBSTR({hex_expr}, {idx}, 1)) - 1)"
+    return f"CAST({digit} AS {_HASH_DECIMAL_TYPE})"
 
 
 def _where_clause(request: CompareHashRequest) -> str:

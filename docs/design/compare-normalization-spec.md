@@ -35,11 +35,11 @@ The database-side aggregate hash is:
 4. Sum the row integers for the segment with exact decimal/integer arithmetic.
 
 MySQL expresses step 3 with `CONV(..., 16, 10)` cast to `DECIMAL(20,0)`. DM must avoid
-floating conversion for the 64-bit value: split the 16 hex characters into high and low
-32-bit chunks, expand each chunk with integer weights, then compute
-`high * 4294967296 + low` as `DECIMAL(38,0)`. Segment aggregation must keep row hashes in
-`DECIMAL(38,0)` before `SUM`, giving enough headroom for medium segments such as 100K
-rows.
+floating conversion and integer-domain overflow for the 64-bit value: fold the 16 hex
+characters with Horner arithmetic, keeping the accumulator, multiplier `16`, and each
+digit in `DECIMAL(38,0)` before every multiply/add. Segment aggregation must keep row
+hashes in `DECIMAL(38,0)` before `SUM`, giving enough headroom for medium segments such
+as 100K rows.
 
 The aggregate result is a prefilter only. Equal aggregate hashes let the engine skip a
 segment; mismatches recurse or switch to row-level comparison. Final truth remains the

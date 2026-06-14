@@ -85,8 +85,9 @@ def test_compare_hash_sql_contains_normalization_rules_and_segment_params() -> N
     assert "POWER(" not in dm_plan.row_hash_expression
     assert "INSTR('0123456789ABCDEF'" in dm_plan.row_hash_expression
     assert "DECIMAL(20,0)" not in dm_plan.row_hash_expression
-    assert "CAST(4294967296 AS DECIMAL(38,0))" in dm_plan.row_hash_expression
-    assert dm_plan.row_hash_expression.count("DECIMAL(38,0)") >= 3
+    assert "4294967296" not in dm_plan.row_hash_expression
+    assert "CAST(16 AS DECIMAL(38,0))" in dm_plan.row_hash_expression
+    assert dm_plan.row_hash_expression.count("CAST((INSTR(") == 16
     assert ":segment_start" in dm_plan.sql
     assert dm_plan.params == {"segment_start": 0, "segment_end": 32_000}
 
