@@ -107,6 +107,7 @@ class AsgiClient:
             if not receive_called:
                 receive_called = True
                 return {"type": "http.request", "body": body, "more_body": False}
+            await asyncio.sleep(3600)
             return {"type": "http.disconnect"}
 
         async def send(message: Message) -> None:

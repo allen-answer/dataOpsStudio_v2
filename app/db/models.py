@@ -497,6 +497,101 @@ metadata_caches = Table(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# compare_tasks —— Compare 2.2 持久化任务定义
+# ─────────────────────────────────────────────────────────────────────────────
+compare_tasks = Table(
+    "compare_tasks",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column(
+        "project_id",
+        String(36),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("name", String(128), nullable=False),
+    Column(
+        "source_id",
+        String(36),
+        ForeignKey("datasources.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "target_id",
+        String(36),
+        ForeignKey("datasources.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("source_ref", JSONB(), nullable=False),
+    Column("target_ref", JSONB(), nullable=False),
+    Column("columns", JSONB(), nullable=False, server_default=text("'[]'::jsonb")),
+    Column("compare_rules", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),
+    Column("run_limits", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),
+    Column(
+        "created_by",
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    UniqueConstraint("project_id", "name", name="uq_compare_tasks_project_name"),
+    Index("ix_compare_tasks_project_updated", "project_id", "updated_at"),
+    Index("ix_compare_tasks_source_id", "source_id"),
+    Index("ix_compare_tasks_target_id", "target_id"),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# run_index —— Compare/后续能力域统一结果反向索引
+# ─────────────────────────────────────────────────────────────────────────────
+run_index = Table(
+    "run_index",
+    metadata,
+    Column("run_id", String(36), primary_key=True),
+    Column("kind", String(32), nullable=False),
+    Column("job_id", String(36), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False),
+    Column(
+        "owner_user_id",
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "project_id",
+        String(36),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "task_id",
+        String(36),
+        ForeignKey("compare_tasks.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    Column("status", String(32), nullable=False, server_default="pending"),
+    Column("result_path", Text(), nullable=True),
+    Column("bucket_spools", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),
+    Column("bucket_counts", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),
+    Column("progress", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("finished_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint(
+        "kind IN ('compare_run')",
+        name="kind_is_supported",
+    ),
+    CheckConstraint(
+        "status IN ('pending', 'running', 'success', 'failed', 'cancelled', 'timeout')",
+        name="status_is_valid",
+    ),
+    UniqueConstraint("job_id", name="uq_run_index_job_id"),
+    Index("ix_run_index_owner_project_created", "owner_user_id", "project_id", "created_at"),
+    Index("ix_run_index_task_created", "task_id", "created_at"),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # result_sets —— ★ R6 红线 DB 层:无 cursor 字段
 # ─────────────────────────────────────────────────────────────────────────────
 result_sets = Table(
@@ -583,6 +678,7 @@ __all__ = [
     "APPLICATION_SECRET_KINDS",
     "ai_configs",
     "audit_logs",
+    "compare_tasks",
     "datasources",
     "export_download_tokens",
     "job_events",
@@ -595,6 +691,7 @@ __all__ = [
     "projects",
     "result_sets",
     "revoked_tokens",
+    "run_index",
     "secret_refs",
     "sql_consoles",
     "sql_templates",

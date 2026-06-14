@@ -345,7 +345,7 @@ class LocalFsResultStore(ResultStore):
         return [Row(values=_decode_row_json(item)) for item in values]
 
     def _ref_for_path(self, path: Path) -> ResultRef:
-        return ResultRef(backend=_BACKEND, uri=str(path.relative_to(self._root)))
+        return ResultRef(backend=_BACKEND, uri=path.relative_to(self._root).as_posix())
 
     def _path_from_ref(self, ref: ResultRef) -> Path:
         if ref.backend != _BACKEND:
