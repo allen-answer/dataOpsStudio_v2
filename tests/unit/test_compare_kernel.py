@@ -99,6 +99,33 @@ def test_unknown_or_json_columns_explicitly_degrade_to_client_hash() -> None:
     ]
 
 
+def test_mysql_unsafe_charset_or_collation_degrades_to_client_hash() -> None:
+    request = _hash_request(
+        rules=_rules().model_copy(update={"charset": "utf8mb4;select", "collation": "utf8mb4-bin"})
+    )
+
+    plan = build_mysql_compare_hash_plan(request)
+
+    assert plan.execution_mode is CompareHashExecutionMode.CLIENT_ROW_HASH
+    assert plan.sql is None
+    assert plan.degrade_reasons == [
+        "mysql compare charset requires a safe identifier name",
+        "mysql compare collation requires a safe identifier name",
+    ]
+
+
+def test_dm_non_utf8_charset_degrades_to_client_hash() -> None:
+    request = _hash_request(rules=_rules().model_copy(update={"charset": "latin1"}))
+
+    plan = build_dm_compare_hash_plan(request)
+
+    assert plan.execution_mode is CompareHashExecutionMode.CLIENT_ROW_HASH
+    assert plan.sql is None
+    assert plan.degrade_reasons == [
+        "dm compare db hash requires a UTF-8 normalization charset",
+    ]
+
+
 def test_golden_normalized_hash_matches_mysql_and_dm_logical_rows() -> None:
     columns = _columns()
     rules = _rules()
@@ -299,12 +326,13 @@ def _hash_request(
     *,
     columns: list[CompareColumn] | None = None,
     level: CompareHashLevel = CompareHashLevel.AGGREGATE,
+    rules: CompareRules | None = None,
 ) -> CompareHashRequest:
     return CompareHashRequest(
         table=CompareTableRef(schema_name="app", name="orders"),
         columns=columns or _columns(),
         key_columns=[CompareColumn(name="id", type=ColumnType.INTEGER)],
-        rules=_rules(),
+        rules=rules or _rules(),
         segment=CompareSegment(key_column="id", start=0, end=32_000),
         level=level,
     )

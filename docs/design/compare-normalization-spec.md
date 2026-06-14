@@ -55,8 +55,9 @@ top-level segment scan plus recursive probes instead of a full-table row scan.
 ## Degradation
 
 Adapters must explicitly return client row hashing when DB-side normalization or hashing is
-not expressible. The current kernel degrades for unknown, JSON, and binary column types.
-Future adapters may add more reasons, but must not silently use engine defaults.
+not expressible. The current kernel degrades for unknown, JSON, and binary column types,
+unsafe MySQL charset/collation names, and non-UTF-8 DM normalization charsets. Future
+adapters may add more reasons, but must not silently use engine defaults.
 
 ## DM PoC Gate
 

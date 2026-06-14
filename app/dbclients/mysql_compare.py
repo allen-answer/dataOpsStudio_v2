@@ -12,6 +12,7 @@ from app.domain.compare import (
 from app.domain.schema import ColumnType
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.$-]+$")
+_MYSQL_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 _SUPPORTED_DB_HASH_TYPES = {
     ColumnType.STRING,
     ColumnType.INTEGER,
@@ -25,7 +26,7 @@ _SUPPORTED_DB_HASH_TYPES = {
 
 
 def build_mysql_compare_hash_plan(request: CompareHashRequest) -> CompareHashPlan:
-    reasons = _degrade_reasons(request.columns)
+    reasons = _degrade_reasons(request)
     if reasons:
         return CompareHashPlan(
             execution_mode=CompareHashExecutionMode.CLIENT_ROW_HASH,
@@ -64,13 +65,17 @@ def build_mysql_compare_hash_plan(request: CompareHashRequest) -> CompareHashPla
     )
 
 
-def _degrade_reasons(columns: list[CompareColumn]) -> list[str]:
+def _degrade_reasons(request: CompareHashRequest) -> list[str]:
     reasons: list[str] = []
-    for column in columns:
+    for column in request.columns:
         if column.type not in _SUPPORTED_DB_HASH_TYPES:
             reasons.append(
                 f"column {column.name} type {column.type.value} requires client row hash"
             )
+    if _MYSQL_NAME_RE.fullmatch(request.rules.charset) is None:
+        reasons.append("mysql compare charset requires a safe identifier name")
+    if _MYSQL_NAME_RE.fullmatch(request.rules.collation) is None:
+        reasons.append("mysql compare collation requires a safe identifier name")
     return reasons
 
 
