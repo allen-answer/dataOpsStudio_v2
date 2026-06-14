@@ -66,6 +66,7 @@ def test_compare_hash_sql_contains_normalization_rules_and_segment_params() -> N
     assert "LOWER(" in mysql_payload
     assert "IF((NULLIF(" in mysql_payload
     assert "CHAR_LENGTH(" in mysql_payload
+    assert "%%Y-%%m-%%d" in mysql_payload
     assert "%(segment_start)s" in mysql_plan.sql
     assert mysql_plan.params == {"segment_start": 0, "segment_end": 32_000}
 
@@ -73,11 +74,28 @@ def test_compare_hash_sql_contains_normalization_rules_and_segment_params() -> N
     dm_payload = dm_plan.normalized_payload_expression
     assert dm_payload is not None
     assert " || " in dm_payload
-    assert "CONVERT(" in dm_payload
+    assert 'TO_CHAR("NAME")' in dm_payload
+    assert "CONVERT(" not in dm_payload
+    assert "VARCHAR(4000)" not in dm_payload
     assert "CASE WHEN (NULLIF(" in dm_payload
     assert "LENGTH(" in dm_payload
+    assert dm_plan.row_hash_expression is not None
+    assert "TO_NUMBER(" not in dm_plan.row_hash_expression
+    assert "INSTR('0123456789ABCDEF'" in dm_plan.row_hash_expression
     assert ":segment_start" in dm_plan.sql
     assert dm_plan.params == {"segment_start": 0, "segment_end": 32_000}
+
+
+def test_mysql_datetime_hash_sql_survives_pyformat_interpolation() -> None:
+    plan = build_mysql_compare_hash_plan(_hash_request())
+
+    assert plan.sql is not None
+    # PyMySQL applies Python %-formatting whenever params are passed. This catches
+    # DATE_FORMAT literals such as %Y before they reach a real MySQL server.
+    interpolated = plan.sql % plan.params
+
+    assert "DATE_FORMAT" in interpolated
+    assert "%Y-%m-%d" in interpolated
 
 
 def test_unknown_or_json_columns_explicitly_degrade_to_client_hash() -> None:

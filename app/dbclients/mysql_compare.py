@@ -111,15 +111,15 @@ def _normalized_value_expression(column: CompareColumn, request: CompareHashRequ
     if column.type is ColumnType.BOOLEAN:
         return f"CASE WHEN {quoted} IS NULL THEN NULL WHEN {quoted} THEN '1' ELSE '0' END"
     if column.type is ColumnType.DATE:
-        return f"DATE_FORMAT({quoted}, '%Y-%m-%d')"
+        return f"DATE_FORMAT({quoted}, {_sql_string(_date_format('%Y-%m-%d'))})"
     if column.type is ColumnType.TIME:
         return _truncate_fraction(
-            f"DATE_FORMAT({quoted}, '%H:%i:%s.%f')",
+            f"DATE_FORMAT({quoted}, {_sql_string(_date_format('%H:%i:%s.%f'))})",
             rules.timestamp_precision,
         )
     if column.type is ColumnType.DATETIME:
         return _truncate_fraction(
-            f"DATE_FORMAT({quoted}, '%Y-%m-%d %H:%i:%s.%f')",
+            f"DATE_FORMAT({quoted}, {_sql_string(_date_format('%Y-%m-%d %H:%i:%s.%f'))})",
             rules.timestamp_precision,
         )
 
@@ -139,6 +139,10 @@ def _truncate_fraction(expr: str, precision: int) -> str:
     if precision == 0:
         return f"SUBSTR({expr}, 1, CHAR_LENGTH({expr}) - 7)"
     return f"SUBSTR({expr}, 1, CHAR_LENGTH({expr}) - {6 - precision})"
+
+
+def _date_format(value: str) -> str:
+    return value.replace("%", "%%")
 
 
 def _where_clause(request: CompareHashRequest) -> str:

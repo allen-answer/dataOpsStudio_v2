@@ -37,7 +37,8 @@ def build_dm_compare_hash_plan(request: CompareHashRequest) -> CompareHashPlan:
     hash_hex_expr = (
         f"RAWTOHEX(DBMS_CRYPTO.HASH(UTL_RAW.CAST_TO_RAW({payload_expr}), DBMS_CRYPTO.HASH_MD5))"
     )
-    row_hash_expr = f"TO_NUMBER(SUBSTR({hash_hex_expr}, 1, 16), 'XXXXXXXXXXXXXXXX')"
+    hash_hex_alias = '"__HASH_HEX"'
+    row_hash_expr = _hex_prefix_to_uint64(hash_hex_alias)
     table_expr = _table_expression(request.table.schema_name, request.table.name)
     where_clause = _where_clause(request)
     if request.level is CompareHashLevel.ROW:
@@ -45,17 +46,28 @@ def build_dm_compare_hash_plan(request: CompareHashRequest) -> CompareHashPlan:
             f"{_quote_identifier(column.name)} AS {_quote_identifier(column.name)}"
             for column in request.key_columns
         )
+        hash_source_exprs = (
+            f"{key_exprs}, {hash_hex_expr} AS {hash_hex_alias}"
+            if key_exprs
+            else f"{hash_hex_expr} AS {hash_hex_alias}"
+        )
         select_exprs = (
             f'{key_exprs}, {row_hash_expr} AS "__ROW_HASH64"'
             if key_exprs
             else (f'{row_hash_expr} AS "__ROW_HASH64"')
         )
-        sql = f"SELECT {select_exprs} FROM {table_expr}{where_clause}"
+        sql = (
+            f"SELECT {select_exprs} FROM "
+            f"(SELECT {hash_source_exprs} FROM {table_expr}{where_clause}) "
+            "DATAOPS_COMPARE_HEX"
+        )
     else:
         sql = (
             'SELECT COUNT(*) AS "ROW_COUNT", '
             'NVL(SUM("__ROW_HASH64"), 0) AS "AGGREGATE_HASH" '
-            f'FROM (SELECT {row_hash_expr} AS "__ROW_HASH64" FROM {table_expr}{where_clause}) '
+            f'FROM (SELECT {row_hash_expr} AS "__ROW_HASH64" '
+            f"FROM (SELECT {hash_hex_expr} AS {hash_hex_alias} FROM {table_expr}{where_clause}) "
+            "DATAOPS_COMPARE_HEX) "
             "DATAOPS_COMPARE_HASH"
         )
     return CompareHashPlan(
@@ -121,7 +133,7 @@ def _normalized_value_expression(column: CompareColumn, request: CompareHashRequ
     if column.type is ColumnType.DATETIME:
         return _dm_timestamp_expr(quoted, rules.timestamp_precision)
 
-    expr = f"CONVERT(CAST({quoted} AS VARCHAR(4000)), 'UTF8')"
+    expr = f"TO_CHAR({quoted})"
     if rules.trim_strings:
         expr = f"TRIM({expr})"
     if rules.case_insensitive:
@@ -146,6 +158,15 @@ def _dm_timestamp_expr(expr: str, precision: int) -> str:
     if precision == 0:
         return f"TO_CHAR(CAST({expr} AS TIMESTAMP(0)), 'YYYY-MM-DD HH24:MI:SS')"
     return f"TO_CHAR(CAST({expr} AS TIMESTAMP({precision})), 'YYYY-MM-DD HH24:MI:SS.FF{precision}')"
+
+
+def _hex_prefix_to_uint64(hex_expr: str) -> str:
+    terms = [
+        f"(INSTR('0123456789ABCDEF', SUBSTR({hex_expr}, {idx}, 1)) - 1) * POWER(16, {16 - idx})"
+        for idx in range(1, 16)
+    ]
+    terms.append(f"(INSTR('0123456789ABCDEF', SUBSTR({hex_expr}, 16, 1)) - 1)")
+    return "(" + " + ".join(terms) + ")"
 
 
 def _where_clause(request: CompareHashRequest) -> str:
