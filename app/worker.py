@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import signal
 import tempfile
 import time
@@ -13,11 +14,36 @@ from sqlalchemy import URL, create_engine, insert, select, update
 from sqlalchemy.engine import Engine
 
 from app.config import Settings, load_settings
-from app.db.models import datasources, jobs, result_sets
+from app.db.models import datasources, jobs, result_sets, run_index
 from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.protocol import AdapterConnectionError
+from app.domain.compare import (
+    CompareColumn,
+    CompareDiffBucket,
+    CompareDiffEvent,
+    CompareHashLevel,
+    CompareHashPlan,
+    CompareHashRequest,
+    CompareRow,
+    CompareRules,
+    CompareSegment,
+    CompareTableRef,
+    HashdiffProgress,
+    HashdiffResult,
+    RunLimits,
+    SegmentFingerprint,
+    compare_row_hash64,
+    normalized_compare_identity,
+    recursive_hashdiff,
+)
+from app.domain.compare_result import (
+    COMPARE_BUCKETS,
+    compare_result_columns,
+    empty_bucket_counts,
+    encode_compare_result_row,
+)
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
-from app.domain.job import Job, JobErrorCode, JobKind
+from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.plan import PlanNode
 from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Row
@@ -34,6 +60,7 @@ from app.infrastructure.secretstore.local_file import LocalFileSecretStore
 from app.observability.logging import configure_logging
 
 logger = structlog.get_logger(__name__)
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.$-]+$")
 
 
 class JobCancelled(RuntimeError):
@@ -102,6 +129,8 @@ class DatabaseAdapterLike(Protocol):
 
     def test_connection(self) -> bool: ...
 
+    def build_compare_hash_query(self, request: CompareHashRequest) -> CompareHashPlan: ...
+
 
 class ResultSetCatalogLike(Protocol):
     def write_streaming(
@@ -132,6 +161,30 @@ class ResultSetCatalogLike(Protocol):
         *,
         result_set_id: str,
         state: str,
+    ) -> None: ...
+
+
+class CompareRunCatalogLike(Protocol):
+    def write_running(
+        self,
+        *,
+        run_id: str,
+        bucket_spools: dict[str, str],
+    ) -> None: ...
+
+    def write_complete(
+        self,
+        *,
+        run_id: str,
+        bucket_counts: dict[str, int],
+        progress: dict[str, int],
+    ) -> None: ...
+
+    def write_terminal(
+        self,
+        *,
+        run_id: str,
+        status: str,
     ) -> None: ...
 
 
@@ -174,6 +227,7 @@ class WorkerRunner:
         config: WorkerRunnerConfig,
         result_set_catalog: ResultSetCatalogLike | None = None,
         job_error_code_writer: JobErrorCodeWriterLike | None = None,
+        compare_run_catalog: CompareRunCatalogLike | None = None,
     ) -> None:
         if config.sql_spool_batch_size <= 0:
             raise ValueError("sql_spool_batch_size must be positive")
@@ -190,6 +244,7 @@ class WorkerRunner:
         self._config = config
         self._result_set_catalog = result_set_catalog
         self._job_error_code_writer = job_error_code_writer
+        self._compare_run_catalog = compare_run_catalog
         self._stop_requested = False
         self._next_result_gc_at = 0.0
 
@@ -236,11 +291,14 @@ class WorkerRunner:
                 outcome = self._execute_sql_explain(job)
             elif job.kind is JobKind.RESULT_EXPORT:
                 outcome = self._execute_result_export(job)
+            elif job.kind is JobKind.COMPARE_RUN:
+                outcome = self._execute_compare_run(job)
             else:
                 raise UnsupportedJobKindError(f"Unsupported job kind: {job.kind.value}")
         except JobCancelled as exc:
             self._backend.mark_cancelled(job.id, str(exc))
             self._write_result_set_terminal(job, "closed")
+            self._write_compare_run_terminal(job, JobStatus.CANCELLED.value)
             logger.info(
                 "worker job cancelled",
                 job_id=job.id,
@@ -253,6 +311,7 @@ class WorkerRunner:
             self._backend.fail(job.id, public_error)
             self._write_error_code(job.id, error_code)
             self._write_result_set_terminal(job, "failed")
+            self._write_compare_run_terminal(job, JobStatus.FAILED.value)
             logger.exception(
                 "worker job failed",
                 job_id=job.id,
@@ -446,6 +505,145 @@ class WorkerRunner:
             loaded_rows=_manifest_int(manifest, "loaded_rows"),
         )
 
+    def _execute_compare_run(self, job: Job) -> _ExecutionOutcome:
+        payload = job.payload
+        run_id = _required_payload_str(payload, "run_id")
+        source_id = _required_payload_str(payload, "source_id")
+        target_id = _required_payload_str(payload, "target_id")
+        bucket_spools = _payload_bucket_result_set_ids(payload)
+        columns = _payload_compare_columns(payload)
+        rules = _payload_compare_rules(payload)
+        limits = _payload_run_limits(payload)
+        key_columns = _key_columns(columns, rules)
+        if not key_columns:
+            raise ValueError("compare_run requires key_columns")
+        compare_columns = _effective_compare_columns(columns, rules)
+        if not compare_columns:
+            raise ValueError("compare_run requires at least one compare column")
+
+        for result_set_id in bucket_spools.values():
+            self._result_store.set_spool_columns(result_set_id, compare_result_columns())
+        self._write_compare_run_running(run_id, bucket_spools)
+
+        source_ds = self._datasource_loader(source_id)
+        target_ds = self._datasource_loader(target_id)
+        _require_operation_allowed(source_ds.operation_policy, "select")
+        _require_operation_allowed(target_ds.operation_policy, "select")
+
+        source_adapter = self._adapter_factory(
+            source_ds,
+            lambda: self._backend.is_cancel_requested(job.id),
+            lambda columns: None,
+        )
+        target_adapter = self._adapter_factory(
+            target_ds,
+            lambda: self._backend.is_cancel_requested(job.id),
+            lambda columns: None,
+        )
+        source_ref = _payload_compare_data_ref(payload, "source_ref")
+        target_ref = _payload_compare_data_ref(payload, "target_ref")
+        source_reader = _DatabaseCompareReader(
+            adapter=source_adapter,
+            datasource=source_ds,
+            data_ref=source_ref,
+            key_columns=key_columns,
+            value_columns=compare_columns,
+            select_key_names=[column.name for column in key_columns],
+            select_value_names=[column.name for column in compare_columns],
+            rules=rules,
+        )
+        target_reader = _DatabaseCompareReader(
+            adapter=target_adapter,
+            datasource=target_ds,
+            data_ref=target_ref,
+            key_columns=key_columns,
+            value_columns=compare_columns,
+            select_key_names=[
+                rules.column_mappings.get(column.name, column.name) for column in key_columns
+            ],
+            select_value_names=[
+                rules.column_mappings.get(column.name, column.name) for column in compare_columns
+            ],
+            rules=rules,
+        )
+
+        effective_limits = (
+            limits.model_copy(update={"recursive_checksum": False})
+            if limits.persist_same_bucket
+            else limits
+        )
+        started_at = time.monotonic()
+        result = _run_compare_hashdiff(
+            source_reader=source_reader,
+            target_reader=target_reader,
+            key_columns=key_columns,
+            limits=effective_limits,
+        )
+        bucket_counts = empty_bucket_counts()
+        bucket_counts[CompareDiffBucket.SAME.value] += result.progress.skipped_rows
+        batches: dict[str, list[Row]] = {bucket: [] for bucket in COMPARE_BUCKETS}
+        flushed_rows = 0
+        flush_batch_size = min(self._config.sql_spool_batch_size, limits.compare_batch_size)
+        last_heartbeat = time.monotonic()
+
+        for event in result.events:
+            bucket = event.bucket.value
+            bucket_counts[bucket] += 1
+            if event.bucket is CompareDiffBucket.SAME and not limits.persist_same_bucket:
+                continue
+            batches[bucket].append(
+                _compare_event_to_spool_row(
+                    event,
+                    key_columns=key_columns,
+                    value_columns=compare_columns,
+                    rules=rules,
+                )
+            )
+            if len(batches[bucket]) >= flush_batch_size:
+                self._flush_batch(job.id, bucket_spools[bucket], batches[bucket])
+                flushed_rows += len(batches[bucket])
+                batches[bucket] = []
+                last_heartbeat = self._heartbeat_if_due(job.id, last_heartbeat, force=True)
+            else:
+                last_heartbeat = self._heartbeat_if_due(job.id, last_heartbeat)
+
+        for bucket, batch in batches.items():
+            if not batch:
+                continue
+            self._flush_batch(job.id, bucket_spools[bucket], batch)
+            flushed_rows += len(batch)
+
+        self._heartbeat(job.id)
+        progress = {
+            key: value
+            for key, value in result.progress.model_dump(mode="json").items()
+            if isinstance(value, int)
+        }
+        self._write_compare_run_complete(run_id, bucket_counts, progress)
+        logger.info(
+            "compare run spooled buckets",
+            job_id=job.id,
+            run_id=run_id,
+            only_source=bucket_counts[CompareDiffBucket.ONLY_SOURCE.value],
+            only_target=bucket_counts[CompareDiffBucket.ONLY_TARGET.value],
+            diff=bucket_counts[CompareDiffBucket.DIFF.value],
+            same=bucket_counts[CompareDiffBucket.SAME.value],
+            flushed_rows=flushed_rows,
+            elapsed_seconds=_elapsed_seconds(started_at),
+        )
+        return _ExecutionOutcome(
+            result_ref=ResultRef(
+                backend="compare_run",
+                uri=f"compare/{run_id}",
+                metadata={
+                    "run_id": run_id,
+                    "bucket_counts": bucket_counts,
+                    "progress": progress,
+                },
+            ),
+            loaded_rows=sum(bucket_counts.values()),
+        )
+
     def _iter_spool_rows(self, job_id: str, result_set_id: str) -> Iterable[Row]:
         offset = 0
         last_heartbeat = time.monotonic()
@@ -550,6 +748,33 @@ class WorkerRunner:
             )
         if state == "closed":
             self._delete_result_spool(result_set_id)
+
+    def _write_compare_run_running(self, run_id: str, bucket_spools: dict[str, str]) -> None:
+        if self._compare_run_catalog is None:
+            return
+        self._compare_run_catalog.write_running(run_id=run_id, bucket_spools=bucket_spools)
+
+    def _write_compare_run_complete(
+        self,
+        run_id: str,
+        bucket_counts: dict[str, int],
+        progress: dict[str, int],
+    ) -> None:
+        if self._compare_run_catalog is None:
+            return
+        self._compare_run_catalog.write_complete(
+            run_id=run_id,
+            bucket_counts=bucket_counts,
+            progress=progress,
+        )
+
+    def _write_compare_run_terminal(self, job: Job, status: str) -> None:
+        if job.kind is not JobKind.COMPARE_RUN:
+            return
+        run_id = _payload_optional_str(job.payload, "run_id")
+        if run_id is None or self._compare_run_catalog is None:
+            return
+        self._compare_run_catalog.write_terminal(run_id=run_id, status=status)
 
     def _delete_result_spool(self, result_set_id: str) -> None:
         started_at = time.monotonic()
@@ -706,6 +931,53 @@ class PostgresResultSetCatalog:
             )
 
 
+class PostgresCompareRunCatalog:
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def write_running(self, *, run_id: str, bucket_spools: dict[str, str]) -> None:
+        with self._engine.begin() as conn:
+            conn.execute(
+                update(run_index)
+                .where(run_index.c.run_id == run_id)
+                .values(
+                    status=JobStatus.RUNNING.value,
+                    bucket_spools=bucket_spools,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+
+    def write_complete(
+        self,
+        *,
+        run_id: str,
+        bucket_counts: dict[str, int],
+        progress: dict[str, int],
+    ) -> None:
+        now = datetime.now(UTC)
+        with self._engine.begin() as conn:
+            conn.execute(
+                update(run_index)
+                .where(run_index.c.run_id == run_id)
+                .values(
+                    status=JobStatus.SUCCESS.value,
+                    bucket_counts=bucket_counts,
+                    progress=progress,
+                    updated_at=now,
+                    finished_at=now,
+                )
+            )
+
+    def write_terminal(self, *, run_id: str, status: str) -> None:
+        now = datetime.now(UTC)
+        with self._engine.begin() as conn:
+            conn.execute(
+                update(run_index)
+                .where(run_index.c.run_id == run_id)
+                .values(status=status, updated_at=now, finished_at=now)
+            )
+
+
 class PostgresJobErrorCodeWriter:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
@@ -771,6 +1043,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
         ),
         PostgresResultSetCatalog(engine),
         PostgresJobErrorCodeWriter(engine),
+        PostgresCompareRunCatalog(engine),
     )
 
 
@@ -928,6 +1201,387 @@ def _require_operation_allowed(policy: OperationPolicy, operation: str) -> None:
         raise OperationPolicyDeniedError("explain denied by datasource operation_policy")
 
 
+class _DatabaseCompareReader:
+    def __init__(
+        self,
+        *,
+        adapter: DatabaseAdapterLike,
+        datasource: DatasourceConnInfo,
+        data_ref: dict[str, object],
+        key_columns: list[CompareColumn],
+        value_columns: list[CompareColumn],
+        select_key_names: list[str],
+        select_value_names: list[str],
+        rules: CompareRules,
+    ) -> None:
+        self._adapter = adapter
+        self._datasource = datasource
+        self._data_ref = data_ref
+        self._key_columns = key_columns
+        self._value_columns = value_columns
+        self._select_key_names = select_key_names
+        self._select_value_names = select_value_names
+        self._rules = rules
+        self._db_hash_disabled = False
+
+    def bounds(self) -> tuple[int | None, int | None]:
+        if len(self._key_columns) != 1:
+            return None, None
+        key_name = self._select_key_names[0]
+        table_expr = _compare_table_expression(self._datasource.db_type, self._data_ref)
+        key_expr = _quote_identifier(self._datasource.db_type, key_name)
+        sql = f"SELECT MIN({key_expr}) AS min_key, MAX({key_expr}) AS max_key FROM {table_expr}"
+        rows = list(self._adapter.execute_select(sql, {}))
+        if not rows or len(rows[0].values) < 2:
+            return None, None
+        min_key = _optional_int(rows[0].values[0])
+        max_key = _optional_int(rows[0].values[1])
+        return min_key, max_key
+
+    def segment_fingerprint(self, segment: CompareSegment) -> SegmentFingerprint:
+        if not self._db_hash_disabled and self._can_use_db_hash():
+            try:
+                return self._db_segment_fingerprint(segment)
+            except Exception:
+                self._db_hash_disabled = True
+        rows = list(self.fetch_rows(segment))
+        return SegmentFingerprint(
+            row_count=len(rows),
+            aggregate_hash=sum(row.row_hash64 or 0 for row in rows),
+        )
+
+    def fetch_rows(self, segment: CompareSegment | None) -> Iterable[CompareRow]:
+        sql = self._row_query(segment)
+        for row in self._adapter.execute_select(sql, {}):
+            yield self._row_to_compare(row)
+
+    def fetch_all(self) -> list[CompareRow]:
+        return list(self.fetch_rows(None))
+
+    def _can_use_db_hash(self) -> bool:
+        if self._data_ref.get("kind", "table") != "table":
+            return False
+        if len(self._key_columns) != 1:
+            return False
+        if self._select_key_names != [column.name for column in self._key_columns]:
+            return False
+        if self._select_value_names != [column.name for column in self._value_columns]:
+            return False
+        return self._datasource.db_type in {DbType.MYSQL, DbType.DM}
+
+    def _db_segment_fingerprint(self, segment: CompareSegment) -> SegmentFingerprint:
+        table_name = self._data_ref.get("table_name")
+        if not isinstance(table_name, str):
+            raise ValueError("table compare ref requires table_name")
+        schema_name = self._data_ref.get("schema_name")
+        request = CompareHashRequest(
+            table=CompareTableRef(
+                schema_name=schema_name if isinstance(schema_name, str) else None,
+                name=table_name,
+            ),
+            columns=self._value_columns,
+            key_columns=self._key_columns,
+            rules=self._rules,
+            segment=segment,
+            level=CompareHashLevel.AGGREGATE,
+        )
+        plan = self._adapter.build_compare_hash_query(request)
+        if not plan.uses_database_hash or plan.sql is None:
+            raise ValueError("compare db hash plan degraded to client hash")
+        rows = list(self._adapter.execute_select(plan.sql, plan.params))
+        if not rows or len(rows[0].values) < 2:
+            return SegmentFingerprint(row_count=0, aggregate_hash=0)
+        return SegmentFingerprint(
+            row_count=int(rows[0].values[0] or 0),
+            aggregate_hash=int(rows[0].values[1] or 0),
+        )
+
+    def _row_query(self, segment: CompareSegment | None) -> str:
+        table_expr = _compare_table_expression(self._datasource.db_type, self._data_ref)
+        key_exprs = [
+            _select_identifier(self._datasource.db_type, name, alias=column.name)
+            for name, column in zip(self._select_key_names, self._key_columns, strict=True)
+        ]
+        value_exprs = [
+            _select_identifier(self._datasource.db_type, name, alias=column.name)
+            for name, column in zip(self._select_value_names, self._value_columns, strict=True)
+        ]
+        where_clause = ""
+        if segment is not None:
+            key_expr = _quote_identifier(self._datasource.db_type, self._select_key_names[0])
+            where_clause = f" WHERE {key_expr} >= {segment.start} AND {key_expr} < {segment.end}"
+        order_exprs = ", ".join(
+            _quote_identifier(self._datasource.db_type, name) for name in self._select_key_names
+        )
+        return (
+            f"SELECT {', '.join([*key_exprs, *value_exprs])} "
+            f"FROM {table_expr}{where_clause} ORDER BY {order_exprs}"
+        )
+
+    def _row_to_compare(self, row: Row) -> CompareRow:
+        key_len = len(self._key_columns)
+        expected_len = key_len + len(self._value_columns)
+        if len(row.values) != expected_len:
+            raise ValueError("compare row shape does not match task columns")
+        pk = tuple(row.values[:key_len])
+        raw_values = tuple(row.values[key_len:])
+        return CompareRow(
+            pk=pk,
+            values=normalized_compare_identity(self._value_columns, raw_values, self._rules),
+            raw_values=raw_values,
+            row_hash64=compare_row_hash64(self._value_columns, raw_values, self._rules),
+        )
+
+
+def _run_compare_hashdiff(
+    *,
+    source_reader: _DatabaseCompareReader,
+    target_reader: _DatabaseCompareReader,
+    key_columns: list[CompareColumn],
+    limits: RunLimits,
+) -> HashdiffResult:
+    if len(key_columns) != 1 or key_columns[0].type is not ColumnType.INTEGER:
+        return _diff_all_rows(source_reader.fetch_all(), target_reader.fetch_all())
+    source_min, source_max = source_reader.bounds()
+    target_min, target_max = target_reader.bounds()
+    bounds = [
+        value for value in (source_min, source_max, target_min, target_max) if value is not None
+    ]
+    if not bounds:
+        return _diff_all_rows([], [])
+    root = CompareSegment(
+        key_column=key_columns[0].name,
+        start=min(bounds),
+        end=max(bounds) + 1,
+    )
+    return recursive_hashdiff(source_reader, target_reader, root, limits)
+
+
+def _diff_all_rows(source_rows: list[CompareRow], target_rows: list[CompareRow]) -> HashdiffResult:
+    source_by_pk = {row.pk: row for row in source_rows}
+    target_by_pk = {row.pk: row for row in target_rows}
+    events: list[CompareDiffEvent] = []
+    for pk in sorted(source_by_pk.keys() | target_by_pk.keys()):
+        source = source_by_pk.get(pk)
+        target = target_by_pk.get(pk)
+        if source is None and target is not None:
+            events.append(
+                CompareDiffEvent(
+                    bucket=CompareDiffBucket.ONLY_TARGET,
+                    pk=pk,
+                    target_values=target.raw_values or target.values,
+                )
+            )
+        elif target is None and source is not None:
+            events.append(
+                CompareDiffEvent(
+                    bucket=CompareDiffBucket.ONLY_SOURCE,
+                    pk=pk,
+                    source_values=source.raw_values or source.values,
+                )
+            )
+        elif source is not None and target is not None:
+            bucket = (
+                CompareDiffBucket.SAME if source.values == target.values else CompareDiffBucket.DIFF
+            )
+            events.append(
+                CompareDiffEvent(
+                    bucket=bucket,
+                    pk=pk,
+                    source_values=source.raw_values or source.values,
+                    target_values=target.raw_values or target.values,
+                )
+            )
+    return HashdiffResult(
+        events=events,
+        progress=HashdiffProgress(row_mode_segments=1 if events else 0),
+    )
+
+
+def _payload_bucket_result_set_ids(payload: dict[str, object]) -> dict[str, str]:
+    raw = payload.get("bucket_result_set_ids")
+    if not isinstance(raw, dict):
+        raise ValueError("compare_run payload requires bucket_result_set_ids")
+    out: dict[str, str] = {}
+    for bucket in COMPARE_BUCKETS:
+        value = raw.get(bucket)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"compare_run payload missing bucket result set id: {bucket}")
+        out[bucket] = value
+    return out
+
+
+def _payload_compare_columns(payload: dict[str, object]) -> list[CompareColumn]:
+    raw = payload.get("columns")
+    if not isinstance(raw, list):
+        raise ValueError("compare_run payload columns must be a list")
+    columns = []
+    for item in raw:
+        column = Column.model_validate(item)
+        columns.append(
+            CompareColumn(
+                name=column.name,
+                type=column.type,
+                driver_type=column.driver_type,
+            )
+        )
+    return columns
+
+
+def _payload_compare_rules(payload: dict[str, object]) -> CompareRules:
+    raw = payload.get("compare_rules")
+    if raw is None:
+        return CompareRules()
+    if not isinstance(raw, dict):
+        raise ValueError("compare_run payload compare_rules must be an object")
+    return CompareRules.model_validate(raw)
+
+
+def _payload_run_limits(payload: dict[str, object]) -> RunLimits:
+    raw = payload.get("run_limits")
+    if raw is None:
+        return RunLimits()
+    if not isinstance(raw, dict):
+        raise ValueError("compare_run payload run_limits must be an object")
+    return RunLimits.model_validate(raw)
+
+
+def _payload_compare_data_ref(payload: dict[str, object], key: str) -> dict[str, object]:
+    raw = payload.get(key)
+    if not isinstance(raw, dict):
+        raise ValueError(f"compare_run payload {key} must be an object")
+    kind = raw.get("kind", "table")
+    if kind not in {"table", "sql"}:
+        raise ValueError("compare ref kind must be table or sql")
+    return dict(raw)
+
+
+def _key_columns(columns: list[CompareColumn], rules: CompareRules) -> list[CompareColumn]:
+    by_name = {column.name: column for column in columns}
+    return [
+        by_name.get(name, CompareColumn(name=name, type=ColumnType.UNKNOWN))
+        for name in rules.key_columns
+    ]
+
+
+def _effective_compare_columns(
+    columns: list[CompareColumn],
+    rules: CompareRules,
+) -> list[CompareColumn]:
+    ignored = set(rules.ignore_columns)
+    return [column for column in columns if column.name not in ignored]
+
+
+def _compare_event_to_spool_row(
+    event: CompareDiffEvent,
+    *,
+    key_columns: list[CompareColumn],
+    value_columns: list[CompareColumn],
+    rules: CompareRules,
+) -> Row:
+    source_values = event.source_values
+    target_values = event.target_values
+    source = _values_dict(value_columns, source_values)
+    target = _values_dict(value_columns, target_values)
+    cells = (
+        _cell_diffs(value_columns, source_values, target_values, rules)
+        if event.bucket is CompareDiffBucket.DIFF
+        and source_values is not None
+        and target_values is not None
+        else []
+    )
+    return encode_compare_result_row(
+        pk={column.name: event.pk[index] for index, column in enumerate(key_columns)},
+        source=source,
+        target=target,
+        cells=cells,
+    )
+
+
+def _cell_diffs(
+    columns: list[CompareColumn],
+    source_values: tuple[object, ...],
+    target_values: tuple[object, ...],
+    rules: CompareRules,
+) -> list[dict[str, object]]:
+    source_identity = normalized_compare_identity(columns, source_values, rules)
+    target_identity = normalized_compare_identity(columns, target_values, rules)
+    cells: list[dict[str, object]] = []
+    for index, column in enumerate(columns):
+        if source_identity[index] == target_identity[index]:
+            continue
+        cells.append(
+            {
+                "column": column.name,
+                "source": source_values[index],
+                "target": target_values[index],
+            }
+        )
+    return cells
+
+
+def _values_dict(
+    columns: list[CompareColumn],
+    values: tuple[object, ...] | None,
+) -> dict[str, object] | None:
+    if values is None:
+        return None
+    return {column.name: values[index] for index, column in enumerate(columns)}
+
+
+def _compare_table_expression(db_type: DbType, data_ref: dict[str, object]) -> str:
+    kind = data_ref.get("kind", "table")
+    if kind == "sql":
+        sql = data_ref.get("sql")
+        if not isinstance(sql, str) or not sql.strip():
+            raise ValueError("sql compare ref requires sql")
+        return f"({sql}) DATAOPS_COMPARE_SOURCE"
+    table_name = data_ref.get("table_name")
+    if not isinstance(table_name, str) or not table_name:
+        raise ValueError("table compare ref requires table_name")
+    schema_name = data_ref.get("schema_name")
+    if isinstance(schema_name, str) and schema_name:
+        return f"{_quote_identifier(db_type, schema_name)}.{_quote_identifier(db_type, table_name)}"
+    return _quote_identifier(db_type, table_name)
+
+
+def _select_identifier(db_type: DbType, name: str, *, alias: str) -> str:
+    return f"{_quote_identifier(db_type, name)} AS {_quote_alias(db_type, alias)}"
+
+
+def _quote_identifier(db_type: DbType, identifier: str) -> str:
+    if not identifier or _IDENTIFIER_RE.fullmatch(identifier) is None:
+        raise ValueError("Invalid database identifier")
+    if db_type is DbType.MYSQL:
+        return ".".join(f"`{part.replace('`', '``')}`" for part in identifier.split("."))
+    return ".".join(
+        f'"{part.replace(chr(34), chr(34) + chr(34)).upper()}"' for part in identifier.split(".")
+    )
+
+
+def _quote_alias(db_type: DbType, alias: str) -> str:
+    if not alias or _IDENTIFIER_RE.fullmatch(alias) is None:
+        raise ValueError("Invalid database identifier")
+    if db_type is DbType.MYSQL:
+        return f"`{alias.replace('`', '``')}`"
+    return f'"{alias.replace(chr(34), chr(34) + chr(34))}"'
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
 def _public_error_message(exc: Exception, kind: JobKind) -> str:
     if isinstance(exc, DatasourceConnectionTestError):
         return exc.error_code
@@ -961,7 +1615,7 @@ def _job_error_code(exc: Exception, kind: JobKind) -> JobErrorCode:
         return JobErrorCode.CONNECTION_FAILED
     if isinstance(exc, AdapterConnectionError):
         return JobErrorCode.CONNECTION_FAILED
-    if kind in {JobKind.SQL_QUERY, JobKind.SQL_EXPLAIN}:
+    if kind in {JobKind.SQL_QUERY, JobKind.SQL_EXPLAIN, JobKind.COMPARE_RUN}:
         return JobErrorCode.SQL_FAILED
     if kind is JobKind.RESULT_EXPORT:
         return JobErrorCode.EXPORT_FAILED

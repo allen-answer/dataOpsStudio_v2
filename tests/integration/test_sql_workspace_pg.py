@@ -17,6 +17,7 @@ from app.api.app import create_app
 from app.api.security import create_access_token
 from app.api.services import ApiServices, RateLimiter
 from app.db.models import datasources, jobs, metadata, projects, result_sets, users
+from app.domain.compare import CompareHashPlan, CompareHashRequest
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.job import JobKind, JobStatus
 from app.domain.plan import PlanNode
@@ -550,6 +551,10 @@ class _SlowAdapter:
 
     def test_connection(self) -> bool:
         return True
+
+    def build_compare_hash_query(self, request: CompareHashRequest) -> CompareHashPlan:
+        del request
+        raise NotImplementedError
 
 
 def _slow_adapter_factory(
