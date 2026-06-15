@@ -102,6 +102,16 @@ def test_metadata_has_19_tables() -> None:
     assert set(metadata.tables.keys()) == expected
 
 
+def test_metadata_cache_supports_index_cache_level() -> None:
+    check_sql = " ".join(
+        str(constraint.sqltext)
+        for constraint in metadata_caches.constraints
+        if isinstance(constraint, CheckConstraint)
+    )
+
+    assert "'indexes'" in check_sql
+
+
 def test_compare_tasks_and_run_index_schema_support_compare_run() -> None:
     task_cols = set(compare_tasks.columns.keys())
     run_cols = set(run_index.columns.keys())
