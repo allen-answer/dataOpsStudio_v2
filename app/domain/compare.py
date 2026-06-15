@@ -49,6 +49,7 @@ class CompareRules(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    key_columns: list[str] = Field(default_factory=list)
     ignore_columns: list[str] = Field(default_factory=list)
     column_mappings: dict[str, str] = Field(default_factory=dict)
     numeric_tolerance: float | None = None
@@ -154,6 +155,7 @@ class CompareRow(BaseModel):
     pk: tuple[Any, ...]
     values: tuple[Any, ...]
     row_hash64: int | None = None
+    raw_values: tuple[Any, ...] | None = None
 
 
 class CompareDiffEvent(BaseModel):
@@ -170,6 +172,7 @@ class HashdiffProgress(BaseModel):
 
     scanned_segments: int = 0
     skipped_segments: int = 0
+    skipped_rows: int = 0
     recursed_segments: int = 0
     row_mode_segments: int = 0
     max_depth_seen: int = 0
@@ -192,6 +195,7 @@ class _MutableProgress:
     def __init__(self) -> None:
         self.scanned_segments = 0
         self.skipped_segments = 0
+        self.skipped_rows = 0
         self.recursed_segments = 0
         self.row_mode_segments = 0
         self.max_depth_seen = 0
@@ -200,6 +204,7 @@ class _MutableProgress:
         return HashdiffProgress(
             scanned_segments=self.scanned_segments,
             skipped_segments=self.skipped_segments,
+            skipped_rows=self.skipped_rows,
             recursed_segments=self.recursed_segments,
             row_mode_segments=self.row_mode_segments,
             max_depth_seen=self.max_depth_seen,
@@ -238,6 +243,7 @@ def recursive_hashdiff(
         progress.scanned_segments += 1
         if source_fingerprint == target_fingerprint:
             progress.skipped_segments += 1
+            progress.skipped_rows += source_fingerprint.row_count
             continue
 
         estimated_rows = max(source_fingerprint.row_count, target_fingerprint.row_count)
@@ -288,7 +294,7 @@ def _row_level_diff(
                 CompareDiffEvent(
                     bucket=CompareDiffBucket.ONLY_TARGET,
                     pk=pk,
-                    target_values=target_row.values,
+                    target_values=target_row.raw_values or target_row.values,
                 )
             )
         elif target_row is None and source_row is not None:
@@ -296,7 +302,7 @@ def _row_level_diff(
                 CompareDiffEvent(
                     bucket=CompareDiffBucket.ONLY_SOURCE,
                     pk=pk,
-                    source_values=source_row.values,
+                    source_values=source_row.raw_values or source_row.values,
                 )
             )
         elif source_row is not None and target_row is not None:
@@ -309,8 +315,8 @@ def _row_level_diff(
                 CompareDiffEvent(
                     bucket=bucket,
                     pk=pk,
-                    source_values=source_row.values,
-                    target_values=target_row.values,
+                    source_values=source_row.raw_values or source_row.values,
+                    target_values=target_row.raw_values or target_row.values,
                 )
             )
     return events
@@ -402,6 +408,7 @@ def _normalize_compare_rows(
                 "row_hash64": row.row_hash64
                 if row.row_hash64 is not None
                 else compare_row_hash64(columns, row.values, rules),
+                "raw_values": row.raw_values or row.values,
             }
         )
         for row in rows

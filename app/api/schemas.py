@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.domain.datasource import DbType, OperationPolicy
 from app.domain.job import JobErrorCode, JobStatus
@@ -123,6 +123,120 @@ class SqlExecuteRequest(BaseModel):
 class SqlExecuteResponse(BaseModel):
     job_id: str
     result_set_id: str
+
+
+CompareBucket = Literal["only_source", "only_target", "diff", "same"]
+
+
+class CompareDataRef(BaseModel):
+    kind: Literal["table", "sql"] = "table"
+    schema_name: str | None = None
+    table_name: str | None = Field(default=None, min_length=1)
+    sql: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_ref(self) -> CompareDataRef:
+        if self.kind == "table" and not self.table_name:
+            raise ValueError("table ref requires table_name")
+        if self.kind == "sql" and not self.sql:
+            raise ValueError("sql ref requires sql")
+        return self
+
+
+class CompareRulesPayload(BaseModel):
+    key_columns: list[str] = Field(default_factory=list)
+    ignore_columns: list[str] = Field(default_factory=list)
+    column_mappings: dict[str, str] = Field(default_factory=dict)
+    numeric_tolerance: float | None = None
+    trim_strings: bool = False
+    case_insensitive: bool = False
+    empty_as_null: bool = False
+    schema_policy: Literal["warn", "strict"] = "warn"
+
+
+class CompareRunLimitsPayload(BaseModel):
+    max_rows: int | None = Field(default=None, gt=0)
+    export_max_rows: int | None = Field(default=None, gt=0)
+    fetch_chunk_size: int = Field(default=1000, gt=0)
+    compare_batch_size: int = Field(default=10_000, gt=0)
+    stream_compare: bool = True
+    recursive_checksum: bool = True
+    bisection_factor: int = Field(default=16, ge=8, le=32)
+    bisection_threshold: int = Field(default=16_000, gt=0)
+    max_bisection_depth: int = Field(default=8, ge=0)
+    sample_quick_check: bool = False
+    result_format: str = "parquet"
+    persist_same_bucket: bool = False
+    query_timeout_seconds: int = Field(default=1800, gt=0)
+    run_disk_quota_mb: int | None = Field(default=None, gt=0)
+
+
+class CompareTaskCreateRequest(BaseModel):
+    project_id: str
+    name: str = Field(min_length=1, max_length=128)
+    source_id: str
+    target_id: str
+    source_ref: CompareDataRef
+    target_ref: CompareDataRef
+    columns: list[Column] = Field(default_factory=list)
+    compare_rules: CompareRulesPayload = Field(default_factory=CompareRulesPayload)
+    run_limits: CompareRunLimitsPayload = Field(default_factory=CompareRunLimitsPayload)
+
+
+class CompareTaskUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    source_id: str | None = None
+    target_id: str | None = None
+    source_ref: CompareDataRef | None = None
+    target_ref: CompareDataRef | None = None
+    columns: list[Column] | None = None
+    compare_rules: CompareRulesPayload | None = None
+    run_limits: CompareRunLimitsPayload | None = None
+
+
+class CompareTaskResponse(BaseModel):
+    id: str
+    project_id: str
+    name: str
+    source_id: str
+    target_id: str
+    source_ref: CompareDataRef
+    target_ref: CompareDataRef
+    columns: list[Column] = Field(default_factory=list)
+    compare_rules: CompareRulesPayload
+    run_limits: CompareRunLimitsPayload
+    created_by: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class CompareRunCreateResponse(BaseModel):
+    job_id: str
+    run_id: str
+
+
+class CompareCellDiff(BaseModel):
+    column: str
+    source: Any | None = None
+    target: Any | None = None
+
+
+class CompareResultRow(BaseModel):
+    pk: dict[str, Any]
+    source: dict[str, Any] | None = None
+    target: dict[str, Any] | None = None
+    cells: list[CompareCellDiff] = Field(default_factory=list)
+
+
+class CompareRunResultResponse(BaseModel):
+    job_id: str
+    run_id: str
+    bucket: CompareBucket
+    offset: int
+    limit: int
+    bucket_counts: dict[CompareBucket, int]
+    progress: dict[str, int] = Field(default_factory=dict)
+    rows: list[CompareResultRow] = Field(default_factory=list)
 
 
 class JobResponse(BaseModel):

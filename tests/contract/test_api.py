@@ -12,10 +12,11 @@ from app.api.routes import core as core_routes
 from app.api.security import create_access_token
 from app.api.services import ApiServices
 from app.dbclients.protocol import AdapterConnectionError
+from app.domain.compare_result import encode_compare_result_row
 from app.domain.job import Job, JobKind
 from app.domain.license import LicenseMode
 from app.domain.result import ResultRef
-from app.domain.schema import Column, ColumnType, Schema, Table
+from app.domain.schema import Column, ColumnType, Row, Schema, Table
 from tests._asgi_client import AsgiClient
 
 pytestmark = pytest.mark.contract
@@ -53,6 +54,13 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("POST", "/api/sql/explain") in routes
     assert ("POST", "/api/sql/format") in routes
     assert ("POST", "/api/sql/expand-star") in routes
+    assert ("GET", "/api/compare/tasks") in routes
+    assert ("POST", "/api/compare/tasks") in routes
+    assert ("GET", "/api/compare/tasks/{task_id}") in routes
+    assert ("PATCH", "/api/compare/tasks/{task_id}") in routes
+    assert ("DELETE", "/api/compare/tasks/{task_id}") in routes
+    assert ("POST", "/api/compare/tasks/{task_id}/run") in routes
+    assert ("GET", "/api/compare/runs/{run_id}/results") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/schemas") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/tables") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/columns") in routes
@@ -389,6 +397,7 @@ def test_delete_datasource_returns_409_with_job_references() -> None:
                     "status": "running",
                 }
             ],
+            [],
         ]
     )
     secret_store = _SecretStore()
@@ -557,7 +566,7 @@ def test_sql_expand_star_uses_metadata_cache_contract_fields() -> None:
                         "comment": None,
                     },
                 ],
-                "expires_at": _dt(30),
+                "expires_at": datetime.now(UTC) + timedelta(days=1),
             },
         ]
     )
@@ -643,6 +652,138 @@ def test_sql_explain_rejects_params_instead_of_ignoring_them() -> None:
     assert services.job_backend.enqueued == []
 
 
+def test_compare_task_create_persists_explicit_rules_contract() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            [
+                {"id": "ds-source", "project_id": "project-1"},
+                {"id": "ds-target", "project_id": "project-1"},
+            ],
+            _compare_task_row(),
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/compare/tasks",
+        headers=_auth_headers(),
+        json_body={
+            "project_id": "project-1",
+            "name": "orders",
+            "source_id": "ds-source",
+            "target_id": "ds-target",
+            "source_ref": {"kind": "table", "schema_name": "app", "table_name": "orders_a"},
+            "target_ref": {"kind": "table", "schema_name": "app", "table_name": "orders_b"},
+            "columns": [
+                {"name": "id", "type": "integer"},
+                {"name": "amount", "type": "decimal"},
+            ],
+            "compare_rules": {
+                "key_columns": ["id"],
+                "numeric_tolerance": 0.01,
+                "schema_policy": "strict",
+            },
+            "run_limits": {"recursive_checksum": True, "bisection_factor": 8},
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["id"] == "task-1"
+    assert payload["compare_rules"]["key_columns"] == ["id"]
+    assert payload["compare_rules"]["schema_policy"] == "strict"
+    assert payload["run_limits"]["bisection_factor"] == 8
+    assert any("INSERT INTO compare_tasks" in statement for statement in engine.statements)
+    assert any(audit["action"] == "compare_task_create" for audit in services.audits)
+
+
+def test_compare_task_run_enqueues_compare_job_and_run_index() -> None:
+    engine = _FakeEngine([_compare_task_row(), {"id": "project-1"}])
+    job_backend = _JobBackend()
+    services = _Services(engine, job_backend=job_backend)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/compare/tasks/task-1/run",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert set(payload) == {"job_id", "run_id"}
+    job = job_backend.enqueued[0]
+    assert job.kind is JobKind.COMPARE_RUN
+    assert job.timeout_seconds == 1800
+    assert job.datasource_ids == ["ds-source", "ds-target"]
+    assert set(job.payload["bucket_result_set_ids"]) == {
+        "only_source",
+        "only_target",
+        "diff",
+        "same",
+    }
+    assert any("INSERT INTO run_index" in statement for statement in engine.statements)
+    assert any(audit["action"] == "compare_run" for audit in services.audits)
+
+
+def test_compare_run_result_contract_returns_bucket_counts_and_cell_diffs() -> None:
+    run_row = {
+        "run_id": "run-1",
+        "job_id": "job-1",
+        "project_id": "project-1",
+        "bucket_spools": {"diff": "rs-diff"},
+        "bucket_counts": {
+            "only_source": 1,
+            "only_target": 1,
+            "diff": 1,
+            "same": 7,
+        },
+        "progress": {
+            "scanned_segments": 2,
+            "skipped_segments": 1,
+            "skipped_rows": 7,
+            "row_mode_segments": 1,
+        },
+    }
+    result_store = _ResultStore(
+        rows=[
+            encode_compare_result_row(
+                pk={"id": 3},
+                source={"id": 3, "amount": "10.00"},
+                target={"id": 3, "amount": "11.00"},
+                cells=[{"column": "amount", "source": "10.00", "target": "11.00"}],
+            )
+        ]
+    )
+    engine = _FakeEngine([run_row, {"id": "project-1"}])
+    app = create_app(services=cast(ApiServices, _Services(engine, result_store=result_store)))
+
+    response = AsgiClient(app).get(
+        "/api/compare/runs/run-1/results",
+        headers=_auth_headers(),
+        params={"bucket": "diff", "offset": 0, "limit": 10},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["bucket_counts"] == {
+        "only_source": 1,
+        "only_target": 1,
+        "diff": 1,
+        "same": 7,
+    }
+    assert payload["progress"]["skipped_rows"] == 7
+    assert payload["rows"] == [
+        {
+            "pk": {"id": 3},
+            "source": {"id": 3, "amount": "10.00"},
+            "target": {"id": 3, "amount": "11.00"},
+            "cells": [{"column": "amount", "source": "10.00", "target": "11.00"}],
+        }
+    ]
+
+
 def test_create_export_enqueues_result_export_job_and_returns_one_time_token() -> None:
     engine = _FakeEngine(
         [
@@ -674,7 +815,7 @@ def test_create_export_enqueues_result_export_job_and_returns_one_time_token() -
     assert job.payload["source_result_set_id"] == "rs-source"
     assert job.payload["format"] == "csv"
     assert job.payload["source_db_type"] == "mysql"
-    assert services.audits[-1]["action"] == "sql_export"
+    assert any(audit["action"] == "sql_export" for audit in services.audits)
     assert "download_token" not in str(services.audits[-1])
 
 
@@ -814,6 +955,31 @@ def _source_job_row() -> dict[str, object]:
     }
 
 
+def _compare_task_row() -> dict[str, object]:
+    return {
+        "id": "task-1",
+        "project_id": "project-1",
+        "name": "orders",
+        "source_id": "ds-source",
+        "target_id": "ds-target",
+        "source_ref": {"kind": "table", "schema_name": "app", "table_name": "orders_a"},
+        "target_ref": {"kind": "table", "schema_name": "app", "table_name": "orders_b"},
+        "columns": [
+            {"name": "id", "type": "integer"},
+            {"name": "amount", "type": "decimal"},
+        ],
+        "compare_rules": {"key_columns": ["id"], "schema_policy": "strict"},
+        "run_limits": {
+            "recursive_checksum": True,
+            "bisection_factor": 8,
+            "query_timeout_seconds": 1800,
+        },
+        "created_by": "user-1",
+        "created_at": _dt(1),
+        "updated_at": _dt(2),
+    }
+
+
 class _NoopServices:
     pass
 
@@ -933,9 +1099,11 @@ class _ResultStore:
         self,
         downloads: dict[str, bytes] | None = None,
         spool_exists: bool = True,
+        rows: list[Row] | None = None,
     ) -> None:
         self._downloads = downloads or {}
         self._spool_exists = spool_exists
+        self._rows = rows or []
 
     def spool_ref(self, result_set_id: str) -> ResultRef:
         return ResultRef(backend="local_fs", uri=f"spool/{result_set_id}")
@@ -951,6 +1119,10 @@ class _ResultStore:
             "loaded_rows": 1,
             "truncated": False,
         }
+
+    def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]:
+        del result_set_id
+        return list(self._rows[offset : offset + limit])
 
     def open_download(self, ref: ResultRef) -> io.BytesIO:
         if ref.uri not in self._downloads:

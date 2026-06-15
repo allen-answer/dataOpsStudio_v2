@@ -5,7 +5,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from secrets import token_urlsafe
-from typing import Any
+from typing import Any, cast
 
 import sqlglot
 import structlog
@@ -22,6 +22,15 @@ from app.api.errors import ApiError
 from app.api.routes.account import consume_recovery_code, verify_user_totp
 from app.api.schemas import (
     CancelResponse,
+    CompareBucket,
+    CompareResultRow,
+    CompareRulesPayload,
+    CompareRunCreateResponse,
+    CompareRunLimitsPayload,
+    CompareRunResultResponse,
+    CompareTaskCreateRequest,
+    CompareTaskResponse,
+    CompareTaskUpdateRequest,
     DatasourceCreateRequest,
     DatasourceDeleteBlockedResponse,
     DatasourceListItem,
@@ -63,6 +72,7 @@ from app.api.schemas import (
 from app.api.security import create_access_token
 from app.api.services import ApiServices, new_id
 from app.db.models import (
+    compare_tasks,
     datasources,
     export_download_tokens,
     jobs,
@@ -71,6 +81,7 @@ from app.db.models import (
     project_members,
     projects,
     result_sets,
+    run_index,
     sql_consoles,
     sql_templates,
     users,
@@ -78,6 +89,11 @@ from app.db.models import (
 from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
+from app.domain.compare_result import (
+    COMPARE_BUCKETS,
+    decode_compare_result_row,
+    empty_bucket_counts,
+)
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.resource import ResourceProfile
@@ -100,6 +116,7 @@ _METADATA_LEVEL_SCHEMAS = "schemas"
 _METADATA_LEVEL_TABLES = "tables"
 _METADATA_LEVEL_COLUMNS = "columns"
 _EXPORT_FORMATS = frozenset({"csv", "excel", "json", "sql"})
+_COMPARE_BUCKET_QUERY = Query(default="diff")
 
 router = APIRouter()
 
@@ -381,6 +398,7 @@ def delete_datasource(datasource_id: str, request: Request) -> JSONResponse | Re
         old_secret_ref = str(row["password_secret_ref"])
         _require_project_access(conn, project_id, user.id)
         references = _datasource_job_references(conn, datasource_id)
+        compare_references = _datasource_compare_task_references(conn, datasource_id)
         if references:
             payload = DatasourceDeleteBlockedResponse(
                 error="datasource_in_use",
@@ -388,6 +406,15 @@ def delete_datasource(datasource_id: str, request: Request) -> JSONResponse | Re
                 references=references,
             )
             return JSONResponse(status_code=409, content=payload.model_dump(mode="json"))
+        if compare_references:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "datasource_in_use",
+                    "message": "Datasource is referenced by existing compare tasks",
+                    "references": compare_references,
+                },
+            )
         conn.execute(delete(datasources).where(datasources.c.id == datasource_id))
 
     services.secret_store.delete_secret(
@@ -1080,6 +1107,304 @@ def render_sql_template(
     for name, value in body.values.items():
         rendered = rendered.replace("{{" + name + "}}", value)
     return SqlTemplateRenderResponse(sql_text=rendered)
+
+
+@router.get("/compare/tasks", response_model=list[CompareTaskResponse])
+def list_compare_tasks(
+    request: Request,
+    project_id: str | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list[CompareTaskResponse]:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        if project_id is not None:
+            _require_project_access(conn, project_id, user.id)
+        filters = [_project_access_filter(user.id)]
+        if project_id is not None:
+            filters.append(compare_tasks.c.project_id == project_id)
+        rows = (
+            conn.execute(
+                select(compare_tasks)
+                .select_from(_compare_tasks_visible_to_user(user.id))
+                .where(and_(*filters))
+                .order_by(compare_tasks.c.updated_at.desc(), compare_tasks.c.created_at.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            .mappings()
+            .all()
+        )
+    return [_compare_task_response(row) for row in rows]
+
+
+@router.post("/compare/tasks", response_model=CompareTaskResponse, status_code=201)
+def create_compare_task(
+    body: CompareTaskCreateRequest,
+    request: Request,
+) -> CompareTaskResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    now = datetime.now(UTC)
+    task_id = new_id()
+    with services.engine.begin() as conn:
+        _validate_compare_task_datasources(
+            conn,
+            project_id=body.project_id,
+            source_id=body.source_id,
+            target_id=body.target_id,
+            user_id=user.id,
+        )
+        conn.execute(
+            insert(compare_tasks).values(
+                id=task_id,
+                project_id=body.project_id,
+                name=body.name,
+                source_id=body.source_id,
+                target_id=body.target_id,
+                source_ref=body.source_ref.model_dump(mode="json"),
+                target_ref=body.target_ref.model_dump(mode="json"),
+                columns=[column.model_dump(mode="json") for column in body.columns],
+                compare_rules=body.compare_rules.model_dump(mode="json"),
+                run_limits=body.run_limits.model_dump(mode="json"),
+                created_by=user.id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        row = (
+            conn.execute(select(compare_tasks).where(compare_tasks.c.id == task_id))
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise ApiError(404, "not_found", "Compare task not found")
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=body.project_id,
+        action="compare_task_create",
+        resource_type="compare_task",
+        resource_id=task_id,
+        result="success",
+        detail={"source_id": body.source_id, "target_id": body.target_id},
+    )
+    return _compare_task_response(row)
+
+
+@router.get("/compare/tasks/{task_id}", response_model=CompareTaskResponse)
+def get_compare_task(task_id: str, request: Request) -> CompareTaskResponse:
+    return _compare_task_response(_compare_task_for_current_user(request, task_id))
+
+
+@router.patch("/compare/tasks/{task_id}", response_model=CompareTaskResponse)
+def update_compare_task(
+    task_id: str,
+    body: CompareTaskUpdateRequest,
+    request: Request,
+) -> CompareTaskResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.begin() as conn:
+        row = (
+            conn.execute(select(compare_tasks).where(compare_tasks.c.id == task_id))
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise ApiError(404, "not_found", "Compare task not found")
+        project_id = str(row["project_id"])
+        _require_project_access(conn, project_id, user.id)
+        source_id = body.source_id or str(row["source_id"])
+        target_id = body.target_id or str(row["target_id"])
+        if body.source_id is not None or body.target_id is not None:
+            _validate_compare_task_datasources(
+                conn,
+                project_id=project_id,
+                source_id=source_id,
+                target_id=target_id,
+                user_id=user.id,
+            )
+        values: dict[str, object] = {}
+        if body.name is not None:
+            values["name"] = body.name
+        if body.source_id is not None:
+            values["source_id"] = body.source_id
+        if body.target_id is not None:
+            values["target_id"] = body.target_id
+        if body.source_ref is not None:
+            values["source_ref"] = body.source_ref.model_dump(mode="json")
+        if body.target_ref is not None:
+            values["target_ref"] = body.target_ref.model_dump(mode="json")
+        if body.columns is not None:
+            values["columns"] = [column.model_dump(mode="json") for column in body.columns]
+        if body.compare_rules is not None:
+            values["compare_rules"] = body.compare_rules.model_dump(mode="json")
+        if body.run_limits is not None:
+            values["run_limits"] = body.run_limits.model_dump(mode="json")
+        if values:
+            values["updated_at"] = datetime.now(UTC)
+            conn.execute(
+                update(compare_tasks).where(compare_tasks.c.id == task_id).values(**values)
+            )
+        updated = (
+            conn.execute(select(compare_tasks).where(compare_tasks.c.id == task_id))
+            .mappings()
+            .one_or_none()
+        )
+        if updated is None:
+            raise ApiError(404, "not_found", "Compare task not found")
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=str(updated["project_id"]),
+        action="compare_task_update",
+        resource_type="compare_task",
+        resource_id=task_id,
+        result="success",
+    )
+    return _compare_task_response(updated)
+
+
+@router.delete("/compare/tasks/{task_id}", response_model=None)
+def delete_compare_task(task_id: str, request: Request) -> Response:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.begin() as conn:
+        row = (
+            conn.execute(select(compare_tasks).where(compare_tasks.c.id == task_id))
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise ApiError(404, "not_found", "Compare task not found")
+        _require_project_access(conn, str(row["project_id"]), user.id)
+        conn.execute(delete(compare_tasks).where(compare_tasks.c.id == task_id))
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=str(row["project_id"]),
+        action="compare_task_delete",
+        resource_type="compare_task",
+        resource_id=task_id,
+        result="success",
+    )
+    return Response(status_code=204)
+
+
+@router.post(
+    "/compare/tasks/{task_id}/run",
+    response_model=CompareRunCreateResponse,
+    status_code=202,
+)
+def run_compare_task(task_id: str, request: Request) -> CompareRunCreateResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    row = _compare_task_for_current_user(request, task_id)
+    rules = dict(row["compare_rules"] or {})
+    limits = dict(row["run_limits"] or {})
+    key_columns = rules.get("key_columns")
+    if not isinstance(key_columns, list) or not key_columns:
+        raise ApiError(400, "missing_compare_key", "Compare task requires key_columns")
+    columns = row["columns"] if isinstance(row["columns"], list) else []
+    if not columns:
+        raise ApiError(400, "missing_compare_columns", "Compare task requires columns")
+
+    job_id = new_id()
+    run_id = new_id()
+    bucket_spools = {bucket: new_id() for bucket in COMPARE_BUCKETS}
+    timeout_seconds = min(int(limits.get("query_timeout_seconds") or 1800), 3600)
+    job = Job(
+        id=job_id,
+        kind=JobKind.COMPARE_RUN,
+        status=JobStatus.PENDING,
+        owner_user_id=user.id,
+        project_id=str(row["project_id"]),
+        datasource_ids=[str(row["source_id"]), str(row["target_id"])],
+        priority=0,
+        timeout_seconds=timeout_seconds,
+        resource_profile=ResourceProfile(timeout_seconds=timeout_seconds),
+        audit_id=new_id(),
+        payload={
+            "task_id": task_id,
+            "run_id": run_id,
+            "source_id": str(row["source_id"]),
+            "target_id": str(row["target_id"]),
+            "source_ref": dict(row["source_ref"] or {}),
+            "target_ref": dict(row["target_ref"] or {}),
+            "columns": columns,
+            "compare_rules": rules,
+            "run_limits": limits,
+            "bucket_result_set_ids": bucket_spools,
+        },
+    )
+    now = datetime.now(UTC)
+    with services.engine.begin() as conn:
+        conn.execute(
+            insert(run_index).values(
+                run_id=run_id,
+                kind=JobKind.COMPARE_RUN.value,
+                job_id=job_id,
+                owner_user_id=user.id,
+                project_id=str(row["project_id"]),
+                task_id=task_id,
+                status=JobStatus.PENDING.value,
+                result_path=f"compare/{run_id}",
+                bucket_spools=bucket_spools,
+                bucket_counts=empty_bucket_counts(),
+                progress={},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    services.job_backend.enqueue(job)
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=str(row["project_id"]),
+        action="compare_run",
+        resource_type="compare_task",
+        resource_id=task_id,
+        result="accepted",
+        detail={"job_id": job_id},
+    )
+    return CompareRunCreateResponse(job_id=job_id, run_id=run_id)
+
+
+@router.get("/compare/runs/{run_id}/results", response_model=CompareRunResultResponse)
+def get_compare_run_results(
+    run_id: str,
+    request: Request,
+    bucket: CompareBucket = _COMPARE_BUCKET_QUERY,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> CompareRunResultResponse:
+    services = services_from(request)
+    run_row = _compare_run_for_current_user(request, run_id)
+    bucket_spools = dict(run_row["bucket_spools"] or {})
+    bucket_counts = _compare_bucket_counts(run_row["bucket_counts"])
+    result_set_id = bucket_spools.get(bucket)
+    rows = []
+    if isinstance(result_set_id, str) and services.result_store.spool_exists(result_set_id):
+        rows = [
+            CompareResultRow.model_validate(decode_compare_result_row(row))
+            for row in services.result_store.fetch_range(result_set_id, offset, limit)
+        ]
+    return CompareRunResultResponse(
+        job_id=str(run_row["job_id"]),
+        run_id=str(run_row["run_id"]),
+        bucket=bucket,
+        offset=offset,
+        limit=limit,
+        bucket_counts=bucket_counts,
+        progress=_compare_progress(run_row["progress"]),
+        rows=rows,
+    )
 
 
 @router.get("/jobs", response_model=list[JobListItem])
@@ -1826,6 +2151,114 @@ def _sql_template_response(row: RowMapping) -> SqlTemplateResponse:
     )
 
 
+def _compare_task_response(row: RowMapping) -> CompareTaskResponse:
+    return CompareTaskResponse(
+        id=str(row["id"]),
+        project_id=str(row["project_id"]),
+        name=str(row["name"]),
+        source_id=str(row["source_id"]),
+        target_id=str(row["target_id"]),
+        source_ref=row["source_ref"],
+        target_ref=row["target_ref"],
+        columns=[Column.model_validate(item) for item in row["columns"] or []],
+        compare_rules=CompareRulesPayload.model_validate(row["compare_rules"] or {}),
+        run_limits=CompareRunLimitsPayload.model_validate(row["run_limits"] or {}),
+        created_by=_optional_str(row["created_by"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _compare_task_for_current_user(request: Request, task_id: str) -> RowMapping:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        row = (
+            conn.execute(select(compare_tasks).where(compare_tasks.c.id == task_id))
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise ApiError(404, "not_found", "Compare task not found")
+        _require_project_access(conn, str(row["project_id"]), user.id)
+        return row
+
+
+def _compare_run_for_current_user(request: Request, run_or_job_id: str) -> RowMapping:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        row = (
+            conn.execute(
+                select(run_index).where(
+                    or_(
+                        run_index.c.run_id == run_or_job_id,
+                        run_index.c.job_id == run_or_job_id,
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise ApiError(404, "not_found", "Compare run not found")
+        _require_project_access(conn, str(row["project_id"]), user.id)
+        return row
+
+
+def _validate_compare_task_datasources(
+    conn: Connection,
+    *,
+    project_id: str,
+    source_id: str,
+    target_id: str,
+    user_id: str,
+) -> None:
+    _require_project_access(conn, project_id, user_id)
+    rows = (
+        conn.execute(
+            select(datasources.c.id, datasources.c.project_id).where(
+                datasources.c.id.in_([source_id, target_id])
+            )
+        )
+        .mappings()
+        .all()
+    )
+    by_id = {str(row["id"]): str(row["project_id"]) for row in rows}
+    if by_id.get(source_id) != project_id or by_id.get(target_id) != project_id:
+        raise ApiError(404, "not_found", "Compare datasource not found")
+
+
+def _compare_tasks_visible_to_user(user_id: str) -> Any:
+    return compare_tasks.join(projects, compare_tasks.c.project_id == projects.c.id).outerjoin(
+        project_members,
+        and_(
+            project_members.c.project_id == projects.c.id,
+            project_members.c.user_id == user_id,
+        ),
+    )
+
+
+def _compare_bucket_counts(value: object) -> dict[CompareBucket, int]:
+    counts: dict[str, int] = empty_bucket_counts()
+    if isinstance(value, dict):
+        for bucket in COMPARE_BUCKETS:
+            raw_count = value.get(bucket)
+            if isinstance(raw_count, int):
+                counts[bucket] = raw_count
+    return cast(dict[CompareBucket, int], counts)
+
+
+def _compare_progress(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    progress: dict[str, int] = {}
+    for key, raw_value in value.items():
+        if isinstance(key, str) and isinstance(raw_value, int):
+            progress[key] = raw_value
+    return progress
+
+
 def _normalize_variables(raw: object) -> list[str]:
     if not isinstance(raw, list):
         return []
@@ -2152,6 +2585,35 @@ def _datasource_job_references(
             kind=str(row["kind"]),
             status=JobStatus(str(row["status"])),
         )
+        for row in rows
+    ]
+
+
+def _datasource_compare_task_references(
+    conn: Connection,
+    datasource_id: str,
+) -> list[dict[str, str]]:
+    rows = (
+        conn.execute(
+            select(compare_tasks.c.id, compare_tasks.c.name)
+            .where(
+                or_(
+                    compare_tasks.c.source_id == datasource_id,
+                    compare_tasks.c.target_id == datasource_id,
+                )
+            )
+            .order_by(compare_tasks.c.updated_at.desc(), compare_tasks.c.id.desc())
+            .limit(20)
+        )
+        .mappings()
+        .all()
+    )
+    return [
+        {
+            "task_id": str(row["id"]),
+            "kind": "compare_task",
+            "name": str(row["name"]),
+        }
         for row in rows
     ]
 

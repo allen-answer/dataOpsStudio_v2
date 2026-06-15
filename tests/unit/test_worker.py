@@ -5,6 +5,8 @@ from typing import BinaryIO, Protocol
 
 from app.dbclients.factory import UnsupportedDbTypeError
 from app.dbclients.protocol import AdapterConnectionError
+from app.domain.compare import CompareHashExecutionMode, CompareHashPlan
+from app.domain.compare_result import decode_compare_result_row
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.plan import PlanNode
@@ -178,7 +180,7 @@ def test_worker_cancel_safe_point_marks_cancelled() -> None:
 
 
 def test_worker_unsupported_kind_fails_job() -> None:
-    job = _make_job(kind=JobKind.COMPARE_RUN)
+    job = _make_job(kind=JobKind.AI_ASSIST_CALL)
     backend = _FakeBackend([job])
     runner = WorkerRunner(
         backend,
@@ -191,6 +193,128 @@ def test_worker_unsupported_kind_fails_job() -> None:
     assert runner.run_once() is True
 
     assert backend.failed == [("job-1", "internal")]
+
+
+def test_worker_runs_compare_run_to_four_bucket_spools() -> None:
+    job = _make_job(
+        kind=JobKind.COMPARE_RUN,
+        payload={
+            "run_id": "run-1",
+            "task_id": "task-1",
+            "source_id": "ds-source",
+            "target_id": "ds-target",
+            "source_ref": {"kind": "table", "schema_name": "app", "table_name": "src"},
+            "target_ref": {"kind": "table", "schema_name": "app", "table_name": "tgt"},
+            "columns": [
+                {"name": "id", "type": "integer"},
+                {"name": "name", "type": "string"},
+            ],
+            "compare_rules": {"key_columns": ["id"]},
+            "run_limits": {"recursive_checksum": False, "persist_same_bucket": False},
+            "bucket_result_set_ids": {
+                "only_source": "rs-only-source",
+                "only_target": "rs-only-target",
+                "diff": "rs-diff",
+                "same": "rs-same",
+            },
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    compare_catalog = _FakeCompareRunCatalog()
+    adapters = [
+        _FakeAdapter(
+            [
+                Row(values=[1, 1, "same"]),
+                Row(values=[2, 2, "left"]),
+                Row(values=[3, 3, "old"]),
+            ],
+            bounds=(1, 3),
+        ),
+        _FakeAdapter(
+            [
+                Row(values=[1, 1, "same"]),
+                Row(values=[3, 3, "new"]),
+                Row(values=[4, 4, "right"]),
+            ],
+            bounds=(1, 4),
+        ),
+    ]
+
+    def adapter_factory(
+        conn_info: DatasourceConnInfo,
+        cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
+    ) -> _ColumnSinkAdapter:
+        del conn_info, cancel_check, column_sink
+        return adapters.pop(0)
+
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        adapter_factory,
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=compare_catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert compare_catalog.completed == [
+        {
+            "run_id": "run-1",
+            "bucket_counts": {
+                "only_source": 1,
+                "only_target": 1,
+                "diff": 1,
+                "same": 1,
+            },
+            "progress": {
+                "scanned_segments": 0,
+                "skipped_segments": 0,
+                "skipped_rows": 0,
+                "recursed_segments": 0,
+                "row_mode_segments": 1,
+                "max_depth_seen": 0,
+            },
+        }
+    ]
+    assert result_store.rows_by_result_set.get("rs-same", []) == []
+    assert decode_compare_result_row(result_store.rows_by_result_set["rs-only-source"][0])[
+        "source"
+    ] == {"id": 2, "name": "left"}
+    assert decode_compare_result_row(result_store.rows_by_result_set["rs-only-target"][0])[
+        "target"
+    ] == {"id": 4, "name": "right"}
+    diff_row = decode_compare_result_row(result_store.rows_by_result_set["rs-diff"][0])
+    assert diff_row["pk"] == {"id": 3}
+    assert diff_row["cells"] == [{"column": "name", "source": "old", "target": "new"}]
+    assert backend.completed == [
+        (
+            "job-1",
+            ResultRef(
+                backend="compare_run",
+                uri="compare/run-1",
+                metadata={
+                    "run_id": "run-1",
+                    "bucket_counts": {
+                        "only_source": 1,
+                        "only_target": 1,
+                        "diff": 1,
+                        "same": 1,
+                    },
+                    "progress": {
+                        "scanned_segments": 0,
+                        "skipped_segments": 0,
+                        "skipped_rows": 0,
+                        "recursed_segments": 0,
+                        "row_mode_segments": 1,
+                        "max_depth_seen": 0,
+                    },
+                },
+            ),
+        )
+    ]
 
 
 def test_worker_runs_result_export_from_spool_and_completes() -> None:
@@ -640,6 +764,7 @@ class _FakeAdapter:
         self,
         rows: list[Row],
         *,
+        bounds: tuple[int, int] | None = None,
         test_connection_ok: bool = True,
         connection_error: str | None = None,
         columns: list[Column] | None = None,
@@ -647,6 +772,7 @@ class _FakeAdapter:
         explain_rows: list[dict[str, object]] | None = None,
     ) -> None:
         self._rows = rows
+        self._bounds = bounds
         self._test_connection_ok = test_connection_ok
         self.last_connection_error = connection_error
         self._columns = columns or [Column(name="n", type=ColumnType.UNKNOWN)]
@@ -664,6 +790,9 @@ class _FakeAdapter:
 
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
         self.execute_select_calls += 1
+        if "MIN(" in sql.upper() and self._bounds is not None:
+            yield Row(values=[self._bounds[0], self._bounds[1]])
+            return
         if self._column_sink is not None:
             self._column_sink(self._columns)
             if self._emit_columns_twice:
@@ -677,6 +806,10 @@ class _FakeAdapter:
     def test_connection(self) -> bool:
         self.test_connection_calls += 1
         return self._test_connection_ok
+
+    def build_compare_hash_query(self, request: object) -> CompareHashPlan:
+        del request
+        return CompareHashPlan(execution_mode=CompareHashExecutionMode.CLIENT_ROW_HASH)
 
 
 class _RangeAdapter:
@@ -701,6 +834,10 @@ class _RangeAdapter:
 
     def test_connection(self) -> bool:
         return True
+
+    def build_compare_hash_query(self, request: object) -> CompareHashPlan:
+        del request
+        return CompareHashPlan(execution_mode=CompareHashExecutionMode.CLIENT_ROW_HASH)
 
 
 def _make_job(
@@ -745,6 +882,8 @@ class _ColumnSinkAdapter(Protocol):
     def explain(self, sql: str) -> PlanNode: ...
 
     def test_connection(self) -> bool: ...
+
+    def build_compare_hash_query(self, request: object) -> CompareHashPlan: ...
 
     def with_column_sink(
         self,
@@ -820,3 +959,31 @@ class _FakeResultSetCatalog:
 
     def write_terminal(self, *, result_set_id: str, state: str) -> None:
         self.terminal.append({"result_set_id": result_set_id, "state": state})
+
+
+class _FakeCompareRunCatalog:
+    def __init__(self) -> None:
+        self.running: list[dict[str, object]] = []
+        self.completed: list[dict[str, object]] = []
+        self.terminal: list[dict[str, object]] = []
+
+    def write_running(self, *, run_id: str, bucket_spools: dict[str, str]) -> None:
+        self.running.append({"run_id": run_id, "bucket_spools": dict(bucket_spools)})
+
+    def write_complete(
+        self,
+        *,
+        run_id: str,
+        bucket_counts: dict[str, int],
+        progress: dict[str, int],
+    ) -> None:
+        self.completed.append(
+            {
+                "run_id": run_id,
+                "bucket_counts": dict(bucket_counts),
+                "progress": dict(progress),
+            }
+        )
+
+    def write_terminal(self, *, run_id: str, status: str) -> None:
+        self.terminal.append({"run_id": run_id, "status": status})

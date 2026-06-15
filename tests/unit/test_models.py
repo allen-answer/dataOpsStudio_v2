@@ -15,6 +15,7 @@ from app.db.models import (
     APPLICATION_SECRET_KINDS,
     ai_configs,
     audit_logs,
+    compare_tasks,
     datasources,
     export_download_tokens,
     jobs,
@@ -24,6 +25,7 @@ from app.db.models import (
     mfa_recovery_codes,
     result_sets,
     revoked_tokens,
+    run_index,
     secret_refs,
     sql_consoles,
     sql_templates,
@@ -75,9 +77,10 @@ def test_all_alembic_revision_ids_under_32_chars() -> None:
     assert not violations, f"revision ID 超 32 字符: {violations}"
 
 
-def test_metadata_has_17_tables() -> None:
+def test_metadata_has_19_tables() -> None:
     expected = {
         "ai_configs",
+        "compare_tasks",
         "export_download_tokens",
         "users",
         "mfa_recovery_codes",
@@ -90,12 +93,60 @@ def test_metadata_has_17_tables() -> None:
         "secret_refs",
         "audit_logs",
         "result_sets",
+        "run_index",
         "sql_consoles",
         "sql_templates",
         "metadata_caches",
         "license_state",
     }
     assert set(metadata.tables.keys()) == expected
+
+
+def test_compare_tasks_and_run_index_schema_support_compare_run() -> None:
+    task_cols = set(compare_tasks.columns.keys())
+    run_cols = set(run_index.columns.keys())
+    task_indexes = {idx.name for idx in compare_tasks.indexes}
+    run_indexes = {idx.name for idx in run_index.indexes}
+    run_check_names = {c.name for c in run_index.constraints if c.name is not None}
+
+    assert task_cols == {
+        "id",
+        "project_id",
+        "name",
+        "source_id",
+        "target_id",
+        "source_ref",
+        "target_ref",
+        "columns",
+        "compare_rules",
+        "run_limits",
+        "created_by",
+        "created_at",
+        "updated_at",
+    }
+    assert run_cols == {
+        "run_id",
+        "kind",
+        "job_id",
+        "owner_user_id",
+        "project_id",
+        "task_id",
+        "status",
+        "result_path",
+        "bucket_spools",
+        "bucket_counts",
+        "progress",
+        "created_at",
+        "updated_at",
+        "finished_at",
+    }
+    assert "ix_compare_tasks_project_updated" in task_indexes
+    assert "ix_compare_tasks_source_id" in task_indexes
+    assert "ix_compare_tasks_target_id" in task_indexes
+    assert "ix_run_index_owner_project_created" in run_indexes
+    assert "ix_run_index_task_created" in run_indexes
+    assert "ck_run_index_kind_is_supported" in run_check_names
+    assert "ck_run_index_status_is_valid" in run_check_names
 
 
 def test_export_download_tokens_schema_is_one_time_and_ttl_indexed() -> None:
