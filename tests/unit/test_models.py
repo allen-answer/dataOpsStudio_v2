@@ -112,6 +112,21 @@ def test_metadata_cache_supports_index_cache_level() -> None:
     assert "'indexes'" in check_sql
 
 
+def test_metadata_cache_indexes_migration_uses_real_check_constraint_name() -> None:
+    migration_path = (
+        pathlib.Path(__file__).parent.parent.parent
+        / "app"
+        / "db"
+        / "migrations"
+        / "versions"
+        / "0013_metadata_cache_indexes.py"
+    )
+    text = migration_path.read_text(encoding="utf-8")
+
+    assert text.count('"ck_metadata_caches_cache_level_is_supported"') == 4
+    assert '"cache_level_is_supported"' not in text
+
+
 def test_compare_tasks_and_run_index_schema_support_compare_run() -> None:
     task_cols = set(compare_tasks.columns.keys())
     run_cols = set(run_index.columns.keys())

@@ -18,9 +18,13 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.drop_constraint("cache_level_is_supported", "metadata_caches", type_="check")
+    op.drop_constraint(
+        "ck_metadata_caches_cache_level_is_supported",
+        "metadata_caches",
+        type_="check",
+    )
     op.create_check_constraint(
-        "cache_level_is_supported",
+        "ck_metadata_caches_cache_level_is_supported",
         "metadata_caches",
         "cache_level IN ('schemas', 'tables', 'columns', 'indexes')",
     )
@@ -28,9 +32,13 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute("DELETE FROM metadata_caches WHERE cache_level = 'indexes'")
-    op.drop_constraint("cache_level_is_supported", "metadata_caches", type_="check")
+    op.drop_constraint(
+        "ck_metadata_caches_cache_level_is_supported",
+        "metadata_caches",
+        type_="check",
+    )
     op.create_check_constraint(
-        "cache_level_is_supported",
+        "ck_metadata_caches_cache_level_is_supported",
         "metadata_caches",
         "cache_level IN ('schemas', 'tables', 'columns')",
     )
