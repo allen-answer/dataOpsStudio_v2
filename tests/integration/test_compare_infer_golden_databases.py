@@ -46,8 +46,10 @@ def test_compare_infer_detects_real_primary_keys_and_column_pairs() -> None:
                 source_indexes=mysql_adapter.list_indexes(mysql_env["database"], _MYSQL_TABLE),
                 target_indexes=dm_adapter.list_indexes(dm_env["database"], _DM_TABLE),
             )
-        except Exception:
-            raise RuntimeError("Compare infer metadata probe failed; details redacted") from None
+        except Exception as exc:
+            raise RuntimeError(
+                f"Compare infer metadata probe failed: {type(exc).__name__}; details redacted"
+            ) from exc
 
     assert draft.needs_manual_pk is False
     assert draft.pk_candidates[0].source_columns == ["id"]
