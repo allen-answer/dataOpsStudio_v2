@@ -16,7 +16,7 @@ from app.domain.compare_result import encode_compare_result_row
 from app.domain.job import Job, JobKind
 from app.domain.license import LicenseMode
 from app.domain.result import ResultRef
-from app.domain.schema import Column, ColumnType, Row, Schema, Table
+from app.domain.schema import Column, ColumnType, Index, Row, Schema, Table
 from tests._asgi_client import AsgiClient
 
 pytestmark = pytest.mark.contract
@@ -61,9 +61,13 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("DELETE", "/api/compare/tasks/{task_id}") in routes
     assert ("POST", "/api/compare/tasks/{task_id}/run") in routes
     assert ("GET", "/api/compare/runs/{run_id}/results") in routes
+    assert ("POST", "/api/projects/{project_id}/compare/infer") in routes
+    assert ("GET", "/api/projects/{project_id}/compare/suggest-tasks") in routes
+    assert ("POST", "/api/projects/{project_id}/compare/draft-task") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/schemas") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/tables") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/columns") in routes
+    assert ("GET", "/api/datasources/{datasource_id}/metadata/indexes") in routes
     assert ("GET", "/api/jobs") in routes
     assert ("GET", "/api/jobs/{job_id}") in routes
     assert ("GET", "/api/jobs/{job_id}/result") in routes
@@ -446,6 +450,8 @@ def test_metadata_endpoints_return_cached_contract_fields(monkeypatch: pytest.Mo
             {"id": "project-1"},
             _datasource_row(),
             {"id": "project-1"},
+            _datasource_row(),
+            {"id": "project-1"},
         ]
     )
     services = _Services(engine, metadata_probe_timeout_seconds=6)
@@ -464,6 +470,11 @@ def test_metadata_endpoints_return_cached_contract_fields(monkeypatch: pytest.Mo
     )
     columns_response = client.get(
         "/api/datasources/ds-1/metadata/columns",
+        headers=_auth_headers(),
+        params={"schema": "app", "table": "users", "refresh": "1"},
+    )
+    indexes_response = client.get(
+        "/api/datasources/ds-1/metadata/indexes",
         headers=_auth_headers(),
         params={"schema": "app", "table": "users", "refresh": "1"},
     )
@@ -493,12 +504,18 @@ def test_metadata_endpoints_return_cached_contract_fields(monkeypatch: pytest.Mo
             "comment": None,
         },
     ]
+    assert indexes_response.status_code == 200
+    assert indexes_response.json() == [
+        {"name": "PRIMARY", "columns": ["id"], "is_unique": True, "is_primary": True}
+    ]
     assert {audit["action"] for audit in services.audits} >= {
         "metadata_schemas_list",
         "metadata_tables_list",
         "metadata_columns_list",
+        "metadata_indexes_list",
     }
     assert adapter_kwargs == [
+        {"connect_timeout_seconds": 6, "statement_timeout_seconds": 6},
         {"connect_timeout_seconds": 6, "statement_timeout_seconds": 6},
         {"connect_timeout_seconds": 6, "statement_timeout_seconds": 6},
         {"connect_timeout_seconds": 6, "statement_timeout_seconds": 6},
@@ -699,6 +716,231 @@ def test_compare_task_create_persists_explicit_rules_contract() -> None:
     assert any(audit["action"] == "compare_task_create" for audit in services.audits)
 
 
+def test_compare_infer_contract_returns_mapping_confidence_and_pk_draft() -> None:
+    source_row = _datasource_row()
+    source_row["id"] = "ds-source"
+    target_row = _datasource_row()
+    target_row["id"] = "ds-target"
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            [source_row, target_row],
+            _metadata_cache(
+                [
+                    {
+                        "name": "id",
+                        "type": "integer",
+                        "driver_type": "INT",
+                        "nullable": False,
+                        "primary_key": True,
+                        "comment": None,
+                    },
+                    {
+                        "name": "amount",
+                        "type": "decimal",
+                        "driver_type": "DECIMAL(12,2)",
+                        "nullable": True,
+                        "primary_key": False,
+                        "comment": None,
+                    },
+                ]
+            ),
+            _metadata_cache(
+                [
+                    {
+                        "name": "ID",
+                        "type": "integer",
+                        "driver_type": "INT",
+                        "nullable": False,
+                        "primary_key": True,
+                        "comment": None,
+                    },
+                    {
+                        "name": "amount",
+                        "type": "decimal",
+                        "driver_type": "DECIMAL(12,2)",
+                        "nullable": True,
+                        "primary_key": False,
+                        "comment": None,
+                    },
+                ]
+            ),
+            _metadata_cache(
+                [{"name": "PRIMARY", "columns": ["id"], "is_unique": True, "is_primary": True}]
+            ),
+            _metadata_cache(
+                [{"name": "PRIMARY", "columns": ["ID"], "is_unique": True, "is_primary": True}]
+            ),
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/infer",
+        headers=_auth_headers(),
+        json_body={
+            "source_id": "ds-source",
+            "target_id": "ds-target",
+            "source_table": {"schema_name": "app", "table_name": "orders"},
+            "target_table": {"schema_name": "app", "table_name": "orders"},
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["needs_manual_pk"] is False
+    assert payload["pk_candidates"][0]["source_columns"] == ["id"]
+    assert payload["pk_candidates"][0]["target_columns"] == ["ID"]
+    assert payload["pk_candidates"][0]["reason"] == "primary_key"
+    id_mapping = next(item for item in payload["mappings"] if item["source_column"] == "id")
+    assert id_mapping["target_column"] == "ID"
+    assert id_mapping["confidence"] > 0.8
+    assert id_mapping["reason"] == "exact"
+    assert id_mapping["conflict"] is False
+    assert payload["compare_rules"]["key_columns"] == ["id"]
+    assert payload["compare_rules"]["column_mappings"]["id"] == "ID"
+    assert payload["columns"] == [
+        {
+            "name": "amount",
+            "type": "decimal",
+            "driver_type": "DECIMAL(12,2)",
+            "nullable": True,
+            "primary_key": False,
+            "comment": None,
+        }
+    ]
+
+
+def test_compare_suggest_tasks_contract_returns_normalized_table_pairs() -> None:
+    source_row = _datasource_row()
+    source_row["id"] = "ds-source"
+    target_row = _datasource_row()
+    target_row["id"] = "ds-target"
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            [source_row, target_row],
+            _metadata_cache([{"name": "src"}]),
+            _metadata_cache(
+                [
+                    {"schema_name": "src", "name": "orders", "table_type": "BASE TABLE"},
+                    {"schema_name": "src", "name": "src_customer", "table_type": "BASE TABLE"},
+                ]
+            ),
+            _metadata_cache([{"name": "dst"}]),
+            _metadata_cache(
+                [
+                    {"schema_name": "dst", "name": "orders", "table_type": "BASE TABLE"},
+                    {"schema_name": "dst", "name": "customer", "table_type": "BASE TABLE"},
+                ]
+            ),
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/compare/suggest-tasks",
+        headers=_auth_headers(),
+        params={"source_id": "ds-source", "target_id": "ds-target"},
+    )
+
+    assert response.status_code == 200
+    suggestions = response.json()["suggestions"]
+    assert suggestions[0]["source_table"] == "orders"
+    assert suggestions[0]["target_table"] == "orders"
+    assert suggestions[0]["reason"] == "exact"
+    assert any(
+        item["source_table"] == "src_customer"
+        and item["target_table"] == "customer"
+        and item["reason"] == "normalized"
+        for item in suggestions
+    )
+
+
+def test_compare_draft_task_contract_reuses_compare_task_create() -> None:
+    source_row = _datasource_row()
+    source_row["id"] = "ds-source"
+    target_row = _datasource_row()
+    target_row["id"] = "ds-target"
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            [source_row, target_row],
+            _metadata_cache(
+                [
+                    {
+                        "name": "id",
+                        "type": "integer",
+                        "driver_type": "INT",
+                        "nullable": False,
+                        "primary_key": True,
+                        "comment": None,
+                    },
+                    {
+                        "name": "amount",
+                        "type": "decimal",
+                        "driver_type": "DECIMAL(12,2)",
+                        "nullable": True,
+                        "primary_key": False,
+                        "comment": None,
+                    },
+                ]
+            ),
+            _metadata_cache(
+                [
+                    {
+                        "name": "ID",
+                        "type": "integer",
+                        "driver_type": "INT",
+                        "nullable": False,
+                        "primary_key": True,
+                        "comment": None,
+                    },
+                    {
+                        "name": "amount",
+                        "type": "decimal",
+                        "driver_type": "DECIMAL(12,2)",
+                        "nullable": True,
+                        "primary_key": False,
+                        "comment": None,
+                    },
+                ]
+            ),
+            _metadata_cache(
+                [{"name": "PRIMARY", "columns": ["id"], "is_unique": True, "is_primary": True}]
+            ),
+            _metadata_cache(
+                [{"name": "PRIMARY", "columns": ["ID"], "is_unique": True, "is_primary": True}]
+            ),
+            {"id": "project-1"},
+            [
+                {"id": "ds-source", "project_id": "project-1"},
+                {"id": "ds-target", "project_id": "project-1"},
+            ],
+            _compare_task_row(),
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/draft-task",
+        headers=_auth_headers(),
+        json_body={
+            "name": "orders draft",
+            "source_id": "ds-source",
+            "target_id": "ds-target",
+            "source_table": {"schema_name": "app", "table_name": "orders_a"},
+            "target_table": {"schema_name": "app", "table_name": "orders_b"},
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["id"] == "task-1"
+    assert any("INSERT INTO compare_tasks" in statement for statement in engine.statements)
+    assert any(audit["action"] == "compare_task_draft_create" for audit in services.audits)
+
+
 def test_compare_task_run_enqueues_compare_job_and_run_index() -> None:
     engine = _FakeEngine([_compare_task_row(), {"id": "project-1"}])
     job_backend = _JobBackend()
@@ -897,6 +1139,10 @@ def _auth_headers(user_id: str = "user-1") -> dict[str, str]:
 
 def _dt(second: int) -> datetime:
     return datetime(2026, 1, 1, 0, 0, second, tzinfo=UTC)
+
+
+def _metadata_cache(payload: list[dict[str, object]]) -> dict[str, object]:
+    return {"payload": payload, "expires_at": datetime.now(UTC) + timedelta(days=1)}
 
 
 def _policy(**overrides: bool) -> dict[str, bool]:
@@ -1156,6 +1402,10 @@ class _MetadataAdapter:
                 primary_key=False,
             ),
         ]
+
+    def list_indexes(self, schema: str, table: str) -> list[Index]:
+        del schema, table
+        return [Index(name="PRIMARY", columns=["id"], is_unique=True, is_primary=True)]
 
 
 class _FailingMetadataAdapter:

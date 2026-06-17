@@ -5,6 +5,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.domain.compare_infer import (
+    ColumnMappingCandidate,
+    PrimaryKeyCandidate,
+    TablePairSuggestion,
+)
 from app.domain.datasource import DbType, OperationPolicy
 from app.domain.job import JobErrorCode, JobStatus
 from app.domain.schema import Column
@@ -239,6 +244,40 @@ class CompareRunResultResponse(BaseModel):
     rows: list[CompareResultRow] = Field(default_factory=list)
 
 
+class CompareTableRequest(BaseModel):
+    schema_name: str = Field(min_length=1)
+    table_name: str = Field(min_length=1)
+
+
+class CompareInferRequest(BaseModel):
+    source_id: str
+    target_id: str
+    source_table: CompareTableRequest
+    target_table: CompareTableRequest
+
+
+class CompareInferResponse(BaseModel):
+    project_id: str
+    source_id: str
+    target_id: str
+    source_table: CompareTableRequest
+    target_table: CompareTableRequest
+    mappings: list[ColumnMappingCandidate]
+    pk_candidates: list[PrimaryKeyCandidate]
+    needs_manual_pk: bool
+    compare_rules: CompareRulesPayload
+    columns: list[Column] = Field(default_factory=list)
+
+
+class CompareSuggestedTaskCreateRequest(CompareInferRequest):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    run_limits: CompareRunLimitsPayload = Field(default_factory=CompareRunLimitsPayload)
+
+
+class CompareTaskSuggestionResponse(BaseModel):
+    suggestions: list[TablePairSuggestion]
+
+
 class JobResponse(BaseModel):
     id: str
     kind: str
@@ -316,6 +355,13 @@ class MetadataColumnItem(BaseModel):
     nullable: bool
     primary_key: bool
     comment: str | None = None
+
+
+class MetadataIndexItem(BaseModel):
+    name: str
+    columns: list[str] = Field(default_factory=list)
+    is_unique: bool = False
+    is_primary: bool = False
 
 
 class SqlFormatRequest(BaseModel):

@@ -23,13 +23,18 @@ from app.api.routes.account import consume_recovery_code, verify_user_totp
 from app.api.schemas import (
     CancelResponse,
     CompareBucket,
+    CompareDataRef,
+    CompareInferRequest,
+    CompareInferResponse,
     CompareResultRow,
     CompareRulesPayload,
     CompareRunCreateResponse,
     CompareRunLimitsPayload,
     CompareRunResultResponse,
+    CompareSuggestedTaskCreateRequest,
     CompareTaskCreateRequest,
     CompareTaskResponse,
+    CompareTaskSuggestionResponse,
     CompareTaskUpdateRequest,
     DatasourceCreateRequest,
     DatasourceDeleteBlockedResponse,
@@ -48,6 +53,7 @@ from app.api.schemas import (
     LicenseStatusResponse,
     LoginRequest,
     MetadataColumnItem,
+    MetadataIndexItem,
     MetadataSchemaItem,
     MetadataTableItem,
     ProjectResponse,
@@ -89,6 +95,11 @@ from app.db.models import (
 from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
+from app.domain.compare_infer import (
+    CompareInferenceDraft,
+    infer_compare_draft,
+    infer_table_pair_suggestions,
+)
 from app.domain.compare_result import (
     COMPARE_BUCKETS,
     decode_compare_result_row,
@@ -98,7 +109,7 @@ from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
-from app.domain.schema import Column
+from app.domain.schema import Column, Index, Table
 from app.domain.secret import HashedRef, SecretKind, SecretRef
 from app.infrastructure.result_export import export_content_type, export_extension
 
@@ -115,6 +126,7 @@ _METADATA_CACHE_TTL = timedelta(days=7)
 _METADATA_LEVEL_SCHEMAS = "schemas"
 _METADATA_LEVEL_TABLES = "tables"
 _METADATA_LEVEL_COLUMNS = "columns"
+_METADATA_LEVEL_INDEXES = "indexes"
 _EXPORT_FORMATS = frozenset({"csv", "excel", "json", "sql"})
 _COMPARE_BUCKET_QUERY = Query(default="diff")
 
@@ -689,6 +701,35 @@ def list_datasource_metadata_columns(
     return [MetadataColumnItem.model_validate(item) for item in payload]
 
 
+@router.get(
+    "/datasources/{datasource_id}/metadata/indexes",
+    response_model=list[MetadataIndexItem],
+)
+def list_datasource_metadata_indexes(
+    datasource_id: str,
+    request: Request,
+    schema: str = Query(min_length=1),
+    table: str = Query(min_length=1),
+    refresh: bool = Query(default=False),
+) -> list[MetadataIndexItem]:
+    row = _datasource_for_current_user(request, datasource_id)
+    services = services_from(request)
+    payload = _metadata_payload(
+        services,
+        row,
+        _METADATA_LEVEL_INDEXES,
+        schema_name=schema,
+        table_name=table,
+        refresh=refresh,
+        load=lambda: [
+            _metadata_index_item(index).model_dump(mode="json")
+            for index in _metadata_adapter(services, row).list_indexes(schema, table)
+        ],
+    )
+    _audit_metadata(request, services, row, "metadata_indexes_list", datasource_id, refresh)
+    return [MetadataIndexItem.model_validate(item) for item in payload]
+
+
 @router.post("/sql/format", response_model=SqlFormatResponse)
 def format_sql(body: SqlFormatRequest, request: Request) -> SqlFormatResponse:
     services = services_from(request)
@@ -1109,6 +1150,127 @@ def render_sql_template(
     return SqlTemplateRenderResponse(sql_text=rendered)
 
 
+@router.post(
+    "/projects/{project_id}/compare/infer",
+    response_model=CompareInferResponse,
+)
+def infer_project_compare_task(
+    project_id: str,
+    body: CompareInferRequest,
+    request: Request,
+    refresh: bool = Query(default=False),
+) -> CompareInferResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    source_row, target_row = _compare_datasource_rows_for_project(
+        services,
+        project_id=project_id,
+        source_id=body.source_id,
+        target_id=body.target_id,
+        user_id=user.id,
+    )
+    draft = _compare_inference_draft(
+        services,
+        body,
+        source_row=source_row,
+        target_row=target_row,
+        refresh=refresh,
+    )
+    return _compare_infer_response(
+        project_id=project_id,
+        body=body,
+        draft=draft,
+    )
+
+
+@router.get(
+    "/projects/{project_id}/compare/suggest-tasks",
+    response_model=CompareTaskSuggestionResponse,
+)
+def suggest_project_compare_tasks(
+    project_id: str,
+    request: Request,
+    source_id: str = Query(min_length=1),
+    target_id: str = Query(min_length=1),
+    refresh: bool = Query(default=False),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> CompareTaskSuggestionResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    source_row, target_row = _compare_datasource_rows_for_project(
+        services,
+        project_id=project_id,
+        source_id=source_id,
+        target_id=target_id,
+        user_id=user.id,
+    )
+    suggestions = infer_table_pair_suggestions(
+        _metadata_all_tables(services, source_row, refresh=refresh),
+        _metadata_all_tables(services, target_row, refresh=refresh),
+        limit=limit,
+    )
+    return CompareTaskSuggestionResponse(suggestions=suggestions)
+
+
+@router.post(
+    "/projects/{project_id}/compare/draft-task",
+    response_model=CompareTaskResponse,
+    status_code=201,
+)
+def create_project_compare_task_draft(
+    project_id: str,
+    body: CompareSuggestedTaskCreateRequest,
+    request: Request,
+    refresh: bool = Query(default=False),
+) -> CompareTaskResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    source_row, target_row = _compare_datasource_rows_for_project(
+        services,
+        project_id=project_id,
+        source_id=body.source_id,
+        target_id=body.target_id,
+        user_id=user.id,
+    )
+    draft = _compare_inference_draft(
+        services,
+        body,
+        source_row=source_row,
+        target_row=target_row,
+        refresh=refresh,
+    )
+    if draft.needs_manual_pk:
+        raise ApiError(409, "needs_manual_pk", "Compare task draft requires manual key columns")
+    task_body = CompareTaskCreateRequest(
+        project_id=project_id,
+        name=body.name or f"{body.source_table.table_name} -> {body.target_table.table_name}",
+        source_id=body.source_id,
+        target_id=body.target_id,
+        source_ref=CompareDataRef(
+            kind="table",
+            schema_name=body.source_table.schema_name,
+            table_name=body.source_table.table_name,
+        ),
+        target_ref=CompareDataRef(
+            kind="table",
+            schema_name=body.target_table.schema_name,
+            table_name=body.target_table.table_name,
+        ),
+        columns=draft.columns,
+        compare_rules=CompareRulesPayload.model_validate(
+            draft.compare_rules.model_dump(mode="json")
+        ),
+        run_limits=body.run_limits,
+    )
+    return _create_compare_task_record(
+        services,
+        request,
+        user_id=user.id,
+        body=task_body,
+        audit_action="compare_task_draft_create",
+    )
+
+
 @router.get("/compare/tasks", response_model=list[CompareTaskResponse])
 def list_compare_tasks(
     request: Request,
@@ -1146,6 +1308,23 @@ def create_compare_task(
 ) -> CompareTaskResponse:
     services = services_from(request)
     user = current_user_from(request)
+    return _create_compare_task_record(
+        services,
+        request,
+        user_id=user.id,
+        body=body,
+        audit_action="compare_task_create",
+    )
+
+
+def _create_compare_task_record(
+    services: ApiServices,
+    request: Request,
+    *,
+    user_id: str,
+    body: CompareTaskCreateRequest,
+    audit_action: str,
+) -> CompareTaskResponse:
     now = datetime.now(UTC)
     task_id = new_id()
     with services.engine.begin() as conn:
@@ -1154,7 +1333,7 @@ def create_compare_task(
             project_id=body.project_id,
             source_id=body.source_id,
             target_id=body.target_id,
-            user_id=user.id,
+            user_id=user_id,
         )
         conn.execute(
             insert(compare_tasks).values(
@@ -1168,7 +1347,7 @@ def create_compare_task(
                 columns=[column.model_dump(mode="json") for column in body.columns],
                 compare_rules=body.compare_rules.model_dump(mode="json"),
                 run_limits=body.run_limits.model_dump(mode="json"),
-                created_by=user.id,
+                created_by=user_id,
                 created_at=now,
                 updated_at=now,
             )
@@ -1183,9 +1362,9 @@ def create_compare_task(
     _audit_business(
         services,
         request,
-        user_id=user.id,
+        user_id=user_id,
         project_id=body.project_id,
-        action="compare_task_create",
+        action=audit_action,
         resource_type="compare_task",
         resource_id=task_id,
         result="success",
@@ -1924,6 +2103,103 @@ def _datasource_conn_info(row: RowMapping) -> DatasourceConnInfo:
     )
 
 
+def _metadata_columns_for_table(
+    services: ApiServices,
+    datasource_row: RowMapping,
+    *,
+    schema_name: str,
+    table_name: str,
+    refresh: bool,
+) -> list[Column]:
+    payload = _metadata_payload(
+        services,
+        datasource_row,
+        _METADATA_LEVEL_COLUMNS,
+        schema_name=schema_name,
+        table_name=table_name,
+        refresh=refresh,
+        load=lambda: [
+            _metadata_column_item(column).model_dump(mode="json")
+            for column in _metadata_adapter(services, datasource_row).list_columns(
+                schema_name, table_name
+            )
+        ],
+    )
+    return [Column.model_validate(item) for item in payload]
+
+
+def _metadata_indexes_for_table(
+    services: ApiServices,
+    datasource_row: RowMapping,
+    *,
+    schema_name: str,
+    table_name: str,
+    refresh: bool,
+) -> list[Index]:
+    payload = _metadata_payload(
+        services,
+        datasource_row,
+        _METADATA_LEVEL_INDEXES,
+        schema_name=schema_name,
+        table_name=table_name,
+        refresh=refresh,
+        load=lambda: [
+            _metadata_index_item(index).model_dump(mode="json")
+            for index in _metadata_adapter(services, datasource_row).list_indexes(
+                schema_name, table_name
+            )
+        ],
+    )
+    return [Index.model_validate(item) for item in payload]
+
+
+def _metadata_all_tables(
+    services: ApiServices,
+    datasource_row: RowMapping,
+    *,
+    refresh: bool,
+) -> list[Table]:
+    schema_payload = _metadata_payload(
+        services,
+        datasource_row,
+        _METADATA_LEVEL_SCHEMAS,
+        schema_name="",
+        table_name="",
+        refresh=refresh,
+        load=lambda: [
+            MetadataSchemaItem(name=item.name).model_dump(mode="json")
+            for item in _metadata_adapter(services, datasource_row).list_schemas()
+        ],
+    )
+    tables: list[Table] = []
+    for schema_item in schema_payload:
+        schema_name = schema_item.get("name")
+        if not isinstance(schema_name, str) or not schema_name:
+            continue
+
+        def load_tables_for_schema(schema: str = schema_name) -> list[dict[str, object]]:
+            return [
+                MetadataTableItem(
+                    schema_name=item.schema_name,
+                    name=item.name,
+                    table_type=item.table_type,
+                ).model_dump(mode="json")
+                for item in _metadata_adapter(services, datasource_row).list_tables(schema)
+            ]
+
+        table_payload = _metadata_payload(
+            services,
+            datasource_row,
+            _METADATA_LEVEL_TABLES,
+            schema_name=schema_name,
+            table_name="",
+            refresh=refresh,
+            load=load_tables_for_schema,
+        )
+        tables.extend(Table.model_validate(item) for item in table_payload)
+    return tables
+
+
 def _metadata_column_item(column: Column) -> MetadataColumnItem:
     return MetadataColumnItem(
         name=column.name,
@@ -1932,6 +2208,15 @@ def _metadata_column_item(column: Column) -> MetadataColumnItem:
         nullable=column.nullable,
         primary_key=column.primary_key,
         comment=column.comment,
+    )
+
+
+def _metadata_index_item(index: Index) -> MetadataIndexItem:
+    return MetadataIndexItem(
+        name=index.name,
+        columns=list(index.columns),
+        is_unique=index.is_unique,
+        is_primary=index.is_primary,
     )
 
 
@@ -2227,6 +2512,96 @@ def _validate_compare_task_datasources(
     by_id = {str(row["id"]): str(row["project_id"]) for row in rows}
     if by_id.get(source_id) != project_id or by_id.get(target_id) != project_id:
         raise ApiError(404, "not_found", "Compare datasource not found")
+
+
+def _compare_datasource_rows_for_project(
+    services: ApiServices,
+    *,
+    project_id: str,
+    source_id: str,
+    target_id: str,
+    user_id: str,
+) -> tuple[RowMapping, RowMapping]:
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user_id)
+        rows = (
+            conn.execute(select(datasources).where(datasources.c.id.in_([source_id, target_id])))
+            .mappings()
+            .all()
+        )
+    by_id = {str(row["id"]): row for row in rows}
+    source_row = by_id.get(source_id)
+    target_row = by_id.get(target_id)
+    if (
+        source_row is None
+        or target_row is None
+        or str(source_row["project_id"]) != project_id
+        or str(target_row["project_id"]) != project_id
+    ):
+        raise ApiError(404, "not_found", "Compare datasource not found")
+    return source_row, target_row
+
+
+def _compare_inference_draft(
+    services: ApiServices,
+    body: CompareInferRequest,
+    *,
+    source_row: RowMapping,
+    target_row: RowMapping,
+    refresh: bool,
+) -> CompareInferenceDraft:
+    return infer_compare_draft(
+        source_columns=_metadata_columns_for_table(
+            services,
+            source_row,
+            schema_name=body.source_table.schema_name,
+            table_name=body.source_table.table_name,
+            refresh=refresh,
+        ),
+        target_columns=_metadata_columns_for_table(
+            services,
+            target_row,
+            schema_name=body.target_table.schema_name,
+            table_name=body.target_table.table_name,
+            refresh=refresh,
+        ),
+        source_indexes=_metadata_indexes_for_table(
+            services,
+            source_row,
+            schema_name=body.source_table.schema_name,
+            table_name=body.source_table.table_name,
+            refresh=refresh,
+        ),
+        target_indexes=_metadata_indexes_for_table(
+            services,
+            target_row,
+            schema_name=body.target_table.schema_name,
+            table_name=body.target_table.table_name,
+            refresh=refresh,
+        ),
+    )
+
+
+def _compare_infer_response(
+    *,
+    project_id: str,
+    body: CompareInferRequest,
+    draft: CompareInferenceDraft,
+) -> CompareInferResponse:
+    return CompareInferResponse(
+        project_id=project_id,
+        source_id=body.source_id,
+        target_id=body.target_id,
+        source_table=body.source_table,
+        target_table=body.target_table,
+        mappings=draft.mappings,
+        pk_candidates=draft.pk_candidates,
+        needs_manual_pk=draft.needs_manual_pk,
+        compare_rules=CompareRulesPayload.model_validate(
+            draft.compare_rules.model_dump(mode="json")
+        ),
+        columns=draft.columns,
+    )
 
 
 def _compare_tasks_visible_to_user(user_id: str) -> Any:
