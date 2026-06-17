@@ -201,7 +201,7 @@ class DMAdapter(DatabaseAdapter):
                 c.COLUMN_NAME AS name,
                 c.DATA_TYPE AS data_type,
                 c.NULLABLE AS nullable,
-                cc.COMMENTS AS comment
+                cc.COMMENTS AS "COMMENT"
             FROM ALL_TAB_COLUMNS c
             LEFT JOIN ALL_COL_COMMENTS cc
               ON cc.OWNER = c.OWNER

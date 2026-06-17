@@ -86,6 +86,7 @@ def test_list_columns_maps_data_type_and_keeps_driver_type() -> None:
     adapter = DMAdapter(_conn_info(), cast(SecretStore, _SecretStore("pwd")), dm_module=fake_dm)
 
     columns = adapter.list_columns("APP", "USERS")
+    column_sql = fake_dm.connections[0].cursors[0].executed_sql
 
     assert columns == [
         Column(
@@ -94,6 +95,7 @@ def test_list_columns_maps_data_type_and_keeps_driver_type() -> None:
             driver_type="NUMBER",
             nullable=False,
             primary_key=True,
+            comment="primary key",
         ),
         Column(
             name="NAME",
@@ -103,6 +105,8 @@ def test_list_columns_maps_data_type_and_keeps_driver_type() -> None:
             primary_key=False,
         ),
     ]
+    assert 'cc.COMMENTS AS "COMMENT"' in column_sql
+    assert "as comment" not in column_sql.lower()
 
 
 def test_test_connection_records_dm_server_version() -> None:
@@ -291,8 +295,10 @@ class _FakeCursor:
         self.description: tuple[tuple[Any, ...], ...] = (("ok",),)
         self._rows: list[tuple[Any, ...]] = []
         self._offset = 0
+        self.executed_sql = ""
 
     def execute(self, sql: str, params: object = None) -> None:
+        self.executed_sql = sql
         normalized = " ".join(sql.lower().split())
         if "from dual" in normalized and "select 1 as ok" in normalized:
             self.description = (("ok",),)
@@ -301,10 +307,10 @@ class _FakeCursor:
             self.description = (("banner",),)
             self._rows = [("DM Database Server x64 V8",)]
         elif "all_tab_columns" in normalized:
-            self.description = (("name",), ("data_type",), ("nullable",))
+            self.description = (("name",), ("data_type",), ("nullable",), ("COMMENT",))
             self._rows = [
-                ("ID", "NUMBER", "N"),
-                ("NAME", "VARCHAR2", "Y"),
+                ("ID", "NUMBER", "N", "primary key"),
+                ("NAME", "VARCHAR2", "Y", None),
             ]
         elif "all_constraints" in normalized and "all_cons_columns" in normalized:
             self.description = (("name",),)

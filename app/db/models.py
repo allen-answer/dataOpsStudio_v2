@@ -472,7 +472,7 @@ metadata_caches = Table(
         ForeignKey("datasources.id", ondelete="CASCADE"),
         nullable=False,
     ),
-    Column("cache_level", String(32), nullable=False),  # schemas / tables / columns
+    Column("cache_level", String(32), nullable=False),  # schemas / tables / columns / indexes
     Column("schema_name", String(128), nullable=False, server_default=""),
     Column("table_name", String(128), nullable=False, server_default=""),
     Column("payload", JSONB(), nullable=False, server_default=text("'[]'::jsonb")),
@@ -490,7 +490,7 @@ metadata_caches = Table(
     Index("ix_metadata_caches_datasource_level", "datasource_id", "cache_level"),
     Index("ix_metadata_caches_expires_at", "expires_at"),
     CheckConstraint(
-        "cache_level IN ('schemas', 'tables', 'columns')",
+        "cache_level IN ('schemas', 'tables', 'columns', 'indexes')",
         name="cache_level_is_supported",
     ),
 )
