@@ -170,6 +170,8 @@ class CompareRunLimitsPayload(BaseModel):
     bisection_threshold: int = Field(default=16_000, gt=0)
     max_bisection_depth: int = Field(default=8, ge=0)
     sample_quick_check: bool = False
+    sample_size: int = Field(default=300, gt=0)
+    sample_confidence: float = Field(default=0.95, gt=0, lt=1)
     result_format: str = "parquet"
     persist_same_bucket: bool = False
     query_timeout_seconds: int = Field(default=1800, gt=0)
@@ -241,7 +243,28 @@ class CompareRunResultResponse(BaseModel):
     limit: int
     bucket_counts: dict[CompareBucket, int]
     progress: dict[str, int] = Field(default_factory=dict)
+    diff_profile: dict[str, Any] = Field(default_factory=dict)
+    sample_result: dict[str, Any] | None = None
     rows: list[CompareResultRow] = Field(default_factory=list)
+
+
+class CompareRunProfileResponse(BaseModel):
+    job_id: str
+    run_id: str
+    bucket_counts: dict[CompareBucket, int]
+    progress: dict[str, int] = Field(default_factory=dict)
+    diff_profile: dict[str, Any] = Field(default_factory=dict)
+    sample_result: dict[str, Any] | None = None
+
+
+class CompareAiAttributionResponse(BaseModel):
+    run_id: str
+    ok: bool
+    attribution: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    error: str | None = None
+    egress_level: int = 2
 
 
 class CompareTableRequest(BaseModel):

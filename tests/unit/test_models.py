@@ -161,6 +161,8 @@ def test_compare_tasks_and_run_index_schema_support_compare_run() -> None:
         "bucket_spools",
         "bucket_counts",
         "progress",
+        "diff_profile",
+        "sample_result",
         "created_at",
         "updated_at",
         "finished_at",
