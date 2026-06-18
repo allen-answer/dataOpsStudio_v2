@@ -426,8 +426,10 @@ def _connect_mysql(pymysql: Any, env: dict[str, str]) -> Any:
             charset="utf8mb4",
             connect_timeout=10,
         )
-    except Exception:
-        raise RuntimeError("MySQL compare golden connection failed; details redacted") from None
+    except Exception as exc:
+        raise RuntimeError(
+            f"MySQL compare golden connection failed: {type(exc).__name__}; details redacted"
+        ) from exc
 
 
 def _connect_dm(dm: Any, env: dict[str, str]) -> Any:
@@ -439,8 +441,10 @@ def _connect_dm(dm: Any, env: dict[str, str]) -> Any:
             port=int(env["port"]),
             schema=env["database"],
         )
-    except Exception:
-        raise RuntimeError("DM compare golden connection failed; details redacted") from None
+    except Exception as exc:
+        raise RuntimeError(
+            f"DM compare golden connection failed: {type(exc).__name__}; details redacted"
+        ) from exc
 
 
 def _ignore_error(fn: Callable[[], object]) -> None:

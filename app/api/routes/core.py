@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -22,6 +24,7 @@ from app.api.errors import ApiError
 from app.api.routes.account import consume_recovery_code, verify_user_totp
 from app.api.schemas import (
     CancelResponse,
+    CompareAiAttributionResponse,
     CompareBucket,
     CompareDataRef,
     CompareInferRequest,
@@ -30,6 +33,7 @@ from app.api.schemas import (
     CompareRulesPayload,
     CompareRunCreateResponse,
     CompareRunLimitsPayload,
+    CompareRunProfileResponse,
     CompareRunResultResponse,
     CompareSuggestedTaskCreateRequest,
     CompareTaskCreateRequest,
@@ -78,6 +82,7 @@ from app.api.schemas import (
 from app.api.security import create_access_token
 from app.api.services import ApiServices, new_id
 from app.db.models import (
+    ai_configs,
     compare_tasks,
     datasources,
     export_download_tokens,
@@ -95,11 +100,13 @@ from app.db.models import (
 from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
+from app.domain.ai import AiContext, AiOptions, ContextItem, EgressLevel
 from app.domain.compare_infer import (
     CompareInferenceDraft,
     infer_compare_draft,
     infer_table_pair_suggestions,
 )
+from app.domain.compare_profile import profile_for_ai
 from app.domain.compare_result import (
     COMPARE_BUCKETS,
     decode_compare_result_row,
@@ -112,6 +119,12 @@ from app.domain.result import ResultRef
 from app.domain.schema import Column, Index, Table
 from app.domain.secret import HashedRef, SecretKind, SecretRef
 from app.infrastructure.result_export import export_content_type, export_extension
+from app.services.ai.default_gateway import (
+    AI_API_KEY_ENV,
+    AiGatewayRuntimeConfig,
+    build_gateway_from_runtime_config,
+)
+from app.services.ai.errors import AiGatewayError
 
 logger = structlog.get_logger(__name__)
 
@@ -1582,7 +1595,146 @@ def get_compare_run_results(
         limit=limit,
         bucket_counts=bucket_counts,
         progress=_compare_progress(run_row["progress"]),
+        diff_profile=_compare_diff_profile(_row_value(run_row, "diff_profile", {})),
+        sample_result=_compare_sample_result(_row_value(run_row, "sample_result", None)),
         rows=rows,
+    )
+
+
+@router.get("/compare/runs/{run_id}/profile", response_model=CompareRunProfileResponse)
+def get_compare_run_profile(run_id: str, request: Request) -> CompareRunProfileResponse:
+    run_row = _compare_run_for_current_user(request, run_id)
+    return CompareRunProfileResponse(
+        job_id=str(run_row["job_id"]),
+        run_id=str(run_row["run_id"]),
+        bucket_counts=_compare_bucket_counts(run_row["bucket_counts"]),
+        progress=_compare_progress(run_row["progress"]),
+        diff_profile=_compare_diff_profile(_row_value(run_row, "diff_profile", {})),
+        sample_result=_compare_sample_result(_row_value(run_row, "sample_result", None)),
+    )
+
+
+@router.post(
+    "/compare/runs/{run_id}/ai-attribution",
+    response_model=CompareAiAttributionResponse,
+)
+def explain_compare_run_diff_profile(
+    run_id: str,
+    request: Request,
+) -> CompareAiAttributionResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    run_row = _compare_run_for_current_user(request, run_id)
+    diff_profile = _compare_diff_profile(_row_value(run_row, "diff_profile", {}))
+    if not diff_profile:
+        return CompareAiAttributionResponse(
+            run_id=str(run_row["run_id"]),
+            ok=False,
+            error="no_diff_profile",
+        )
+
+    try:
+        with services.engine.connect() as conn:
+            ai_row = _ai_config_row_or_none(conn)
+        runtime = _ai_runtime_config(services, ai_row)
+    except Exception as exc:
+        error = type(exc).__name__
+        _audit_business(
+            services,
+            request,
+            user_id=user.id,
+            project_id=str(run_row["project_id"]),
+            action="compare_diff_attribution",
+            resource_type="compare_run",
+            resource_id=str(run_row["run_id"]),
+            result="failed",
+            detail={"error": error},
+        )
+        return CompareAiAttributionResponse(
+            run_id=str(run_row["run_id"]),
+            ok=False,
+            error=error,
+        )
+    if not runtime.enabled or runtime.provider in {None, "off"}:
+        _audit_business(
+            services,
+            request,
+            user_id=user.id,
+            project_id=str(run_row["project_id"]),
+            action="compare_diff_attribution",
+            resource_type="compare_run",
+            resource_id=str(run_row["run_id"]),
+            result="skipped",
+            detail={"error": "ai_disabled"},
+        )
+        return CompareAiAttributionResponse(
+            run_id=str(run_row["run_id"]),
+            ok=False,
+            error="ai_disabled",
+        )
+
+    safe_profile = profile_for_ai(diff_profile)
+    context = AiContext(
+        items=[
+            ContextItem(
+                content=json.dumps(
+                    safe_profile,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                    separators=(",", ":"),
+                ),
+                egress_level=EgressLevel.L2,
+            )
+        ]
+    )
+    prompt = (
+        "Explain the likely causes of this database compare diff profile. "
+        "Use only aggregate statistics from the provided JSON. "
+        "Do not infer or invent row values. Return concise attribution and next checks."
+    )
+    try:
+        response = build_gateway_from_runtime_config(runtime).complete(
+            prompt,
+            context,
+            AiOptions(purpose="compare_diff_attribution", max_tokens=600),
+        )
+    except AiGatewayError as exc:
+        error = type(exc).__name__
+        _audit_business(
+            services,
+            request,
+            user_id=user.id,
+            project_id=str(run_row["project_id"]),
+            action="compare_diff_attribution",
+            resource_type="compare_run",
+            resource_id=str(run_row["run_id"]),
+            result="failed",
+            detail={"error": error},
+        )
+        return CompareAiAttributionResponse(
+            run_id=str(run_row["run_id"]),
+            ok=False,
+            error=error,
+        )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=str(run_row["project_id"]),
+        action="compare_diff_attribution",
+        resource_type="compare_run",
+        resource_id=str(run_row["run_id"]),
+        result="success",
+        detail={"provider": response.provider},
+    )
+    return CompareAiAttributionResponse(
+        run_id=str(run_row["run_id"]),
+        ok=True,
+        attribution=response.content,
+        provider=response.provider,
+        model=response.model,
+        egress_level=int(EgressLevel.L2),
     )
 
 
@@ -2632,6 +2784,51 @@ def _compare_progress(value: object) -> dict[str, int]:
         if isinstance(key, str) and isinstance(raw_value, int):
             progress[key] = raw_value
     return progress
+
+
+def _compare_diff_profile(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): raw_value for key, raw_value in value.items()}
+
+
+def _compare_sample_result(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return {str(key): raw_value for key, raw_value in value.items()}
+
+
+def _row_value(row: RowMapping, key: str, default: object) -> object:
+    try:
+        return row[key]
+    except KeyError:
+        return default
+
+
+def _ai_config_row_or_none(conn: Connection) -> RowMapping | None:
+    return conn.execute(select(ai_configs).where(ai_configs.c.id == 1)).mappings().one_or_none()
+
+
+def _ai_runtime_config(services: ApiServices, row: RowMapping | None) -> AiGatewayRuntimeConfig:
+    if row is None:
+        return AiGatewayRuntimeConfig()
+    stored_ref = _optional_str(row["api_key_secret_ref"])
+    api_key = None
+    if stored_ref is not None:
+        api_key = services.secret_store.reveal_secret(
+            SecretRef(ref=stored_ref, kind=SecretKind.AI_API_KEY)
+        )
+    elif os.environ.get(AI_API_KEY_ENV):
+        api_key = os.environ[AI_API_KEY_ENV]
+    return AiGatewayRuntimeConfig(
+        enabled=bool(row["enabled"]) and bool(row["enable_inference"]),
+        provider=_optional_str(row["provider"]),
+        endpoint=_optional_str(row["base_url"]),
+        model=_optional_str(row["model"]),
+        api_key=api_key,
+        max_auto_egress_level=int(row["max_auto_egress_level"]),
+        l4_requires_optin=bool(row["l4_requires_optin"]),
+    )
 
 
 def _normalize_variables(raw: object) -> list[str]:

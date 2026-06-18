@@ -7,6 +7,9 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
+from hashlib import sha256
+from random import Random
 from typing import Any, BinaryIO, Protocol, cast
 
 import structlog
@@ -35,6 +38,13 @@ from app.domain.compare import (
     compare_row_hash64,
     normalized_compare_identity,
     recursive_hashdiff,
+)
+from app.domain.compare_profile import (
+    DEFAULT_SAMPLE_CONFIDENCE,
+    DEFAULT_SAMPLE_SIZE,
+    DiffProfileBuilder,
+    empty_diff_profile,
+    sample_quick_check_result,
 )
 from app.domain.compare_result import (
     COMPARE_BUCKETS,
@@ -178,6 +188,8 @@ class CompareRunCatalogLike(Protocol):
         run_id: str,
         bucket_counts: dict[str, int],
         progress: dict[str, int],
+        diff_profile: dict[str, object],
+        sample_result: dict[str, object] | None,
     ) -> None: ...
 
     def write_terminal(
@@ -573,14 +585,30 @@ class WorkerRunner:
             else limits
         )
         started_at = time.monotonic()
-        result = _run_compare_hashdiff(
-            source_reader=source_reader,
-            target_reader=target_reader,
-            key_columns=key_columns,
-            limits=effective_limits,
-        )
+        sample_result: dict[str, object] | None = None
+        if limits.sample_quick_check:
+            result, sample_result = _run_compare_sample_quick_check(
+                source_reader=source_reader,
+                target_reader=target_reader,
+                key_columns=key_columns,
+                limits=limits,
+                run_id=run_id,
+            )
+        else:
+            result = _run_compare_hashdiff(
+                source_reader=source_reader,
+                target_reader=target_reader,
+                key_columns=key_columns,
+                limits=effective_limits,
+            )
         bucket_counts = empty_bucket_counts()
         bucket_counts[CompareDiffBucket.SAME.value] += result.progress.skipped_rows
+        profile_builder: DiffProfileBuilder | None = DiffProfileBuilder(
+            key_columns=key_columns,
+            value_columns=compare_columns,
+            rules=rules,
+        )
+        profile_error: str | None = None
         batches: dict[str, list[Row]] = {bucket: [] for bucket in COMPARE_BUCKETS}
         flushed_rows = 0
         flush_batch_size = min(self._config.sql_spool_batch_size, limits.compare_batch_size)
@@ -589,6 +617,18 @@ class WorkerRunner:
         for event in result.events:
             bucket = event.bucket.value
             bucket_counts[bucket] += 1
+            if profile_builder is not None:
+                try:
+                    profile_builder.observe(event)
+                except Exception as exc:
+                    profile_error = type(exc).__name__
+                    profile_builder = None
+                    logger.warning(
+                        "compare diff profile generation disabled",
+                        job_id=job.id,
+                        run_id=run_id,
+                        error_type=profile_error,
+                    )
             if event.bucket is CompareDiffBucket.SAME and not limits.persist_same_bucket:
                 continue
             batches[bucket].append(
@@ -619,7 +659,22 @@ class WorkerRunner:
             for key, value in result.progress.model_dump(mode="json").items()
             if isinstance(value, int)
         }
-        self._write_compare_run_complete(run_id, bucket_counts, progress)
+        diff_profile = _finish_diff_profile(
+            profile_builder=profile_builder,
+            profile_error=profile_error,
+            bucket_counts=bucket_counts,
+            progress=progress,
+            sample_result=sample_result,
+            job_id=job.id,
+            run_id=run_id,
+        )
+        self._write_compare_run_complete(
+            run_id,
+            bucket_counts,
+            progress,
+            diff_profile=diff_profile,
+            sample_result=sample_result,
+        )
         logger.info(
             "compare run spooled buckets",
             job_id=job.id,
@@ -639,6 +694,8 @@ class WorkerRunner:
                     "run_id": run_id,
                     "bucket_counts": bucket_counts,
                     "progress": progress,
+                    "diff_profile": diff_profile,
+                    "sample_result": sample_result,
                 },
             ),
             loaded_rows=sum(bucket_counts.values()),
@@ -759,6 +816,9 @@ class WorkerRunner:
         run_id: str,
         bucket_counts: dict[str, int],
         progress: dict[str, int],
+        *,
+        diff_profile: dict[str, object],
+        sample_result: dict[str, object] | None,
     ) -> None:
         if self._compare_run_catalog is None:
             return
@@ -766,6 +826,8 @@ class WorkerRunner:
             run_id=run_id,
             bucket_counts=bucket_counts,
             progress=progress,
+            diff_profile=diff_profile,
+            sample_result=sample_result,
         )
 
     def _write_compare_run_terminal(self, job: Job, status: str) -> None:
@@ -953,6 +1015,8 @@ class PostgresCompareRunCatalog:
         run_id: str,
         bucket_counts: dict[str, int],
         progress: dict[str, int],
+        diff_profile: dict[str, object],
+        sample_result: dict[str, object] | None,
     ) -> None:
         now = datetime.now(UTC)
         with self._engine.begin() as conn:
@@ -963,6 +1027,8 @@ class PostgresCompareRunCatalog:
                     status=JobStatus.SUCCESS.value,
                     bucket_counts=bucket_counts,
                     progress=progress,
+                    diff_profile=diff_profile,
+                    sample_result=sample_result,
                     updated_at=now,
                     finished_at=now,
                 )
@@ -1258,6 +1324,23 @@ class _DatabaseCompareReader:
     def fetch_all(self) -> list[CompareRow]:
         return list(self.fetch_rows(None))
 
+    def fetch_first_at_or_after(self, anchor: int) -> CompareRow | None:
+        if len(self._key_columns) != 1:
+            return None
+        key_expr = _quote_identifier(self._datasource.db_type, self._select_key_names[0])
+        rows = list(self._fetch_rows_with_where(f"{key_expr} >= {anchor}", limit=1))
+        return rows[0] if rows else None
+
+    def fetch_key(self, key: int) -> list[CompareRow]:
+        if len(self._key_columns) != 1:
+            return []
+        segment = CompareSegment(
+            key_column=self._key_columns[0].name,
+            start=key,
+            end=key + 1,
+        )
+        return list(self.fetch_rows(segment))
+
     def _can_use_db_hash(self) -> bool:
         if self._data_ref.get("kind", "table") != "table":
             return False
@@ -1297,6 +1380,28 @@ class _DatabaseCompareReader:
         )
 
     def _row_query(self, segment: CompareSegment | None) -> str:
+        where_clause = None
+        if segment is not None:
+            key_expr = _quote_identifier(self._datasource.db_type, self._select_key_names[0])
+            where_clause = f"{key_expr} >= {segment.start} AND {key_expr} < {segment.end}"
+        return self._row_query_with_where(where_clause)
+
+    def _fetch_rows_with_where(
+        self,
+        where_clause: str,
+        *,
+        limit: int | None = None,
+    ) -> Iterable[CompareRow]:
+        sql = self._row_query_with_where(where_clause, limit=limit)
+        for row in self._adapter.execute_select(sql, {}):
+            yield self._row_to_compare(row)
+
+    def _row_query_with_where(
+        self,
+        where_clause: str | None,
+        *,
+        limit: int | None = None,
+    ) -> str:
         table_expr = _compare_table_expression(self._datasource.db_type, self._data_ref)
         key_exprs = [
             _select_identifier(self._datasource.db_type, name, alias=column.name)
@@ -1306,16 +1411,14 @@ class _DatabaseCompareReader:
             _select_identifier(self._datasource.db_type, name, alias=column.name)
             for name, column in zip(self._select_value_names, self._value_columns, strict=True)
         ]
-        where_clause = ""
-        if segment is not None:
-            key_expr = _quote_identifier(self._datasource.db_type, self._select_key_names[0])
-            where_clause = f" WHERE {key_expr} >= {segment.start} AND {key_expr} < {segment.end}"
+        where_sql = f" WHERE {where_clause}" if where_clause else ""
         order_exprs = ", ".join(
             _quote_identifier(self._datasource.db_type, name) for name in self._select_key_names
         )
+        limit_sql = _limit_clause(self._datasource.db_type, limit)
         return (
             f"SELECT {', '.join([*key_exprs, *value_exprs])} "
-            f"FROM {table_expr}{where_clause} ORDER BY {order_exprs}"
+            f"FROM {table_expr}{where_sql} ORDER BY {order_exprs}{limit_sql}"
         )
 
     def _row_to_compare(self, row: Row) -> CompareRow:
@@ -1355,6 +1458,149 @@ def _run_compare_hashdiff(
         end=max(bounds) + 1,
     )
     return recursive_hashdiff(source_reader, target_reader, root, limits)
+
+
+def _run_compare_sample_quick_check(
+    *,
+    source_reader: _DatabaseCompareReader,
+    target_reader: _DatabaseCompareReader,
+    key_columns: list[CompareColumn],
+    limits: RunLimits,
+    run_id: str,
+) -> tuple[HashdiffResult, dict[str, object]]:
+    requested_rows = limits.sample_size or DEFAULT_SAMPLE_SIZE
+    confidence = limits.sample_confidence or DEFAULT_SAMPLE_CONFIDENCE
+    if len(key_columns) != 1 or key_columns[0].type is not ColumnType.INTEGER:
+        sample_result = sample_quick_check_result(
+            requested_rows=requested_rows,
+            sampled_rows=0,
+            observed_differences=0,
+            confidence=confidence,
+            mode="unsupported_key",
+        )
+        sample_result["error"] = "single_integer_pk_required"
+        return HashdiffResult(events=[], progress=HashdiffProgress()), sample_result
+
+    source_min, source_max = source_reader.bounds()
+    target_min, target_max = target_reader.bounds()
+    bounds = [
+        value for value in (source_min, source_max, target_min, target_max) if value is not None
+    ]
+    if not bounds:
+        sample_result = sample_quick_check_result(
+            requested_rows=requested_rows,
+            sampled_rows=0,
+            observed_differences=0,
+            confidence=confidence,
+        )
+        sample_result["error"] = "empty_bounds"
+        return HashdiffResult(events=[], progress=HashdiffProgress()), sample_result
+
+    start = min(bounds)
+    end = max(bounds)
+    sampled_keys = _sample_primary_keys(
+        source_reader=source_reader,
+        target_reader=target_reader,
+        start=start,
+        end=end,
+        requested_rows=requested_rows,
+        seed=_sample_seed(run_id),
+    )
+    events: list[CompareDiffEvent] = []
+    for key in sampled_keys:
+        events.extend(
+            _diff_all_rows(
+                source_reader.fetch_key(key),
+                target_reader.fetch_key(key),
+            ).events
+        )
+
+    observed_differences = sum(1 for event in events if event.bucket is not CompareDiffBucket.SAME)
+    progress = HashdiffProgress(row_mode_segments=1 if events else 0)
+    sample_result = sample_quick_check_result(
+        requested_rows=requested_rows,
+        sampled_rows=len(events),
+        observed_differences=observed_differences,
+        confidence=confidence,
+    )
+    sample_result["anchor_strategy"] = "pk_random_anchor_no_order_by_rand"
+    return HashdiffResult(events=events, progress=progress), sample_result
+
+
+def _sample_primary_keys(
+    *,
+    source_reader: _DatabaseCompareReader,
+    target_reader: _DatabaseCompareReader,
+    start: int,
+    end: int,
+    requested_rows: int,
+    seed: int,
+) -> list[int]:
+    if end < start:
+        return []
+    rng = Random(seed)
+    keys: set[int] = set()
+    max_attempts = max(requested_rows * 10, requested_rows + 100)
+    attempts = 0
+    while len(keys) < requested_rows and attempts < max_attempts:
+        attempts += 1
+        anchor = rng.randint(start, end)
+        for reader in (source_reader, target_reader):
+            row = reader.fetch_first_at_or_after(anchor)
+            key = _first_int_pk(row)
+            if key is not None and start <= key <= end:
+                keys.add(key)
+                if len(keys) >= requested_rows:
+                    break
+    return sorted(keys)
+
+
+def _sample_seed(run_id: str) -> int:
+    digest = sha256(f"compare-sample:{run_id}".encode()).digest()
+    return int.from_bytes(digest[:8], "big", signed=False)
+
+
+def _first_int_pk(row: CompareRow | None) -> int | None:
+    if row is None or len(row.pk) != 1:
+        return None
+    value = row.pk[0]
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, Decimal) and value == value.to_integral_value():
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value)
+    return None
+
+
+def _finish_diff_profile(
+    *,
+    profile_builder: DiffProfileBuilder | None,
+    profile_error: str | None,
+    bucket_counts: dict[str, int],
+    progress: dict[str, int],
+    sample_result: dict[str, object] | None,
+    job_id: str,
+    run_id: str,
+) -> dict[str, object]:
+    if profile_builder is None:
+        return empty_diff_profile(reason=profile_error, sample_result=sample_result)
+    try:
+        return profile_builder.finish(
+            bucket_counts=bucket_counts,
+            progress=progress,
+            sample_result=sample_result,
+        )
+    except Exception as exc:
+        logger.warning(
+            "compare diff profile generation failed",
+            job_id=job_id,
+            run_id=run_id,
+            error_type=type(exc).__name__,
+        )
+        return empty_diff_profile(reason=type(exc).__name__, sample_result=sample_result)
 
 
 def _diff_all_rows(source_rows: list[CompareRow], target_rows: list[CompareRow]) -> HashdiffResult:
@@ -1565,6 +1811,16 @@ def _quote_alias(db_type: DbType, alias: str) -> str:
     if db_type is DbType.MYSQL:
         return f"`{alias.replace('`', '``')}`"
     return f'"{alias.replace(chr(34), chr(34) + chr(34))}"'
+
+
+def _limit_clause(db_type: DbType, limit: int | None) -> str:
+    if limit is None:
+        return ""
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    if db_type is DbType.MYSQL:
+        return f" LIMIT {limit}"
+    return f" FETCH FIRST {limit} ROWS ONLY"
 
 
 def _optional_int(value: object) -> int | None:

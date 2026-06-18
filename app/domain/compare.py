@@ -87,6 +87,8 @@ class RunLimits(BaseModel):
     bisection_threshold: int = Field(default=16_000, gt=0)
     max_bisection_depth: int = Field(default=8, ge=0)
     sample_quick_check: bool = False
+    sample_size: int = Field(default=300, gt=0)
+    sample_confidence: float = Field(default=0.95, gt=0, lt=1)
     result_format: str = "parquet"
     persist_same_bucket: bool = False
     query_timeout_seconds: int = Field(default=1800, gt=0)
