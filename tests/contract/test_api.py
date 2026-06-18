@@ -61,6 +61,8 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("DELETE", "/api/compare/tasks/{task_id}") in routes
     assert ("POST", "/api/compare/tasks/{task_id}/run") in routes
     assert ("GET", "/api/compare/runs/{run_id}/results") in routes
+    assert ("GET", "/api/compare/runs/{run_id}/profile") in routes
+    assert ("POST", "/api/compare/runs/{run_id}/ai-attribution") in routes
     assert ("POST", "/api/projects/{project_id}/compare/infer") in routes
     assert ("GET", "/api/projects/{project_id}/compare/suggest-tasks") in routes
     assert ("POST", "/api/projects/{project_id}/compare/draft-task") in routes
@@ -970,6 +972,8 @@ def test_compare_task_run_enqueues_compare_job_and_run_index() -> None:
 
 
 def test_compare_run_result_contract_returns_bucket_counts_and_cell_diffs() -> None:
+    diff_profile = _diff_profile_payload()
+    sample_result = _sample_result_payload()
     run_row = {
         "run_id": "run-1",
         "job_id": "job-1",
@@ -987,6 +991,8 @@ def test_compare_run_result_contract_returns_bucket_counts_and_cell_diffs() -> N
             "skipped_rows": 7,
             "row_mode_segments": 1,
         },
+        "diff_profile": diff_profile,
+        "sample_result": sample_result,
     }
     result_store = _ResultStore(
         rows=[
@@ -1016,6 +1022,8 @@ def test_compare_run_result_contract_returns_bucket_counts_and_cell_diffs() -> N
         "same": 7,
     }
     assert payload["progress"]["skipped_rows"] == 7
+    assert payload["diff_profile"] == diff_profile
+    assert payload["sample_result"] == sample_result
     assert payload["rows"] == [
         {
             "pk": {"id": 3},
@@ -1024,6 +1032,97 @@ def test_compare_run_result_contract_returns_bucket_counts_and_cell_diffs() -> N
             "cells": [{"column": "amount", "source": "10.00", "target": "11.00"}],
         }
     ]
+
+
+def test_compare_run_profile_contract_returns_profile_without_rows() -> None:
+    diff_profile = _diff_profile_payload()
+    sample_result = _sample_result_payload()
+    run_row = {
+        "run_id": "run-1",
+        "job_id": "job-1",
+        "project_id": "project-1",
+        "bucket_spools": {},
+        "bucket_counts": {"only_source": 0, "only_target": 0, "diff": 1, "same": 10},
+        "progress": {"row_mode_segments": 1},
+        "diff_profile": diff_profile,
+        "sample_result": sample_result,
+    }
+    app = create_app(
+        services=cast(
+            ApiServices,
+            _Services(_FakeEngine([run_row, {"id": "project-1"}])),
+        )
+    )
+
+    response = AsgiClient(app).get("/api/compare/runs/run-1/profile", headers=_auth_headers())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["run_id"] == "run-1"
+    assert payload["diff_profile"] == diff_profile
+    assert payload["sample_result"] == sample_result
+    assert "rows" not in payload
+
+
+def test_compare_ai_attribution_uses_gateway_l2_profile() -> None:
+    run_row = {
+        "run_id": "run-1",
+        "job_id": "job-1",
+        "project_id": "project-1",
+        "bucket_spools": {},
+        "bucket_counts": {"only_source": 0, "only_target": 0, "diff": 1, "same": 10},
+        "progress": {},
+        "diff_profile": _diff_profile_payload(),
+        "sample_result": None,
+    }
+    ai_row = {
+        "enabled": True,
+        "provider": "mock",
+        "model": "mock-model",
+        "base_url": None,
+        "api_key_secret_ref": None,
+        "max_auto_egress_level": 2,
+        "l4_requires_optin": True,
+        "enable_inference": True,
+    }
+    services = _Services(_FakeEngine([run_row, {"id": "project-1"}, ai_row]))
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/compare/runs/run-1/ai-attribution",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["attribution"] == "ok"
+    assert payload["egress_level"] == 2
+    assert any(audit["action"] == "compare_diff_attribution" for audit in services.audits)
+
+
+def test_compare_ai_attribution_disabled_degrades_without_profile_loss() -> None:
+    run_row = {
+        "run_id": "run-1",
+        "job_id": "job-1",
+        "project_id": "project-1",
+        "bucket_spools": {},
+        "bucket_counts": {"only_source": 0, "only_target": 0, "diff": 1, "same": 10},
+        "progress": {},
+        "diff_profile": _diff_profile_payload(),
+        "sample_result": None,
+    }
+    services = _Services(_FakeEngine([run_row, {"id": "project-1"}, None]))
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/compare/runs/run-1/ai-attribution",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["error"] == "ai_disabled"
+    assert response.json()["ok"] is False
 
 
 def test_create_export_enqueues_result_export_job_and_returns_one_time_token() -> None:
@@ -1223,6 +1322,41 @@ def _compare_task_row() -> dict[str, object]:
         "created_by": "user-1",
         "created_at": _dt(1),
         "updated_at": _dt(2),
+    }
+
+
+def _diff_profile_payload() -> dict[str, object]:
+    return {
+        "version": 1,
+        "generated": True,
+        "summary": {"diff_rows": 1, "same_rows": 10, "paired_rows_observed": 11},
+        "columns": {
+            "amount": {
+                "type": "decimal",
+                "observed_rows": 11,
+                "changed_rows": 1,
+                "diff_rate": 1.0,
+                "numeric_delta": {
+                    "count": 1,
+                    "constant_offset": "-1.00",
+                    "systematic_offset": True,
+                },
+            }
+        },
+        "missing_key_ranges": {"only_source": [], "only_target": []},
+    }
+
+
+def _sample_result_payload() -> dict[str, object]:
+    return {
+        "enabled": True,
+        "mode": "pk_random_anchor",
+        "requested_rows": 300,
+        "sampled_rows": 300,
+        "observed_differences": 0,
+        "all_sampled_equal": True,
+        "confidence": 0.95,
+        "difference_rate_upper_bound": 0.00994,
     }
 
 

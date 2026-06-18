@@ -30,6 +30,8 @@ pytestmark = pytest.mark.integration
 
 _MYSQL_TABLE = "dosv2_compare_run_src"
 _DM_TABLE = "DOSV2_COMPARE_RUN_TGT"
+_MYSQL_SAMPLE_TABLE = "dosv2_compare_run_sample_src"
+_DM_SAMPLE_TABLE = "DOSV2_COMPARE_RUN_SAMPLE_TGT"
 
 
 def test_compare_run_four_buckets_match_real_mysql_and_dm(tmp_path: Any) -> None:
@@ -37,9 +39,15 @@ def test_compare_run_four_buckets_match_real_mysql_and_dm(tmp_path: Any) -> None
     dm_env = _dm_env_or_skip()
     result_store = LocalFsResultStore(tmp_path)
     job = _compare_job()
+    sample_job = _sample_compare_job()
     backend = _FakeBackend([job])
 
-    with _seed_mysql_source(mysql_env), _seed_dm_target(dm_env):
+    with (
+        _seed_mysql_source(mysql_env),
+        _seed_dm_target(dm_env),
+        _seed_mysql_sample(mysql_env),
+        _seed_dm_sample(dm_env),
+    ):
         runner = WorkerRunner(
             backend,
             result_store,
@@ -50,6 +58,17 @@ def test_compare_run_four_buckets_match_real_mysql_and_dm(tmp_path: Any) -> None
 
         assert runner.run_once() is True
 
+        sample_backend = _FakeBackend([sample_job])
+        sample_runner = WorkerRunner(
+            sample_backend,
+            result_store,
+            lambda datasource_id: _conn_info(datasource_id, mysql_env, dm_env),
+            _adapter_factory(mysql_env, dm_env),
+            WorkerRunnerConfig(worker_id="worker-1"),
+        )
+        assert sample_runner.run_once() is True
+        sample_metadata = sample_backend.completed[0][1].metadata
+
     assert backend.failed == []
     assert len(backend.completed) == 1
     metadata = backend.completed[0][1].metadata
@@ -59,6 +78,10 @@ def test_compare_run_four_buckets_match_real_mysql_and_dm(tmp_path: Any) -> None
         "diff": 1,
         "same": 1,
     }
+    diff_profile = metadata["diff_profile"]
+    assert diff_profile["columns"]["amount"]["numeric_delta"]["constant_offset"] == "-1.00"
+    assert diff_profile["columns"]["created_at"]["time_delta"]["constant_offset_seconds"] == -28800
+    assert diff_profile["columns"]["created_at"]["time_delta"]["likely_timezone_offset"] is True
     assert result_store.fetch_range("rs-same", 0, 10) == []
     only_source = decode_compare_result_row(result_store.fetch_range("rs-only-source", 0, 1)[0])
     only_target = decode_compare_result_row(result_store.fetch_range("rs-only-target", 0, 1)[0])
@@ -66,7 +89,13 @@ def test_compare_run_four_buckets_match_real_mysql_and_dm(tmp_path: Any) -> None
     assert only_source["pk"] == {"id": 2}
     assert only_target["pk"] == {"id": 4}
     assert diff["pk"] == {"id": 3}
-    assert diff["cells"] == [{"column": "name", "source": "old", "target": "new"}]
+    assert {cell["column"] for cell in diff["cells"]} == {"name", "amount", "created_at"}
+
+    sample_result = sample_metadata["sample_result"]
+    assert sample_result["requested_rows"] == 3
+    assert sample_result["sampled_rows"] == 3
+    assert sample_result["all_sampled_equal"] is True
+    assert sample_result["difference_rate_upper_bound"] is not None
 
 
 def _compare_job() -> Job:
@@ -91,6 +120,8 @@ def _compare_job() -> Job:
             "columns": [
                 {"name": "id", "type": "integer"},
                 {"name": "name", "type": "string"},
+                {"name": "amount", "type": "decimal"},
+                {"name": "created_at", "type": "datetime"},
             ],
             "compare_rules": {"key_columns": ["id"]},
             "run_limits": {
@@ -108,6 +139,46 @@ def _compare_job() -> Job:
     )
 
 
+def _sample_compare_job() -> Job:
+    return Job(
+        id="job-compare-sample",
+        kind=JobKind.COMPARE_RUN,
+        status=JobStatus.PENDING,
+        owner_user_id="user-1",
+        project_id="project-1",
+        datasource_ids=["mysql", "dm"],
+        priority=0,
+        timeout_seconds=3600,
+        resource_profile=ResourceProfile(timeout_seconds=3600),
+        audit_id="audit-1",
+        payload={
+            "run_id": "run-compare-sample",
+            "task_id": "task-compare",
+            "source_id": "mysql",
+            "target_id": "dm",
+            "source_ref": {"kind": "table", "table_name": _MYSQL_SAMPLE_TABLE},
+            "target_ref": {"kind": "table", "table_name": _DM_SAMPLE_TABLE},
+            "columns": [
+                {"name": "id", "type": "integer"},
+                {"name": "name", "type": "string"},
+            ],
+            "compare_rules": {"key_columns": ["id"]},
+            "run_limits": {
+                "sample_quick_check": True,
+                "sample_size": 3,
+                "sample_confidence": 0.95,
+                "persist_same_bucket": False,
+            },
+            "bucket_result_set_ids": {
+                "only_source": "rs-sample-only-source",
+                "only_target": "rs-sample-only-target",
+                "diff": "rs-sample-diff",
+                "same": "rs-sample-same",
+            },
+        },
+    )
+
+
 @contextmanager
 def _seed_mysql_source(env: dict[str, str]) -> Iterator[None]:
     pymysql = importlib.import_module("pymysql")
@@ -115,10 +186,21 @@ def _seed_mysql_source(env: dict[str, str]) -> Iterator[None]:
     cursor = conn.cursor()
     try:
         cursor.execute(f"DROP TABLE IF EXISTS `{_MYSQL_TABLE}`")
-        cursor.execute(f"CREATE TABLE `{_MYSQL_TABLE}` (`id` INT PRIMARY KEY, `name` VARCHAR(64))")
+        cursor.execute(
+            f"CREATE TABLE `{_MYSQL_TABLE}` ("
+            "`id` INT PRIMARY KEY, "
+            "`name` VARCHAR(64), "
+            "`amount` DECIMAL(12,2), "
+            "`created_at` DATETIME"
+            ")"
+        )
         cursor.executemany(
-            f"INSERT INTO `{_MYSQL_TABLE}` VALUES (%s, %s)",
-            [(1, "same"), (2, "left"), (3, "old")],
+            f"INSERT INTO `{_MYSQL_TABLE}` VALUES (%s, %s, %s, %s)",
+            [
+                (1, "same", "10.00", "2026-01-01 00:00:00"),
+                (2, "left", "20.00", "2026-01-02 00:00:00"),
+                (3, "old", "30.00", "2026-01-03 00:00:00"),
+            ],
         )
         conn.commit()
         yield
@@ -138,16 +220,75 @@ def _seed_dm_target(env: dict[str, str]) -> Iterator[None]:
     cursor = conn.cursor()
     try:
         _ignore_error(lambda: cursor.execute(f"DROP TABLE {_DM_TABLE}"))
-        cursor.execute(f"CREATE TABLE {_DM_TABLE} (ID INT PRIMARY KEY, NAME VARCHAR(64))")
+        cursor.execute(
+            f"CREATE TABLE {_DM_TABLE} ("
+            "ID INT PRIMARY KEY, "
+            "NAME VARCHAR(64), "
+            "AMOUNT DECIMAL(12,2), "
+            "CREATED_AT TIMESTAMP"
+            ")"
+        )
         cursor.executemany(
-            f"INSERT INTO {_DM_TABLE} VALUES (?, ?)",
-            [(1, "same"), (3, "new"), (4, "right")],
+            f"INSERT INTO {_DM_TABLE} VALUES (?, ?, ?, ?)",
+            [
+                (1, "same", "10.00", "2026-01-01 00:00:00"),
+                (3, "new", "31.00", "2026-01-03 08:00:00"),
+                (4, "right", "40.00", "2026-01-04 00:00:00"),
+            ],
         )
         conn.commit()
         yield
     finally:
         try:
             _ignore_error(lambda: cursor.execute(f"DROP TABLE {_DM_TABLE}"))
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+
+@contextmanager
+def _seed_mysql_sample(env: dict[str, str]) -> Iterator[None]:
+    pymysql = importlib.import_module("pymysql")
+    conn = _connect_mysql(pymysql, env)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f"DROP TABLE IF EXISTS `{_MYSQL_SAMPLE_TABLE}`")
+        cursor.execute(
+            f"CREATE TABLE `{_MYSQL_SAMPLE_TABLE}` (`id` INT PRIMARY KEY, `name` VARCHAR(64))"
+        )
+        cursor.executemany(
+            f"INSERT INTO `{_MYSQL_SAMPLE_TABLE}` VALUES (%s, %s)",
+            [(1, "same-1"), (2, "same-2"), (3, "same-3")],
+        )
+        conn.commit()
+        yield
+    finally:
+        try:
+            cursor.execute(f"DROP TABLE IF EXISTS `{_MYSQL_SAMPLE_TABLE}`")
+            conn.commit()
+        finally:
+            cursor.close()
+            conn.close()
+
+
+@contextmanager
+def _seed_dm_sample(env: dict[str, str]) -> Iterator[None]:
+    dm = importlib.import_module("dmPython")
+    conn = _connect_dm(dm, env)
+    cursor = conn.cursor()
+    try:
+        _ignore_error(lambda: cursor.execute(f"DROP TABLE {_DM_SAMPLE_TABLE}"))
+        cursor.execute(f"CREATE TABLE {_DM_SAMPLE_TABLE} (ID INT PRIMARY KEY, NAME VARCHAR(64))")
+        cursor.executemany(
+            f"INSERT INTO {_DM_SAMPLE_TABLE} VALUES (?, ?)",
+            [(1, "same-1"), (2, "same-2"), (3, "same-3")],
+        )
+        conn.commit()
+        yield
+    finally:
+        try:
+            _ignore_error(lambda: cursor.execute(f"DROP TABLE {_DM_SAMPLE_TABLE}"))
             conn.commit()
         finally:
             cursor.close()
@@ -251,8 +392,10 @@ def _connect_mysql(pymysql: Any, env: dict[str, str]) -> Any:
             charset="utf8mb4",
             connect_timeout=10,
         )
-    except Exception:
-        raise RuntimeError("MySQL compare_run connection failed; details redacted") from None
+    except Exception as exc:
+        raise RuntimeError(
+            f"MySQL compare_run connection failed: {type(exc).__name__}; details redacted"
+        ) from exc
 
 
 def _connect_dm(dm: Any, env: dict[str, str]) -> Any:
@@ -264,8 +407,10 @@ def _connect_dm(dm: Any, env: dict[str, str]) -> Any:
             port=int(env["port"]),
             schema=env["database"],
         )
-    except Exception:
-        raise RuntimeError("DM compare_run connection failed; details redacted") from None
+    except Exception as exc:
+        raise RuntimeError(
+            f"DM compare_run connection failed: {type(exc).__name__}; details redacted"
+        ) from exc
 
 
 def _ignore_error(fn: Callable[[], object]) -> None:

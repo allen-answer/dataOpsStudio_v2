@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable
 from typing import BinaryIO, Protocol
 
@@ -260,24 +261,28 @@ def test_worker_runs_compare_run_to_four_bucket_spools() -> None:
 
     assert runner.run_once() is True
 
-    assert compare_catalog.completed == [
-        {
-            "run_id": "run-1",
-            "bucket_counts": {
-                "only_source": 1,
-                "only_target": 1,
-                "diff": 1,
-                "same": 1,
-            },
-            "progress": {
-                "scanned_segments": 0,
-                "skipped_segments": 0,
-                "skipped_rows": 0,
-                "recursed_segments": 0,
-                "row_mode_segments": 1,
-                "max_depth_seen": 0,
-            },
-        }
+    completed_run = compare_catalog.completed[0]
+    assert completed_run["run_id"] == "run-1"
+    assert completed_run["bucket_counts"] == {
+        "only_source": 1,
+        "only_target": 1,
+        "diff": 1,
+        "same": 1,
+    }
+    assert completed_run["progress"] == {
+        "scanned_segments": 0,
+        "skipped_segments": 0,
+        "skipped_rows": 0,
+        "recursed_segments": 0,
+        "row_mode_segments": 1,
+        "max_depth_seen": 0,
+    }
+    diff_profile = completed_run["diff_profile"]
+    assert isinstance(diff_profile, dict)
+    assert diff_profile["summary"]["diff_rows"] == 1
+    assert diff_profile["columns"]["name"]["diff_rate"] == 1.0
+    assert diff_profile["missing_key_ranges"]["only_source"] == [
+        {"start": 2, "end": 2, "count": 1, "span": 1}
     ]
     assert result_store.rows_by_result_set.get("rs-same", []) == []
     assert decode_compare_result_row(result_store.rows_by_result_set["rs-only-source"][0])[
@@ -289,32 +294,84 @@ def test_worker_runs_compare_run_to_four_bucket_spools() -> None:
     diff_row = decode_compare_result_row(result_store.rows_by_result_set["rs-diff"][0])
     assert diff_row["pk"] == {"id": 3}
     assert diff_row["cells"] == [{"column": "name", "source": "old", "target": "new"}]
-    assert backend.completed == [
-        (
-            "job-1",
-            ResultRef(
-                backend="compare_run",
-                uri="compare/run-1",
-                metadata={
-                    "run_id": "run-1",
-                    "bucket_counts": {
-                        "only_source": 1,
-                        "only_target": 1,
-                        "diff": 1,
-                        "same": 1,
-                    },
-                    "progress": {
-                        "scanned_segments": 0,
-                        "skipped_segments": 0,
-                        "skipped_rows": 0,
-                        "recursed_segments": 0,
-                        "row_mode_segments": 1,
-                        "max_depth_seen": 0,
-                    },
-                },
-            ),
-        )
+    assert backend.completed[0][0] == "job-1"
+    result_ref = backend.completed[0][1]
+    assert result_ref.backend == "compare_run"
+    assert result_ref.uri == "compare/run-1"
+    assert result_ref.metadata["bucket_counts"] == completed_run["bucket_counts"]
+    assert result_ref.metadata["diff_profile"] == diff_profile
+
+
+def test_worker_sample_quick_check_reports_zero_defect_upper_bound() -> None:
+    job = _make_job(
+        kind=JobKind.COMPARE_RUN,
+        payload={
+            "run_id": "run-sample",
+            "task_id": "task-1",
+            "source_id": "ds-source",
+            "target_id": "ds-target",
+            "source_ref": {"kind": "table", "schema_name": "app", "table_name": "src"},
+            "target_ref": {"kind": "table", "schema_name": "app", "table_name": "tgt"},
+            "columns": [
+                {"name": "id", "type": "integer"},
+                {"name": "name", "type": "string"},
+            ],
+            "compare_rules": {"key_columns": ["id"]},
+            "run_limits": {
+                "sample_quick_check": True,
+                "sample_size": 2,
+                "sample_confidence": 0.95,
+                "persist_same_bucket": False,
+            },
+            "bucket_result_set_ids": {
+                "only_source": "rs-only-source",
+                "only_target": "rs-only-target",
+                "diff": "rs-diff",
+                "same": "rs-same",
+            },
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    compare_catalog = _FakeCompareRunCatalog()
+    adapters = [
+        _FakeAdapter(
+            [
+                Row(values=[1, 1, "same-1"]),
+                Row(values=[2, 2, "same-2"]),
+                Row(values=[3, 3, "same-3"]),
+            ],
+            bounds=(1, 3),
+        ),
+        _FakeAdapter(
+            [
+                Row(values=[1, 1, "same-1"]),
+                Row(values=[2, 2, "same-2"]),
+                Row(values=[3, 3, "same-3"]),
+            ],
+            bounds=(1, 3),
+        ),
     ]
+
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        lambda conn_info, cancel_check, column_sink: adapters.pop(0),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=compare_catalog,
+    )
+
+    assert runner.run_once() is True
+
+    sample_result = compare_catalog.completed[0]["sample_result"]
+    assert isinstance(sample_result, dict)
+    assert sample_result["requested_rows"] == 2
+    assert sample_result["sampled_rows"] == 2
+    assert sample_result["all_sampled_equal"] is True
+    assert sample_result["difference_rate_upper_bound"] is not None
+    assert "does not prove full equality" in sample_result["statement"]
+    assert result_store.rows_by_result_set.get("rs-same", []) == []
 
 
 def test_worker_runs_result_export_from_spool_and_completes() -> None:
@@ -797,7 +854,8 @@ class _FakeAdapter:
             self._column_sink(self._columns)
             if self._emit_columns_twice:
                 self._column_sink(self._columns)
-        yield from self._rows
+        rows = _filter_fake_compare_rows(sql, self._rows)
+        yield from rows
 
     def explain(self, sql: str) -> PlanNode:
         self.explain_calls += 1
@@ -810,6 +868,29 @@ class _FakeAdapter:
     def build_compare_hash_query(self, request: object) -> CompareHashPlan:
         del request
         return CompareHashPlan(execution_mode=CompareHashExecutionMode.CLIENT_ROW_HASH)
+
+
+def _filter_fake_compare_rows(sql: str, rows: list[Row]) -> list[Row]:
+    filtered = list(rows)
+    greater_equal = re.search(r">=\s*(-?\d+)", sql)
+    less_than = re.search(r"<\s*(-?\d+)", sql)
+    if greater_equal is not None:
+        start = int(greater_equal.group(1))
+        filtered = [
+            row
+            for row in filtered
+            if row.values and isinstance(row.values[0], int) and row.values[0] >= start
+        ]
+    if less_than is not None:
+        end = int(less_than.group(1))
+        filtered = [
+            row
+            for row in filtered
+            if row.values and isinstance(row.values[0], int) and row.values[0] < end
+        ]
+    if "FETCH FIRST 1 ROWS ONLY" in sql.upper() or " LIMIT 1" in sql.upper():
+        filtered = filtered[:1]
+    return filtered
 
 
 class _RangeAdapter:
@@ -976,12 +1057,16 @@ class _FakeCompareRunCatalog:
         run_id: str,
         bucket_counts: dict[str, int],
         progress: dict[str, int],
+        diff_profile: dict[str, object],
+        sample_result: dict[str, object] | None,
     ) -> None:
         self.completed.append(
             {
                 "run_id": run_id,
                 "bucket_counts": dict(bucket_counts),
                 "progress": dict(progress),
+                "diff_profile": dict(diff_profile),
+                "sample_result": sample_result,
             }
         )
 

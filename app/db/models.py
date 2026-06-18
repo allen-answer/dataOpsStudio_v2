@@ -574,6 +574,8 @@ run_index = Table(
     Column("bucket_spools", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),
     Column("bucket_counts", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),
     Column("progress", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),
+    Column("diff_profile", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),
+    Column("sample_result", JSONB(), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
     Column("finished_at", DateTime(timezone=True), nullable=True),
