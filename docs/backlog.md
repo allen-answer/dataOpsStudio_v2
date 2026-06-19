@@ -118,6 +118,24 @@ sql_query 等业务 job);保留对业务 job 的保护语义。补单测:测过�
 **触发条件**:下一个 2.0.x 补丁窗口。**优先级**:中(影响日常管理操作)。
 
 ---
+
+## 来自 2.2.0 Compare 前端(2026-06-19)
+
+### **2.2.x 应补** — Compare 结果缺专用导出端点
+
+**位置**:`app/api/routes/core.py`(导出端点)/ 前端 CompareView 导出入口(留口未做)
+
+**现状**:Compare-PR5 前端(#74)原计划做 4 桶结果导出,但后端
+`/jobs/{id}/export` 的 `_require_exportable_source` 只接 `SQL_QUERY` job,
+**没有 compare 专用导出端点**。子代理正确地未加导出按钮(避免点了就 4xx 误导用户),
+在 PR 说明里标了偏差。
+
+**修法**:后端补 compare run 导出端点(4 桶分 sheet,沿用 W2 导出的一次性 token +
+公式注入防御 + 限额 + GC 通道);前端 CompareView 追加导出按钮接上。
+
+**触发条件**:2.2.x 顺手窗口 / 用户 dogfood 提需求时。**优先级**:中(功能补全,不阻塞核心对比)。
+
+---
 ## Backlog 维护规则
 
 1. **每个 review 反馈**判断三类:
