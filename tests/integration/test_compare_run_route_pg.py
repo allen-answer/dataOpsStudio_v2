@@ -27,42 +27,45 @@ def test_compare_task_run_route_persists_job_before_run_index(tmp_path: Path) ->
     engine = _pg_engine_or_skip()
     metadata.create_all(engine)
     _clear_metadata(engine)
-    jwt_secret = secrets.token_urlsafe(48)
-    services = ApiServices(
-        engine=engine,
-        job_backend=PostgresJobBackend(engine),
-        secret_store=cast(LocalFileSecretStore, object()),
-        result_store=LocalFsResultStore(tmp_path / "results"),
-        jwt_secret=jwt_secret,
-        rate_limiter=RateLimiter(limit=10_000),
-    )
-    client = AsgiClient(create_app(services=services))
-    seed = _seed_compare_task(engine)
-
-    response = client.post(
-        f"/api/compare/tasks/{seed.task_id}/run",
-        headers=_headers(seed.user_id, jwt_secret),
-    )
-
-    assert response.status_code == 202
-    payload = response.json()
-    with engine.connect() as conn:
-        job_row = (
-            conn.execute(select(jobs).where(jobs.c.id == payload["job_id"]))
-            .mappings()
-            .one_or_none()
+    try:
+        jwt_secret = secrets.token_urlsafe(48)
+        services = ApiServices(
+            engine=engine,
+            job_backend=PostgresJobBackend(engine),
+            secret_store=cast(LocalFileSecretStore, object()),
+            result_store=LocalFsResultStore(tmp_path / "results"),
+            jwt_secret=jwt_secret,
+            rate_limiter=RateLimiter(limit=10_000),
         )
-        run_row = (
-            conn.execute(select(run_index).where(run_index.c.run_id == payload["run_id"]))
-            .mappings()
-            .one_or_none()
+        client = AsgiClient(create_app(services=services))
+        seed = _seed_compare_task(engine)
+
+        response = client.post(
+            f"/api/compare/tasks/{seed.task_id}/run",
+            headers=_headers(seed.user_id, jwt_secret),
         )
-    assert job_row is not None
-    assert job_row["kind"] == JobKind.COMPARE_RUN.value
-    assert job_row["status"] == JobStatus.PENDING.value
-    assert run_row is not None
-    assert run_row["job_id"] == payload["job_id"]
-    assert run_row["task_id"] == seed.task_id
+
+        assert response.status_code == 202
+        payload = response.json()
+        with engine.connect() as conn:
+            job_row = (
+                conn.execute(select(jobs).where(jobs.c.id == payload["job_id"]))
+                .mappings()
+                .one_or_none()
+            )
+            run_row = (
+                conn.execute(select(run_index).where(run_index.c.run_id == payload["run_id"]))
+                .mappings()
+                .one_or_none()
+            )
+        assert job_row is not None
+        assert job_row["kind"] == JobKind.COMPARE_RUN.value
+        assert job_row["status"] == JobStatus.PENDING.value
+        assert run_row is not None
+        assert run_row["job_id"] == payload["job_id"]
+        assert run_row["task_id"] == seed.task_id
+    finally:
+        _clear_metadata(engine)
 
 
 class _SeededCompareTask:
