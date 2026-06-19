@@ -234,6 +234,31 @@ npm run dev
 
 ---
 
+### fake backend 绕过真 PG 外键,500 留到前端真机才暴露(2.2.0 Compare,PR #71→#75)
+
+**症状**
+- Compare 后端 PR1-4 单测 + 真机测试全过、合并上生产;PR5 前端真机走查点"开始对比"
+  → 500 IntegrityError:run_index 外键 fk_run_index_job_id_jobs 违约。
+
+**根因(两层)**
+1. 代码:`run_compare_task`(routes)在一个事务里**先 insert run_index(带 job_id 外键)**,
+   但 jobs 行此刻还没写(job enqueue 在之后 / 走了独立连接,事务内不可见)→ 外键违约。
+   修法:同一连接 conn 上先 enqueue job 再 insert run_index;PostgresJobBackend 要绑当前 conn。
+2. 测试盲区:PR2 的"真机"测试用 `_FakeBackend`(假 job backend,不走真 PG 外键),
+   只覆盖 worker 层,**没覆盖 routes 层 run_compare_task 的真 PG 写顺序**。所以这个外键违约
+   单测、worker 真机测试都抓不到,只有"真 PG + 真 HTTP 路由"路径才暴露——拖到前端真机走查。
+
+**修法**
+- #75 修插入顺序 + 补一条 routes 级真 PG 集成测试(提交 run → 断言 jobs + run_index 都落库)。
+
+**教训**
+- **"真机测试"也分层**:用 fake/stub 替身的"集成测试"仍可能绕过真 DB 约束(外键/唯一/CHECK)。
+  凡是写多表 + 有外键依赖的写路径,要有一条**真 PG + 真路由**的端到端测试,别让替身把约束架空。
+- 后端能力域合并上线 ≠ 全链路验过;**接它的前端真机走查是最后一道真 DB 闸**——这也是
+  "每棒前端都真机走查"的复利:它逼出了后端测试替身掩盖的约束违约。
+
+---
+
 ## 3. 设计背景
 
 ### 1.x DataOpsStudio 的定位(原 contract §9 内容)

@@ -23,16 +23,21 @@
 > Compare(2.2.0)/ Lineage(2.4.0)按 1.x 使用反馈 8 条 + 业界调研修订;
 > 新增 ADR-0019(子图优先)、ADR-0020(血缘边表持久化 + sql_hash 缓存)。
 >
+> **2.2.0 Compare 能力域已上线生产(2026-06-19)**:跨库规范化哈希内核 + compare_run
+> 4 桶 + 映射/主键推断 + 差异画像/采样/AI 归因 + 前端,全部合并,服务器部署到 d7218ef
+> 并经 Fable 5 真机走查(真 MySQL+DM,4 桶/单元格分裂/画像逐项验通)。下一能力域为
+> 2.3.0 Scenario Lab(设计 v0.3.3)。
+>
 > **2.1.0 SQL Workspace 完整版已上线生产(2026-06-14)**:W1 地基 + W2(元数据浏览器
 > / format / expand-star / EXPLAIN / 4 格式导出)全部合并,服务器已部署到 07624ef
-> 并经 Fable 5 真机走查。下一能力域为 2.2.0 Compare(设计 v0.3.3)。
+> 并经 Fable 5 真机走查。
 >
 > **后续候选(待人拍板,均无 owner/未排期)**:test_connection 终态 job 不阻塞数据源
 > 删除(`docs/backlog.md`,2.0.x patch)、Oracle adapter(2.0.x)、外部安全审计
 > 触发项(密码进 body 改造)、正式 license 签发(首个商业交付前)、worker DM 加密库
 > 部署文档(首个 DM 客户前)、DM 列头 driver_type 美化(`docs/backlog.md`,2.1.x)、
-> **2.2.0 Compare 能力域**(设计 v0.3.3 已就绪:递归 checksum 下钻 + 跨库规范化层 +
-> 差异画像 + 任务建议)。
+> Compare 导出端点(前端 PR5 留口待后端补,见下)、**2.3.0 Scenario Lab 能力域**
+> (设计 v0.3.3:DSL + materialize + verify + run-all)。
 
 ---
 
@@ -51,6 +56,21 @@
 
 ## 已完成归档
 
+> **2.2.0 Compare 能力域(2026-06-19 全部合并 + 已上生产)**:
+> PR1 跨库规范化哈希内核(Codex,[#70](https://github.com/allen-answer/dataOpsStudio_v2/pull/70)):
+> 规范化 SQL + 递归 hashdiff + 逐行 MD5/SUM,MySQL+DM 黄金一致性真机过(5 轮纠错:
+> %转义/CAST/精度/位宽/Horner);DM 100K PoC 2.1s。
+> PR2 compare_run + 4 桶 + CompareTask 持久化(Codex,[#71](https://github.com/allen-answer/dataOpsStudio_v2/pull/71))。
+> PR3 映射/主键自动推断 + 任务建议(Codex,[#72](https://github.com/allen-answer/dataOpsStudio_v2/pull/72);
+> 顺带修 DM list_columns 保留字 comment bug)。
+> PR4 差异画像 diff_profile + 采样快检 + AI 归因(Codex,[#73](https://github.com/allen-answer/dataOpsStudio_v2/pull/73);
+> R-AI 守严:AI 只收脱敏画像 JSON,行值不出境;恒定偏移/时区自动检测真机验通)。
+> PR5 前端(**Claude Opus 子代理**,[#74](https://github.com/allen-answer/dataOpsStudio_v2/pull/74)):
+> 任务列表/8步推断确认/4桶+单元格分裂/画像面板/采样/AI 入口。
+> FK 修复(Codex,[#75](https://github.com/allen-answer/dataOpsStudio_v2/pull/75)):run_compare_task
+> 的 jobs/run_index 插入顺序(前端真机走查首次触发的外键违约 500,PR2 fake backend 盲区)。
+> 全部 Fable 5 复核 + 真机验证(证据在各 PR 评论)。生产部署 d7218ef。
+>
 > **2.1.0 Wave 2 — SQL Workspace 工具链(2026-06-14 全部合并 + 已上生产)**:
 > W2-PR1 元数据浏览器 + SQL 工具后端(Codex,[#65](https://github.com/allen-answer/dataOpsStudio_v2/pull/65)):
 > metadata schemas/tables/columns(MySQL+DM,7 天缓存 + 探测超时 503)/ format /
