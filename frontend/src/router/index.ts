@@ -8,6 +8,7 @@ const PlaceholderView = () => import('../views/PlaceholderView.vue')
 const DesignSystemPreview = () => import('../views/DesignSystemPreview.vue')
 const TokensView = () => import('../views/TokensView.vue')
 const SqlWorkspaceView = () => import('../views/SqlWorkspaceView.vue')
+const CompareView = () => import('../views/CompareView.vue')
 const JobsView = () => import('../views/JobsView.vue')
 const AccountSecurityView = () => import('../views/AccountSecurityView.vue')
 const AdminLayout = () => import('../views/AdminLayout.vue')
@@ -51,6 +52,11 @@ const routes: RouteRecordRaw[] = [
         path: 'projects/:id/sql',
         name: 'sql',
         component: SqlWorkspaceView,
+      },
+      {
+        path: 'projects/:id/compare',
+        name: 'compare',
+        component: CompareView,
       },
       {
         path: 'projects/:id/jobs',
