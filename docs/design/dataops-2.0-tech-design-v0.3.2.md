@@ -1826,10 +1826,10 @@ dataops_worker_up{worker_id}                         gauge
 | **2.0.0** | 骨架版 | 登录 / datasource / SELECT 基础 / **PG 全形态 + Portable launcher** / **API-Worker 分离 + PG queue** / SecretStore(两层)/ License skeleton + Repair Mode / AI Gateway 壳 / migrate_from_v1.py / Adapter(MySQL+DM Certified,Oracle 2.0.x 补,DB2 Preview) | 2-2.5 月 |
 | 2.1.0 | SQL Workspace 完整 + AI Assist 一批 | ResultSet spool / virtual scroll / 历史 / 模板 / **AI Assist: 计划解释 / 错误翻译 / 改写** / DB2 转 Certified | 2.5 月 |
 | 2.2.0 | Compare + AI Assist 二批 | 流式 + parquet + 异步导出 + 跨源 / 映射自动推断 + diff_profile + 递归 checksum 下钻 + 跨库规范化层 + 任务建议 / **AI Assist: 残余字段映射 + 差异归因** | 1.5 月 |
-| 2.3.0 | Scenario Lab | DSL + materialize + verify + run-all | 1.5 月 |
-| 2.4.0 | Lineage(沿用 LineageReport) | 表级+列级血缘(沿用 1.x LineageReport)+ 子图优先图引擎 + 基础影响分析 + 解析覆盖率治理 + 资产页 + trace-compare / **AI Assist: 血缘解释 + 兜底解析** | 2 月 |
-| 2.5.0 | Workflow(Job DAG) | DAG + 调度 + 节点白名单 + 通知 | 1 月 |
-| 2.6.0 | AI Copilot MVP | Copilot Loop(自写)+ Memory + **C1(Schema-aware SQL)+ C5 基础版(Scenario 脚手架)** | 2.5 月 |
+| 2.3.0 | Lineage(沿用 LineageReport) | 表级+列级血缘(沿用 1.x LineageReport)+ 子图优先图引擎 + 基础影响分析 + 解析覆盖率治理 + 资产页 + trace-compare / **AI Assist: 血缘解释 + 兜底解析** | 2 月 |
+| 2.4.0 | Workflow(Job DAG) | DAG + 调度 + 节点白名单 + 通知 | 1 月 |
+| 2.6.0 | AI Copilot MVP + Scenario Lab | Copilot Loop(自写)+ Memory + **C1(Schema-aware SQL)** + **Scenario Lab 完整版**(三层 DSL: tables/anomalies/workloads + AI fill 一体;1.x 挖掘结论见 `docs/backlog.md`)+ C5(AI Scenario 脚手架与之合并) | 3.5 月 |
+| (原 2.3.0 Scenario Lab 槽位) | — | **移至 2.6.0**(2026-06-19 重排):Scenario 的 AI fill 与 AI Copilot 一体,且 workload 依赖 Lineage(2.3)/Workflow(2.4),放 2.6 依赖全部就位。详见下方排期说明 | — |
 | 2.7.0 | 多租户 Hosted + Copilot 进阶 | RLS + OIDC + 腾讯云自管部署 + **C2 + C4 + C5进阶 + C3** | 2.5 月 |
 | 2.8.0+ | 反馈驱动 | — | 不定 |
 

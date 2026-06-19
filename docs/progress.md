@@ -25,8 +25,13 @@
 >
 > **2.2.0 Compare 能力域已上线生产(2026-06-19)**:跨库规范化哈希内核 + compare_run
 > 4 桶 + 映射/主键推断 + 差异画像/采样/AI 归因 + 前端,全部合并,服务器部署到 d7218ef
-> 并经 Fable 5 真机走查(真 MySQL+DM,4 桶/单元格分裂/画像逐项验通)。下一能力域为
-> 2.3.0 Scenario Lab(设计 v0.3.3)。
+> 并经 Fable 5 真机走查(真 MySQL+DM,4 桶/单元格分裂/画像逐项验通)。
+>
+> **★ roadmap 重排(2026-06-19,用户拍板)**:**Scenario Lab 移至 2.6.0**(与 AI Copilot
+> 一体——立项调研挖 1.x 源码发现其 DSL 是"结构确定 + AI fill"三层架构,AI fill 是灵魂,
+> 且 workload 依赖 Lineage/Workflow;1.x 测绘结论存 `docs/backlog.md`)。**Lineage 提到
+> 2.3.0**(v0.3.3 设计稿 + ADR-0019/0020 就绪,纯确定性解析无 AI 依赖)。新排期:
+> 2.3 Lineage → 2.4 Workflow → 2.6 Copilot + Scenario。下一能力域 = **2.3.0 Lineage**。
 >
 > **2.1.0 SQL Workspace 完整版已上线生产(2026-06-14)**:W1 地基 + W2(元数据浏览器
 > / format / expand-star / EXPLAIN / 4 格式导出)全部合并,服务器已部署到 07624ef

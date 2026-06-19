@@ -136,6 +136,44 @@ sql_query 等业务 job);保留对业务 job 的保护语义。补单测:测过�
 **触发条件**:2.2.x 顺手窗口 / 用户 dogfood 提需求时。**优先级**:中(功能补全,不阻塞核心对比)。
 
 ---
+
+## 来自 2.3.0 立项调研(2026-06-19,Scenario Lab 移期 2.6.0)
+
+### **2.6.0 做 Scenario 时必读** — 1.x scenario 真实 DSL 测绘结论
+
+**背景**:立项 2.3.0 时去服务器挖 1.x scenario 源码(`~/dataops-studio/app/scenarios/`),
+发现 **PRD §13 推测的 DSL(steps/asserts/cleanup)是错的**,1.x 真实 DSL 强大得多。
+据此决定 Scenario 移至 2.6.0 与 AI Copilot 一体(roadmap 已改,见设计稿)。
+
+**1.x 真实 DSL = 声明式三层架构**(`app/scenarios/models.py`):
+- **tables**:schema 结构。列含 8 种 generator(`uuid_short`/`random_int`/`realistic`/
+  `timestamp`/`enum`/`constant`/`sequence`/`foreign_key`)。foreign_key 从另一表列值池抽样
+  保证 JOIN 匹配(`references: "table.column"` + `match_rate` + `fk_distribution`)。
+  支持 `dist_params`(lognormal/normal 等真实长尾分布)+ 13 个金融 domain faker provider。
+- **anomalies**:故意制造偏差,6 种(`missing_rows`/`extra_rows`/`value_drift`/
+  `type_mismatch`/`null_drift`/`duplicate_pk`)。target 表用 `derives_from` 继承 source + 加 anomaly。
+- **workloads**:造的数据喂给谁消费,4 种(`compare_task`/`lineage_script`/`slow_query`/
+  `workflow_run`),自带 `expected:` ground truth 供回归断言。
+
+**设计精髓**:结构 deterministic / 内容 AI fill(template 控 schema,LLM 只在 `ai.fill`
+白名单填业务数据)→ 这正是为何与 AI Copilot 一体做。`extra='forbid'` 拦 YAML 笔误。
+
+**操作语义**:materialize=建表+造数(tables+anomalies);verify=跑 workloads 对 expected;
+run-all=两者。cleanup: `drop_after_run` / rollback。
+
+**源码位置(服务器)**:`~/dataops-studio/app/scenarios/`(models/materializer/orchestrator/
+dialects/{mysql,oracle}/ai_filler/faker_providers/yml_importer 等 20 文件);样例 yml 在
+`~/dataops-studio/config/scenarios/*.example.yml`(orders-recon 最完整)。**2.6.0 开工前先全量
+读这套 + 产出 Scenario 设计稿(像 v0.3.3 Compare §2.3.1 那样),别用 PRD 推测 DSL。**
+
+**写操作安全(用户已拍板,2026-06-19)**:Scenario 是 2.0 第一个写客户库的能力域。
+边界 = **沙箱白名单 + 默认禁**:只对显式开 `allow_scenario_write` 的数据源放行
+(`OperationPolicy.allow_scenario_write`,地基已预留,默认 False);生产/未标记数据源
+一律拒绝执行写步骤。统一校验入口复用 sql_guard 思路。
+
+**触发条件**:2.6.0 启动。**优先级**:高(2.6.0 核心范围,且测绘结论易随时间遗忘)。
+
+---
 ## Backlog 维护规则
 
 1. **每个 review 反馈**判断三类:
