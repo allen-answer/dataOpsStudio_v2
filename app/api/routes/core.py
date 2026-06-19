@@ -118,6 +118,7 @@ from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
 from app.domain.schema import Column, Index, Table
 from app.domain.secret import HashedRef, SecretKind, SecretRef
+from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.result_export import export_content_type, export_extension
 from app.services.ai.default_gateway import (
     AI_API_KEY_ENV,
@@ -1536,6 +1537,7 @@ def run_compare_task(task_id: str, request: Request) -> CompareRunCreateResponse
     )
     now = datetime.now(UTC)
     with services.engine.begin() as conn:
+        _enqueue_compare_run_job(conn, services, job)
         conn.execute(
             insert(run_index).values(
                 run_id=run_id,
@@ -1553,7 +1555,6 @@ def run_compare_task(task_id: str, request: Request) -> CompareRunCreateResponse
                 updated_at=now,
             )
         )
-    services.job_backend.enqueue(job)
     _audit_business(
         services,
         request,
@@ -1566,6 +1567,14 @@ def run_compare_task(task_id: str, request: Request) -> CompareRunCreateResponse
         detail={"job_id": job_id},
     )
     return CompareRunCreateResponse(job_id=job_id, run_id=run_id)
+
+
+def _enqueue_compare_run_job(conn: Connection, services: ApiServices, job: Job) -> None:
+    job_backend = cast(Any, services).job_backend
+    if isinstance(job_backend, PostgresJobBackend):
+        PostgresJobBackend(conn).enqueue(job)
+        return
+    job_backend.enqueue(job)
 
 
 @router.get("/compare/runs/{run_id}/results", response_model=CompareRunResultResponse)
