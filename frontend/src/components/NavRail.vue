@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { LayoutGrid, Database, Terminal, ListChecks, Bot } from 'lucide-vue-next'
+import { LayoutGrid, Database, Terminal, GitCompareArrows, ListChecks, Bot } from 'lucide-vue-next'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -26,6 +26,7 @@ const items = computed<NavItem[]>(() => {
     base.push(
       { name: 'datasources', icon: Database, to: { name: 'datasources', params: { id: projectId } } },
       { name: 'sql', icon: Terminal, to: { name: 'sql', params: { id: projectId } } },
+      { name: 'compare', icon: GitCompareArrows, to: { name: 'compare', params: { id: projectId } } },
       { name: 'jobs', icon: ListChecks, to: { name: 'jobs', params: { id: projectId } } },
     )
   }
