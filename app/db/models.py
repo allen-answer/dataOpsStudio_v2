@@ -30,6 +30,7 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     MetaData,
+    Numeric,
     String,
     Table,
     Text,
@@ -594,6 +595,135 @@ run_index = Table(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# lineage_runs / lineage_edges / lineage_column_edges —— Lineage 2.3 edge store
+# ─────────────────────────────────────────────────────────────────────────────
+lineage_runs = Table(
+    "lineage_runs",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column(
+        "project_id",
+        String(36),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "datasource_id",
+        String(36),
+        ForeignKey("datasources.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("dialect", String(32), nullable=False),
+    Column("source_ref", Text(), nullable=False),
+    Column("sql_hash", String(64), nullable=False),
+    Column("parser_version", String(64), nullable=False),
+    Column("status", String(32), nullable=False),
+    Column("parse_summary", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    CheckConstraint(
+        "status IN ('success', 'failed')",
+        name="status_is_valid",
+    ),
+    UniqueConstraint(
+        "project_id",
+        "datasource_id",
+        "dialect",
+        "source_ref",
+        "sql_hash",
+        "parser_version",
+        name="uq_lineage_runs_cache_key",
+    ),
+    Index("ix_lineage_runs_project_hash", "project_id", "sql_hash"),
+    Index("ix_lineage_runs_datasource_created", "datasource_id", "created_at"),
+)
+
+
+lineage_edges = Table(
+    "lineage_edges",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column(
+        "run_id",
+        String(36),
+        ForeignKey("lineage_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "project_id",
+        String(36),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("source_table", String(512), nullable=False),
+    Column("target_table", String(512), nullable=False),
+    Column("edge_kind", String(32), nullable=False),
+    Column("inferred", Boolean(), nullable=False, server_default=text("false")),
+    Column("inference_status", String(32), nullable=False, server_default="confirmed"),
+    Column("confidence", Numeric(5, 4), nullable=False, server_default="1.0"),
+    Column("sql_hash", String(64), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    CheckConstraint(
+        "edge_kind IN ('table')",
+        name="edge_kind_is_supported",
+    ),
+    CheckConstraint(
+        "inference_status IN ('confirmed', 'inferred', 'rejected')",
+        name="inference_status_is_valid",
+    ),
+    Index("ix_lineage_edges_source_table", "project_id", "source_table"),
+    Index("ix_lineage_edges_target_table", "project_id", "target_table"),
+    Index("ix_lineage_edges_run_id", "run_id"),
+)
+
+
+lineage_column_edges = Table(
+    "lineage_column_edges",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column(
+        "run_id",
+        String(36),
+        ForeignKey("lineage_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "project_id",
+        String(36),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("source_table", String(512), nullable=False),
+    Column("source_column", String(256), nullable=False),
+    Column("target_table", String(512), nullable=False),
+    Column("target_column", String(256), nullable=False),
+    Column("transformation", String(32), nullable=False),
+    Column("transformation_subtype", String(32), nullable=False),
+    Column("inferred", Boolean(), nullable=False, server_default=text("false")),
+    Column("inference_status", String(32), nullable=False, server_default="confirmed"),
+    Column("confidence", Numeric(5, 4), nullable=False, server_default="1.0"),
+    Column("sql_hash", String(64), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    CheckConstraint(
+        "transformation IN ('DIRECT', 'INDIRECT')",
+        name="transformation_is_supported",
+    ),
+    CheckConstraint(
+        "transformation_subtype IN "
+        "('DIRECT', 'AGGREGATION', 'TRANSFORMATION', 'FILTER', 'JOIN', 'CAST', 'EXPRESSION')",
+        name="transformation_subtype_is_supported",
+    ),
+    CheckConstraint(
+        "inference_status IN ('confirmed', 'inferred', 'rejected')",
+        name="inference_status_is_valid",
+    ),
+    Index("ix_lineage_column_edges_source", "project_id", "source_table", "source_column"),
+    Index("ix_lineage_column_edges_target", "project_id", "target_table", "target_column"),
+    Index("ix_lineage_column_edges_run_id", "run_id"),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # result_sets —— ★ R6 红线 DB 层:无 cursor 字段
 # ─────────────────────────────────────────────────────────────────────────────
 result_sets = Table(
@@ -686,6 +816,9 @@ __all__ = [
     "job_events",
     "jobs",
     "license_state",
+    "lineage_column_edges",
+    "lineage_edges",
+    "lineage_runs",
     "metadata",
     "metadata_caches",
     "mfa_recovery_codes",

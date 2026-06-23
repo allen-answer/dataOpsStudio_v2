@@ -20,6 +20,9 @@ from app.db.models import (
     export_download_tokens,
     jobs,
     license_state,
+    lineage_column_edges,
+    lineage_edges,
+    lineage_runs,
     metadata,
     metadata_caches,
     mfa_recovery_codes,
@@ -77,7 +80,7 @@ def test_all_alembic_revision_ids_under_32_chars() -> None:
     assert not violations, f"revision ID 超 32 字符: {violations}"
 
 
-def test_metadata_has_19_tables() -> None:
+def test_metadata_has_22_tables() -> None:
     expected = {
         "ai_configs",
         "compare_tasks",
@@ -98,6 +101,9 @@ def test_metadata_has_19_tables() -> None:
         "sql_templates",
         "metadata_caches",
         "license_state",
+        "lineage_column_edges",
+        "lineage_edges",
+        "lineage_runs",
     }
     assert set(metadata.tables.keys()) == expected
 
@@ -174,6 +180,67 @@ def test_compare_tasks_and_run_index_schema_support_compare_run() -> None:
     assert "ix_run_index_task_created" in run_indexes
     assert "ck_run_index_kind_is_supported" in run_check_names
     assert "ck_run_index_status_is_valid" in run_check_names
+
+
+def test_lineage_edge_store_schema_supports_adjacency_traversal() -> None:
+    run_cols = set(lineage_runs.columns.keys())
+    edge_cols = set(lineage_edges.columns.keys())
+    column_edge_cols = set(lineage_column_edges.columns.keys())
+    run_indexes = {idx.name for idx in lineage_runs.indexes}
+    edge_indexes = {idx.name for idx in lineage_edges.indexes}
+    column_edge_indexes = {idx.name for idx in lineage_column_edges.indexes}
+    run_constraints = {c.name for c in lineage_runs.constraints if c.name is not None}
+    column_constraints = {c.name for c in lineage_column_edges.constraints if c.name is not None}
+
+    assert run_cols == {
+        "id",
+        "project_id",
+        "datasource_id",
+        "dialect",
+        "source_ref",
+        "sql_hash",
+        "parser_version",
+        "status",
+        "parse_summary",
+        "created_at",
+        "updated_at",
+    }
+    assert edge_cols == {
+        "id",
+        "run_id",
+        "project_id",
+        "source_table",
+        "target_table",
+        "edge_kind",
+        "inferred",
+        "inference_status",
+        "confidence",
+        "sql_hash",
+        "created_at",
+    }
+    assert column_edge_cols == {
+        "id",
+        "run_id",
+        "project_id",
+        "source_table",
+        "source_column",
+        "target_table",
+        "target_column",
+        "transformation",
+        "transformation_subtype",
+        "inferred",
+        "inference_status",
+        "confidence",
+        "sql_hash",
+        "created_at",
+    }
+    assert "uq_lineage_runs_cache_key" in run_constraints
+    assert "ix_lineage_runs_project_hash" in run_indexes
+    assert "ix_lineage_edges_source_table" in edge_indexes
+    assert "ix_lineage_edges_target_table" in edge_indexes
+    assert "ix_lineage_column_edges_source" in column_edge_indexes
+    assert "ix_lineage_column_edges_target" in column_edge_indexes
+    assert "ck_lineage_column_edges_transformation_is_supported" in column_constraints
 
 
 def test_export_download_tokens_schema_is_one_time_and_ttl_indexed() -> None:
