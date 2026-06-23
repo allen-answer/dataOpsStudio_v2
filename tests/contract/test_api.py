@@ -66,6 +66,9 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("POST", "/api/projects/{project_id}/compare/infer") in routes
     assert ("GET", "/api/projects/{project_id}/compare/suggest-tasks") in routes
     assert ("POST", "/api/projects/{project_id}/compare/draft-task") in routes
+    assert ("POST", "/api/projects/{project_id}/lineage/analyze") in routes
+    assert ("GET", "/api/projects/{project_id}/lineage/subgraph") in routes
+    assert ("GET", "/api/projects/{project_id}/lineage/impact") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/schemas") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/tables") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/columns") in routes
@@ -1231,6 +1234,273 @@ def test_export_download_token_is_one_time() -> None:
     assert second.json()["error"] == "download_token_consumed"
 
 
+def test_lineage_analyze_persists_edges_and_returns_cache_contract() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _datasource_row(),
+            [
+                {
+                    "cache_level": "columns",
+                    "schema_name": "app",
+                    "table_name": "src",
+                    "payload": [{"name": "id", "type": "integer"}],
+                },
+                {
+                    "cache_level": "columns",
+                    "schema_name": "app",
+                    "table_name": "tgt",
+                    "payload": [{"name": "id", "type": "integer"}],
+                },
+            ],
+            None,
+            {
+                "id": "run-1",
+                "project_id": "project-1",
+                "datasource_id": "ds-1",
+                "dialect": "mysql",
+                "source_ref": "script.sql",
+                "sql_hash": "hash-1",
+                "parser_version": "sqlglot-w1-v1",
+                "status": "success",
+                "parse_summary": {
+                    "table_edge_count": 1,
+                    "column_mapping_count": 1,
+                    "parse_error_count": 0,
+                },
+            },
+            1,
+            1,
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/analyze",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "source_ref": "script.sql",
+            "default_schema": "app",
+            "sql_text": "INSERT INTO app.tgt (id) SELECT id FROM app.src",
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["run_id"] == "run-1"
+    assert payload["project_id"] == "project-1"
+    assert payload["cached"] is False
+    assert payload["parser_version"] == "sqlglot-w1-v1"
+    assert payload["table_edge_count"] == 1
+    assert payload["column_edge_count"] == 1
+    assert any("INSERT INTO lineage_runs" in statement for statement in engine.statements)
+    assert any("INSERT INTO lineage_edges" in statement for statement in engine.statements)
+    assert any("INSERT INTO lineage_column_edges" in statement for statement in engine.statements)
+
+
+def test_lineage_analyze_cache_hit_does_not_reinsert_edges() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _datasource_row(),
+            [],
+            {
+                "id": "run-cached",
+                "project_id": "project-1",
+                "datasource_id": "ds-1",
+                "dialect": "mysql",
+                "source_ref": "script.sql",
+                "sql_hash": "hash-1",
+                "parser_version": "sqlglot-w1-v1",
+                "status": "success",
+                "parse_summary": {"table_edge_count": 1, "column_mapping_count": 0},
+            },
+            1,
+            0,
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/analyze",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "source_ref": "script.sql",
+            "sql_text": "INSERT INTO tgt (id) SELECT id FROM src",
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["cached"] is True
+    assert payload["run_id"] == "run-cached"
+    assert payload["table_edge_count"] == 1
+    assert not any("INSERT INTO lineage_edges" in statement for statement in engine.statements)
+
+
+def test_lineage_subgraph_contract_uses_recursive_cte() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            [
+                {
+                    "edge_id": "edge-1",
+                    "source_table": "app.src",
+                    "target_table": "app.mid",
+                    "source_column": None,
+                    "target_column": None,
+                    "source": "app.src",
+                    "target": "app.mid",
+                    "edge_kind": "table",
+                    "transformation": None,
+                    "transformation_subtype": None,
+                    "inferred": False,
+                    "inference_status": "confirmed",
+                    "confidence": 1,
+                    "depth": 1,
+                    "path": ["app.src", "app.mid"],
+                    "direction": "downstream",
+                }
+            ],
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/lineage/subgraph",
+        headers=_auth_headers(),
+        params={"focus": "app.src", "direction": "downstream", "max_depth": 3},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["node_count"] == 2
+    assert payload["edge_count"] == 1
+    assert payload["truncated"] is False
+    assert payload["nodes"][0] == {
+        "id": "app.src",
+        "label": "app.src",
+        "kind": "table",
+        "table": "app.src",
+        "column": None,
+        "depth": 0,
+    }
+    assert payload["edges"][0]["source"] == "app.src"
+    assert payload["edges"][0]["target"] == "app.mid"
+    assert any("WITH RECURSIVE walk" in statement for statement in engine.statements)
+
+
+def test_lineage_subgraph_include_columns_expands_bounded_column_edges() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            "edge-exists",
+            [
+                {
+                    "edge_id": "edge-1",
+                    "source_table": "app.src",
+                    "target_table": "app.mid",
+                    "source_column": None,
+                    "target_column": None,
+                    "source": "app.src",
+                    "target": "app.mid",
+                    "edge_kind": "table",
+                    "transformation": None,
+                    "transformation_subtype": None,
+                    "inferred": False,
+                    "inference_status": "confirmed",
+                    "confidence": 1,
+                    "depth": 1,
+                    "path": ["app.src", "app.mid"],
+                    "direction": "downstream",
+                }
+            ],
+            [
+                {
+                    "id": "col-edge-1",
+                    "source_table": "app.src",
+                    "source_column": "id",
+                    "target_table": "app.mid",
+                    "target_column": "id",
+                    "transformation": "DIRECT",
+                    "transformation_subtype": "DIRECT",
+                    "inferred": False,
+                    "inference_status": "confirmed",
+                    "confidence": 1,
+                }
+            ],
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/lineage/subgraph",
+        headers=_auth_headers(),
+        params={
+            "focus": "app.src",
+            "direction": "downstream",
+            "max_depth": 3,
+            "include_columns": True,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert any(node["id"] == "app.src.id" and node["kind"] == "column" for node in payload["nodes"])
+    assert any(
+        edge["id"] == "col-edge-1" and edge["edge_kind"] == "column" for edge in payload["edges"]
+    )
+
+
+def test_lineage_impact_contract_returns_downstream_paths() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            "edge-exists",
+            [
+                {
+                    "edge_id": "edge-1",
+                    "source_table": "app.src",
+                    "target_table": "app.mid",
+                    "source_column": None,
+                    "target_column": None,
+                    "source": "app.src",
+                    "target": "app.mid",
+                    "edge_kind": "table",
+                    "transformation": None,
+                    "transformation_subtype": None,
+                    "inferred": False,
+                    "inference_status": "confirmed",
+                    "confidence": 1,
+                    "depth": 1,
+                    "path": ["app.src", "app.mid"],
+                    "direction": "downstream",
+                }
+            ],
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/lineage/impact",
+        headers=_auth_headers(),
+        params={"focus": "app.src", "max_depth": 3},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["impact_count"] == 1
+    assert payload["impacts"][0] == {
+        "node": "app.mid",
+        "table": "app.mid",
+        "column": None,
+        "depth": 1,
+        "paths": [["app.src", "app.mid"]],
+    }
+
+
 def _auth_headers(user_id: str = "user-1") -> dict[str, str]:
     token = create_access_token(user_id=user_id, role="admin", secret=_Services.jwt_secret)
     return {"Authorization": f"Bearer {token}"}
@@ -1432,10 +1702,12 @@ class _FakeConnection:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         return None
 
-    def execute(self, statement: object) -> _FakeResult:
+    def execute(self, statement: object, parameters: object | None = None) -> _FakeResult:
+        del parameters
         statement_text = str(statement)
         self._engine.statements.append(statement_text)
-        if statement_text.lstrip().upper().startswith("SELECT"):
+        command = statement_text.lstrip().upper()
+        if command.startswith("SELECT") or command.startswith("WITH"):
             return _FakeResult(self._engine.results.pop(0))
         return _FakeResult(None)
 
@@ -1464,6 +1736,11 @@ class _FakeResult:
         if isinstance(self._result, int):
             return self._result
         raise AssertionError(f"expected scalar result, got {type(self._result).__name__}")
+
+    def scalar_one_or_none(self) -> object | None:
+        if self._result is None or isinstance(self._result, (int, str)):
+            return self._result
+        raise AssertionError(f"expected optional scalar result, got {type(self._result).__name__}")
 
 
 class _JobBackend:

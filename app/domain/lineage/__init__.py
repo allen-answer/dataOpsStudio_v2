@@ -1,3 +1,4 @@
+from app.domain.lineage.cache import LINEAGE_PARSER_VERSION, lineage_sql_hash
 from app.domain.lineage.dialects import register_lineage_dialects
 from app.domain.lineage.models import (
     InsertMapping,
@@ -16,6 +17,7 @@ from app.domain.lineage.parser import (
 from app.domain.lineage.plsql import split_plsql_statements
 
 __all__ = [
+    "LINEAGE_PARSER_VERSION",
     "InsertMapping",
     "LineageParseError",
     "LineageParseRequest",
@@ -25,6 +27,7 @@ __all__ = [
     "TransformationKind",
     "TransformationSubtype",
     "analyze_sql_lineage",
+    "lineage_sql_hash",
     "register_lineage_dialects",
     "schema_from_metadata_cache_rows",
     "split_plsql_statements",

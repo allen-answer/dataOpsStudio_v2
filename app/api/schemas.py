@@ -301,6 +301,90 @@ class CompareTaskSuggestionResponse(BaseModel):
     suggestions: list[TablePairSuggestion]
 
 
+LineageDirection = Literal["upstream", "downstream", "both"]
+
+
+class LineageAnalyzeRequest(BaseModel):
+    datasource_id: str
+    sql_text: str = Field(min_length=1)
+    source_ref: str = Field(min_length=1, max_length=512)
+    dialect: str | None = Field(default=None, min_length=1, max_length=32)
+    default_schema: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class LineageAnalyzeResponse(BaseModel):
+    run_id: str
+    project_id: str
+    datasource_id: str
+    dialect: str
+    source_ref: str
+    sql_hash: str
+    parser_version: str
+    status: Literal["success", "failed"]
+    cached: bool
+    parse_summary: dict[str, Any] = Field(default_factory=dict)
+    table_edge_count: int
+    column_edge_count: int
+
+
+class LineageSubgraphNode(BaseModel):
+    id: str
+    label: str
+    kind: Literal["table", "column"]
+    table: str
+    column: str | None = None
+    depth: int
+
+
+class LineageSubgraphEdge(BaseModel):
+    id: str
+    source: str
+    target: str
+    source_table: str
+    target_table: str
+    source_column: str | None = None
+    target_column: str | None = None
+    depth: int
+    direction: Literal["upstream", "downstream"]
+    edge_kind: str
+    inferred: bool = False
+    inference_status: str = "confirmed"
+    confidence: float = 1.0
+    transformation: str | None = None
+    transformation_subtype: str | None = None
+
+
+class LineageSubgraphResponse(BaseModel):
+    project_id: str
+    focus: str
+    direction: LineageDirection
+    max_depth: int
+    include_columns: bool
+    truncated: bool
+    node_count: int
+    edge_count: int
+    depth_counts: dict[int, int] = Field(default_factory=dict)
+    nodes: list[LineageSubgraphNode] = Field(default_factory=list)
+    edges: list[LineageSubgraphEdge] = Field(default_factory=list)
+
+
+class LineageImpactItem(BaseModel):
+    node: str
+    table: str
+    column: str | None = None
+    depth: int
+    paths: list[list[str]] = Field(default_factory=list)
+
+
+class LineageImpactResponse(BaseModel):
+    project_id: str
+    focus: str
+    max_depth: int
+    truncated: bool
+    impact_count: int
+    impacts: list[LineageImpactItem] = Field(default_factory=list)
+
+
 class JobResponse(BaseModel):
     id: str
     kind: str

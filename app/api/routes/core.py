@@ -7,13 +7,13 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from secrets import token_urlsafe
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import sqlglot
 import structlog
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from sqlalchemy import and_, delete, func, insert, or_, select, update
+from sqlalchemy import and_, delete, func, insert, or_, select, text, update
 from sqlalchemy.engine import Connection, RowMapping
 from sqlglot import exp
 from sqlglot.errors import ParseError
@@ -55,6 +55,14 @@ from app.api.schemas import (
     JobResponse,
     JobResultResponse,
     LicenseStatusResponse,
+    LineageAnalyzeRequest,
+    LineageAnalyzeResponse,
+    LineageDirection,
+    LineageImpactItem,
+    LineageImpactResponse,
+    LineageSubgraphEdge,
+    LineageSubgraphNode,
+    LineageSubgraphResponse,
     LoginRequest,
     MetadataColumnItem,
     MetadataIndexItem,
@@ -88,6 +96,9 @@ from app.db.models import (
     export_download_tokens,
     jobs,
     license_state,
+    lineage_column_edges,
+    lineage_edges,
+    lineage_runs,
     metadata_caches,
     project_members,
     projects,
@@ -114,6 +125,13 @@ from app.domain.compare_result import (
 )
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
+from app.domain.lineage import (
+    LINEAGE_PARSER_VERSION,
+    LineageParseRequest,
+    analyze_sql_lineage,
+    lineage_sql_hash,
+    schema_from_metadata_cache_rows,
+)
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
 from app.domain.schema import Column, Index, Table
@@ -143,6 +161,226 @@ _METADATA_LEVEL_COLUMNS = "columns"
 _METADATA_LEVEL_INDEXES = "indexes"
 _EXPORT_FORMATS = frozenset({"csv", "excel", "json", "sql"})
 _COMPARE_BUCKET_QUERY = Query(default="diff")
+_LINEAGE_FOCUS_QUERY = Query(min_length=1)
+_LINEAGE_DIRECTION_QUERY = Query(default="downstream")
+_LINEAGE_DEPTH_QUERY = Query(default=3, ge=1, le=5)
+_LINEAGE_INCLUDE_COLUMNS_QUERY = Query(default=False)
+
+_LINEAGE_TABLE_DOWNSTREAM_SQL = text(
+    """
+    WITH RECURSIVE walk AS (
+        SELECT
+            e.id AS edge_id,
+            e.source_table,
+            e.target_table,
+            NULL::text AS source_column,
+            NULL::text AS target_column,
+            e.source_table AS source,
+            e.target_table AS target,
+            e.edge_kind,
+            NULL::text AS transformation,
+            NULL::text AS transformation_subtype,
+            e.inferred,
+            e.inference_status,
+            e.confidence,
+            1 AS depth,
+            ARRAY[e.source_table, e.target_table]::text[] AS path
+        FROM lineage_edges e
+        WHERE e.project_id = :project_id
+          AND e.source_table = :focus_table
+          AND e.inference_status <> 'rejected'
+        UNION ALL
+        SELECT
+            e.id,
+            e.source_table,
+            e.target_table,
+            NULL::text,
+            NULL::text,
+            e.source_table,
+            e.target_table,
+            e.edge_kind,
+            NULL::text,
+            NULL::text,
+            e.inferred,
+            e.inference_status,
+            e.confidence,
+            walk.depth + 1,
+            walk.path || e.target_table
+        FROM lineage_edges e
+        JOIN walk ON e.source_table = walk.target_table
+        WHERE e.project_id = :project_id
+          AND e.inference_status <> 'rejected'
+          AND walk.depth < :query_depth
+          AND NOT e.target_table = ANY(walk.path)
+    )
+    SELECT *, :direction AS direction FROM walk
+    """
+)
+
+_LINEAGE_TABLE_UPSTREAM_SQL = text(
+    """
+    WITH RECURSIVE walk AS (
+        SELECT
+            e.id AS edge_id,
+            e.source_table,
+            e.target_table,
+            NULL::text AS source_column,
+            NULL::text AS target_column,
+            e.source_table AS source,
+            e.target_table AS target,
+            e.edge_kind,
+            NULL::text AS transformation,
+            NULL::text AS transformation_subtype,
+            e.inferred,
+            e.inference_status,
+            e.confidence,
+            1 AS depth,
+            ARRAY[e.target_table, e.source_table]::text[] AS path
+        FROM lineage_edges e
+        WHERE e.project_id = :project_id
+          AND e.target_table = :focus_table
+          AND e.inference_status <> 'rejected'
+        UNION ALL
+        SELECT
+            e.id,
+            e.source_table,
+            e.target_table,
+            NULL::text,
+            NULL::text,
+            e.source_table,
+            e.target_table,
+            e.edge_kind,
+            NULL::text,
+            NULL::text,
+            e.inferred,
+            e.inference_status,
+            e.confidence,
+            walk.depth + 1,
+            walk.path || e.source_table
+        FROM lineage_edges e
+        JOIN walk ON e.target_table = walk.source_table
+        WHERE e.project_id = :project_id
+          AND e.inference_status <> 'rejected'
+          AND walk.depth < :query_depth
+          AND NOT e.source_table = ANY(walk.path)
+    )
+    SELECT *, :direction AS direction FROM walk
+    """
+)
+
+_LINEAGE_COLUMN_DOWNSTREAM_SQL = text(
+    """
+    WITH RECURSIVE walk AS (
+        SELECT
+            e.id AS edge_id,
+            e.source_table,
+            e.target_table,
+            e.source_column,
+            e.target_column,
+            e.source_table || '.' || e.source_column AS source,
+            e.target_table || '.' || e.target_column AS target,
+            'column'::text AS edge_kind,
+            e.transformation,
+            e.transformation_subtype,
+            e.inferred,
+            e.inference_status,
+            e.confidence,
+            1 AS depth,
+            ARRAY[
+                e.source_table || '.' || e.source_column,
+                e.target_table || '.' || e.target_column
+            ]::text[] AS path
+        FROM lineage_column_edges e
+        WHERE e.project_id = :project_id
+          AND e.source_table = :focus_table
+          AND e.source_column = :focus_column
+          AND e.inference_status <> 'rejected'
+        UNION ALL
+        SELECT
+            e.id,
+            e.source_table,
+            e.target_table,
+            e.source_column,
+            e.target_column,
+            e.source_table || '.' || e.source_column,
+            e.target_table || '.' || e.target_column,
+            'column'::text,
+            e.transformation,
+            e.transformation_subtype,
+            e.inferred,
+            e.inference_status,
+            e.confidence,
+            walk.depth + 1,
+            walk.path || (e.target_table || '.' || e.target_column)
+        FROM lineage_column_edges e
+        JOIN walk
+          ON e.source_table = walk.target_table
+         AND e.source_column = walk.target_column
+        WHERE e.project_id = :project_id
+          AND e.inference_status <> 'rejected'
+          AND walk.depth < :query_depth
+          AND NOT (e.target_table || '.' || e.target_column) = ANY(walk.path)
+    )
+    SELECT *, :direction AS direction FROM walk
+    """
+)
+
+_LINEAGE_COLUMN_UPSTREAM_SQL = text(
+    """
+    WITH RECURSIVE walk AS (
+        SELECT
+            e.id AS edge_id,
+            e.source_table,
+            e.target_table,
+            e.source_column,
+            e.target_column,
+            e.source_table || '.' || e.source_column AS source,
+            e.target_table || '.' || e.target_column AS target,
+            'column'::text AS edge_kind,
+            e.transformation,
+            e.transformation_subtype,
+            e.inferred,
+            e.inference_status,
+            e.confidence,
+            1 AS depth,
+            ARRAY[
+                e.target_table || '.' || e.target_column,
+                e.source_table || '.' || e.source_column
+            ]::text[] AS path
+        FROM lineage_column_edges e
+        WHERE e.project_id = :project_id
+          AND e.target_table = :focus_table
+          AND e.target_column = :focus_column
+          AND e.inference_status <> 'rejected'
+        UNION ALL
+        SELECT
+            e.id,
+            e.source_table,
+            e.target_table,
+            e.source_column,
+            e.target_column,
+            e.source_table || '.' || e.source_column,
+            e.target_table || '.' || e.target_column,
+            'column'::text,
+            e.transformation,
+            e.transformation_subtype,
+            e.inferred,
+            e.inference_status,
+            e.confidence,
+            walk.depth + 1,
+            walk.path || (e.source_table || '.' || e.source_column)
+        FROM lineage_column_edges e
+        JOIN walk
+          ON e.target_table = walk.source_table
+         AND e.target_column = walk.source_column
+        WHERE e.project_id = :project_id
+          AND e.inference_status <> 'rejected'
+          AND walk.depth < :query_depth
+          AND NOT (e.source_table || '.' || e.source_column) = ANY(walk.path)
+    )
+    SELECT *, :direction AS direction FROM walk
+    """
+)
 
 router = APIRouter()
 
@@ -1747,6 +1985,167 @@ def explain_compare_run_diff_profile(
     )
 
 
+@router.post(
+    "/projects/{project_id}/lineage/analyze",
+    response_model=LineageAnalyzeResponse,
+    status_code=201,
+)
+def analyze_project_lineage(
+    project_id: str,
+    body: LineageAnalyzeRequest,
+    request: Request,
+    refresh: bool = Query(default=False),
+) -> LineageAnalyzeResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.begin() as conn:
+        datasource_row = _lineage_datasource_for_project(
+            conn,
+            project_id=project_id,
+            datasource_id=body.datasource_id,
+            user_id=user.id,
+        )
+        dialect = (body.dialect or str(datasource_row["db_type"])).lower()
+        schema_context = _lineage_schema_context(conn, body.datasource_id, body.default_schema)
+        sql_hash = lineage_sql_hash(
+            sql_text=body.sql_text,
+            dialect=dialect,
+            schema_context=schema_context,
+            parser_version=LINEAGE_PARSER_VERSION,
+        )
+        if not refresh:
+            cached = _lineage_cached_run(
+                conn,
+                project_id=project_id,
+                datasource_id=body.datasource_id,
+                dialect=dialect,
+                source_ref=body.source_ref,
+                sql_hash=sql_hash,
+            )
+            if cached is not None:
+                return _lineage_analyze_response(conn, cached, cached=True)
+        else:
+            _delete_lineage_cache(
+                conn,
+                project_id=project_id,
+                datasource_id=body.datasource_id,
+                dialect=dialect,
+                source_ref=body.source_ref,
+                sql_hash=sql_hash,
+            )
+
+        try:
+            report = analyze_sql_lineage(
+                LineageParseRequest(
+                    sql_text=body.sql_text,
+                    dialect=dialect,
+                    schema=schema_context["schema"],
+                    default_schema=body.default_schema,
+                )
+            )
+        except ValueError as exc:
+            raise ApiError(400, "lineage_parse_failed", "Lineage SQL parse failed") from exc
+
+        run_id = new_id()
+        now = datetime.now(UTC)
+        parse_summary = dict(report.report or {})
+        parse_summary["parser_version"] = LINEAGE_PARSER_VERSION
+        conn.execute(
+            insert(lineage_runs).values(
+                id=run_id,
+                project_id=project_id,
+                datasource_id=body.datasource_id,
+                dialect=dialect,
+                source_ref=body.source_ref,
+                sql_hash=sql_hash,
+                parser_version=LINEAGE_PARSER_VERSION,
+                status="success",
+                parse_summary=parse_summary,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        _insert_lineage_edges(
+            conn,
+            run_id=run_id,
+            project_id=project_id,
+            sql_hash=sql_hash,
+            graph_edges=report.graph_edges,
+            insert_mappings=report.insert_mappings,
+        )
+        row = (
+            conn.execute(select(lineage_runs).where(lineage_runs.c.id == run_id))
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise ApiError(404, "not_found", "Lineage run not found")
+        response = _lineage_analyze_response(conn, row, cached=False)
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="lineage_analyze",
+        resource_type="lineage_run",
+        resource_id=str(row["id"]),
+        result="success",
+        detail={
+            "table_edge_count": response.table_edge_count,
+            "column_edge_count": response.column_edge_count,
+        },
+    )
+    return response
+
+
+@router.get(
+    "/projects/{project_id}/lineage/subgraph",
+    response_model=LineageSubgraphResponse,
+)
+def get_lineage_subgraph(
+    project_id: str,
+    request: Request,
+    focus: str = _LINEAGE_FOCUS_QUERY,
+    direction: LineageDirection = _LINEAGE_DIRECTION_QUERY,
+    max_depth: int = _LINEAGE_DEPTH_QUERY,
+    include_columns: bool = _LINEAGE_INCLUDE_COLUMNS_QUERY,
+) -> LineageSubgraphResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        return _lineage_subgraph_response(
+            conn,
+            project_id=project_id,
+            focus=focus,
+            direction=direction,
+            max_depth=min(max_depth, 5),
+            include_columns=include_columns,
+        )
+
+
+@router.get(
+    "/projects/{project_id}/lineage/impact",
+    response_model=LineageImpactResponse,
+)
+def get_lineage_impact(
+    project_id: str,
+    request: Request,
+    focus: str = _LINEAGE_FOCUS_QUERY,
+    max_depth: int = _LINEAGE_DEPTH_QUERY,
+) -> LineageImpactResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        return _lineage_impact_response(
+            conn,
+            project_id=project_id,
+            focus=focus,
+            max_depth=min(max_depth, 5),
+        )
+
+
 @router.get("/jobs", response_model=list[JobListItem])
 def list_jobs(
     request: Request,
@@ -2805,6 +3204,538 @@ def _compare_sample_result(value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     return {str(key): raw_value for key, raw_value in value.items()}
+
+
+def _lineage_datasource_for_project(
+    conn: Connection,
+    *,
+    project_id: str,
+    datasource_id: str,
+    user_id: str,
+) -> RowMapping:
+    _require_project_access(conn, project_id, user_id)
+    row = (
+        conn.execute(select(datasources).where(datasources.c.id == datasource_id))
+        .mappings()
+        .one_or_none()
+    )
+    if row is None or str(row["project_id"]) != project_id:
+        raise ApiError(404, "not_found", "Lineage datasource not found")
+    return row
+
+
+def _lineage_schema_context(
+    conn: Connection,
+    datasource_id: str,
+    default_schema: str | None,
+) -> dict[str, Any]:
+    rows = (
+        conn.execute(
+            select(
+                metadata_caches.c.cache_level,
+                metadata_caches.c.schema_name,
+                metadata_caches.c.table_name,
+                metadata_caches.c.payload,
+            ).where(
+                and_(
+                    metadata_caches.c.datasource_id == datasource_id,
+                    metadata_caches.c.cache_level == _METADATA_LEVEL_COLUMNS,
+                )
+            )
+        )
+        .mappings()
+        .all()
+    )
+    schema_rows = [dict(row) for row in rows]
+    schema = schema_from_metadata_cache_rows(schema_rows)
+    return {"default_schema": default_schema, "schema": schema}
+
+
+def _lineage_cached_run(
+    conn: Connection,
+    *,
+    project_id: str,
+    datasource_id: str,
+    dialect: str,
+    source_ref: str,
+    sql_hash: str,
+) -> RowMapping | None:
+    return (
+        conn.execute(
+            select(lineage_runs).where(
+                and_(
+                    lineage_runs.c.project_id == project_id,
+                    lineage_runs.c.datasource_id == datasource_id,
+                    lineage_runs.c.dialect == dialect,
+                    lineage_runs.c.source_ref == source_ref,
+                    lineage_runs.c.sql_hash == sql_hash,
+                    lineage_runs.c.parser_version == LINEAGE_PARSER_VERSION,
+                )
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+
+
+def _delete_lineage_cache(
+    conn: Connection,
+    *,
+    project_id: str,
+    datasource_id: str,
+    dialect: str,
+    source_ref: str,
+    sql_hash: str,
+) -> None:
+    conn.execute(
+        delete(lineage_runs).where(
+            and_(
+                lineage_runs.c.project_id == project_id,
+                lineage_runs.c.datasource_id == datasource_id,
+                lineage_runs.c.dialect == dialect,
+                lineage_runs.c.source_ref == source_ref,
+                lineage_runs.c.sql_hash == sql_hash,
+                lineage_runs.c.parser_version == LINEAGE_PARSER_VERSION,
+            )
+        )
+    )
+
+
+def _insert_lineage_edges(
+    conn: Connection,
+    *,
+    run_id: str,
+    project_id: str,
+    sql_hash: str,
+    graph_edges: list[dict[str, Any]],
+    insert_mappings: list[dict[str, Any]],
+) -> None:
+    table_rows = [
+        {
+            "id": new_id(),
+            "run_id": run_id,
+            "project_id": project_id,
+            "source_table": str(edge["source_table"]),
+            "target_table": str(edge["target_table"]),
+            "edge_kind": "table",
+            "inferred": False,
+            "inference_status": "confirmed",
+            "confidence": 1.0,
+            "sql_hash": sql_hash,
+        }
+        for edge in graph_edges
+        if edge.get("source_table") and edge.get("target_table")
+    ]
+    if table_rows:
+        conn.execute(insert(lineage_edges), table_rows)
+    column_rows = [
+        {
+            "id": new_id(),
+            "run_id": run_id,
+            "project_id": project_id,
+            "source_table": str(mapping["source_table"]),
+            "source_column": str(mapping["source_column"]),
+            "target_table": str(mapping["target_table"]),
+            "target_column": str(mapping["target_column"]),
+            "transformation": str(mapping.get("transformation") or "DIRECT"),
+            "transformation_subtype": str(mapping.get("transformation_subtype") or "DIRECT"),
+            "inferred": False,
+            "inference_status": "confirmed",
+            "confidence": 1.0,
+            "sql_hash": sql_hash,
+        }
+        for mapping in insert_mappings
+        if (
+            mapping.get("source_table")
+            and mapping.get("source_column")
+            and mapping.get("target_table")
+            and mapping.get("target_column")
+        )
+    ]
+    if column_rows:
+        conn.execute(insert(lineage_column_edges), column_rows)
+
+
+def _lineage_analyze_response(
+    conn: Connection, row: RowMapping, *, cached: bool
+) -> LineageAnalyzeResponse:
+    run_id = str(row["id"])
+    table_edge_count = int(
+        conn.execute(
+            select(func.count()).select_from(lineage_edges).where(lineage_edges.c.run_id == run_id)
+        ).scalar_one()
+    )
+    column_edge_count = int(
+        conn.execute(
+            select(func.count())
+            .select_from(lineage_column_edges)
+            .where(lineage_column_edges.c.run_id == run_id)
+        ).scalar_one()
+    )
+    return _lineage_analyze_response_from_counts(
+        row,
+        cached=cached,
+        table_edge_count=table_edge_count,
+        column_edge_count=column_edge_count,
+    )
+
+
+def _lineage_analyze_response_from_counts(
+    row: RowMapping,
+    *,
+    cached: bool,
+    table_edge_count: int,
+    column_edge_count: int,
+) -> LineageAnalyzeResponse:
+    return LineageAnalyzeResponse(
+        run_id=str(row["id"]),
+        project_id=str(row["project_id"]),
+        datasource_id=str(row["datasource_id"]),
+        dialect=str(row["dialect"]),
+        source_ref=str(row["source_ref"]),
+        sql_hash=str(row["sql_hash"]),
+        parser_version=str(row["parser_version"]),
+        status=cast(Literal["success", "failed"], str(row["status"])),
+        cached=cached,
+        parse_summary=dict(row["parse_summary"] or {}),
+        table_edge_count=table_edge_count,
+        column_edge_count=column_edge_count,
+    )
+
+
+def _lineage_subgraph_response(
+    conn: Connection,
+    *,
+    project_id: str,
+    focus: str,
+    direction: LineageDirection,
+    max_depth: int,
+    include_columns: bool,
+) -> LineageSubgraphResponse:
+    focus_ref = _lineage_focus_ref(conn, project_id, focus, include_columns=include_columns)
+    rows: list[dict[str, Any]] = []
+    directions: tuple[Literal["upstream", "downstream"], ...]
+    if direction == "both":
+        directions = ("upstream", "downstream")
+    else:
+        directions = (direction,)
+    for item in directions:
+        rows.extend(
+            _lineage_walk_rows(
+                conn,
+                project_id=project_id,
+                focus_ref=focus_ref,
+                direction=item,
+                max_depth=max_depth,
+            )
+        )
+    if include_columns and focus_ref["kind"] == "table":
+        rows.extend(
+            _lineage_column_expansion_rows(
+                conn,
+                project_id=project_id,
+                table_rows=rows,
+                max_depth=max_depth,
+            )
+        )
+    truncated = any(int(row["depth"]) > max_depth for row in rows)
+    visible_rows = [row for row in rows if int(row["depth"]) <= max_depth]
+    nodes, edges, depth_counts = _lineage_graph_from_rows(
+        focus_ref=focus_ref,
+        rows=visible_rows,
+    )
+    return LineageSubgraphResponse(
+        project_id=project_id,
+        focus=focus,
+        direction=direction,
+        max_depth=max_depth,
+        include_columns=include_columns,
+        truncated=truncated,
+        node_count=len(nodes),
+        edge_count=len(edges),
+        depth_counts=depth_counts,
+        nodes=nodes,
+        edges=edges,
+    )
+
+
+def _lineage_impact_response(
+    conn: Connection,
+    *,
+    project_id: str,
+    focus: str,
+    max_depth: int,
+) -> LineageImpactResponse:
+    focus_ref = _lineage_focus_ref(conn, project_id, focus, include_columns=True)
+    rows = _lineage_walk_rows(
+        conn,
+        project_id=project_id,
+        focus_ref=focus_ref,
+        direction="downstream",
+        max_depth=max_depth,
+    )
+    truncated = any(int(row["depth"]) > max_depth for row in rows)
+    grouped: dict[str, LineageImpactItem] = {}
+    for row in rows:
+        depth = int(row["depth"])
+        if depth > max_depth:
+            continue
+        target = str(row["target"])
+        item = grouped.get(target)
+        if item is None:
+            table, column = _lineage_node_parts(target, focus_ref["kind"])
+            item = LineageImpactItem(
+                node=target,
+                table=table,
+                column=column,
+                depth=depth,
+                paths=[],
+            )
+            grouped[target] = item
+        item.depth = min(item.depth, depth)
+        path = _lineage_path(row)
+        if path and path not in item.paths:
+            item.paths.append(path)
+    impacts = sorted(grouped.values(), key=lambda item: (item.depth, item.node))
+    return LineageImpactResponse(
+        project_id=project_id,
+        focus=focus,
+        max_depth=max_depth,
+        truncated=truncated,
+        impact_count=len(impacts),
+        impacts=impacts,
+    )
+
+
+def _lineage_focus_ref(
+    conn: Connection,
+    project_id: str,
+    focus: str,
+    *,
+    include_columns: bool,
+) -> dict[str, str]:
+    if include_columns and not _lineage_table_exists(conn, project_id, focus):
+        table, column = _lineage_split_column_focus(focus)
+        if column is not None:
+            return {"kind": "column", "table": table, "column": column, "node": focus}
+    return {"kind": "table", "table": focus, "column": "", "node": focus}
+
+
+def _lineage_table_exists(conn: Connection, project_id: str, table_name: str) -> bool:
+    exists = conn.execute(
+        select(lineage_edges.c.id)
+        .where(
+            and_(
+                lineage_edges.c.project_id == project_id,
+                or_(
+                    lineage_edges.c.source_table == table_name,
+                    lineage_edges.c.target_table == table_name,
+                ),
+            )
+        )
+        .limit(1)
+    ).scalar_one_or_none()
+    if exists is not None:
+        return True
+    column_exists = conn.execute(
+        select(lineage_column_edges.c.id)
+        .where(
+            and_(
+                lineage_column_edges.c.project_id == project_id,
+                or_(
+                    lineage_column_edges.c.source_table == table_name,
+                    lineage_column_edges.c.target_table == table_name,
+                ),
+            )
+        )
+        .limit(1)
+    ).scalar_one_or_none()
+    return column_exists is not None
+
+
+def _lineage_split_column_focus(focus: str) -> tuple[str, str | None]:
+    parts = focus.rsplit(".", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        return focus, None
+    return parts[0], parts[1]
+
+
+def _lineage_walk_rows(
+    conn: Connection,
+    *,
+    project_id: str,
+    focus_ref: dict[str, str],
+    direction: Literal["upstream", "downstream"],
+    max_depth: int,
+) -> list[dict[str, Any]]:
+    query_depth = max_depth + 1
+    # ADR-0019 red line: lineage graph queries must use focused recursive CTEs.
+    # Do not load the whole graph and filter the neighborhood in Python or the frontend.
+    if focus_ref["kind"] == "column":
+        statement = (
+            _LINEAGE_COLUMN_DOWNSTREAM_SQL
+            if direction == "downstream"
+            else _LINEAGE_COLUMN_UPSTREAM_SQL
+        )
+        params = {
+            "project_id": project_id,
+            "focus_table": focus_ref["table"],
+            "focus_column": focus_ref["column"],
+            "query_depth": query_depth,
+            "direction": direction,
+        }
+    else:
+        statement = (
+            _LINEAGE_TABLE_DOWNSTREAM_SQL
+            if direction == "downstream"
+            else _LINEAGE_TABLE_UPSTREAM_SQL
+        )
+        params = {
+            "project_id": project_id,
+            "focus_table": focus_ref["table"],
+            "query_depth": query_depth,
+            "direction": direction,
+        }
+    return [dict(row) for row in conn.execute(statement, params).mappings().all()]
+
+
+def _lineage_column_expansion_rows(
+    conn: Connection,
+    *,
+    project_id: str,
+    table_rows: list[dict[str, Any]],
+    max_depth: int,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[str, str, str]] = set()
+    for table_row in table_rows:
+        depth = int(table_row["depth"])
+        if depth > max_depth:
+            continue
+        source_table = str(table_row["source_table"])
+        target_table = str(table_row["target_table"])
+        direction = str(table_row["direction"])
+        pair_key = (source_table, target_table, direction)
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+        column_rows = (
+            conn.execute(
+                select(lineage_column_edges).where(
+                    and_(
+                        lineage_column_edges.c.project_id == project_id,
+                        lineage_column_edges.c.source_table == source_table,
+                        lineage_column_edges.c.target_table == target_table,
+                        lineage_column_edges.c.inference_status != "rejected",
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
+        for column_row in column_rows:
+            source = f"{column_row['source_table']}.{column_row['source_column']}"
+            target = f"{column_row['target_table']}.{column_row['target_column']}"
+            path = [source, target] if direction == "downstream" else [target, source]
+            rows.append(
+                {
+                    "edge_id": str(column_row["id"]),
+                    "source_table": str(column_row["source_table"]),
+                    "target_table": str(column_row["target_table"]),
+                    "source_column": str(column_row["source_column"]),
+                    "target_column": str(column_row["target_column"]),
+                    "source": source,
+                    "target": target,
+                    "edge_kind": "column",
+                    "transformation": str(column_row["transformation"]),
+                    "transformation_subtype": str(column_row["transformation_subtype"]),
+                    "inferred": bool(column_row["inferred"]),
+                    "inference_status": str(column_row["inference_status"]),
+                    "confidence": column_row["confidence"],
+                    "depth": depth,
+                    "path": path,
+                    "direction": direction,
+                }
+            )
+    return rows
+
+
+def _lineage_graph_from_rows(
+    *,
+    focus_ref: dict[str, str],
+    rows: list[dict[str, Any]],
+) -> tuple[list[LineageSubgraphNode], list[LineageSubgraphEdge], dict[int, int]]:
+    node_depths: dict[str, int] = {focus_ref["node"]: 0}
+    node_kinds: dict[str, str] = {focus_ref["node"]: focus_ref["kind"]}
+    edges_by_key: dict[tuple[str, str], LineageSubgraphEdge] = {}
+    for row in rows:
+        path = _lineage_path(row)
+        row_kind = "column" if row.get("edge_kind") == "column" else "table"
+        for depth, path_node in enumerate(path):
+            node_depths[path_node] = min(node_depths.get(path_node, depth), depth)
+            node_kinds[path_node] = row_kind
+        edge = _lineage_edge_from_row(row)
+        key = (edge.id, edge.direction)
+        existing = edges_by_key.get(key)
+        if existing is None or edge.depth < existing.depth:
+            edges_by_key[key] = edge
+    nodes = [
+        _lineage_node(node_id, depth, node_kinds.get(node_id, "table"))
+        for node_id, depth in sorted(node_depths.items(), key=lambda item: (item[1], item[0]))
+    ]
+    edges = sorted(edges_by_key.values(), key=lambda edge: (edge.depth, edge.id))
+    depth_counts: dict[int, int] = {}
+    for graph_node in nodes:
+        depth_counts[graph_node.depth] = depth_counts.get(graph_node.depth, 0) + 1
+    return nodes, edges, depth_counts
+
+
+def _lineage_edge_from_row(row: dict[str, Any]) -> LineageSubgraphEdge:
+    return LineageSubgraphEdge(
+        id=str(row["edge_id"]),
+        source=str(row["source"]),
+        target=str(row["target"]),
+        source_table=str(row["source_table"]),
+        target_table=str(row["target_table"]),
+        source_column=_optional_str(row.get("source_column")),
+        target_column=_optional_str(row.get("target_column")),
+        depth=int(row["depth"]),
+        direction=cast(Literal["upstream", "downstream"], str(row["direction"])),
+        edge_kind=str(row["edge_kind"]),
+        inferred=bool(row["inferred"]),
+        inference_status=str(row["inference_status"]),
+        confidence=float(row["confidence"]),
+        transformation=_optional_str(row.get("transformation")),
+        transformation_subtype=_optional_str(row.get("transformation_subtype")),
+    )
+
+
+def _lineage_node(node_id: str, depth: int, kind: str) -> LineageSubgraphNode:
+    table, column = _lineage_node_parts(node_id, kind)
+    return LineageSubgraphNode(
+        id=node_id,
+        label=column or table,
+        kind=cast(Literal["table", "column"], kind),
+        table=table,
+        column=column,
+        depth=depth,
+    )
+
+
+def _lineage_node_parts(node_id: str, kind: str) -> tuple[str, str | None]:
+    if kind != "column":
+        return node_id, None
+    table, column = _lineage_split_column_focus(node_id)
+    return table, column
+
+
+def _lineage_path(row: dict[str, Any]) -> list[str]:
+    value = row.get("path")
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    if isinstance(value, tuple):
+        return [str(item) for item in value]
+    return []
 
 
 def _row_value(row: RowMapping, key: str, default: object) -> object:
