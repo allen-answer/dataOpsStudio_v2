@@ -94,14 +94,14 @@ _ENVIRONMENT_MAP: dict[str, str] = {
 # 2.0.0 骨架未建表的 1.x 源(设计稿 §5.4 含 2.1+ 目标表)。逐项列"跳过 + 原因"。
 _SKIPPED_SOURCES: tuple[tuple[str, str], ...] = (
     ("config/tasks.json → compare_tasks", "2.0.0 骨架未建 compare_tasks 表(2.2 Compare)"),
-    ("config/workflows.json → workflows", "2.0.0 骨架未建 workflows 表(2.5 Workflow)"),
+    ("config/workflows.json → workflows", "2.0.0 骨架未建 workflows 表(2.4 Workflow)"),
     (
         "config/workflow_templates.json → workflow_templates",
-        "2.0.0 骨架未建 workflow_templates 表(2.5 Workflow)",
+        "2.0.0 骨架未建 workflow_templates 表(2.4 Workflow)",
     ),
     (
         "config/scenarios/*.yml → scenario_templates",
-        "2.0.0 骨架未建 scenario_templates 表(2.3 Scenario)",
+        "2.0.0 骨架未建 scenario_templates 表(2.6 Scenario)",
     ),
     (
         "config/sql_templates.json → sql_templates",

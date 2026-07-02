@@ -24,7 +24,7 @@
 ## 2. 红线速记(R1–R10)
 
 > 完整定义 + CI 拦截方式 见 **`AGENT_CONTRACT_v2.md §4`**。改红线相关代码前必读全文。
-> **R7 是预留**(2.5.0 引入 Workflow 时生效);其余 R1–R6 / R8–R10 全部 CI 已生效。
+> **R7 于 2.4.0 Workflow 域生效**(R7 单测已在 CI 激活);R1–R6 / R8–R10 全部 CI 已生效。
 
 | ID | 一行速记 |
 |---|---|
@@ -34,7 +34,7 @@
 | R4 | PG 连接密码禁止写入 `secret_refs` 表(否则启动循环)|
 | R5 | 日志禁止出现敏感值;structlog 脱敏 processor 强制;禁 stdlib logging |
 | R6 | `ResultSet` 禁止持有 `DbCursor` |
-| R7 | Workflow 节点必须在 `ALLOWED_WORKFLOW_NODE_KINDS` 白名单内 **(预留;2.5.0 引入 Workflow 时生效;2.0.0 阶段无 workflow 代码不会触发)** |
+| R7 | Workflow 节点必须在 `ALLOWED_WORKFLOW_NODE_KINDS` 白名单内 **(2.4.0 Workflow 域生效;R7 单测已在 CI 激活)** |
 | R8 | 配置文件禁止明文 password / token / secret;gitleaks 全仓扫 |
 | R9 | CI 不跑 SQLite backend;2.0 只支持 PG |
 | R10 | 禁 f-string 拼 `uuid4().hex` / `str(uuid4())` |
