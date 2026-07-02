@@ -145,6 +145,7 @@ class PostgresqlAdapter(DatabaseAdapter):
             FROM information_schema.schemata
             WHERE schema_name NOT IN ('information_schema', 'pg_catalog')
               AND schema_name NOT LIKE 'pg_toast%'
+              AND schema_name NOT LIKE 'pg_temp%'
             ORDER BY schema_name
             """,
             None,
@@ -218,7 +219,7 @@ class PostgresqlAdapter(DatabaseAdapter):
             """
             SELECT
                 i.relname AS name,
-                a.attname AS column_name,
+                COALESCE(a.attname, '<expression>') AS column_name,
                 ix.indisunique AS is_unique,
                 ix.indisprimary AS is_primary,
                 ord.ordinality AS column_order
@@ -227,7 +228,7 @@ class PostgresqlAdapter(DatabaseAdapter):
             JOIN pg_index ix ON ix.indrelid = t.oid
             JOIN pg_class i ON i.oid = ix.indexrelid
             JOIN unnest(ix.indkey) WITH ORDINALITY AS ord(attnum, ordinality) ON true
-            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ord.attnum
+            LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ord.attnum
             WHERE n.nspname = %s AND t.relname = %s
             ORDER BY i.relname, ord.ordinality
             """,
@@ -354,11 +355,15 @@ class PostgresqlAdapter(DatabaseAdapter):
     def _apply_statement_timeout(self, conn: Any) -> None:
         if self._statement_timeout_seconds <= 0:
             return
+        # psycopg3 默认服务端绑定(extended protocol),SET 是 utility 语句
+        # 不接受绑定参数,"SET statement_timeout = %s" 会直接 SyntaxError;
+        # set_config() 是普通函数调用,可参数化(值为 text,单位毫秒)。
         cursor = None
         try:
             cursor = conn.cursor()
             cursor.execute(
-                "SET statement_timeout = %s", (int(self._statement_timeout_seconds * 1000),)
+                "SELECT set_config('statement_timeout', %s, false)",
+                (str(int(self._statement_timeout_seconds * 1000)),),
             )
         except Exception:
             return

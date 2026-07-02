@@ -23,6 +23,8 @@ _OID_TO_COLUMN_TYPE: dict[int, ColumnType] = {
     1184: ColumnType.DATETIME,
     1700: ColumnType.DECIMAL,
     2950: ColumnType.STRING,
+    114: ColumnType.JSON,
+    3802: ColumnType.JSON,
 }
 
 _NAME_TO_COLUMN_TYPE: dict[str, ColumnType] = {
@@ -55,8 +57,8 @@ _NAME_TO_COLUMN_TYPE: dict[str, ColumnType] = {
     "VARCHAR": ColumnType.STRING,
     "TEXT": ColumnType.STRING,
     "UUID": ColumnType.STRING,
-    "JSON": ColumnType.STRING,
-    "JSONB": ColumnType.STRING,
+    "JSON": ColumnType.JSON,
+    "JSONB": ColumnType.JSON,
 }
 
 
@@ -107,6 +109,8 @@ def _oid_driver_name(oid: int) -> str | None:
         1184: "TIMESTAMPTZ",
         1700: "NUMERIC",
         2950: "UUID",
+        114: "JSON",
+        3802: "JSONB",
     }
     return names.get(oid)
 

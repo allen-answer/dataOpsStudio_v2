@@ -28,9 +28,9 @@ def build_database_adapter(
 ) -> DatabaseAdapter:
     """db_type -> DatabaseAdapter dispatch.
 
-    Certified backends: MySQL + DM + DB2 Preview + PostgreSQL. Other datasource
-    types are explicit structured unsupported errors instead of best-effort driver
-    guesses.
+    Certified backends: MySQL + DM;Preview: DB2;New: PostgreSQL(待真实例
+    验证后升 Certified)。Other datasource types are explicit structured
+    unsupported errors instead of best-effort driver guesses.
     """
 
     if conn_info.db_type is DbType.MYSQL:

@@ -172,12 +172,44 @@ def test_unsupported_operations_raise_not_implemented() -> None:
     assert isinstance(excinfo.value, NotImplementedError)
 
 
+def test_statement_timeout_uses_parameterizable_set_config() -> None:
+    # psycopg3 服务端绑定拒绝 "SET ... = %s"(fake cursor 会直接 raise 模拟),
+    # 必须走可参数化的 set_config();断言精确 SQL 文本防 fake 漂移掩盖回归。
+    fake_pg = _FakePsycopg(rows=[(1,)])
+    adapter = _adapter(fake_pg, statement_timeout_seconds=45)
+
+    rows = list(adapter.execute_select("SELECT 1", {}))
+
+    assert rows == [Row(values=[1])]
+    timeout_cursor = fake_pg.connections[0].cursors[0]
+    assert timeout_cursor.executed_sql == "SELECT set_config('statement_timeout', %s, false)"
+    assert timeout_cursor.executed_params == ("45000",)
+
+
+def test_statement_timeout_zero_skips_set_config() -> None:
+    fake_pg = _FakePsycopg(rows=[(1,)])
+    adapter = _adapter(fake_pg, statement_timeout_seconds=0)
+
+    list(adapter.execute_select("SELECT 1", {}))
+
+    executed = [cursor.executed_sql for cursor in fake_pg.connections[0].cursors]
+    assert not any("set_config" in sql for sql in executed)
+
+
 def test_type_mapping_units() -> None:
     assert type_code_to_column_type(23) is ColumnType.INTEGER
     assert type_code_to_driver_name(23) == "INT4"
     assert type_code_to_column_type(1700) is ColumnType.DECIMAL
     assert type_code_to_column_type(1184) is ColumnType.DATETIME
     assert type_code_to_column_type(999999) is ColumnType.UNKNOWN
+    # PG 招牌类型 json/jsonb:OID 与名字两条路径都必须落 ColumnType.JSON
+    # (与 mysql_types 的 json → ColumnType.JSON 口径一致)
+    assert type_code_to_column_type(114) is ColumnType.JSON
+    assert type_code_to_column_type(3802) is ColumnType.JSON
+    assert type_code_to_driver_name(114) == "JSON"
+    assert type_code_to_driver_name(3802) == "JSONB"
+    assert data_type_string_to_column_type("json") is ColumnType.JSON
+    assert data_type_string_to_column_type("jsonb") is ColumnType.JSON
     assert data_type_string_to_column_type("character varying") is ColumnType.STRING
     assert data_type_string_to_column_type("timestamp with time zone") is ColumnType.DATETIME
     assert data_type_string_to_column_type("weirdtype") is ColumnType.UNKNOWN
@@ -313,6 +345,7 @@ class _FakeCursor:
     ) -> None:
         self.closed = False
         self.executed_sql = ""
+        self.executed_params: object = None
         self.description: tuple[tuple[Any, ...], ...] = description or (("n", 23),)
         self._configured_rows = rows
         self._configured_description = description
@@ -321,10 +354,16 @@ class _FakeCursor:
         self._offset = 0
 
     def execute(self, sql: str, params: object = None) -> None:
-        del params
         self.executed_sql = sql
+        self.executed_params = params
         normalized = " ".join(sql.lower().split())
-        if normalized.startswith("set statement_timeout"):
+        if normalized.startswith("set ") and params is not None:
+            # 模拟 psycopg3 服务端绑定:SET 是 utility 语句,不接受绑定参数
+            raise RuntimeError("psycopg3: cannot use bound parameters with SET")
+        if normalized.startswith("select set_config('statement_timeout'"):
+            self.description = (("set_config", 25),)
+            self._rows = [(str(params[0]) if isinstance(params, tuple) else "",)]
+        elif normalized.startswith("set statement_timeout"):
             self.description = (("ok",),)
             self._rows = []
         elif normalized.startswith("select version()"):
