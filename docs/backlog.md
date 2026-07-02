@@ -2,6 +2,56 @@
 
 > review 过程中 surfaced 的"暂不阻塞、但要记得"项。每一条标明**最迟修复版本**和**触发条件**;到该版本前必修的标 ★ 必修。
 
+## 来自 #91–#98 批量复核(2026-07-02,Fable 5;详细论证在各 PR 评论)
+
+### Compare 导出 follow-up(#96 评论 5 条)
+
+**位置**:`app/worker.py:_execute_compare_result_export` / `frontend/src/api/compare.ts`
+
+1. **每 sheet 无行数上限**:当前安全仅因 `spool_max_rows` 默认 1M < Excel 单 sheet
+   上限 1,048,576;运维调高即产出非法 xlsx。`RunLimits.export_max_rows` 至今无人消费,
+   修法 = cap 到 `min(export_max_rows, 1_048_575)`。
+2. 导出内容是 spool 原始 4 列 JSON blob(pk/source/target/cells)非解码业务列 ——
+   **需人确认是否有意的 v1 形态**;若否,follow-up 用 `decode_compare_result_row` 展开。
+3. token TTL(300s)从创建时刻起算,与导出 job 时长竞争;建议 job 完成时再签发。
+4. `downloadCompareExport` 与 metadata.ts `downloadExport` 逐行重复,可抽共享。
+5. 历史成功 run 后端支持导出但前端无入口。
+
+**触发条件**:2.2.x 顺手窗口。**优先级**:1 为中(配置一改就是坏文件),余为低。
+
+### Workflow 执行器 minor 五条(#92 评论)
+
+**位置**:`app/api/routes/core.py` / `app/domain/workflow_when.py` / `app/worker.py`
+
+1. 终态 run 调 cancel 端点无条件 UPDATE 终态行并返回 `cancelled:true`,应 409。
+2. when 糖替换(`&&`/`||`/`!`/null)作用于插值后整串,字符串字面量内容会被改写 ——
+   当下注入面为零(已核实),但变量集合一扩(如开放 `${nodes.*}`)就是雷;
+   修法 = 先糖替换后插值(占位符不含这些 token,顺序对调即安全)。
+3. workflow 子 job priority=run+1 会压制交互 sql_query(priority=0),大工作流爆发时
+   交互饿死;建议档位 run=-1 / 子 job=0。
+4. 重试口径三处配置可漂移(backend `job_default_max_retries` / worker config /
+   API 端点硬编码 0);API 端应与 worker 同源取配置。
+5. `PostgresLineageCatalog.persist_run` 与 core.py `_insert_lineage_edges` 行构造逻辑
+   逐行重复,应下沉纯函数到 `app/domain/lineage` 供两侧复用;
+   `_topological_nodes` 用 assert 防环(`python -O` 下被剥离),可改 raise。
+
+**触发条件**:2.4.0 Workflow 收口前(PR-4b 顺手窗口)。**优先级**:中。
+
+### PostgreSQL adapter Certified 前置项(#98 评论)
+
+**位置**:`app/dbclients/postgresql_adapter.py`
+
+1. 真实例验证清单:**statement_timeout 真触发**(psycopg3 set_config 路径,合并前
+   修过静默失效 bug,务必真验)、jsonb 列显示、information_schema 注入面。
+2. `server_side_cancel=False` 但 PG 原生支持 cancel(psycopg `cancel_safe()` /
+   `pg_cancel_backend`),Certified 前建议补 —— 修掉后取消不再只靠批次间安全点。
+3. DB2 执行白名单放开(前端 `SUPPORTED_EXECUTION_DB_TYPES` 加 `db2`)已从 #98 回退,
+   **需单独小 PR 人拍板**(GA 决策 DB2 维持 Preview)。
+
+**触发条件**:PG 数据源第一个真实用户 / Certified 验收排期。**优先级**:中。
+
+---
+
 ## 来自首次云服务器 dogfood(5f27cc5,§5 真链路跑通)
 
 ### **GA 前安全评审会被点** — `POST /api/datasources` 密码以明文进 request body
