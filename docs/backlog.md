@@ -57,14 +57,15 @@
 
 **位置**:`app/worker.py:build_database_adapter`(MySQL / DM 分发,其余 raise UnsupportedDbTypeError)
 
-**现状(2.1.0 W1 更新)**:worker 实现 **MySQL + DM adapter**;前端 warn 兜底已落地且升级为
-白名单 `{mysql, dm}`(PR #63,DM Certified 后解除其封锁)。PostgreSQL / Oracle / DB2
-数据源跑 SQL 仍直接 `UnsupportedDbTypeError`,前端对这三类显示"暂不支持"提示。
+**现状(2.1.0 W1 更新)**:worker 实现 **MySQL + DM + DB2 Preview + PostgreSQL adapter**;前端 warn 兜底已落地且升级为
+白名单 `{mysql, dm, postgresql}`(PR #63 建立,DM Certified 后解除其封锁)。Oracle
+数据源跑 SQL 仍直接 `UnsupportedDbTypeError`,前端对该类显示"暂不支持"提示;
+DB2 后端已具备执行能力但维持 Preview(GA 决策),前端白名单放开需单独 PR 人拍板。
 
-**修法**:后端补 PostgreSQL / Oracle / DB2 worker adapter,每补一个方言,前端白名单
+**修法**:后端补 Oracle worker adapter,每补一个方言,前端白名单
 `SUPPORTED_EXECUTION_DB_TYPES`(SqlWorkspaceView.vue)同步加一项。
 
-**触发条件**:多方言执行上线(Oracle 2.0.x / DB2 2.1.x)。**优先级**:中。
+**触发条件**:多方言执行上线(Oracle 2.0.x)。**优先级**:中。
 
 **GA 决策(2026-06-11,人拍板)**:Oracle adapter **滑出 GA,进 2.0.x 后续版本**
 (契约本就允许"Oracle 可滑 2.0.x");DB2 维持 Preview。

@@ -20,7 +20,8 @@
 | DB2 PR-B introspection(SYSCAT.* 元数据 + 类型映射) | Claude 子代理(Fable 5 复核) | #89 | 已合并 | [#91](https://github.com/allen-answer/dataOpsStudio_v2/pull/91) |
 | Workflow PR-5 migrate 实迁 workflows(禁止节点报错不静默丢弃) | Codex(Fable 5 复核) | #86 #87 | 已合并 | [#90](https://github.com/allen-answer/dataOpsStudio_v2/pull/90) |
 | Workflow PR-4 DAG 执行器 + run 端点(cron tick 归 PR-4b) | Claude 子代理(Fable 5 复核) | #88 | 已合并 | [#92](https://github.com/allen-answer/dataOpsStudio_v2/pull/92) |
-| Compare 结果导出端点 + 前端按钮 | Codex(Fable 5 复核) | docs/backlog.md 2.2.x debt | PR 待审 | [#96](https://github.com/allen-answer/dataOpsStudio_v2/pull/96) |
+| Compare 结果导出端点 + 前端按钮 | Codex(Fable 5 复核) | docs/backlog.md 2.2.x debt | 已合并 | [#96](https://github.com/allen-answer/dataOpsStudio_v2/pull/96) |
+| PostgreSQL worker adapter | Codex(Fable 5 复核) | docs/backlog.md T7 section 4 | PR 待审 | [#98](https://github.com/allen-answer/dataOpsStudio_v2/pull/98) |
 
 > **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
 > 安全项全闭环/落档)。**DM 已 Certified**:真实例验证 8/8 + 修复 3 个 adapter bug,
