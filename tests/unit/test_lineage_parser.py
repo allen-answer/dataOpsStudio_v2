@@ -8,6 +8,7 @@ from app.domain.lineage import (
     schema_from_metadata_cache_rows,
     split_plsql_statements,
 )
+from app.domain.lineage.parser import PARSE_ERRORS_SUMMARY_LIMIT
 
 
 def test_lineage_report_preserves_v1_envelope_fields() -> None:
@@ -110,6 +111,46 @@ def test_missing_schema_is_unsupported_parse_error() -> None:
     assert report.parse_errors[0]["error_type"] == "unsupported_schema"
     assert report.parse_errors[0]["unsupported"] is True
     assert "app.unknown_orders" in report.parse_errors[0]["message"]
+
+
+def test_report_summary_includes_parse_error_details() -> None:
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text="INSERT INTO app.target_orders SELECT id FROM app.unknown_orders",
+            dialect="mysql",
+            schema=_schema(),
+            default_schema="app",
+        )
+    )
+
+    assert report.report is not None
+    assert report.report["parse_error_count"] == 1
+    assert report.report["parse_errors"] == report.parse_errors
+    detail = report.report["parse_errors"][0]
+    assert detail["error_type"] == "unsupported_schema"
+    assert detail["statement_index"] == 0
+    assert detail["statement_type"] == "INSERT"
+    assert "app.unknown_orders" in detail["message"]
+
+
+def test_report_summary_truncates_parse_error_details() -> None:
+    statements = ";\n".join(
+        f"INSERT INTO app.target_orders SELECT id FROM app.unknown_{index}"
+        for index in range(PARSE_ERRORS_SUMMARY_LIMIT + 10)
+    )
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text=statements,
+            dialect="mysql",
+            schema=_schema(),
+            default_schema="app",
+        )
+    )
+
+    assert report.report is not None
+    assert report.report["parse_error_count"] == PARSE_ERRORS_SUMMARY_LIMIT + 10
+    assert len(report.report["parse_errors"]) == PARSE_ERRORS_SUMMARY_LIMIT
+    assert report.report["parse_errors"] == report.parse_errors[:PARSE_ERRORS_SUMMARY_LIMIT]
 
 
 def test_plsql_split_rescues_insert_select_body() -> None:

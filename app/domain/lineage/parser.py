@@ -26,6 +26,11 @@ from app.domain.lineage.plsql import split_plsql_statements
 
 LineageSchema = dict[str, dict[str, dict[str, str]]]
 
+# Bound the per-error detail list persisted in lineage_runs.parse_summary (JSONB).
+# parse_error_count stays the full count, so len(parse_errors) < parse_error_count
+# signals truncation without an extra field.
+PARSE_ERRORS_SUMMARY_LIMIT = 50
+
 
 class LineageParseRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -486,6 +491,7 @@ def _summary(report: LineageReport) -> dict[str, Any]:
         "table_edge_count": len(report.graph_edges),
         "column_mapping_count": len(report.insert_mappings),
         "parse_error_count": len(report.parse_errors),
+        "parse_errors": report.parse_errors[:PARSE_ERRORS_SUMMARY_LIMIT],
     }
 
 

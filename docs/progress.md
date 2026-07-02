@@ -11,7 +11,7 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| (暂无活动开发项) | — | — | — | — |
+| Lineage parse_errors 明细进 analyze parse_summary(UI 一等公民后端侧) | Claude 子代理(Fable 5 复核) | #78 #79 | PR 待审 | 本 PR |
 
 > **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
 > 安全项全闭环/落档)。**DM 已 Certified**:真实例验证 8/8 + 修复 3 个 adapter bug,
