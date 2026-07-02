@@ -437,6 +437,68 @@ def test_delete_datasource_returns_409_with_job_references() -> None:
     assert not any("DELETE FROM datasources" in statement for statement in engine.statements)
 
 
+def test_delete_datasource_ignores_terminal_test_connection_jobs() -> None:
+    engine = _FakeEngine(
+        [
+            _datasource_row(password_secret_ref="secret-old"),
+            {"id": "project-1"},
+            [],
+            [],
+        ]
+    )
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "DELETE",
+        "/api/datasources/ds-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 204
+    assert secret_store.deleted == ["secret-old"]
+    assert any("DELETE FROM datasources" in statement for statement in engine.statements)
+    reference_query = next(statement for statement in engine.statements if "FROM jobs" in statement)
+    assert "jobs.kind !=" in reference_query
+    assert "jobs.status NOT IN" in reference_query
+
+
+def test_delete_datasource_still_blocks_business_job_references() -> None:
+    engine = _FakeEngine(
+        [
+            _datasource_row(password_secret_ref="secret-old"),
+            {"id": "project-1"},
+            [
+                {
+                    "id": "job-query-success",
+                    "kind": "sql_query",
+                    "status": "success",
+                },
+            ],
+            [],
+        ]
+    )
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "DELETE",
+        "/api/datasources/ds-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": "datasource_in_use",
+        "message": "Datasource is referenced by existing jobs",
+        "references": [{"job_id": "job-query-success", "kind": "sql_query", "status": "success"}],
+    }
+    assert secret_store.deleted == []
+    assert not any("DELETE FROM datasources" in statement for statement in engine.statements)
+
+
 def test_metadata_endpoints_return_cached_contract_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter = _MetadataAdapter()
     adapter_kwargs: list[dict[str, object]] = []
