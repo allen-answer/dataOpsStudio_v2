@@ -11,10 +11,7 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| Lineage parse_errors 明细进 analyze parse_summary(UI 一等公民后端侧) | Claude 子代理(Fable 5 复核) | #78 #79 | 已合并 | [#81](https://github.com/allen-answer/dataOpsStudio_v2/pull/81) |
-| Lineage 解析覆盖扩展(CTAS/MERGE/UPDATE/CTE/UNION) | Claude 子代理(Fable 5 复核) | #81 | 已合并 | [#82](https://github.com/allen-answer/dataOpsStudio_v2/pull/82) |
-| Lineage AI 兜底解析 + inference 状态机 | Claude 子代理(Fable 5 复核) | #79 #81 | 已合并 | [#83](https://github.com/allen-answer/dataOpsStudio_v2/pull/83) |
-| 2.3.0 Lineage-PR3 前端(子图/影响/解析三 tab + 路由/导航/i18n) | Claude 子代理(Fable 5 复核) | #78 #79 后端已合并 | PR 待审 | 本 PR |
+| 2.3.0 Lineage 真机走查 + 生产部署(收口) | 待人排期 | #78–#83 全部已合并 | 未开工 | — |
 
 > **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
 > 安全项全闭环/落档)。**DM 已 Certified**:真实例验证 8/8 + 修复 3 个 adapter bug,
@@ -64,6 +61,21 @@
 
 ## 已完成归档
 
+> **2.3.0 Lineage 能力域主体(2026-07-02 全部合并;真机走查 + 生产部署待排期)**:
+> 后端地基(此前已合并):sqlglot 解析核心(Codex,[#78](https://github.com/allen-answer/dataOpsStudio_v2/pull/78))、
+> 边表持久化 + 子图/影响端点(ADR-0019/0020,[#79](https://github.com/allen-answer/dataOpsStudio_v2/pull/79))。
+> 本轮四连(**Claude 子代理开发 / Fable 5 逐文件复核 + 独立复跑验证**,后端未用 Codex):
+> parse_errors 明细进 parse_summary(前 50 条截断,[#81](https://github.com/allen-answer/dataOpsStudio_v2/pull/81));
+> 解析覆盖扩展 CTAS/MERGE/多表&相关子查询 UPDATE/CTE 穿透/UNION 分支合并
+> (parser_version bump v2 作废 v1 负缓存,[#82](https://github.com/allen-answer/dataOpsStudio_v2/pull/82));
+> AI 兜底解析(L2 默认关,字面量遮蔽出站,事务提交后执行不拖垮主路径)+ inferred 边
+> confirmed/rejected 状态机([#83](https://github.com/allen-answer/dataOpsStudio_v2/pull/83),
+> **5 个设计裁决项见 PR 描述**:触发形态/confidence 缺省/reason 落库/unconfirmed 边
+> impact 权重/切分函数收敛);前端子图 SVG 分层 + 影响分析 + SQL 解析三 tab
+> ([#80](https://github.com/allen-answer/dataOpsStudio_v2/pull/80),**真机走查未做**——
+> 用户拍板先跳过,收口时补)。踩坑:CI mypy 范围是 `mypy app tests`,比本地
+> check-redlines 宽,#82/#83 首轮 CI 各红一次(案例待入 playbook)。
+>
 > **2.2.0 Compare 能力域(2026-06-19 全部合并 + 已上生产)**:
 > PR1 跨库规范化哈希内核(Codex,[#70](https://github.com/allen-answer/dataOpsStudio_v2/pull/70)):
 > 规范化 SQL + 递归 hashdiff + 逐行 MD5/SUM,MySQL+DM 黄金一致性真机过(5 轮纠错:
