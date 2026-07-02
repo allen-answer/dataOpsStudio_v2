@@ -30,7 +30,7 @@
  * 结果/画像/归因端点用 run_id,本 client 同用 run_id。
  */
 import { apiClient } from './client'
-import type { Column } from './types'
+import type { Column, ExportFormat } from './types'
 
 // ── 4 桶 ────────────────────────────────────────────────────────────
 export type CompareBucket = 'only_source' | 'only_target' | 'diff' | 'same'
@@ -289,6 +289,14 @@ export interface CompareAiAttributionResponse {
   egress_level: number
 }
 
+export interface CompareExportCreateResponse {
+  job_id: string
+  download_token: string
+  expires_at: string
+  format: ExportFormat
+  filename: string
+}
+
 // ── endpoints ───────────────────────────────────────────────────────
 export function listCompareTasks(projectId?: string): Promise<CompareTaskResponse[]> {
   const qs = projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''
@@ -342,6 +350,28 @@ export function draftCompareTask(
 /** POST /compare/tasks/{id}/run —— 202 异步入队 COMPARE_RUN job,返回 job_id + run_id。 */
 export function runCompareTask(taskId: string): Promise<CompareRunCreateResponse> {
   return apiClient.post<CompareRunCreateResponse>(`/compare/tasks/${taskId}/run`)
+}
+
+export function createCompareExport(runId: string): Promise<CompareExportCreateResponse> {
+  return apiClient.post<CompareExportCreateResponse>(`/compare/runs/${runId}/export`, { format: 'excel' })
+}
+
+export async function downloadCompareExport(
+  token: string,
+  fallbackFilename: string,
+): Promise<void> {
+  const { blob, filename } = await apiClient.downloadBlob(`/exports/${encodeURIComponent(token)}`)
+  const url = URL.createObjectURL(blob)
+  try {
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = filename ?? fallbackFilename
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+  } finally {
+    URL.revokeObjectURL(url)
+  }
 }
 
 export function getCompareRunResults(

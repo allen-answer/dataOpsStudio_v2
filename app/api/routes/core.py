@@ -29,6 +29,7 @@ from app.api.schemas import (
     CompareAiAttributionResponse,
     CompareBucket,
     CompareDataRef,
+    CompareExportCreateRequest,
     CompareInferRequest,
     CompareInferResponse,
     CompareResultRow,
@@ -1903,6 +1904,79 @@ def get_compare_run_profile(run_id: str, request: Request) -> CompareRunProfileR
         progress=_compare_progress(run_row["progress"]),
         diff_profile=_compare_diff_profile(_row_value(run_row, "diff_profile", {})),
         sample_result=_compare_sample_result(_row_value(run_row, "sample_result", None)),
+    )
+
+
+@router.post("/compare/runs/{run_id}/export", response_model=ExportCreateResponse, status_code=202)
+def create_compare_run_export(
+    run_id: str,
+    body: CompareExportCreateRequest,
+    request: Request,
+) -> ExportCreateResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    run_row = _compare_run_for_current_user(request, run_id)
+    _require_compare_run_exportable(run_row)
+    bucket_spools = _compare_bucket_spools(run_row["bucket_spools"])
+    for result_set_id in bucket_spools.values():
+        if not services.result_store.spool_exists(result_set_id):
+            raise ApiError(404, "not_found", "Compare run result not found")
+    _enforce_export_rate_limit(services, user.id)
+
+    export_job_id = new_id()
+    filename = _compare_export_filename(str(run_row["run_id"]))
+    content_type = export_content_type(body.format)
+    download_token = token_urlsafe(32)
+    token_hash = _download_token_hash(download_token)
+    expires_at = datetime.now(UTC) + timedelta(seconds=services.download_url_ttl_seconds)
+    job = Job(
+        id=export_job_id,
+        kind=JobKind.RESULT_EXPORT,
+        status=JobStatus.PENDING,
+        owner_user_id=user.id,
+        project_id=str(run_row["project_id"]),
+        datasource_ids=[],
+        priority=0,
+        timeout_seconds=300,
+        resource_profile=ResourceProfile(),
+        audit_id=new_id(),
+        payload={
+            "compare_run_id": str(run_row["run_id"]),
+            "bucket_result_set_ids": bucket_spools,
+            "format": body.format,
+            "filename": filename,
+        },
+    )
+    services.job_backend.enqueue(job)
+    with services.engine.begin() as conn:
+        conn.execute(
+            insert(export_download_tokens).values(
+                token_hash=token_hash,
+                job_id=export_job_id,
+                owner_user_id=user.id,
+                format=body.format,
+                filename=filename,
+                content_type=content_type,
+                expires_at=expires_at,
+            )
+        )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=str(run_row["project_id"]),
+        action="compare_export",
+        resource_type="compare_run",
+        resource_id=str(run_row["run_id"]),
+        result="accepted",
+        detail={"export_job_id": export_job_id, "format": body.format},
+    )
+    return ExportCreateResponse(
+        job_id=export_job_id,
+        download_token=download_token,
+        expires_at=expires_at,
+        format=body.format,
+        filename=filename,
     )
 
 
@@ -3842,6 +3916,18 @@ def _compare_tasks_visible_to_user(user_id: str) -> Any:
     )
 
 
+def _compare_bucket_spools(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ApiError(404, "not_found", "Compare run result not found")
+    spools: dict[str, str] = {}
+    for bucket in COMPARE_BUCKETS:
+        result_set_id = value.get(bucket)
+        if not isinstance(result_set_id, str) or not result_set_id:
+            raise ApiError(404, "not_found", "Compare run result not found")
+        spools[bucket] = result_set_id
+    return spools
+
+
 def _compare_bucket_counts(value: object) -> dict[CompareBucket, int]:
     counts: dict[str, int] = empty_bucket_counts()
     if isinstance(value, dict):
@@ -4897,6 +4983,11 @@ def _require_exportable_source(row: RowMapping) -> None:
         raise ApiError(409, "job_not_successful", "Source job must complete before export")
 
 
+def _require_compare_run_exportable(row: RowMapping) -> None:
+    if JobStatus(str(row["status"])) is not JobStatus.SUCCESS:
+        raise ApiError(409, "compare_run_not_successful", "Compare run must complete before export")
+
+
 def _enforce_export_rate_limit(services: ApiServices, user_id: str) -> None:
     since = datetime.now(UTC) - timedelta(hours=1)
     with services.engine.connect() as conn:
@@ -4919,6 +5010,10 @@ def _export_filename(source_job_id: str, export_format: ExportFormat) -> str:
     if export_format not in _EXPORT_FORMATS:
         raise ApiError(400, "unsupported_export_format", "Unsupported export format")
     return f"{source_job_id}.{export_extension(export_format)}"
+
+
+def _compare_export_filename(run_id: str) -> str:
+    return f"{run_id}.xlsx"
 
 
 def _datasource_ids_from_row(row: RowMapping) -> list[str]:
