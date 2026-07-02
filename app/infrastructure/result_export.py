@@ -64,6 +64,25 @@ def write_result_export(
     return writer.bytes_written
 
 
+def write_xlsx_workbook(
+    *,
+    stream: BinaryIO,
+    sheets: Iterable[tuple[str, list[Column], Iterable[Row]]],
+    limit_bytes: int,
+) -> int:
+    if limit_bytes <= 0:
+        raise ValueError("limit_bytes must be positive")
+    normalized_sheets = []
+    for name, columns, rows in sheets:
+        normalized_columns, normalized_rows = _prepare_columns(columns, rows)
+        normalized_sheets.append((_safe_sheet_name(name), normalized_columns, normalized_rows))
+    if not normalized_sheets:
+        normalized_sheets.append(("Result", [Column(name="value")], []))
+    writer = _LimitedBinaryWriter(stream, limit_bytes)
+    _write_xlsx_sheets(writer, normalized_sheets)
+    return writer.bytes_written
+
+
 def sanitize_formula_text(value: str) -> str:
     if value.startswith(FORMULA_PREFIXES):
         return "'" + value
@@ -139,25 +158,95 @@ def _write_xlsx(
     columns: list[Column],
     rows: Iterable[Row],
 ) -> None:
+    _write_xlsx_sheets(writer, [("Result", columns, rows)])
+
+
+def _write_xlsx_sheets(
+    writer: _LimitedBinaryWriter,
+    sheets: list[tuple[str, list[Column], Iterable[Row]]],
+) -> None:
     with zipfile.ZipFile(cast(Any, writer), mode="w", compression=zipfile.ZIP_DEFLATED) as workbook:
-        workbook.writestr("[Content_Types].xml", _CONTENT_TYPES_XML)
+        workbook.writestr("[Content_Types].xml", _content_types_xml(len(sheets)))
         workbook.writestr("_rels/.rels", _RELS_XML)
-        workbook.writestr("xl/workbook.xml", _WORKBOOK_XML)
-        workbook.writestr("xl/_rels/workbook.xml.rels", _WORKBOOK_RELS_XML)
+        workbook.writestr("xl/workbook.xml", _workbook_xml([name for name, _, _ in sheets]))
+        workbook.writestr("xl/_rels/workbook.xml.rels", _workbook_rels_xml(len(sheets)))
         workbook.writestr("xl/styles.xml", _STYLES_XML)
-        with workbook.open("xl/worksheets/sheet1.xml", mode="w") as sheet:
-            sheet.write(
-                b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-                b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-                b"<sheetData>"
-            )
-            _write_xlsx_row(sheet, 1, [column.name for column in columns])
-            width = len(columns)
-            row_number = 2
-            for row in rows:
-                _write_xlsx_row(sheet, row_number, _padded_values(row, width))
-                row_number += 1
-            sheet.write(b"</sheetData></worksheet>")
+        for sheet_index, (_, columns, rows) in enumerate(sheets, start=1):
+            with workbook.open(f"xl/worksheets/sheet{sheet_index}.xml", mode="w") as sheet:
+                sheet.write(
+                    b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                    b"<sheetData>"
+                )
+                _write_xlsx_row(sheet, 1, [column.name for column in columns])
+                width = len(columns)
+                row_number = 2
+                for row in rows:
+                    _write_xlsx_row(sheet, row_number, _padded_values(row, width))
+                    row_number += 1
+                sheet.write(b"</sheetData></worksheet>")
+
+
+def _content_types_xml(sheet_count: int) -> str:
+    sheet_overrides = "".join(
+        f'<Override PartName="/xl/worksheets/sheet{index}.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        for index in range(1, sheet_count + 1)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" '
+        'ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        f"{sheet_overrides}"
+        '<Override PartName="/xl/styles.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        "</Types>"
+    )
+
+
+def _workbook_xml(sheet_names: list[str]) -> str:
+    sheets_xml = "".join(
+        f'<sheet name="{_xml_attr(name)}" sheetId="{index}" r:id="rId{index}"/>'
+        for index, name in enumerate(sheet_names, start=1)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f"<sheets>{sheets_xml}</sheets>"
+        "</workbook>"
+    )
+
+
+def _workbook_rels_xml(sheet_count: int) -> str:
+    sheet_rels = "".join(
+        f'<Relationship Id="rId{index}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        f'Target="worksheets/sheet{index}.xml"/>'
+        for index in range(1, sheet_count + 1)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f"{sheet_rels}"
+        f'<Relationship Id="rId{sheet_count + 1}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
+        'Target="styles.xml"/>'
+        "</Relationships>"
+    )
+
+
+def _safe_sheet_name(name: str) -> str:
+    cleaned = "".join("_" if char in "[]:*?/\\" else char for char in name.strip())
+    return (cleaned or "Sheet")[:31]
+
+
+def _xml_attr(value: str) -> str:
+    return escape(value, {'"': "&quot;", "'": "&apos;"})
 
 
 def _write_xlsx_row(sheet: IO[bytes], row_number: int, values: list[object]) -> None:

@@ -64,6 +64,7 @@ from app.infrastructure.result_export import (
     ExportFormat,
     ExportSizeLimitExceeded,
     write_result_export,
+    write_xlsx_workbook,
 )
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
 from app.infrastructure.secretstore.local_file import LocalFileSecretStore
@@ -480,6 +481,8 @@ class WorkerRunner:
 
     def _execute_result_export(self, job: Job) -> _ExecutionOutcome:
         payload = job.payload
+        if "compare_run_id" in payload:
+            return self._execute_compare_result_export(job)
         source_result_set_id = _required_payload_str(payload, "source_result_set_id")
         export_format = _payload_export_format(payload)
         filename = _required_payload_str(payload, "filename")
@@ -516,6 +519,51 @@ class WorkerRunner:
             result_ref=result_ref,
             loaded_rows=_manifest_int(manifest, "loaded_rows"),
         )
+
+    def _execute_compare_result_export(self, job: Job) -> _ExecutionOutcome:
+        payload = job.payload
+        run_id = _required_payload_str(payload, "compare_run_id")
+        export_format = _payload_export_format(payload)
+        if export_format != "excel":
+            raise ValueError("compare result export only supports excel")
+        filename = _required_payload_str(payload, "filename")
+        bucket_spools = _payload_export_bucket_result_set_ids(payload)
+        limit_bytes = self._config.export_limit_mb * 1024 * 1024
+        loaded_rows = 0
+        sheets: list[tuple[str, list[Column], Iterable[Row]]] = []
+        for bucket in COMPARE_BUCKETS:
+            result_set_id = bucket_spools[bucket]
+            manifest = self._result_store.get_spool_manifest(result_set_id)
+            loaded_rows += _manifest_int(manifest, "loaded_rows")
+            sheets.append(
+                (
+                    bucket,
+                    _columns_from_manifest(manifest),
+                    self._iter_spool_rows(job.id, result_set_id),
+                )
+            )
+        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as stream:
+            binary_stream = cast(BinaryIO, stream)
+            exported_bytes = write_xlsx_workbook(
+                stream=binary_stream,
+                sheets=sheets,
+                limit_bytes=limit_bytes,
+            )
+            binary_stream.seek(0)
+            result_ref = self._result_store.put_export_artifact(job.id, filename, binary_stream)
+        self._heartbeat(job.id)
+        result_ref = result_ref.model_copy(
+            update={
+                "metadata": {
+                    "format": export_format,
+                    "filename": filename,
+                    "bytes": exported_bytes,
+                    "compare_run_id": run_id,
+                    "bucket_result_set_ids": bucket_spools,
+                }
+            }
+        )
+        return _ExecutionOutcome(result_ref=result_ref, loaded_rows=loaded_rows)
 
     def _execute_compare_run(self, job: Job) -> _ExecutionOutcome:
         payload = job.payload
@@ -1648,11 +1696,22 @@ def _payload_bucket_result_set_ids(payload: dict[str, object]) -> dict[str, str]
     raw = payload.get("bucket_result_set_ids")
     if not isinstance(raw, dict):
         raise ValueError("compare_run payload requires bucket_result_set_ids")
+    return _required_bucket_result_set_ids(raw, "compare_run payload")
+
+
+def _payload_export_bucket_result_set_ids(payload: dict[str, object]) -> dict[str, str]:
+    raw = payload.get("bucket_result_set_ids")
+    if not isinstance(raw, dict):
+        raise ValueError("compare export payload requires bucket_result_set_ids")
+    return _required_bucket_result_set_ids(raw, "compare export payload")
+
+
+def _required_bucket_result_set_ids(raw: dict[object, object], label: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for bucket in COMPARE_BUCKETS:
         value = raw.get(bucket)
         if not isinstance(value, str) or not value:
-            raise ValueError(f"compare_run payload missing bucket result set id: {bucket}")
+            raise ValueError(f"{label} missing bucket result set id: {bucket}")
         out[bucket] = value
     return out
 

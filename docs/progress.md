@@ -18,6 +18,7 @@
 | Workflow PR-3 定义 API(CRUD + R7 门禁) | Claude 子代理(Fable 5 复核) | #87 | 已合并 | [#88](https://github.com/allen-answer/dataOpsStudio_v2/pull/88) |
 | DB2 PR-A adapter 核心(连接/流式/超时/探活/factory 分发) | Claude 子代理(Fable 5 复核) | 1.x 移植 | 已合并 | [#89](https://github.com/allen-answer/dataOpsStudio_v2/pull/89) |
 | Workflow PR-5 migrate 实迁 workflows(禁止节点报错不静默丢弃) | Codex(Fable 5 复核) | #86 #87 | PR 待审 | 本 PR |
+| Compare 结果导出端点 + 前端按钮 | Codex | docs/backlog.md 2.2.x debt | PR 待审 | [#96](https://github.com/allen-answer/dataOpsStudio_v2/pull/96) |
 
 > **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
 > 安全项全闭环/落档)。**DM 已 Certified**:真实例验证 8/8 + 修复 3 个 adapter bug,
@@ -47,7 +48,7 @@
 > 删除(`docs/backlog.md`,2.0.x patch)、Oracle adapter(2.0.x)、外部安全审计
 > 触发项(密码进 body 改造)、正式 license 签发(首个商业交付前)、worker DM 加密库
 > 部署文档(首个 DM 客户前)、DM 列头 driver_type 美化(`docs/backlog.md`,2.1.x)、
-> Compare 导出端点(前端 PR5 留口待后端补,见下)、**2.3.0 Scenario Lab 能力域**
+> **2.3.0 Scenario Lab 能力域**
 > (设计 v0.3.3:DSL + materialize + verify + run-all)。
 
 ---

@@ -464,6 +464,10 @@ class ExportCreateRequest(BaseModel):
     table_name: str = Field(default="exported_result", min_length=1, max_length=128)
 
 
+class CompareExportCreateRequest(BaseModel):
+    format: Literal["excel"] = "excel"
+
+
 class ExportCreateResponse(BaseModel):
     job_id: str
     download_token: str
