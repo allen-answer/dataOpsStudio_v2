@@ -952,11 +952,12 @@ def _relation_for_alias(
     scope: exp.Expression,
     alias: str,
 ) -> exp.Table | exp.Subquery | None:
-    relations = [
-        node
-        for node in scope.find_all(exp.Table, exp.Subquery)
-        if isinstance(node, exp.Table) or node.alias_or_name
-    ]
+    relations: list[exp.Table | exp.Subquery] = []
+    for candidate in scope.find_all(exp.Table, exp.Subquery):
+        if isinstance(candidate, exp.Table) or (
+            isinstance(candidate, exp.Subquery) and candidate.alias_or_name
+        ):
+            relations.append(candidate)
     if not alias:
         for node in relations:
             if isinstance(node, exp.Table):
@@ -975,7 +976,11 @@ def _relation_for_alias(
 def _projection_named(select_expr: exp.Select, name: str) -> exp.Expression | None:
     lowered = name.lower()
     for item in select_expr.expressions:
-        if item.alias_or_name and item.alias_or_name.lower() == lowered:
+        if (
+            isinstance(item, exp.Expression)
+            and item.alias_or_name
+            and item.alias_or_name.lower() == lowered
+        ):
             return item
     return None
 
