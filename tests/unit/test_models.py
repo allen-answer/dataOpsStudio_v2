@@ -33,6 +33,8 @@ from app.db.models import (
     sql_consoles,
     sql_templates,
     users,
+    workflow_templates,
+    workflows,
 )
 
 
@@ -80,7 +82,7 @@ def test_all_alembic_revision_ids_under_32_chars() -> None:
     assert not violations, f"revision ID 超 32 字符: {violations}"
 
 
-def test_metadata_has_22_tables() -> None:
+def test_metadata_has_24_tables() -> None:
     expected = {
         "ai_configs",
         "compare_tasks",
@@ -104,6 +106,8 @@ def test_metadata_has_22_tables() -> None:
         "lineage_column_edges",
         "lineage_edges",
         "lineage_runs",
+        "workflows",
+        "workflow_templates",
     }
     assert set(metadata.tables.keys()) == expected
 
@@ -241,6 +245,49 @@ def test_lineage_edge_store_schema_supports_adjacency_traversal() -> None:
     assert "ix_lineage_column_edges_source" in column_edge_indexes
     assert "ix_lineage_column_edges_target" in column_edge_indexes
     assert "ck_lineage_column_edges_transformation_is_supported" in column_constraints
+
+
+def test_workflow_tables_support_dag_persistence_and_schedule_scan() -> None:
+    """Workflow 2.4 PR-2:dag_jsonb 存 WorkflowSpec;schedule 冗余列供调度器扫表。"""
+    wf_cols = set(workflows.columns.keys())
+    tpl_cols = set(workflow_templates.columns.keys())
+    wf_indexes = {idx.name for idx in workflows.indexes}
+    wf_constraints = {c.name for c in workflows.constraints if c.name is not None}
+    tpl_constraints = {c.name for c in workflow_templates.constraints if c.name is not None}
+
+    assert wf_cols == {
+        "id",
+        "project_id",
+        "name",
+        "dag_jsonb",
+        "schedule_cron",
+        "schedule_enabled",
+        "enabled",
+        "created_by",
+        "created_at",
+        "updated_at",
+    }
+    assert tpl_cols == {
+        "id",
+        "name",
+        "description",
+        "dag_jsonb",
+        "created_by",
+        "created_at",
+        "updated_at",
+    }
+    # 调度器扫表用的冗余列(PR-4):cron 可空、开关非空
+    assert workflows.columns["schedule_cron"].nullable is True
+    assert workflows.columns["schedule_enabled"].nullable is False
+    assert workflows.columns["enabled"].nullable is False
+    assert workflows.columns["dag_jsonb"].nullable is False
+    assert workflow_templates.columns["dag_jsonb"].nullable is False
+    # R4:定义表不出现任何密码 / secret 列
+    forbidden = {"password", "secret", "token", "api_key"}
+    assert not {c for c in wf_cols | tpl_cols for f in forbidden if f in c}
+    assert "uq_workflows_project_name" in wf_constraints
+    assert "uq_workflow_templates_name" in tpl_constraints
+    assert "ix_workflows_project_updated" in wf_indexes
 
 
 def test_export_download_tokens_schema_is_one_time_and_ttl_indexed() -> None:
