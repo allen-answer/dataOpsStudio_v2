@@ -310,6 +310,21 @@ class LineageAnalyzeRequest(BaseModel):
     source_ref: str = Field(min_length=1, max_length=512)
     dialect: str | None = Field(default=None, min_length=1, max_length=32)
     default_schema: str | None = Field(default=None, min_length=1, max_length=128)
+    # AI 兜底解析(L2,默认关;设计稿 §2.4 第 7 条)。开关形态设计稿未定,
+    # 先按请求级可选字段实现(最小假设,见 PR 说明)。
+    ai_fallback: bool = False
+
+
+class LineageAiFallbackResult(BaseModel):
+    """analyze 响应中 AI 兜底执行情况(纯追加;executed=False 时 reason 说明原因)。"""
+
+    requested: bool
+    executed: bool
+    reason: str | None = None
+    inferred_table_edge_count: int = 0
+    inferred_column_edge_count: int = 0
+    provider: str | None = None
+    model: str | None = None
 
 
 class LineageAnalyzeResponse(BaseModel):
@@ -325,6 +340,7 @@ class LineageAnalyzeResponse(BaseModel):
     parse_summary: dict[str, Any] = Field(default_factory=dict)
     table_edge_count: int
     column_edge_count: int
+    ai_fallback: LineageAiFallbackResult | None = None
 
 
 class LineageSubgraphNode(BaseModel):
@@ -366,6 +382,20 @@ class LineageSubgraphResponse(BaseModel):
     depth_counts: dict[int, int] = Field(default_factory=dict)
     nodes: list[LineageSubgraphNode] = Field(default_factory=list)
     edges: list[LineageSubgraphEdge] = Field(default_factory=list)
+
+
+class LineageEdgeInferenceUpdateRequest(BaseModel):
+    """AI 推断边状态机转换请求(设计稿 §2.4 第 7 条:inferred → confirmed / rejected)。"""
+
+    inference_status: Literal["confirmed", "rejected"]
+
+
+class LineageEdgeInferenceResponse(BaseModel):
+    edge_id: str
+    edge_kind: Literal["table", "column"]
+    inference_status: str
+    inferred: bool
+    confidence: float
 
 
 class LineageImpactItem(BaseModel):

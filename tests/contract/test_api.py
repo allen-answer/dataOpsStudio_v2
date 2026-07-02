@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -12,6 +13,7 @@ from app.api.routes import core as core_routes
 from app.api.security import create_access_token
 from app.api.services import ApiServices
 from app.dbclients.protocol import AdapterConnectionError
+from app.domain.ai import AiResponse
 from app.domain.compare_result import encode_compare_result_row
 from app.domain.job import Job, JobKind
 from app.domain.license import LicenseMode
@@ -69,6 +71,7 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("POST", "/api/projects/{project_id}/lineage/analyze") in routes
     assert ("GET", "/api/projects/{project_id}/lineage/subgraph") in routes
     assert ("GET", "/api/projects/{project_id}/lineage/impact") in routes
+    assert ("PATCH", "/api/projects/{project_id}/lineage/edges/{edge_id}") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/schemas") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/tables") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/columns") in routes
@@ -1522,6 +1525,358 @@ def test_lineage_impact_contract_returns_downstream_paths() -> None:
         "depth": 1,
         "paths": [["app.src", "app.mid"]],
     }
+
+
+def _lineage_run_row(parse_error_count: int = 2) -> dict[str, object]:
+    return {
+        "id": "run-1",
+        "project_id": "project-1",
+        "datasource_id": "ds-1",
+        "dialect": "mysql",
+        "source_ref": "script.sql",
+        "sql_hash": "hash-1",
+        "parser_version": "sqlglot-w1-v1",
+        "status": "success",
+        "parse_summary": {
+            "table_edge_count": 0,
+            "column_mapping_count": 0,
+            "parse_error_count": parse_error_count,
+        },
+    }
+
+
+def _ai_config_row() -> dict[str, object]:
+    return {
+        "enabled": True,
+        "provider": "mock",
+        "model": "mock-model",
+        "base_url": None,
+        "api_key_secret_ref": None,
+        "max_auto_egress_level": 2,
+        "l4_requires_optin": True,
+        "enable_inference": True,
+    }
+
+
+def test_lineage_analyze_ai_fallback_writes_inferred_edges_via_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _datasource_row(),
+            [],  # empty metadata cache → unsupported_schema parse errors
+            None,  # no cached run
+            _lineage_run_row(),
+            0,
+            0,
+            _ai_config_row(),
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+    captured: dict[str, Any] = {}
+
+    class _Gateway:
+        def complete(self, prompt: str, context: Any, options: Any) -> Any:
+            captured["prompt"] = prompt
+            captured["context"] = context
+            captured["options"] = options
+            return AiResponse(
+                content=json.dumps(
+                    {
+                        "table_edges": [
+                            {
+                                "source_table": "app.src",
+                                "target_table": "app.tgt",
+                                "confidence": 0.62,
+                            }
+                        ],
+                        "column_edges": [
+                            {
+                                "source_table": "app.src",
+                                "source_column": "id",
+                                "target_table": "app.tgt",
+                                "target_column": "id",
+                                "confidence": 0.55,
+                            }
+                        ],
+                    }
+                ),
+                provider="mock",
+                model="mock-model",
+            )
+
+    monkeypatch.setattr(
+        core_routes,
+        "build_gateway_from_runtime_config",
+        lambda runtime, **kwargs: _Gateway(),
+    )
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/analyze",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "source_ref": "script.sql",
+            "sql_text": (
+                "INSERT INTO app.tgt (id, name) SELECT id, name FROM app.src "
+                "WHERE name = 'top-secret-value'"
+            ),
+            "ai_fallback": True,
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["ai_fallback"] == {
+        "requested": True,
+        "executed": True,
+        "reason": None,
+        "inferred_table_edge_count": 1,
+        "inferred_column_edge_count": 1,
+        "provider": "mock",
+        "model": "mock-model",
+    }
+    # R-AI:AI 只收脱敏片段(字面量不出境),L2 出站。
+    context = captured["context"]
+    assert len(context.items) == 1
+    assert context.items[0].egress_level == 2
+    assert context.items[0].redacted is True
+    assert "top-secret-value" not in context.items[0].content
+    assert "app.src" in context.items[0].content
+    assert captured["options"].purpose == "lineage_ai_fallback"
+    assert any("INSERT INTO lineage_edges" in statement for statement in engine.statements)
+    assert any("INSERT INTO lineage_column_edges" in statement for statement in engine.statements)
+    assert any("UPDATE lineage_runs" in statement for statement in engine.statements)
+    assert any(
+        audit["action"] == "lineage_ai_fallback" and audit["result"] == "success"
+        for audit in services.audits
+    )
+    assert "top-secret-value" not in str(services.audits)
+
+
+def test_lineage_analyze_ai_fallback_disabled_degrades_to_deterministic() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _datasource_row(),
+            [],
+            None,
+            _lineage_run_row(),
+            0,
+            0,
+            None,  # no ai_configs row → ai disabled
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/analyze",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "source_ref": "script.sql",
+            "sql_text": "INSERT INTO app.tgt (id) SELECT id FROM app.src",
+            "ai_fallback": True,
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["run_id"] == "run-1"
+    assert payload["ai_fallback"]["requested"] is True
+    assert payload["ai_fallback"]["executed"] is False
+    assert payload["ai_fallback"]["reason"] == "ai_disabled"
+    assert not any("INSERT INTO lineage_edges" in statement for statement in engine.statements)
+    assert any(
+        audit["action"] == "lineage_ai_fallback" and audit["result"] == "skipped"
+        for audit in services.audits
+    )
+
+
+def test_lineage_analyze_ai_fallback_invalid_ai_response_degrades() -> None:
+    # 真 DefaultAiGateway + MockProvider(回 "ok",不可解析为边 JSON)→ 优雅降级。
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _datasource_row(),
+            [],
+            None,
+            _lineage_run_row(),
+            0,
+            0,
+            _ai_config_row(),
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/analyze",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "source_ref": "script.sql",
+            "sql_text": "INSERT INTO app.tgt (id) SELECT id FROM app.src",
+            "ai_fallback": True,
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["ai_fallback"]["executed"] is False
+    assert payload["ai_fallback"]["reason"] == "invalid_ai_response"
+    assert payload["table_edge_count"] == 0
+    assert not any("INSERT INTO lineage_edges" in statement for statement in engine.statements)
+    assert not any("UPDATE lineage_runs" in statement for statement in engine.statements)
+
+
+def test_lineage_analyze_without_ai_fallback_keeps_response_shape() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _datasource_row(),
+            [],
+            None,
+            _lineage_run_row(),
+            0,
+            0,
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/analyze",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "source_ref": "script.sql",
+            "sql_text": "INSERT INTO app.tgt (id) SELECT id FROM app.src",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["ai_fallback"] is None
+    assert not any(audit["action"] == "lineage_ai_fallback" for audit in services.audits)
+
+
+def _inferred_edge_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "id": "edge-1",
+        "run_id": "run-1",
+        "project_id": "project-1",
+        "source_table": "app.src",
+        "target_table": "app.tgt",
+        "edge_kind": "table",
+        "inferred": True,
+        "inference_status": "inferred",
+        "confidence": 0.66,
+        "sql_hash": "hash-1",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_lineage_edge_inference_confirm_table_edge() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _inferred_edge_row()])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "PATCH",
+        "/api/projects/project-1/lineage/edges/edge-1",
+        headers=_auth_headers(),
+        json_body={"inference_status": "confirmed"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "edge_id": "edge-1",
+        "edge_kind": "table",
+        "inference_status": "confirmed",
+        "inferred": True,
+        "confidence": 0.66,
+    }
+    assert any(statement.startswith("UPDATE lineage_edges") for statement in engine.statements)
+    assert any(audit["action"] == "lineage_edge_inference" for audit in services.audits)
+
+
+def test_lineage_edge_inference_reject_column_edge() -> None:
+    column_row = _inferred_edge_row(
+        id="col-edge-1",
+        source_column="id",
+        target_column="id",
+        transformation="DIRECT",
+        transformation_subtype="DIRECT",
+    )
+    engine = _FakeEngine([{"id": "project-1"}, None, column_row])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).request(
+        "PATCH",
+        "/api/projects/project-1/lineage/edges/col-edge-1",
+        headers=_auth_headers(),
+        json_body={"inference_status": "rejected"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["edge_kind"] == "column"
+    assert payload["inference_status"] == "rejected"
+    assert any(
+        statement.startswith("UPDATE lineage_column_edges") for statement in engine.statements
+    )
+
+
+def test_lineage_edge_inference_rejects_non_inferred_transition() -> None:
+    engine = _FakeEngine(
+        [{"id": "project-1"}, _inferred_edge_row(inference_status="confirmed", inferred=False)]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).request(
+        "PATCH",
+        "/api/projects/project-1/lineage/edges/edge-1",
+        headers=_auth_headers(),
+        json_body={"inference_status": "rejected"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "invalid_inference_transition"
+    assert not any(statement.startswith("UPDATE lineage_edges") for statement in engine.statements)
+
+
+def test_lineage_edge_inference_rejects_invalid_status_value() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _inferred_edge_row()])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).request(
+        "PATCH",
+        "/api/projects/project-1/lineage/edges/edge-1",
+        headers=_auth_headers(),
+        json_body={"inference_status": "inferred"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_lineage_edge_inference_cross_project_edge_is_not_found() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _inferred_edge_row(project_id="project-other")])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).request(
+        "PATCH",
+        "/api/projects/project-1/lineage/edges/edge-1",
+        headers=_auth_headers(),
+        json_body={"inference_status": "confirmed"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "not_found"
+    assert not any(statement.startswith("UPDATE lineage_edges") for statement in engine.statements)
 
 
 def _auth_headers(user_id: str = "user-1") -> dict[str, str]:
