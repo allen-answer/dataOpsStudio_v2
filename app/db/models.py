@@ -296,6 +296,16 @@ jobs = Table(
     # owner / project 时间序常用查询
     Index("ix_jobs_owner_user_id", "owner_user_id", "created_at"),
     Index("ix_jobs_project_id", "project_id", "created_at"),
+    # workflow 子 job 幂等兜底:同一 run 内同一节点只允许一个子 job
+    # (stale worker 苏醒后的重复 enqueue 撞唯一索引被跳过,防节点双跑);
+    # 前导列同时充当 list_jobs_by_parent 的邻接索引
+    Index(
+        "uq_jobs_workflow_node_per_run",
+        "parent_workflow_run_id",
+        text("(payload->>'workflow_node_id')"),
+        unique=True,
+        postgresql_where=text("parent_workflow_run_id IS NOT NULL"),
+    ),
 )
 
 
