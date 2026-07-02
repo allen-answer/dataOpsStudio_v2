@@ -15,6 +15,7 @@ from app.dbclients.db2_adapter import Db2Adapter
 from app.dbclients.dm_adapter import DMAdapter
 from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.mysql_adapter import MySQLAdapter
+from app.dbclients.postgresql_adapter import PostgresqlAdapter
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.secret import HashedRef, RotationReport, SecretKind, SecretRef
 from app.infrastructure.secretstore.protocol import SecretStore
@@ -43,7 +44,17 @@ def test_dispatch_db2_builds_db2_adapter_not_unsupported() -> None:
     assert adapter.capabilities.compare_db_hash is False
 
 
-@pytest.mark.parametrize("db_type", [DbType.ORACLE, DbType.POSTGRESQL])
+def test_dispatch_postgresql_builds_postgresql_adapter_not_unsupported() -> None:
+    adapter = build_database_adapter(
+        _conn_info(DbType.POSTGRESQL),
+        cast(SecretStore, _SecretStore()),
+    )
+    assert isinstance(adapter, PostgresqlAdapter)
+    assert adapter.capabilities.execute_select is True
+    assert adapter.capabilities.list_schemas is True
+
+
+@pytest.mark.parametrize("db_type", [DbType.ORACLE])
 def test_dispatch_uncertified_db_types_still_unsupported(db_type: DbType) -> None:
     with pytest.raises(UnsupportedDbTypeError) as exc_info:
         build_database_adapter(_conn_info(db_type), cast(SecretStore, _SecretStore()))
@@ -64,10 +75,16 @@ def test_dispatch_passes_cancel_and_column_sink_through() -> None:
 
 
 def _conn_info(db_type: DbType) -> DatasourceConnInfo:
-    port = 3306 if db_type is DbType.MYSQL else 5236
+    ports = {
+        DbType.MYSQL: 3306,
+        DbType.DM: 5236,
+        DbType.DB2: 50000,
+        DbType.POSTGRESQL: 5432,
+        DbType.ORACLE: 1521,
+    }
     return DatasourceConnInfo(
         host="127.0.0.1",
-        port=port,
+        port=ports[db_type],
         username="dataops",
         database="app",
         password_ref=SecretRef(ref="secret-1", kind=SecretKind.DATASOURCE_PASSWORD),
