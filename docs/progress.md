@@ -81,7 +81,7 @@
 > impact 权重/切分函数收敛);前端子图 SVG 分层 + 影响分析 + SQL 解析三 tab
 > ([#80](https://github.com/allen-answer/dataOpsStudio_v2/pull/80),**真机走查未做**——
 > 用户拍板先跳过,收口时补)。踩坑:CI mypy 范围是 `mypy app tests`,比本地
-> check-redlines 宽,#82/#83 首轮 CI 各红一次(案例待入 playbook)。
+> check-redlines 宽,#82/#83 首轮 CI 各红一次(案例已入 `docs/agent-playbook.md §2`)。
 >
 > **2.2.0 Compare 能力域(2026-06-19 全部合并 + 已上生产)**:
 > PR1 跨库规范化哈希内核(Codex,[#70](https://github.com/allen-answer/dataOpsStudio_v2/pull/70)):
