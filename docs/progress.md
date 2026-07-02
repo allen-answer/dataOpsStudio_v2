@@ -14,6 +14,7 @@
 | 2.3.0 Lineage 真机走查 + 生产部署(收口) | 待人排期 | #78–#83 全部已合并 | 未开工 | — |
 | Workflow PR-0 ADR-0009 + 版本口径订正 | Claude 子代理(Fable 5 复核) | — | 已合并 | [#85](https://github.com/allen-answer/dataOpsStudio_v2/pull/85) |
 | Workflow PR-1 领域模型(WorkflowSpec/Node/Edge/RetryPolicy + R7 构造期校验) | Claude 子代理(Fable 5 复核) | ADR-0009 | PR 待审 | 本 PR |
+| Workflow PR-2 持久化(workflows/workflow_templates 表 + 0016 迁移) | Claude 子代理(Fable 5 复核) | #86 | PR 待审 | 本 PR |
 
 > **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
 > 安全项全闭环/落档)。**DM 已 Certified**:真实例验证 8/8 + 修复 3 个 adapter bug,
