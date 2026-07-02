@@ -53,21 +53,6 @@
 > 能支撑的全部范围**。下列 PRD 功能**全部卡在后端缺端点 / 缺字段**,不是前端漏做 ——
 > 前端侧已用 `★ 后补` 注释在对应位置标好,后端补齐即可直接接上(多数无需前端二次改)。
 
-### **DM 列头 driver_type 显示原始 Python 类名** — dm_adapter 美化
-
-**位置**:`app/dbclients/dm_adapter.py`(Column.driver_type 赋值处)
-
-**现状**:DM 查询结果列头的 driver_type 显示为 `<class 'dmPython.STRING'>` 原始 repr
-(2.1.0 W1 真机走查发现,PR #63 评论已记)。归一化 ColumnType(string/datetime)正确,
-仅 driver_type 原样透传了 dmPython 类型对象的 repr。
-
-**修法**:dm_adapter 侧把 dmPython 类型对象映射为干净名(STRING / TIMESTAMP / NUMBER …),
-对齐 MySQL adapter 的 driver_type 风格。
-
-**触发条件**:2.1.x 任意顺手窗口。**优先级**:低(纯显示,不影响功能)。
-
----
-
 ### **T7 §4 SQL 跑非 MySQL/DM 需要** — worker 仅支持 MySQL / DM
 
 **位置**:`app/worker.py:build_database_adapter`(MySQL / DM 分发,其余 raise UnsupportedDbTypeError)
