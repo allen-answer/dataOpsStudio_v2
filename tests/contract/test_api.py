@@ -77,6 +77,9 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("GET", "/api/projects/{project_id}/workflows/{workflow_id}") in routes
     assert ("PUT", "/api/projects/{project_id}/workflows/{workflow_id}") in routes
     assert ("DELETE", "/api/projects/{project_id}/workflows/{workflow_id}") in routes
+    assert ("POST", "/api/projects/{project_id}/workflows/{workflow_id}/runs") in routes
+    assert ("GET", "/api/projects/{project_id}/workflow-runs/{run_id}") in routes
+    assert ("POST", "/api/projects/{project_id}/workflow-runs/{run_id}:cancel") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/schemas") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/tables") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/columns") in routes
@@ -2251,6 +2254,187 @@ def test_workflow_delete_contract_removes_definition() -> None:
     assert any(audit["action"] == "workflow_delete" for audit in services.audits)
 
 
+def test_workflow_run_trigger_contract_enqueues_workflow_run_job() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row()])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows/wf-1/runs",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["workflow_id"] == "wf-1"
+    assert payload["run_id"] == payload["job_id"]  # WorkflowRun 本身就是 job(ADR-0009)
+    backend = services.job_backend
+    assert len(backend.enqueued) == 1
+    job = backend.enqueued[0]
+    assert job.kind is JobKind.WORKFLOW_RUN
+    assert job.id == payload["run_id"]
+    assert job.project_id == "project-1"
+    assert job.payload["workflow_id"] == "wf-1"
+    assert job.payload["trigger"] == "manual"
+    # spec 快照进 payload:执行期不回读 workflows 表
+    spec = job.payload["spec"]
+    assert isinstance(spec, dict)
+    assert spec["nodes"][0]["id"] == "n1"
+    # when 变量在触发时刻冻结进 payload:执行器与状态查询同源,决策不随时间漂移
+    frozen = job.payload["when_variables"]
+    assert isinstance(frozen, dict)
+    assert set(frozen) == {"today", "now", "year", "month", "day"}
+    assert all(isinstance(value, str) for value in frozen.values())
+    assert any(audit["action"] == "workflow_run_trigger" for audit in services.audits)
+
+
+def test_workflow_run_trigger_disabled_workflow_returns_409() -> None:
+    row = _workflow_row()
+    row["enabled"] = False
+    engine = _FakeEngine([{"id": "project-1"}, row])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows/wf-1/runs",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "workflow_disabled"
+    assert services.job_backend.enqueued == []
+
+
+def test_workflow_run_trigger_missing_workflow_returns_404() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, None])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows/wf-missing/runs",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "not_found"
+    assert services.job_backend.enqueued == []
+
+
+def test_workflow_run_status_contract_returns_run_and_node_states() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_run_job_row(status="running"),
+            [_workflow_child_job_row("n1", status="success")],
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflow-runs/run-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["run_id"] == "run-1"
+    assert payload["workflow_id"] == "wf-1"
+    assert payload["project_id"] == "project-1"
+    assert payload["status"] == "running"
+    assert len(payload["nodes"]) == 1
+    node = payload["nodes"][0]
+    assert node["node_id"] == "n1"
+    assert node["job_kind"] == "sql_query"
+    assert node["status"] == "success"
+    assert node["job_id"] == "child-1"
+    assert node["attempts"] == 0
+
+
+def test_workflow_run_status_not_found_returns_404() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, None])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflow-runs/run-missing",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "not_found"
+
+
+def test_workflow_run_cancel_contract_propagates_to_unfinished_children() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_run_job_row(status="running"),
+            [
+                _workflow_child_job_row("n1", status="running", job_id="child-1"),
+                _workflow_child_job_row("n2", status="success", job_id="child-2"),
+                _workflow_child_job_row("n3", status="pending", job_id="child-3"),
+            ],
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflow-runs/run-1:cancel",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"cancelled": True}
+    backend = services.job_backend
+    # run 软取消 + 未终态子 job 传播;已 success 的子 job 不动
+    assert backend.cancel_requested == ["run-1", "child-1", "child-3"]
+    assert backend.cancelled_pending == [("child-3", "workflow run cancelled")]
+    assert any(audit["action"] == "workflow_run_cancel" for audit in services.audits)
+
+
+def _workflow_run_job_row(*, status: str = "running") -> dict[str, object]:
+    return {
+        "id": "run-1",
+        "kind": "workflow_run",
+        "status": status,
+        "owner_user_id": "user-1",
+        "project_id": "project-1",
+        "payload": {
+            "workflow_id": "wf-1",
+            "workflow_name": "nightly-report",
+            "trigger": "manual",
+            "spec": _workflow_spec_payload(),
+        },
+        "error": None,
+        "retry_count": 0,
+        "created_at": _dt(1),
+        "started_at": _dt(2),
+        "finished_at": None,
+    }
+
+
+def _workflow_child_job_row(
+    node_id: str,
+    *,
+    status: str,
+    job_id: str = "child-1",
+) -> dict[str, object]:
+    return {
+        "id": job_id,
+        "kind": "sql_query",
+        "status": status,
+        "owner_user_id": "user-1",
+        "project_id": "project-1",
+        "payload": {"sql": "SELECT 1", "workflow_node_id": node_id},
+        "error": None,
+        "retry_count": 0,
+        "created_at": _dt(3),
+        "started_at": _dt(4),
+        "finished_at": _dt(5) if status in {"success", "failed", "cancelled"} else None,
+        "parent_workflow_run_id": "run-1",
+    }
+
+
 def _workflow_spec_payload(
     *,
     job_kind: str = "sql_query",
@@ -2537,9 +2721,17 @@ class _FakeResult:
 class _JobBackend:
     def __init__(self) -> None:
         self.enqueued: list[Job] = []
+        self.cancel_requested: list[str] = []
+        self.cancelled_pending: list[tuple[str, str]] = []
 
     def enqueue(self, job: Job) -> None:
         self.enqueued.append(job)
+
+    def request_cancel(self, job_id: str) -> None:
+        self.cancel_requested.append(job_id)
+
+    def cancel_pending_job(self, job_id: str, reason: str = "cancelled") -> None:
+        self.cancelled_pending.append((job_id, reason))
 
 
 class _ResultStore:

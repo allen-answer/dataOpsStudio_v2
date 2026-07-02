@@ -188,6 +188,90 @@ class PostgresJobBackend(JobBackend):
         job = self.get_job(job_id)
         return bool(job and job.cancel_requested)
 
+    # ── workflow_run 编排(2.4.0 PR-4;ADR-0009)────────────────────────────
+    # workflow_run job 以「推进器」方式运行:claim → 推进 DAG 一步 → 让位
+    # (requeue 回 pending),不阻塞占用 worker 槽位等子 job(单 worker 串行
+    # 模型下阻塞等待会死锁:占住唯一槽位的 run 永远等不到子 job 被消费)。
+
+    def list_jobs_by_parent(self, parent_workflow_run_id: str) -> list[Job]:
+        def op(conn: Connection) -> list[Job]:
+            rows = (
+                conn.execute(
+                    select(jobs)
+                    .where(jobs.c.parent_workflow_run_id == parent_workflow_run_id)
+                    .order_by(jobs.c.created_at.asc(), jobs.c.id.asc())
+                )
+                .mappings()
+                .all()
+            )
+            return [_job_from_row(row) for row in rows]
+
+        return self._read(op)
+
+    def requeue_workflow_run(self, job_id: str) -> None:
+        """workflow_run 推进一步后让位:running → pending(高频,不写事件)。"""
+        worker_id = self._require_worker_id("requeue_workflow_run")
+
+        def op(conn: Connection) -> None:
+            conn.execute(
+                update(jobs)
+                .where(jobs.c.id == job_id)
+                .where(jobs.c.worker_id == worker_id)
+                .where(jobs.c.status == JobStatus.RUNNING.value)
+                .values(
+                    status=JobStatus.PENDING.value,
+                    worker_id=None,
+                    started_at=None,
+                    last_heartbeat=None,
+                )
+            )
+
+        self._write(op)
+
+    def retry_workflow_node(self, job_id: str) -> None:
+        """节点子 job 失败后按 RetryPolicy 重排:failed/timeout → pending,retry_count+1。"""
+
+        def op(conn: Connection) -> None:
+            result = conn.execute(
+                update(jobs)
+                .where(jobs.c.id == job_id)
+                .where(jobs.c.status.in_([JobStatus.FAILED.value, JobStatus.TIMEOUT.value]))
+                .values(
+                    status=JobStatus.PENDING.value,
+                    worker_id=None,
+                    started_at=None,
+                    last_heartbeat=None,
+                    finished_at=None,
+                    error=None,
+                    error_code=None,
+                    retry_count=jobs.c.retry_count + 1,
+                )
+            )
+            if result.rowcount:
+                self._write_event(conn, job_id, "workflow_node_retry", None)
+
+        self._write(op)
+
+    def cancel_pending_job(self, job_id: str, reason: str = "cancelled") -> None:
+        """直接取消尚未被 claim 的 pending job(abort / run 取消传播用)。"""
+
+        def op(conn: Connection) -> None:
+            result = conn.execute(
+                update(jobs)
+                .where(jobs.c.id == job_id)
+                .where(jobs.c.status == JobStatus.PENDING.value)
+                .values(
+                    status=JobStatus.CANCELLED.value,
+                    cancel_requested=True,
+                    cancel_reason=reason,
+                    finished_at=text("now()"),
+                )
+            )
+            if result.rowcount:
+                self._write_event(conn, job_id, "cancelled", reason)
+
+        self._write(op)
+
     def get_job(self, job_id: str) -> Job | None:
         def op(conn: Connection) -> Job | None:
             row = conn.execute(select(jobs).where(jobs.c.id == job_id)).mappings().one_or_none()
@@ -206,18 +290,22 @@ class PostgresJobBackend(JobBackend):
         if limit <= 0:
             raise ValueError("limit must be positive")
 
-        if self._job_default_max_retries > 0:
-            requeued = self._requeue_stale_jobs(heartbeat_timeout_seconds, limit)
-            remaining_limit = max(limit - requeued, 0)
+        # workflow_run 推进器幂等可续(每步 claim → 计划 → 让位),worker 崩溃
+        # 后 requeue 即恢复编排;走默认 fail 路径会永久杀死在途 run 并留下
+        # 无人编排的孤儿子 job,因此无条件 requeue、不占重试预算。
+        resumed = self._requeue_stale_workflow_runs(heartbeat_timeout_seconds, limit)
+        remaining_limit = max(limit - resumed, 0)
+        if self._job_default_max_retries > 0 and remaining_limit > 0:
+            requeued = self._requeue_stale_jobs(heartbeat_timeout_seconds, remaining_limit)
+            remaining_limit = max(remaining_limit - requeued, 0)
         else:
             requeued = 0
-            remaining_limit = limit
         failed = (
             self._fail_stale_jobs(heartbeat_timeout_seconds, remaining_limit)
             if remaining_limit > 0
             else 0
         )
-        return ReapReport(requeued=requeued, failed=failed)
+        return ReapReport(requeued=resumed + requeued, failed=failed)
 
     def clear_all_jobs_for_tests(self) -> None:
         def op(conn: Connection) -> None:
@@ -226,6 +314,43 @@ class PostgresJobBackend(JobBackend):
 
         self._write(op)
 
+    def _requeue_stale_workflow_runs(self, heartbeat_timeout_seconds: int, limit: int) -> int:
+        """stale 的 workflow_run 无条件恢复(pending),不计 retry_count。"""
+        sql = text(
+            """
+            WITH stale AS (
+                SELECT id
+                FROM jobs
+                WHERE status = 'running'
+                  AND kind = 'workflow_run'
+                  AND last_heartbeat < now() - (:timeout_seconds * interval '1 second')
+                ORDER BY last_heartbeat ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT :limit
+            )
+            UPDATE jobs AS j
+            SET status = 'pending',
+                worker_id = NULL,
+                started_at = NULL,
+                last_heartbeat = NULL
+            FROM stale
+            WHERE j.id = stale.id
+            RETURNING j.id
+            """
+        )
+
+        def op(conn: Connection) -> int:
+            result = conn.execute(
+                sql,
+                {"timeout_seconds": heartbeat_timeout_seconds, "limit": limit},
+            )
+            job_ids = [str(row[0]) for row in result.fetchall()]
+            for job_id in job_ids:
+                self._write_event(conn, job_id, "workflow_run_resumed_after_stale_heartbeat", None)
+            return len(job_ids)
+
+        return self._write(op)
+
     def _requeue_stale_jobs(self, heartbeat_timeout_seconds: int, limit: int) -> int:
         sql = text(
             """
@@ -233,6 +358,7 @@ class PostgresJobBackend(JobBackend):
                 SELECT id
                 FROM jobs
                 WHERE status = 'running'
+                  AND kind <> 'workflow_run'
                   AND last_heartbeat < now() - (:timeout_seconds * interval '1 second')
                   AND retry_count < :max_retries
                 ORDER BY last_heartbeat ASC
@@ -275,6 +401,7 @@ class PostgresJobBackend(JobBackend):
                 SELECT id
                 FROM jobs
                 WHERE status = 'running'
+                  AND kind <> 'workflow_run'
                   AND last_heartbeat < now() - (:timeout_seconds * interval '1 second')
                 ORDER BY last_heartbeat ASC
                 FOR UPDATE SKIP LOCKED
