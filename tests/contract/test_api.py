@@ -72,6 +72,11 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("GET", "/api/projects/{project_id}/lineage/subgraph") in routes
     assert ("GET", "/api/projects/{project_id}/lineage/impact") in routes
     assert ("PATCH", "/api/projects/{project_id}/lineage/edges/{edge_id}") in routes
+    assert ("GET", "/api/projects/{project_id}/workflows") in routes
+    assert ("POST", "/api/projects/{project_id}/workflows") in routes
+    assert ("GET", "/api/projects/{project_id}/workflows/{workflow_id}") in routes
+    assert ("PUT", "/api/projects/{project_id}/workflows/{workflow_id}") in routes
+    assert ("DELETE", "/api/projects/{project_id}/workflows/{workflow_id}") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/schemas") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/tables") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/columns") in routes
@@ -1877,6 +1882,280 @@ def test_lineage_edge_inference_cross_project_edge_is_not_found() -> None:
     assert response.status_code == 404
     assert response.json()["error"] == "not_found"
     assert not any(statement.startswith("UPDATE lineage_edges") for statement in engine.statements)
+
+
+def test_workflow_create_contract_persists_spec_and_schedule_redundant_columns() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, None, _workflow_row()])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows",
+        headers=_auth_headers(),
+        json_body={
+            "name": "nightly-report",
+            "spec": _workflow_spec_payload(schedule={"cron": "0 2 * * *", "enabled": True}),
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["id"] == "wf-1"
+    assert payload["name"] == "nightly-report"
+    assert payload["enabled"] is True
+    assert payload["schedule_cron"] == "0 2 * * *"
+    assert payload["schedule_enabled"] is True
+    assert payload["spec"]["nodes"][0]["job_kind"] == "sql_query"
+    insert_statement = next(
+        statement
+        for statement in engine.statements
+        if statement.startswith("INSERT INTO workflows")
+    )
+    assert "dag_jsonb" in insert_statement
+    assert "schedule_cron" in insert_statement
+    assert "schedule_enabled" in insert_statement
+    assert any(audit["action"] == "workflow_create" for audit in services.audits)
+
+
+def test_workflow_create_rejects_forbidden_node_kind_before_any_db_write() -> None:
+    engine = _FakeEngine([])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows",
+        headers=_auth_headers(),
+        json_body={"name": "bad", "spec": _workflow_spec_payload(job_kind="shell")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "forbidden_node_kind"
+    assert engine.statements == []
+
+
+def test_workflow_create_rejects_unsupported_node_kind_distinct_from_forbidden() -> None:
+    engine = _FakeEngine([])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows",
+        headers=_auth_headers(),
+        json_body={"name": "bad", "spec": _workflow_spec_payload(job_kind="notify")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "unsupported_node_kind"
+    assert engine.statements == []
+
+
+def test_workflow_create_rejects_cyclic_dag() -> None:
+    engine = _FakeEngine([])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows",
+        headers=_auth_headers(),
+        json_body={
+            "name": "cyclic",
+            "spec": {
+                "nodes": [
+                    {"id": "a", "job_kind": "sql_query", "timeout_seconds": 60},
+                    {"id": "b", "job_kind": "sql_query", "timeout_seconds": 60},
+                ],
+                "edges": [
+                    {"source": "a", "target": "b"},
+                    {"source": "b", "target": "a"},
+                ],
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "cycle_detected"
+    assert engine.statements == []
+
+
+def test_workflow_create_conflicting_name_returns_409() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, {"id": "wf-existing"}])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows",
+        headers=_auth_headers(),
+        json_body={"name": "nightly-report", "spec": _workflow_spec_payload()},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "workflow_name_conflict"
+    assert not any(statement.startswith("INSERT INTO workflows") for statement in engine.statements)
+
+
+def test_workflow_create_without_project_access_returns_404() -> None:
+    engine = _FakeEngine([None])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-other/workflows",
+        headers=_auth_headers(),
+        json_body={"name": "nightly-report", "spec": _workflow_spec_payload()},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "not_found"
+    assert not any(statement.startswith("INSERT INTO workflows") for statement in engine.statements)
+
+
+def test_workflow_list_contract_scopes_to_project_and_paginates() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, [_workflow_row()]])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflows",
+        headers=_auth_headers(),
+        params={"limit": 10, "offset": 0},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["id"] for item in payload] == ["wf-1"]
+    assert payload[0]["node_count"] == 1
+    assert payload[0]["schedule_cron"] == "0 2 * * *"
+    assert "spec" not in payload[0]
+    statement = engine.statements[-1]
+    assert "workflows.project_id" in statement
+    assert "LIMIT" in statement
+    assert "OFFSET" in statement
+
+
+def test_workflow_detail_contract_returns_full_spec() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row()])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == "wf-1"
+    assert payload["spec"]["nodes"][0]["id"] == "n1"
+    assert payload["spec"]["schedule"] == {"cron": "0 2 * * *", "enabled": True}
+
+
+def test_workflow_detail_outside_project_returns_404() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, None])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflows/wf-missing",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "not_found"
+
+
+def test_workflow_update_contract_revalidates_spec_and_syncs_schedule_columns() -> None:
+    updated_row = _workflow_row()
+    updated_row["name"] = "renamed"
+    updated_row["dag_jsonb"] = _workflow_spec_payload()
+    updated_row["schedule_cron"] = None
+    updated_row["schedule_enabled"] = False
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row(), None, updated_row])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={"name": "renamed", "spec": _workflow_spec_payload()},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["name"] == "renamed"
+    assert payload["schedule_cron"] is None
+    assert payload["schedule_enabled"] is False
+    update_statement = next(
+        statement for statement in engine.statements if statement.startswith("UPDATE workflows")
+    )
+    assert "updated_at" in update_statement
+    assert "schedule_cron" in update_statement
+    assert any(audit["action"] == "workflow_update" for audit in services.audits)
+
+
+def test_workflow_update_rejects_forbidden_node_kind_before_any_db_write() -> None:
+    engine = _FakeEngine([])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={"name": "bad", "spec": _workflow_spec_payload(job_kind="shell")},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "forbidden_node_kind"
+    assert engine.statements == []
+
+
+def test_workflow_delete_contract_removes_definition() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row()])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "DELETE",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 204
+    assert any(statement.startswith("DELETE FROM workflows") for statement in engine.statements)
+    assert any(audit["action"] == "workflow_delete" for audit in services.audits)
+
+
+def _workflow_spec_payload(
+    *,
+    job_kind: str = "sql_query",
+    schedule: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "nodes": [{"id": "n1", "job_kind": job_kind, "timeout_seconds": 60}],
+        "edges": [],
+        "schedule": schedule,
+    }
+
+
+def _workflow_row() -> dict[str, object]:
+    return {
+        "id": "wf-1",
+        "project_id": "project-1",
+        "name": "nightly-report",
+        "dag_jsonb": {
+            "nodes": [
+                {
+                    "id": "n1",
+                    "job_kind": "sql_query",
+                    "payload": {},
+                    "retry_policy": None,
+                    "timeout_seconds": 60,
+                    "on_failure": "abort",
+                    "when": None,
+                }
+            ],
+            "edges": [],
+            "schedule": {"cron": "0 2 * * *", "enabled": True},
+        },
+        "schedule_cron": "0 2 * * *",
+        "schedule_enabled": True,
+        "enabled": True,
+        "created_by": "user-1",
+        "created_at": _dt(1),
+        "updated_at": _dt(2),
+    }
 
 
 def _auth_headers(user_id: str = "user-1") -> dict[str, str]:

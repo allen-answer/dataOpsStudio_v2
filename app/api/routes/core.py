@@ -13,6 +13,7 @@ import sqlglot
 import structlog
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import ValidationError
 from sqlalchemy import Table as SqlaTable
 from sqlalchemy import and_, delete, func, insert, or_, select, text, update
 from sqlalchemy.engine import Connection, RowMapping
@@ -90,6 +91,10 @@ from app.api.schemas import (
     SqlTemplateResponse,
     SqlTemplateUpdateRequest,
     TokenResponse,
+    WorkflowCreateRequest,
+    WorkflowListItem,
+    WorkflowResponse,
+    WorkflowUpdateRequest,
 )
 from app.api.security import create_access_token
 from app.api.services import ApiServices, new_id
@@ -111,6 +116,7 @@ from app.db.models import (
     sql_consoles,
     sql_templates,
     users,
+    workflows,
 )
 from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
@@ -146,6 +152,7 @@ from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
 from app.domain.schema import Column, Index, Table
 from app.domain.secret import HashedRef, SecretKind, SecretRef
+from app.domain.workflow import WorkflowSpec
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.result_export import export_content_type, export_extension
 from app.services.ai.default_gateway import (
@@ -175,6 +182,24 @@ _LINEAGE_FOCUS_QUERY = Query(min_length=1)
 _LINEAGE_DIRECTION_QUERY = Query(default="downstream")
 _LINEAGE_DEPTH_QUERY = Query(default=3, ge=1, le=5)
 _LINEAGE_INCLUDE_COLUMNS_QUERY = Query(default=False)
+
+# WorkflowSpec 构造期校验的 code 前缀约定(app/domain/workflow.py 的 ValueError);
+# 不在集合内的 pydantic 校验问题(缺字段 / 类型错)统一映射 invalid_workflow_spec。
+_WORKFLOW_SPEC_ERROR_CODES = frozenset(
+    {
+        "forbidden_node_kind",
+        "unsupported_node_kind",
+        "unsupported_on_failure",
+        "invalid_node_id",
+        "invalid_when",
+        "invalid_cron",
+        "duplicate_node_id",
+        "unknown_edge_node",
+        "self_loop",
+        "cycle_detected",
+    }
+)
+_PYDANTIC_VALUE_ERROR_PREFIX = "Value error, "
 
 _LINEAGE_TABLE_DOWNSTREAM_SQL = text(
     """
@@ -2233,6 +2258,283 @@ def update_lineage_edge_inference(
         inference_status=body.inference_status,
         inferred=bool(row["inferred"]),
         confidence=float(row["confidence"]),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Workflow 定义 CRUD(2.4.0 PR-3;run 触发 / 取消 / 调度端点属 PR-4)
+#   R7 门禁落地点 = _validated_workflow_spec:WorkflowSpec 构造期校验
+#   (forbidden_node_kind / unsupported_node_kind / 环检测等)映射为结构化 4xx,
+#   forbidden 与 unsupported 错误码必须可区分(ADR-0009)。
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@router.get("/projects/{project_id}/workflows", response_model=list[WorkflowListItem])
+def list_project_workflows(
+    project_id: str,
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list[WorkflowListItem]:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        rows = (
+            conn.execute(
+                select(workflows)
+                .where(workflows.c.project_id == project_id)
+                .order_by(workflows.c.updated_at.desc(), workflows.c.created_at.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            .mappings()
+            .all()
+        )
+    return [_workflow_list_item(row) for row in rows]
+
+
+@router.post(
+    "/projects/{project_id}/workflows",
+    response_model=WorkflowResponse,
+    status_code=201,
+)
+def create_project_workflow(
+    project_id: str,
+    body: WorkflowCreateRequest,
+    request: Request,
+) -> WorkflowResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    spec = _validated_workflow_spec(body.spec)
+    workflow_id = new_id()
+    now = datetime.now(UTC)
+    with services.engine.begin() as conn:
+        _require_project_access(conn, project_id, user.id)
+        _require_workflow_name_available(conn, project_id=project_id, name=body.name)
+        conn.execute(
+            insert(workflows).values(
+                id=workflow_id,
+                project_id=project_id,
+                name=body.name,
+                dag_jsonb=spec.model_dump(mode="json"),
+                schedule_cron=spec.schedule.cron if spec.schedule else None,
+                schedule_enabled=spec.schedule.enabled if spec.schedule else False,
+                enabled=True,
+                created_by=user.id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        row = (
+            conn.execute(select(workflows).where(workflows.c.id == workflow_id))
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise ApiError(404, "not_found", "Workflow not found")
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="workflow_create",
+        resource_type="workflow",
+        resource_id=workflow_id,
+        result="success",
+        detail={"node_count": len(spec.nodes)},
+    )
+    return _workflow_response(row)
+
+
+@router.get(
+    "/projects/{project_id}/workflows/{workflow_id}",
+    response_model=WorkflowResponse,
+)
+def get_project_workflow(
+    project_id: str,
+    workflow_id: str,
+    request: Request,
+) -> WorkflowResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        row = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+    return _workflow_response(row)
+
+
+@router.put(
+    "/projects/{project_id}/workflows/{workflow_id}",
+    response_model=WorkflowResponse,
+)
+def update_project_workflow(
+    project_id: str,
+    workflow_id: str,
+    body: WorkflowUpdateRequest,
+    request: Request,
+) -> WorkflowResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    spec = _validated_workflow_spec(body.spec)
+    with services.engine.begin() as conn:
+        _require_project_access(conn, project_id, user.id)
+        _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+        _require_workflow_name_available(
+            conn,
+            project_id=project_id,
+            name=body.name,
+            exclude_workflow_id=workflow_id,
+        )
+        conn.execute(
+            update(workflows)
+            .where(workflows.c.id == workflow_id)
+            .values(
+                name=body.name,
+                dag_jsonb=spec.model_dump(mode="json"),
+                schedule_cron=spec.schedule.cron if spec.schedule else None,
+                schedule_enabled=spec.schedule.enabled if spec.schedule else False,
+                updated_at=datetime.now(UTC),
+            )
+        )
+        updated = (
+            conn.execute(select(workflows).where(workflows.c.id == workflow_id))
+            .mappings()
+            .one_or_none()
+        )
+        if updated is None:
+            raise ApiError(404, "not_found", "Workflow not found")
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="workflow_update",
+        resource_type="workflow",
+        resource_id=workflow_id,
+        result="success",
+        detail={"node_count": len(spec.nodes)},
+    )
+    return _workflow_response(updated)
+
+
+@router.delete("/projects/{project_id}/workflows/{workflow_id}", status_code=204)
+def delete_project_workflow(
+    project_id: str,
+    workflow_id: str,
+    request: Request,
+) -> Response:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.begin() as conn:
+        _require_project_access(conn, project_id, user.id)
+        _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+        # workflow 目前无 run 引用(run 属 PR-4),直接删;引入 run 后再议引用检查
+        conn.execute(delete(workflows).where(workflows.c.id == workflow_id))
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="workflow_delete",
+        resource_type="workflow",
+        resource_id=workflow_id,
+        result="success",
+    )
+    return Response(status_code=204)
+
+
+def _validated_workflow_spec(payload: dict[str, Any]) -> WorkflowSpec:
+    """R7 门禁落地点:WorkflowSpec 构造期校验错误 → 结构化 4xx。
+
+    forbidden_node_kind(R7 红线,永不开放)与 unsupported_node_kind
+    (白名单内但首版未实现)必须可区分(ADR-0009 Consequences)。
+    """
+    try:
+        return WorkflowSpec.model_validate(payload)
+    except ValidationError as exc:
+        code, message = _workflow_spec_error(exc)
+        raise ApiError(400, code, message) from exc
+
+
+def _workflow_spec_error(exc: ValidationError) -> tuple[str, str]:
+    # 领域层 ValueError 约定 "code: 说明";pydantic 包装后位于 errors()[i]["msg"]
+    # 且带 "Value error, " 前缀。取第一条可识别 code(按节点声明顺序,确定性)。
+    for error in exc.errors():
+        message = str(error.get("msg", "")).removeprefix(_PYDANTIC_VALUE_ERROR_PREFIX)
+        code, sep, _ = message.partition(":")
+        if sep and code in _WORKFLOW_SPEC_ERROR_CODES:
+            return code, message
+    return "invalid_workflow_spec", "Workflow spec is invalid"
+
+
+def _require_workflow_name_available(
+    conn: Connection,
+    *,
+    project_id: str,
+    name: str,
+    exclude_workflow_id: str | None = None,
+) -> None:
+    query = (
+        select(workflows.c.id)
+        .where(workflows.c.project_id == project_id)
+        .where(workflows.c.name == name)
+    )
+    if exclude_workflow_id is not None:
+        query = query.where(workflows.c.id != exclude_workflow_id)
+    row = conn.execute(query).mappings().one_or_none()
+    if row is not None:
+        raise ApiError(409, "workflow_name_conflict", "Workflow name already exists in project")
+
+
+def _workflow_row_for_project(
+    conn: Connection,
+    *,
+    project_id: str,
+    workflow_id: str,
+) -> RowMapping:
+    row = (
+        conn.execute(
+            select(workflows)
+            .where(workflows.c.id == workflow_id)
+            .where(workflows.c.project_id == project_id)
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        raise ApiError(404, "not_found", "Workflow not found")
+    return row
+
+
+def _workflow_response(row: RowMapping) -> WorkflowResponse:
+    return WorkflowResponse(
+        id=str(row["id"]),
+        project_id=str(row["project_id"]),
+        name=str(row["name"]),
+        spec=WorkflowSpec.model_validate(row["dag_jsonb"]),
+        enabled=bool(row["enabled"]),
+        schedule_cron=_optional_str(row["schedule_cron"]),
+        schedule_enabled=bool(row["schedule_enabled"]),
+        created_by=_optional_str(row["created_by"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _workflow_list_item(row: RowMapping) -> WorkflowListItem:
+    dag = dict(row["dag_jsonb"] or {})
+    return WorkflowListItem(
+        id=str(row["id"]),
+        project_id=str(row["project_id"]),
+        name=str(row["name"]),
+        node_count=len(dag.get("nodes") or []),
+        enabled=bool(row["enabled"]),
+        schedule_cron=_optional_str(row["schedule_cron"]),
+        schedule_enabled=bool(row["schedule_enabled"]),
+        created_by=_optional_str(row["created_by"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 

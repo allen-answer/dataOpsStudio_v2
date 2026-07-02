@@ -13,6 +13,7 @@ from app.domain.compare_infer import (
 from app.domain.datasource import DbType, OperationPolicy
 from app.domain.job import JobErrorCode, JobStatus
 from app.domain.schema import Column
+from app.domain.workflow import WorkflowSpec
 
 
 class LoginRequest(BaseModel):
@@ -766,3 +767,45 @@ class AdminAiConfigTestResponse(BaseModel):
     model: str | None = None
     latency_ms: int
     error: str | None = None
+
+
+# ── Workflow(2.4.0 PR-3:定义 CRUD;run 触发 / 取消 / 调度属 PR-4)──────────
+
+
+class WorkflowCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    # WorkflowSpec 形状的原始 payload:路由层显式 model_validate,
+    # 以便把 R7 门禁等构造期校验错误映射为结构化错误码
+    # (直接类型化会走 FastAPI 默认 422 detail,丢失 forbidden/unsupported 区分)
+    spec: dict[str, Any]
+
+
+class WorkflowUpdateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    spec: dict[str, Any]
+
+
+class WorkflowResponse(BaseModel):
+    id: str
+    project_id: str
+    name: str
+    spec: WorkflowSpec
+    enabled: bool
+    schedule_cron: str | None = None
+    schedule_enabled: bool = False
+    created_by: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class WorkflowListItem(BaseModel):
+    id: str
+    project_id: str
+    name: str
+    node_count: int
+    enabled: bool
+    schedule_cron: str | None = None
+    schedule_enabled: bool = False
+    created_by: str | None = None
+    created_at: datetime
+    updated_at: datetime
