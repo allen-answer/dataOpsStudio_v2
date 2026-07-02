@@ -11,7 +11,9 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| 2.3.0 Lineage 真机走查 + 生产部署(收口) | 待人排期 | #78–#83 全部已合并 | 未开工 | — |
+| 生产部署 433f087(Lineage/Workflow/DB2/PG/导出/心跳全量上线) | Fable 5 | #78–#98 全部已合并 | 已完成(2026-07-02) | 本 PR 记录 |
+| 2.3.0 Lineage + 2.4.0 Workflow 真机走查(带登录深走) | 待人排期(需 admin 凭据) | 生产部署 433f087 | 未开工 | — |
+| Workflow PR-4b cron tick(定时触发) | 待出任务书 | #92 | 未开工 | — |
 | Workflow PR-0 ADR-0009 + 版本口径订正 | Claude 子代理(Fable 5 复核) | — | 已合并 | [#85](https://github.com/allen-answer/dataOpsStudio_v2/pull/85) |
 | Workflow PR-1 领域模型(WorkflowSpec/Node/Edge/RetryPolicy + R7 构造期校验) | Claude 子代理(Fable 5 复核) | ADR-0009 | 已合并 | [#86](https://github.com/allen-answer/dataOpsStudio_v2/pull/86) |
 | Workflow PR-2 持久化(workflows/workflow_templates 表 + 0016 迁移) | Claude 子代理(Fable 5 复核) | #86 | 已合并 | [#87](https://github.com/allen-answer/dataOpsStudio_v2/pull/87) |
@@ -22,8 +24,16 @@
 | Workflow PR-4 DAG 执行器 + run 端点(cron tick 归 PR-4b) | Claude 子代理(Fable 5 复核) | #88 | 已合并 | [#92](https://github.com/allen-answer/dataOpsStudio_v2/pull/92) |
 | Compare 结果导出端点 + 前端按钮 | Codex(Fable 5 复核) | docs/backlog.md 2.2.x debt | 已合并 | [#96](https://github.com/allen-answer/dataOpsStudio_v2/pull/96) |
 | PostgreSQL worker adapter | Codex(Fable 5 复核) | docs/backlog.md T7 section 4 | 已合并 | [#98](https://github.com/allen-answer/dataOpsStudio_v2/pull/98) |
-| Worker 独立心跳线程(F2) | Codex(Fable 5 复核) | docs/backlog.md F2 | PR 待审 | [#97](https://github.com/allen-answer/dataOpsStudio_v2/pull/97) |
+| Worker 独立心跳线程(F2) | Codex(Fable 5 复核) | docs/backlog.md F2 | 已合并 | [#97](https://github.com/allen-answer/dataOpsStudio_v2/pull/97) |
 
+> **★ 生产部署 433f087(2026-07-02,Fable 5 按 upgrade-in-place.md 执行)**:
+> d7218ef → 433f087(#78–#98 全量:2.3.0 Lineage、2.4.0 Workflow PR0–5、DB2 PR-A/B、
+> PostgreSQL adapter、Compare 导出、Worker 心跳线程)。迁移 0015/0016/0017 干净应用;
+> **`DATAOPS_WORKER_HEARTBEAT_TIMEOUT_SECONDS=90`** 进 launch 行(#97 心跳线程合并后
+> ADR-0018 的 600s trade-off 解除,launch 行已记入 `~/dataops-launcher.log` 同款位置)。
+> 冒烟:四进程绿 / SPA 登录页真渲染 console 零 error / auth 链路 401 结构化 /
+> Workflow+Lineage 新路由 401 非 404。**带登录深走查待人**(admin 凭据仅人持有)。
+>
 > **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
 > 安全项全闭环/落档)。**DM 已 Certified**:真实例验证 8/8 + 修复 3 个 adapter bug,
 > 见 `docs/acceptance-dm-certified.md`([#53](https://github.com/allen-answer/dataOpsStudio_v2/pull/53))。
