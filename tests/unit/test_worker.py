@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import re
+import threading
+import time
 import zipfile
 from collections.abc import Callable, Iterable
 from typing import Any, BinaryIO, Protocol
@@ -46,6 +48,51 @@ def test_worker_runs_sql_query_to_spool_and_completes() -> None:
     assert backend.completed == [("job-1", ResultRef(backend="local_fs", uri="spool/rs-1"))]
     assert backend.failed == []
     assert backend.cancelled == []
+
+
+def test_worker_heartbeats_while_waiting_for_first_sql_row() -> None:
+    job = _make_job(payload={"sql": "SELECT slow", "result_set_id": "rs-1"})
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingFirstRowAdapter(_FakeAdapter):
+        def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
+            del sql, params
+            self.execute_select_calls += 1
+            started.set()
+            if not release.wait(2.0):
+                raise TimeoutError("test did not release blocking adapter")
+            if self._column_sink is not None:
+                self._column_sink([Column(name="n", type=ColumnType.UNKNOWN)])
+            yield Row(values=[1])
+
+    adapter = _BlockingFirstRowAdapter([])
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1", heartbeat_interval_seconds=0.01),
+    )
+
+    worker_thread = threading.Thread(target=runner.run_once)
+    worker_thread.start()
+    try:
+        assert started.wait(1.0)
+        deadline = time.monotonic() + 1.0
+        while not backend.heartbeats and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert backend.heartbeats
+        assert result_store.rows_by_result_set == {}
+    finally:
+        release.set()
+        worker_thread.join(timeout=2.0)
+
+    assert not worker_thread.is_alive()
+    assert backend.completed == [("job-1", ResultRef(backend="local_fs", uri="spool/rs-1"))]
+    assert result_store.rows_by_result_set == {"rs-1": [Row(values=[1])]}
 
 
 def test_worker_persists_columns_to_spool_and_catalog() -> None:
