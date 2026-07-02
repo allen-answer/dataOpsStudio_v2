@@ -17,8 +17,9 @@
 | Workflow PR-2 持久化(workflows/workflow_templates 表 + 0016 迁移) | Claude 子代理(Fable 5 复核) | #86 | 已合并 | [#87](https://github.com/allen-answer/dataOpsStudio_v2/pull/87) |
 | Workflow PR-3 定义 API(CRUD + R7 门禁) | Claude 子代理(Fable 5 复核) | #87 | 已合并 | [#88](https://github.com/allen-answer/dataOpsStudio_v2/pull/88) |
 | DB2 PR-A adapter 核心(连接/流式/超时/探活/factory 分发) | Claude 子代理(Fable 5 复核) | 1.x 移植 | 已合并 | [#89](https://github.com/allen-answer/dataOpsStudio_v2/pull/89) |
-| Workflow PR-5 migrate 实迁 workflows(禁止节点报错不静默丢弃) | Codex(Fable 5 复核) | #86 #87 | PR 待审 | 本 PR |
-| Compare 结果导出端点 + 前端按钮 | Codex | docs/backlog.md 2.2.x debt | PR 待审 | [#96](https://github.com/allen-answer/dataOpsStudio_v2/pull/96) |
+| DB2 PR-B introspection(SYSCAT.* 元数据 + 类型映射) | Claude 子代理(Fable 5 复核) | #89 | 已合并 | [#91](https://github.com/allen-answer/dataOpsStudio_v2/pull/91) |
+| Workflow PR-5 migrate 实迁 workflows(禁止节点报错不静默丢弃) | Codex(Fable 5 复核) | #86 #87 | 已合并 | [#90](https://github.com/allen-answer/dataOpsStudio_v2/pull/90) |
+| Compare 结果导出端点 + 前端按钮 | Codex(Fable 5 复核) | docs/backlog.md 2.2.x debt | PR 待审 | [#96](https://github.com/allen-answer/dataOpsStudio_v2/pull/96) |
 
 > **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
 > 安全项全闭环/落档)。**DM 已 Certified**:真实例验证 8/8 + 修复 3 个 adapter bug,
@@ -81,7 +82,7 @@
 > impact 权重/切分函数收敛);前端子图 SVG 分层 + 影响分析 + SQL 解析三 tab
 > ([#80](https://github.com/allen-answer/dataOpsStudio_v2/pull/80),**真机走查未做**——
 > 用户拍板先跳过,收口时补)。踩坑:CI mypy 范围是 `mypy app tests`,比本地
-> check-redlines 宽,#82/#83 首轮 CI 各红一次(案例待入 playbook)。
+> check-redlines 宽,#82/#83 首轮 CI 各红一次(案例已入 `docs/agent-playbook.md §2`)。
 >
 > **2.2.0 Compare 能力域(2026-06-19 全部合并 + 已上生产)**:
 > PR1 跨库规范化哈希内核(Codex,[#70](https://github.com/allen-answer/dataOpsStudio_v2/pull/70)):

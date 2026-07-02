@@ -4814,7 +4814,22 @@ def _datasource_job_references(
     rows = (
         conn.execute(
             select(jobs.c.id, jobs.c.kind, jobs.c.status)
-            .where(jobs.c.datasource_ids.any(datasource_id))
+            .where(
+                and_(
+                    jobs.c.datasource_ids.any(datasource_id),
+                    or_(
+                        jobs.c.kind != JobKind.TEST_CONNECTION.value,
+                        jobs.c.status.notin_(
+                            [
+                                JobStatus.SUCCESS.value,
+                                JobStatus.FAILED.value,
+                                JobStatus.CANCELLED.value,
+                                JobStatus.TIMEOUT.value,
+                            ]
+                        ),
+                    ),
+                )
+            )
             .order_by(jobs.c.created_at.desc(), jobs.c.id.desc())
             .limit(20)
         )
