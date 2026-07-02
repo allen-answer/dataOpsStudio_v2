@@ -1,0 +1,162 @@
+/**
+ * 2.3.0 Lineage —— 血缘 API client。
+ *
+ * ★ 字段形状全部锚自后端契约,不臆造:
+ *  - app/api/schemas.py:
+ *    LineageDirection / LineageAnalyzeRequest / LineageAnalyzeResponse /
+ *    LineageSubgraphNode / LineageSubgraphEdge / LineageSubgraphResponse /
+ *    LineageImpactItem / LineageImpactResponse
+ *  - app/api/routes/core.py:
+ *    POST /projects/{pid}/lineage/analyze?refresh=   -> LineageAnalyzeResponse (201)
+ *      refresh=true 时删除同 sql_hash 缓存并强制重解析(默认 false 命中缓存直接返回 cached=true)
+ *      解析失败 400 lineage_parse_failed;datasource 不在项目内 404 not_found
+ *    GET /projects/{pid}/lineage/subgraph?focus=&direction=&max_depth=&include_columns=
+ *      direction 默认 downstream;max_depth 默认 3(ge=1 le=5,后端再 min(,5))
+ *      focus 未知不 404 —— 返回只含焦点节点的空图(edge_count=0)
+ *    GET /projects/{pid}/lineage/impact?focus=&max_depth=  (纯下游遍历,按 depth 分组)
+ * 契约测试权威来源:tests/contract/test_api.py(搜 test_lineage_*)。
+ */
+import { apiClient } from './client'
+
+export type LineageDirection = 'upstream' | 'downstream' | 'both'
+
+export interface LineageAnalyzeRequest {
+  datasource_id: string
+  sql_text: string
+  source_ref: string
+  dialect?: string | null
+  default_schema?: string | null
+}
+
+/**
+ * parse_summary 后端是开放 JSON(dict[str, Any],来自 LineageReport.report 摘要 +
+ * parser_version)。已知键锚 app/domain/lineage/parser.py _summary();未知键宽容降级。
+ */
+export interface LineageParseSummary {
+  statement_count?: number
+  table_edge_count?: number
+  column_mapping_count?: number
+  parse_error_count?: number
+  parser_version?: string
+  [key: string]: unknown
+}
+
+export interface LineageAnalyzeResponse {
+  run_id: string
+  project_id: string
+  datasource_id: string
+  dialect: string
+  source_ref: string
+  sql_hash: string
+  parser_version: string
+  status: 'success' | 'failed'
+  cached: boolean
+  parse_summary: LineageParseSummary
+  table_edge_count: number
+  column_edge_count: number
+}
+
+export interface LineageSubgraphNode {
+  id: string
+  label: string
+  kind: 'table' | 'column'
+  table: string
+  column: string | null
+  depth: number
+}
+
+export interface LineageSubgraphEdge {
+  id: string
+  source: string
+  target: string
+  source_table: string
+  target_table: string
+  source_column: string | null
+  target_column: string | null
+  depth: number
+  direction: 'upstream' | 'downstream'
+  edge_kind: string
+  inferred: boolean
+  inference_status: string
+  confidence: number
+  transformation: string | null
+  transformation_subtype: string | null
+}
+
+export interface LineageSubgraphResponse {
+  project_id: string
+  focus: string
+  direction: LineageDirection
+  max_depth: number
+  include_columns: boolean
+  truncated: boolean
+  node_count: number
+  edge_count: number
+  /** Pydantic dict[int, int] —— JSON 序列化后键是字符串。 */
+  depth_counts: Record<string, number>
+  nodes: LineageSubgraphNode[]
+  edges: LineageSubgraphEdge[]
+}
+
+export interface LineageImpactItem {
+  node: string
+  table: string
+  column: string | null
+  depth: number
+  paths: string[][]
+}
+
+export interface LineageImpactResponse {
+  project_id: string
+  focus: string
+  max_depth: number
+  truncated: boolean
+  impact_count: number
+  impacts: LineageImpactItem[]
+}
+
+// ── endpoints ───────────────────────────────────────────────────────
+
+/** POST /projects/{pid}/lineage/analyze —— refresh=true 绕过 sql_hash 缓存强制重解析。 */
+export function analyzeLineage(
+  projectId: string,
+  req: LineageAnalyzeRequest,
+  refresh = false,
+): Promise<LineageAnalyzeResponse> {
+  const qs = refresh ? '?refresh=true' : ''
+  return apiClient.post<LineageAnalyzeResponse>(
+    `/projects/${projectId}/lineage/analyze${qs}`,
+    req,
+  )
+}
+
+export interface LineageSubgraphParams {
+  focus: string
+  direction?: LineageDirection
+  maxDepth?: number
+  includeColumns?: boolean
+}
+
+export function getLineageSubgraph(
+  projectId: string,
+  params: LineageSubgraphParams,
+): Promise<LineageSubgraphResponse> {
+  const qs = new URLSearchParams({ focus: params.focus })
+  if (params.direction) qs.set('direction', params.direction)
+  if (params.maxDepth != null) qs.set('max_depth', String(params.maxDepth))
+  if (params.includeColumns != null) qs.set('include_columns', String(params.includeColumns))
+  return apiClient.get<LineageSubgraphResponse>(
+    `/projects/${projectId}/lineage/subgraph?${qs.toString()}`,
+  )
+}
+
+export function getLineageImpact(
+  projectId: string,
+  focus: string,
+  maxDepth = 3,
+): Promise<LineageImpactResponse> {
+  const qs = new URLSearchParams({ focus, max_depth: String(maxDepth) })
+  return apiClient.get<LineageImpactResponse>(
+    `/projects/${projectId}/lineage/impact?${qs.toString()}`,
+  )
+}
