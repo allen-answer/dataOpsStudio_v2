@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 import re
 import threading
 import time
+import zipfile
 from collections.abc import Callable, Iterable
 from typing import Any, BinaryIO, Protocol
 
@@ -11,7 +13,11 @@ from sqlalchemy.exc import IntegrityError
 from app.dbclients.factory import UnsupportedDbTypeError
 from app.dbclients.protocol import AdapterConnectionError
 from app.domain.compare import CompareHashExecutionMode, CompareHashPlan
-from app.domain.compare_result import decode_compare_result_row
+from app.domain.compare_result import (
+    compare_result_columns,
+    decode_compare_result_row,
+    encode_compare_result_row,
+)
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.lineage import LineageReport, schema_from_metadata_cache_rows
@@ -470,6 +476,57 @@ def test_worker_runs_result_export_from_spool_and_completes() -> None:
     assert result_store.export_artifacts[("job-1", "result.csv")] == (
         b"formula,n\n'=SUM(A1:A2),7\n"
     )
+    assert backend.failed == []
+
+
+def test_worker_runs_compare_result_export_to_four_sheet_workbook() -> None:
+    bucket_spools = {
+        "only_source": "rs-only-source",
+        "only_target": "rs-only-target",
+        "diff": "rs-diff",
+        "same": "rs-same",
+    }
+    job = _make_job(
+        kind=JobKind.RESULT_EXPORT,
+        payload={
+            "compare_run_id": "run-1",
+            "bucket_result_set_ids": bucket_spools,
+            "format": "excel",
+            "filename": "run-1.xlsx",
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    for result_set_id in bucket_spools.values():
+        result_store.columns_by_result_set[result_set_id] = compare_result_columns()
+    result_store.rows_by_result_set["rs-only-source"] = [
+        encode_compare_result_row(
+            pk={"id": 1},
+            source={"id": 1, "name": "=cmd"},
+            target=None,
+            cells=[],
+        )
+    ]
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is True
+
+    artifact = result_store.export_artifacts[("job-1", "run-1.xlsx")]
+    with zipfile.ZipFile(io.BytesIO(artifact)) as workbook:
+        workbook_xml = workbook.read("xl/workbook.xml").decode("utf-8")
+        sheet1_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        sheet4_xml = workbook.read("xl/worksheets/sheet4.xml").decode("utf-8")
+    assert 'name="only_source"' in workbook_xml
+    assert 'name="same"' in workbook_xml
+    assert "=cmd" in sheet1_xml
+    assert "pk" in sheet4_xml
+    assert backend.completed[0][1].metadata["compare_run_id"] == "run-1"
     assert backend.failed == []
 
 

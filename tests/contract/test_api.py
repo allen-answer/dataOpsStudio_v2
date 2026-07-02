@@ -88,6 +88,7 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("GET", "/api/jobs/{job_id}") in routes
     assert ("GET", "/api/jobs/{job_id}/result") in routes
     assert ("POST", "/api/jobs/{job_id}/export") in routes
+    assert ("POST", "/api/compare/runs/{run_id}/export") in routes
     assert ("GET", "/api/exports/{token}") in routes
     assert ("POST", "/api/jobs/{job_id}/cancel") in routes
     assert ("GET", "/api/account/security") in routes
@@ -1199,6 +1200,77 @@ def test_compare_ai_attribution_disabled_degrades_without_profile_loss() -> None
     assert response.status_code == 200
     assert response.json()["error"] == "ai_disabled"
     assert response.json()["ok"] is False
+
+
+def test_create_compare_export_enqueues_four_bucket_export_and_token() -> None:
+    bucket_spools: dict[str, str] = {
+        "only_source": "rs-only-source",
+        "only_target": "rs-only-target",
+        "diff": "rs-diff",
+        "same": "rs-same",
+    }
+    run_row: dict[str, object] = {
+        "run_id": "run-1",
+        "job_id": "job-compare",
+        "project_id": "project-1",
+        "status": "success",
+        "bucket_spools": bucket_spools,
+        "bucket_counts": {"only_source": 1, "only_target": 0, "diff": 1, "same": 7},
+        "progress": {},
+        "diff_profile": {},
+        "sample_result": None,
+    }
+    engine = _FakeEngine([run_row, {"id": "project-1"}, 0])
+    job_backend = _JobBackend()
+    services = _Services(engine, job_backend=job_backend)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/compare/runs/run-1/export",
+        headers=_auth_headers(),
+        json_body={"format": "excel"},
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    assert payload["job_id"]
+    assert payload["download_token"]
+    assert payload["format"] == "excel"
+    assert payload["filename"] == "run-1.xlsx"
+    job = job_backend.enqueued[0]
+    assert job.kind is JobKind.RESULT_EXPORT
+    assert job.payload["compare_run_id"] == "run-1"
+    assert job.payload["bucket_result_set_ids"] == bucket_spools
+    assert job.payload["format"] == "excel"
+    assert job.payload["filename"] == "run-1.xlsx"
+    assert any(audit["action"] == "compare_export" for audit in services.audits)
+    assert "download_token" not in str(services.audits[-1])
+
+
+def test_create_compare_export_requires_successful_run() -> None:
+    run_row: dict[str, object] = {
+        "run_id": "run-1",
+        "job_id": "job-compare",
+        "project_id": "project-1",
+        "status": "running",
+        "bucket_spools": {},
+        "bucket_counts": {},
+        "progress": {},
+        "diff_profile": {},
+        "sample_result": None,
+    }
+    services = _Services(_FakeEngine([run_row, {"id": "project-1"}]))
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/compare/runs/run-1/export",
+        headers=_auth_headers(),
+        json_body={"format": "excel"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "compare_run_not_successful"
+    assert services.job_backend.enqueued == []
 
 
 def test_create_export_enqueues_result_export_job_and_returns_one_time_token() -> None:
