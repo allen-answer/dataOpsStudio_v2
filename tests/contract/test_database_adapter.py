@@ -4,7 +4,7 @@
 2.0.0 Certified adapter + DB2 Preview adapter,同一套 Protocol 签名全都过,并覆盖:
 - 标识符大小写差异(MySQL 反引号原样 vs DM/Oracle UPPER + 双引号)
 - server_side_cancel 多为 False 的优雅降级
-- capability=False 的能力(DB2 PR-A 的 introspection/compare)按声明降级:
+- capability=False 的能力(DB2 Preview 的 explain/DDL/compare)按声明降级:
   调用方先查 capabilities,直调必须抛 NotImplementedError(不静默返回空)
 """
 
@@ -308,10 +308,18 @@ class _FakeDb2Cursor:
         self._offset = 0
 
     def execute(self, sql: str, params: object = None) -> None:
-        # 契约测试只关心 Protocol 形态;DB2 行为细节(连接串/超时/错误反查)
-        # 见 tests/unit/test_db2_adapter.py
-        self.description = (("OK",),)
-        self._rows = [(1,)]
+        # 契约测试只关心 Protocol 形态;DB2 行为细节(连接串/超时/错误反查/
+        # SYSCAT SQL 断言)见 tests/unit/test_db2_adapter.py
+        normalized = " ".join(sql.lower().split())
+        if "syscat.schemata" in normalized:
+            self.description = (("NAME",),)
+            self._rows = [("APP",)]
+        elif "syscat.columns" in normalized:
+            self.description = (("NAME",), ("DATA_TYPE",), ("NULLABLE",), ("KEYSEQ",), ("COMMENT",))
+            self._rows = [("ID", "BIGINT", "N", 1, None), ("NAME", "VARCHAR", "Y", None, None)]
+        else:
+            self.description = (("OK",),)
+            self._rows = [(1,)]
         self._offset = 0
 
     def fetchone(self) -> tuple[Any, ...] | None:
