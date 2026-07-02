@@ -13,7 +13,8 @@
 |---|---|---|---|---|
 | Lineage parse_errors 明细进 analyze parse_summary(UI 一等公民后端侧) | Claude 子代理(Fable 5 复核) | #78 #79 | 已合并 | [#81](https://github.com/allen-answer/dataOpsStudio_v2/pull/81) |
 | Lineage 解析覆盖扩展(CTAS/MERGE/UPDATE/CTE/UNION) | Claude 子代理(Fable 5 复核) | #81 | 已合并 | [#82](https://github.com/allen-answer/dataOpsStudio_v2/pull/82) |
-| Lineage AI 兜底解析 + inference 状态机 | Claude 子代理(Fable 5 复核) | #79 #81 | PR 待审 | 本 PR |
+| Lineage AI 兜底解析 + inference 状态机 | Claude 子代理(Fable 5 复核) | #79 #81 | 已合并 | [#83](https://github.com/allen-answer/dataOpsStudio_v2/pull/83) |
+| 2.3.0 Lineage-PR3 前端(子图/影响/解析三 tab + 路由/导航/i18n) | Claude 子代理(Fable 5 复核) | #78 #79 后端已合并 | PR 待审 | 本 PR |
 
 > **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
 > 安全项全闭环/落档)。**DM 已 Certified**:真实例验证 8/8 + 修复 3 个 adapter bug,
