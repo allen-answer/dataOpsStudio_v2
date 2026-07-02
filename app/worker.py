@@ -11,13 +11,24 @@ from decimal import Decimal
 from hashlib import sha256
 from random import Random
 from typing import Any, BinaryIO, Protocol, cast
+from uuid import uuid4
 
 import structlog
-from sqlalchemy import URL, create_engine, insert, select, update
+from sqlalchemy import URL, and_, create_engine, insert, select, update
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 
 from app.config import Settings, load_settings
-from app.db.models import datasources, jobs, result_sets, run_index
+from app.db.models import (
+    datasources,
+    jobs,
+    lineage_column_edges,
+    lineage_edges,
+    lineage_runs,
+    metadata_caches,
+    result_sets,
+    run_index,
+)
 from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.protocol import AdapterConnectionError
 from app.domain.compare import (
@@ -54,10 +65,25 @@ from app.domain.compare_result import (
 )
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
+from app.domain.lineage import (
+    LINEAGE_PARSER_VERSION,
+    LineageParseRequest,
+    LineageReport,
+    analyze_sql_lineage,
+    lineage_sql_hash,
+    schema_from_metadata_cache_rows,
+)
 from app.domain.plan import PlanNode
+from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import SecretKind, SecretRef
+from app.domain.workflow import WorkflowNode, WorkflowSpec
+from app.domain.workflow_execution import (
+    WorkflowChildJob,
+    plan_workflow_step,
+)
+from app.domain.workflow_when import builtin_when_variables, when_variables_from_payload
 from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.result_export import (
@@ -93,6 +119,10 @@ class DatasourceConnectionTestError(RuntimeError):
         self.error_code = error_code
 
 
+class WorkflowRunFailedError(RuntimeError):
+    """WorkflowRun 终态失败(节点失败 / abort);message 为公开错误串。"""
+
+
 class BackendLike(Protocol):
     def claim_next(self, worker_id: str) -> Job | None: ...
 
@@ -112,6 +142,19 @@ class BackendLike(Protocol):
         *,
         limit: int = 100,
     ) -> object: ...
+
+    # workflow_run 编排(2.4.0 PR-4)
+    def enqueue(self, job: Job) -> None: ...
+
+    def request_cancel(self, job_id: str) -> None: ...
+
+    def list_jobs_by_parent(self, parent_workflow_run_id: str) -> list[Job]: ...
+
+    def requeue_workflow_run(self, job_id: str) -> None: ...
+
+    def retry_workflow_node(self, job_id: str) -> None: ...
+
+    def cancel_pending_job(self, job_id: str, reason: str = "cancelled") -> None: ...
 
 
 class ResultStoreLike(Protocol):
@@ -204,6 +247,38 @@ class JobErrorCodeWriterLike(Protocol):
     def set_error_code(self, job_id: str, error_code: JobErrorCode) -> None: ...
 
 
+class LineageCatalogLike(Protocol):
+    """lineage_analyze 子 job 的落库依赖(workflow 节点执行用,2.4.0 PR-4)。"""
+
+    def schema_context(
+        self,
+        datasource_id: str,
+        default_schema: str | None,
+    ) -> dict[str, Any]: ...
+
+    def cached_run_id(
+        self,
+        *,
+        project_id: str,
+        datasource_id: str,
+        dialect: str,
+        source_ref: str,
+        sql_hash: str,
+    ) -> str | None: ...
+
+    def persist_run(
+        self,
+        *,
+        run_id: str,
+        project_id: str,
+        datasource_id: str,
+        dialect: str,
+        source_ref: str,
+        sql_hash: str,
+        report: LineageReport,
+    ) -> None: ...
+
+
 DatasourceLoader = Callable[[str], DatasourceConnInfo]
 AdapterFactory = Callable[
     [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None]],
@@ -221,6 +296,11 @@ class WorkerRunnerConfig:
     cancel_check_row_interval: int = 5000
     result_gc_interval_seconds: float = 600.0
     export_limit_mb: int = 1024
+    # workflow_run 推进器:一步无进展时让位前的节流睡眠(避免 claim/requeue 热循环)
+    workflow_advance_interval_seconds: float = 1.0
+    # RetryPolicy=None 时继承的全局重试次数(与 PostgresJobBackend
+    # job_default_max_retries 同口径;当前部署默认 0 = 不重试)
+    workflow_node_default_max_retries: int = 0
 
 
 @dataclass(frozen=True)
@@ -240,6 +320,7 @@ class WorkerRunner:
         result_set_catalog: ResultSetCatalogLike | None = None,
         job_error_code_writer: JobErrorCodeWriterLike | None = None,
         compare_run_catalog: CompareRunCatalogLike | None = None,
+        lineage_catalog: LineageCatalogLike | None = None,
     ) -> None:
         if config.sql_spool_batch_size <= 0:
             raise ValueError("sql_spool_batch_size must be positive")
@@ -249,6 +330,10 @@ class WorkerRunner:
             raise ValueError("result_gc_interval_seconds must be positive")
         if config.export_limit_mb <= 0:
             raise ValueError("export_limit_mb must be positive")
+        if config.workflow_advance_interval_seconds <= 0:
+            raise ValueError("workflow_advance_interval_seconds must be positive")
+        if config.workflow_node_default_max_retries < 0:
+            raise ValueError("workflow_node_default_max_retries must be non-negative")
         self._backend = backend
         self._result_store = result_store
         self._datasource_loader = datasource_loader
@@ -257,6 +342,7 @@ class WorkerRunner:
         self._result_set_catalog = result_set_catalog
         self._job_error_code_writer = job_error_code_writer
         self._compare_run_catalog = compare_run_catalog
+        self._lineage_catalog = lineage_catalog
         self._stop_requested = False
         self._next_result_gc_at = 0.0
 
@@ -293,6 +379,7 @@ class WorkerRunner:
             kind=job.kind.value,
             worker_id=self._config.worker_id,
         )
+        outcome: _ExecutionOutcome | None
         try:
             self._check_cancel(job.id)
             if job.kind is JobKind.TEST_CONNECTION:
@@ -303,11 +390,20 @@ class WorkerRunner:
                 outcome = self._execute_sql_explain(job)
             elif job.kind is JobKind.RESULT_EXPORT:
                 outcome = self._execute_result_export(job)
+            elif job.kind is JobKind.EXPORT_EXCEL:
+                outcome = self._execute_export_excel(job)
             elif job.kind is JobKind.COMPARE_RUN:
                 outcome = self._execute_compare_run(job)
+            elif job.kind is JobKind.LINEAGE_ANALYZE:
+                outcome = self._execute_lineage_analyze(job)
+            elif job.kind is JobKind.WORKFLOW_RUN:
+                outcome = self._execute_workflow_run(job)
             else:
                 raise UnsupportedJobKindError(f"Unsupported job kind: {job.kind.value}")
         except JobCancelled as exc:
+            if job.kind is JobKind.WORKFLOW_RUN:
+                # run 取消传播:运行中子 job 软取消,pending 子 job 直接终态
+                self._cancel_workflow_children(job.id)
             self._backend.mark_cancelled(job.id, str(exc))
             self._write_result_set_terminal(job, "closed")
             self._write_compare_run_terminal(job, JobStatus.CANCELLED.value)
@@ -333,6 +429,15 @@ class WorkerRunner:
                 elapsed_seconds=_elapsed_seconds(started_at),
             )
         else:
+            if outcome is None:
+                # workflow_run 推进一步后让位(已 requeue 回 pending),
+                # 不是终态,不写 complete/fail。
+                logger.info(
+                    "worker workflow run yielded",
+                    job_id=job.id,
+                    elapsed_seconds=_elapsed_seconds(started_at),
+                )
+                return
             self._backend.complete(job.id, outcome.result_ref)
             logger.info(
                 "worker job complete",
@@ -701,6 +806,192 @@ class WorkerRunner:
             loaded_rows=sum(bucket_counts.values()),
         )
 
+    def _execute_export_excel(self, job: Job) -> _ExecutionOutcome:
+        """export_excel = result_export 固定 format=excel 的薄封装(workflow 节点用)。"""
+        payload = dict(job.payload)
+        payload["format"] = "excel"
+        return self._execute_result_export(job.model_copy(update={"payload": payload}))
+
+    def _execute_lineage_analyze(self, job: Job) -> _ExecutionOutcome:
+        """lineage_analyze 薄 handler:确定性解析 + 落 lineage_runs/edges。
+
+        复用 API 侧 analyze 的 service 逻辑(app/domain/lineage 纯解析 +
+        sql_hash 缓存语义);不含 AI 兜底(worker 侧只跑确定性主路径)。
+        """
+        if self._lineage_catalog is None:
+            raise UnsupportedJobKindError("lineage_analyze requires a lineage catalog")
+        payload = job.payload
+        datasource_id = _payload_datasource_id(job)
+        sql_text = _required_payload_str(payload, "sql_text")
+        source_ref = _payload_optional_str(payload, "source_ref") or "workflow"
+        default_schema = _payload_optional_str(payload, "default_schema")
+        dialect = _payload_optional_str(payload, "dialect")
+        if dialect is None:
+            dialect = self._datasource_loader(datasource_id).db_type.value
+        dialect = dialect.lower()
+        schema_context = self._lineage_catalog.schema_context(datasource_id, default_schema)
+        sql_hash = lineage_sql_hash(
+            sql_text=sql_text,
+            dialect=dialect,
+            schema_context=schema_context,
+            parser_version=LINEAGE_PARSER_VERSION,
+        )
+        cached_run_id = self._lineage_catalog.cached_run_id(
+            project_id=job.project_id,
+            datasource_id=datasource_id,
+            dialect=dialect,
+            source_ref=source_ref,
+            sql_hash=sql_hash,
+        )
+        if cached_run_id is not None:
+            return _ExecutionOutcome(
+                ResultRef(
+                    backend="lineage_run",
+                    uri=f"lineage/{cached_run_id}",
+                    metadata={"lineage_run_id": cached_run_id, "cached": True},
+                )
+            )
+        report = analyze_sql_lineage(
+            LineageParseRequest.model_validate(
+                {
+                    "sql_text": sql_text,
+                    "dialect": dialect,
+                    "schema": schema_context["schema"],
+                    "default_schema": default_schema,
+                }
+            )
+        )
+        run_id = str(uuid4())
+        self._lineage_catalog.persist_run(
+            run_id=run_id,
+            project_id=job.project_id,
+            datasource_id=datasource_id,
+            dialect=dialect,
+            source_ref=source_ref,
+            sql_hash=sql_hash,
+            report=report,
+        )
+        self._heartbeat(job.id)
+        return _ExecutionOutcome(
+            ResultRef(
+                backend="lineage_run",
+                uri=f"lineage/{run_id}",
+                metadata={
+                    "lineage_run_id": run_id,
+                    "cached": False,
+                    "table_edge_count": len(report.graph_edges),
+                    "column_edge_count": len(report.insert_mappings),
+                    "parse_error_count": len(report.parse_errors),
+                },
+            )
+        )
+
+    def _execute_workflow_run(self, job: Job) -> _ExecutionOutcome | None:
+        """workflow_run 推进器:claim → 推进 DAG 一步 → 让位(返回 None)。
+
+        ★ 架构关键(ADR-0009 + 单 worker 串行模型):worker 是单进程单槽位
+        串行循环,workflow_run 若阻塞轮询子 job 会占住唯一槽位形成死锁
+        (子 job 永远不被消费)。因此 run job 每次 claim 只推进一步:
+        enqueue 就绪节点(子 job 优先级 = run+1,保证先于 run 被 claim)、
+        重排到期重试、然后 requeue 自己回 pending 让出槽位;全节点终态时
+        才 complete/fail。多 worker 部署同样成立,无需拓扑前提。
+        """
+        spec = _workflow_spec_from_payload(job.payload)
+        children_jobs = self._backend.list_jobs_by_parent(job.id)
+        # run 取消:传播后走统一 JobCancelled 路径
+        self._check_cancel(job.id)
+        children = _workflow_children_snapshots(children_jobs)
+        now = datetime.now(UTC)
+        # when 变量优先用触发时冻结的快照(与 API 状态查询同源,决策不随
+        # 推进时刻漂移);在途旧 run 无快照时回退为按当前时刻计算
+        frozen_variables = when_variables_from_payload(job.payload)
+        plan = plan_workflow_step(
+            spec,
+            children,
+            now=now,
+            default_max_retries=self._config.workflow_node_default_max_retries,
+            when_variables=(
+                frozen_variables if frozen_variables is not None else builtin_when_variables(now)
+            ),
+        )
+        nodes_by_id = {node.id: node for node in spec.nodes}
+        for node_id in plan.enqueue_node_ids:
+            child_job = _build_workflow_child_job(job, nodes_by_id[node_id])
+            try:
+                self._backend.enqueue(child_job)
+            except IntegrityError:
+                # uq_jobs_workflow_node_per_run 兜底:stale worker 苏醒等竞态下
+                # 另一 worker 已 enqueue 同一节点,跳过防止节点双跑
+                logger.warning(
+                    "workflow node already enqueued by another worker, skipping",
+                    job_id=job.id,
+                    node_id=node_id,
+                )
+                continue
+            logger.info(
+                "workflow node enqueued",
+                job_id=job.id,
+                node_id=node_id,
+                child_job_id=child_job.id,
+                kind=child_job.kind.value,
+            )
+        for child_job_id in plan.retry_job_ids:
+            self._backend.retry_workflow_node(child_job_id)
+            logger.info(
+                "workflow node retry requeued",
+                job_id=job.id,
+                child_job_id=child_job_id,
+            )
+        for child_job_id in plan.cancel_job_ids:
+            self._backend.request_cancel(child_job_id)
+            self._backend.cancel_pending_job(child_job_id, "workflow aborted")
+
+        if plan.run_status is None:
+            made_progress = bool(plan.enqueue_node_ids or plan.retry_job_ids)
+            if not made_progress:
+                # 无进展(子 job 在跑 / 等 backoff):节流后让位,避免热循环
+                delay = self._config.workflow_advance_interval_seconds
+                if plan.wait_seconds is not None:
+                    delay = min(max(plan.wait_seconds, 0.05), delay)
+                time.sleep(delay)
+            self._heartbeat(job.id)
+            self._backend.requeue_workflow_run(job.id)
+            return None
+
+        summary = {
+            node_id: {
+                "status": state.status.value,
+                "job_id": state.job_id,
+                "attempts": state.attempts,
+                "error": state.error,
+            }
+            for node_id, state in plan.node_states.items()
+        }
+        if plan.run_status is JobStatus.FAILED:
+            logger.info(
+                "workflow run failed",
+                job_id=job.id,
+                error=plan.run_error,
+                nodes=summary,
+            )
+            raise WorkflowRunFailedError(plan.run_error or "workflow failed")
+        return _ExecutionOutcome(
+            ResultRef(
+                backend="workflow_run",
+                uri=f"workflow/{job.id}",
+                metadata={
+                    "workflow_id": _payload_optional_str(job.payload, "workflow_id"),
+                    "nodes": summary,
+                },
+            )
+        )
+
+    def _cancel_workflow_children(self, run_job_id: str) -> None:
+        for child in self._backend.list_jobs_by_parent(run_job_id):
+            if child.status in {JobStatus.PENDING, JobStatus.RUNNING}:
+                self._backend.request_cancel(child.id)
+                self._backend.cancel_pending_job(child.id, "workflow run cancelled")
+
     def _iter_spool_rows(self, job_id: str, result_set_id: str) -> Iterable[Row]:
         offset = 0
         last_heartbeat = time.monotonic()
@@ -1044,6 +1335,144 @@ class PostgresCompareRunCatalog:
             )
 
 
+class PostgresLineageCatalog:
+    """worker 侧 lineage_analyze 落库(与 API analyze 同表同缓存语义;无 AI 兜底)。"""
+
+    _METADATA_LEVEL_COLUMNS = "columns"
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def schema_context(
+        self,
+        datasource_id: str,
+        default_schema: str | None,
+    ) -> dict[str, Any]:
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    select(
+                        metadata_caches.c.cache_level,
+                        metadata_caches.c.schema_name,
+                        metadata_caches.c.table_name,
+                        metadata_caches.c.payload,
+                    ).where(
+                        and_(
+                            metadata_caches.c.datasource_id == datasource_id,
+                            metadata_caches.c.cache_level == self._METADATA_LEVEL_COLUMNS,
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        schema = schema_from_metadata_cache_rows([dict(row) for row in rows])
+        return {"default_schema": default_schema, "schema": schema}
+
+    def cached_run_id(
+        self,
+        *,
+        project_id: str,
+        datasource_id: str,
+        dialect: str,
+        source_ref: str,
+        sql_hash: str,
+    ) -> str | None:
+        with self._engine.connect() as conn:
+            row = (
+                conn.execute(
+                    select(lineage_runs.c.id).where(
+                        and_(
+                            lineage_runs.c.project_id == project_id,
+                            lineage_runs.c.datasource_id == datasource_id,
+                            lineage_runs.c.dialect == dialect,
+                            lineage_runs.c.source_ref == source_ref,
+                            lineage_runs.c.sql_hash == sql_hash,
+                            lineage_runs.c.parser_version == LINEAGE_PARSER_VERSION,
+                        )
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return str(row["id"]) if row is not None else None
+
+    def persist_run(
+        self,
+        *,
+        run_id: str,
+        project_id: str,
+        datasource_id: str,
+        dialect: str,
+        source_ref: str,
+        sql_hash: str,
+        report: LineageReport,
+    ) -> None:
+        now = datetime.now(UTC)
+        parse_summary = dict(report.report or {})
+        parse_summary["parser_version"] = LINEAGE_PARSER_VERSION
+        table_rows = [
+            {
+                "id": str(uuid4()),
+                "run_id": run_id,
+                "project_id": project_id,
+                "source_table": str(edge["source_table"]),
+                "target_table": str(edge["target_table"]),
+                "edge_kind": "table",
+                "inferred": False,
+                "inference_status": "confirmed",
+                "confidence": 1.0,
+                "sql_hash": sql_hash,
+            }
+            for edge in report.graph_edges
+            if edge.get("source_table") and edge.get("target_table")
+        ]
+        column_rows = [
+            {
+                "id": str(uuid4()),
+                "run_id": run_id,
+                "project_id": project_id,
+                "source_table": str(mapping["source_table"]),
+                "source_column": str(mapping["source_column"]),
+                "target_table": str(mapping["target_table"]),
+                "target_column": str(mapping["target_column"]),
+                "transformation": str(mapping.get("transformation") or "DIRECT"),
+                "transformation_subtype": str(mapping.get("transformation_subtype") or "DIRECT"),
+                "inferred": False,
+                "inference_status": "confirmed",
+                "confidence": 1.0,
+                "sql_hash": sql_hash,
+            }
+            for mapping in report.insert_mappings
+            if (
+                mapping.get("source_table")
+                and mapping.get("source_column")
+                and mapping.get("target_table")
+                and mapping.get("target_column")
+            )
+        ]
+        with self._engine.begin() as conn:
+            conn.execute(
+                insert(lineage_runs).values(
+                    id=run_id,
+                    project_id=project_id,
+                    datasource_id=datasource_id,
+                    dialect=dialect,
+                    source_ref=source_ref,
+                    sql_hash=sql_hash,
+                    parser_version=LINEAGE_PARSER_VERSION,
+                    status="success",
+                    parse_summary=parse_summary,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            if table_rows:
+                conn.execute(insert(lineage_edges), table_rows)
+            if column_rows:
+                conn.execute(insert(lineage_column_edges), column_rows)
+
+
 class PostgresJobErrorCodeWriter:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
@@ -1110,6 +1539,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
         PostgresResultSetCatalog(engine),
         PostgresJobErrorCodeWriter(engine),
         PostgresCompareRunCatalog(engine),
+        PostgresLineageCatalog(engine),
     )
 
 
@@ -1174,6 +1604,62 @@ def _payload_datasource_id(job: Job) -> str:
 def _payload_optional_str(payload: dict[str, object], key: str) -> str | None:
     value = payload.get(key)
     return value if isinstance(value, str) and value else None
+
+
+def _workflow_spec_from_payload(payload: dict[str, Any]) -> WorkflowSpec:
+    """载入 run payload 里的 spec 快照;model_validate 即 R7 执行期再校验。"""
+    raw_spec = payload.get("spec")
+    if not isinstance(raw_spec, dict):
+        raise ValueError("workflow_run payload requires spec object")
+    return WorkflowSpec.model_validate(raw_spec)
+
+
+def _workflow_children_snapshots(children: list[Job]) -> dict[str, WorkflowChildJob]:
+    """子 job → 节点快照;同一节点重试复用同一 job id,后写覆盖(按 created_at 序)。"""
+    snapshots: dict[str, WorkflowChildJob] = {}
+    for child in children:
+        node_id = child.payload.get("workflow_node_id")
+        if not isinstance(node_id, str) or not node_id:
+            continue
+        snapshots[node_id] = WorkflowChildJob(
+            node_id=node_id,
+            job_id=child.id,
+            status=child.status,
+            retry_count=child.retry_count,
+            finished_at=child.finished_at,
+            error=child.error,
+        )
+    return snapshots
+
+
+def _build_workflow_child_job(run_job: Job, node: WorkflowNode) -> Job:
+    payload: dict[str, Any] = dict(node.payload)
+    payload["workflow_node_id"] = node.id
+    return Job(
+        id=str(uuid4()),
+        kind=JobKind(node.job_kind),
+        status=JobStatus.PENDING,
+        owner_user_id=run_job.owner_user_id,
+        project_id=run_job.project_id,
+        datasource_ids=_node_datasource_ids(payload),
+        # 子 job 优先级高于 run job:单 worker 串行下保证子 job 先被 claim,
+        # run 推进器不会饿死子 job(claim 序 = priority DESC, created_at ASC)
+        priority=run_job.priority + 1,
+        timeout_seconds=node.timeout_seconds,
+        resource_profile=ResourceProfile(timeout_seconds=node.timeout_seconds),
+        audit_id=str(uuid4()),
+        payload=payload,
+        parent_workflow_run_id=run_job.id,
+    )
+
+
+def _node_datasource_ids(payload: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    for key in ("datasource_id", "source_id", "target_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value and value not in ids:
+            ids.append(value)
+    return ids
 
 
 def _payload_export_format(payload: dict[str, object]) -> ExportFormat:
@@ -1849,6 +2335,9 @@ def _public_error_message(exc: Exception, kind: JobKind) -> str:
         return "export_limit_exceeded"
     if isinstance(exc, UnsupportedJobKindError):
         return "internal"
+    if isinstance(exc, WorkflowRunFailedError):
+        # message 由推进器构造(节点 id + 公开错误串),可直接透出
+        return str(exc)
     if _is_timeout_error(exc):
         return "timeout"
     if _is_cancel_error(exc):
@@ -1857,6 +2346,9 @@ def _public_error_message(exc: Exception, kind: JobKind) -> str:
 
 
 def _job_error_code(exc: Exception, kind: JobKind) -> JobErrorCode:
+    if isinstance(exc, WorkflowRunFailedError):
+        # 节点失败详情在 message / 子 job 各自的 error_code 里;run 级别统一 internal
+        return JobErrorCode.INTERNAL
     if isinstance(exc, OperationPolicyDeniedError):
         return JobErrorCode.PERMISSION_DENIED
     if isinstance(exc, UnsupportedDbTypeError):

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable
-from typing import BinaryIO, Protocol
+from typing import Any, BinaryIO, Protocol
+
+from sqlalchemy.exc import IntegrityError
 
 from app.dbclients.factory import UnsupportedDbTypeError
 from app.dbclients.protocol import AdapterConnectionError
@@ -10,6 +12,7 @@ from app.domain.compare import CompareHashExecutionMode, CompareHashPlan
 from app.domain.compare_result import decode_compare_result_row
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
+from app.domain.lineage import LineageReport, schema_from_metadata_cache_rows
 from app.domain.plan import PlanNode
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
@@ -672,6 +675,13 @@ class _FakeBackend:
         self.heartbeats: list[tuple[str, str]] = []
         self.cancel_after_checks: int | None = None
         self._cancel_checks = 0
+        # workflow_run 编排(PR-4)
+        self.enqueued: list[Job] = []
+        self.children_by_parent: dict[str, list[Job]] = {}
+        self.requeued_workflow_runs: list[str] = []
+        self.retried_nodes: list[str] = []
+        self.cancel_requested_ids: list[str] = []
+        self.cancelled_pending: list[tuple[str, str]] = []
 
     def claim_next(self, worker_id: str) -> Job | None:
         if not self._jobs:
@@ -696,6 +706,26 @@ class _FakeBackend:
         return (
             self.cancel_after_checks is not None and self._cancel_checks >= self.cancel_after_checks
         )
+
+    def enqueue(self, job: Job) -> None:
+        self.enqueued.append(job)
+        if job.parent_workflow_run_id is not None:
+            self.children_by_parent.setdefault(job.parent_workflow_run_id, []).append(job)
+
+    def request_cancel(self, job_id: str) -> None:
+        self.cancel_requested_ids.append(job_id)
+
+    def list_jobs_by_parent(self, parent_workflow_run_id: str) -> list[Job]:
+        return list(self.children_by_parent.get(parent_workflow_run_id, []))
+
+    def requeue_workflow_run(self, job_id: str) -> None:
+        self.requeued_workflow_runs.append(job_id)
+
+    def retry_workflow_node(self, job_id: str) -> None:
+        self.retried_nodes.append(job_id)
+
+    def cancel_pending_job(self, job_id: str, reason: str = "cancelled") -> None:
+        self.cancelled_pending.append((job_id, reason))
 
     def reap_stale_running_jobs(
         self,
@@ -1072,3 +1102,365 @@ class _FakeCompareRunCatalog:
 
     def write_terminal(self, *, run_id: str, status: str) -> None:
         self.terminal.append({"run_id": run_id, "status": status})
+
+
+# ── workflow_run 推进器(2.4.0 PR-4)──────────────────────────────────────────
+
+
+def _workflow_spec_payload(
+    nodes: list[dict[str, object]] | None = None,
+    edges: list[dict[str, str]] | None = None,
+) -> dict[str, object]:
+    return {
+        "nodes": nodes
+        or [
+            {
+                "id": "n1",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 1", "datasource_id": "ds-9"},
+                "timeout_seconds": 60,
+            }
+        ],
+        "edges": edges or [],
+    }
+
+
+def _workflow_run_job(spec: dict[str, object] | None = None) -> Job:
+    return _make_job(
+        kind=JobKind.WORKFLOW_RUN,
+        payload={"workflow_id": "wf-1", "spec": spec or _workflow_spec_payload()},
+    )
+
+
+def _workflow_runner(backend: _FakeBackend) -> WorkerRunner:
+    return WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1", workflow_advance_interval_seconds=0.01),
+    )
+
+
+def _workflow_child(
+    run_id: str,
+    node_id: str,
+    status: JobStatus,
+    *,
+    retry_count: int = 0,
+    error: str | None = None,
+) -> Job:
+    return Job(
+        id=f"child-{node_id}",
+        kind=JobKind.SQL_QUERY,
+        status=status,
+        owner_user_id="u_1",
+        project_id="p_1",
+        datasource_ids=["ds-9"],
+        priority=1,
+        timeout_seconds=60,
+        resource_profile=ResourceProfile(),
+        audit_id="audit-child",
+        payload={"sql": "SELECT 1", "workflow_node_id": node_id},
+        parent_workflow_run_id=run_id,
+        retry_count=retry_count,
+        error=error,
+    )
+
+
+def test_workflow_run_first_step_enqueues_root_child_and_yields() -> None:
+    backend = _FakeBackend([_workflow_run_job()])
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    # 推进一步:enqueue 根节点子 job 后让位(requeue 回 pending),不 complete/fail
+    assert backend.completed == []
+    assert backend.failed == []
+    assert backend.requeued_workflow_runs == ["job-1"]
+    assert len(backend.enqueued) == 1
+    child = backend.enqueued[0]
+    assert child.kind is JobKind.SQL_QUERY
+    assert child.parent_workflow_run_id == "job-1"
+    assert child.priority == 1  # run priority + 1:子 job 先于 run 被 claim,防饿死
+    assert child.timeout_seconds == 60
+    assert child.payload["workflow_node_id"] == "n1"
+    assert child.datasource_ids == ["ds-9"]
+
+
+def test_workflow_run_completes_when_all_nodes_success() -> None:
+    run_job = _workflow_run_job()
+    backend = _FakeBackend([run_job])
+    backend.children_by_parent["job-1"] = [_workflow_child("job-1", "n1", JobStatus.SUCCESS)]
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert backend.requeued_workflow_runs == []
+    assert len(backend.completed) == 1
+    job_id, result_ref = backend.completed[0]
+    assert job_id == "job-1"
+    assert result_ref.backend == "workflow_run"
+    nodes = result_ref.metadata["nodes"]
+    assert isinstance(nodes, dict)
+    assert nodes["n1"]["status"] == "success"
+    assert nodes["n1"]["job_id"] == "child-n1"
+
+
+def test_workflow_run_node_failure_fails_run_with_node_error() -> None:
+    backend = _FakeBackend([_workflow_run_job()])
+    backend.children_by_parent["job-1"] = [
+        _workflow_child("job-1", "n1", JobStatus.FAILED, error="sql_failed")
+    ]
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert backend.completed == []
+    assert len(backend.failed) == 1
+    job_id, error = backend.failed[0]
+    assert job_id == "job-1"
+    assert "n1" in error
+    assert "sql_failed" in error
+
+
+def test_workflow_run_retries_failed_node_within_budget() -> None:
+    spec = _workflow_spec_payload(
+        nodes=[
+            {
+                "id": "n1",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 1", "datasource_id": "ds-9"},
+                "timeout_seconds": 60,
+                "retry_policy": {"max_retries": 2, "backoff_seconds": 0},
+            }
+        ]
+    )
+    backend = _FakeBackend([_workflow_run_job(spec)])
+    backend.children_by_parent["job-1"] = [
+        _workflow_child("job-1", "n1", JobStatus.FAILED, retry_count=0, error="boom")
+    ]
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert backend.retried_nodes == ["child-n1"]
+    assert backend.requeued_workflow_runs == ["job-1"]
+    assert backend.failed == []
+
+
+def test_workflow_run_cancel_propagates_to_children() -> None:
+    backend = _FakeBackend([_workflow_run_job()])
+    backend.children_by_parent["job-1"] = [_workflow_child("job-1", "n1", JobStatus.RUNNING)]
+    backend.cancel_after_checks = 1
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert backend.cancelled == [("job-1", "cancel requested")]
+    assert "child-n1" in backend.cancel_requested_ids
+    assert ("child-n1", "workflow run cancelled") in backend.cancelled_pending
+    assert backend.completed == []
+    assert backend.failed == []
+
+
+def test_workflow_run_uses_frozen_when_variables_from_payload() -> None:
+    # 触发时冻结的 when 变量快照优先于按当前时刻计算的 builtin 变量:
+    # day="99" 是真实时钟不可能给出的值,节点被 enqueue 即证明用的是快照
+    spec = _workflow_spec_payload(
+        nodes=[
+            {
+                "id": "n1",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 1", "datasource_id": "ds-9"},
+                "timeout_seconds": 60,
+                "when": "${day} == '99'",
+            }
+        ]
+    )
+    run_job = _make_job(
+        kind=JobKind.WORKFLOW_RUN,
+        payload={"workflow_id": "wf-1", "spec": spec, "when_variables": {"day": "99"}},
+    )
+    backend = _FakeBackend([run_job])
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert len(backend.enqueued) == 1
+    assert backend.enqueued[0].payload["workflow_node_id"] == "n1"
+    assert backend.failed == []
+
+
+def test_workflow_run_skips_duplicate_child_on_integrity_error() -> None:
+    # uq_jobs_workflow_node_per_run 兜底:另一 worker 已 enqueue 同一节点时
+    # 本 worker 的 enqueue 撞唯一索引,应跳过继续推进而不是把 run 打挂
+    class _DuplicateRejectingBackend(_FakeBackend):
+        def enqueue(self, job: Job) -> None:
+            raise IntegrityError(
+                "INSERT INTO jobs", {}, Exception("duplicate key uq_jobs_workflow_node_per_run")
+            )
+
+    backend = _DuplicateRejectingBackend([_workflow_run_job()])
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert backend.enqueued == []
+    assert backend.failed == []
+    assert backend.requeued_workflow_runs == ["job-1"]
+
+
+def test_workflow_run_rejects_spec_with_forbidden_kind_at_execution() -> None:
+    # R7 执行期再校验:payload 里被篡改的 spec(shell)必须在 worker 侧拒绝
+    spec: dict[str, object] = {
+        "nodes": [{"id": "n1", "job_kind": "shell", "timeout_seconds": 60}],
+        "edges": [],
+    }
+    backend = _FakeBackend([_workflow_run_job(spec)])
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert backend.enqueued == []
+    assert len(backend.failed) == 1
+
+
+def test_worker_runs_export_excel_as_result_export_with_forced_excel_format() -> None:
+    job = _make_job(
+        kind=JobKind.EXPORT_EXCEL,
+        payload={
+            "source_result_set_id": "rs-source",
+            "filename": "report.xlsx",
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    result_store.columns_by_result_set["rs-source"] = [Column(name="n", type=ColumnType.INTEGER)]
+    result_store.rows_by_result_set["rs-source"] = [Row(values=[7])]
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is True
+
+    assert len(backend.completed) == 1
+    _, result_ref = backend.completed[0]
+    assert result_ref.metadata["format"] == "excel"
+    assert result_ref.metadata["filename"] == "report.xlsx"
+    assert ("job-1", "report.xlsx") in result_store.export_artifacts
+
+
+def test_worker_runs_lineage_analyze_with_thin_catalog_handler() -> None:
+    job = _make_job(
+        kind=JobKind.LINEAGE_ANALYZE,
+        payload={
+            "datasource_id": "ds-9",
+            "sql_text": "INSERT INTO t2 (a) SELECT a FROM t1",
+            "dialect": "mysql",
+            "source_ref": "wf-node",
+        },
+    )
+    backend = _FakeBackend([job])
+    catalog = _FakeLineageCatalog()
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert len(catalog.persisted) == 1
+    persisted = catalog.persisted[0]
+    assert persisted["project_id"] == "p_1"
+    assert persisted["datasource_id"] == "ds-9"
+    assert persisted["source_ref"] == "wf-node"
+    assert len(backend.completed) == 1
+    _, result_ref = backend.completed[0]
+    assert result_ref.backend == "lineage_run"
+    assert result_ref.metadata["cached"] is False
+
+
+def test_worker_lineage_analyze_reuses_cached_run() -> None:
+    job = _make_job(
+        kind=JobKind.LINEAGE_ANALYZE,
+        payload={
+            "datasource_id": "ds-9",
+            "sql_text": "INSERT INTO t2 (a) SELECT a FROM t1",
+            "dialect": "mysql",
+        },
+    )
+    backend = _FakeBackend([job])
+    catalog = _FakeLineageCatalog(cached_run_id="run-cached")
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert catalog.persisted == []
+    _, result_ref = backend.completed[0]
+    assert result_ref.metadata == {"lineage_run_id": "run-cached", "cached": True}
+
+
+class _FakeLineageCatalog:
+    def __init__(self, cached_run_id: str | None = None) -> None:
+        self._cached_run_id = cached_run_id
+        self.persisted: list[dict[str, object]] = []
+
+    def schema_context(
+        self,
+        datasource_id: str,
+        default_schema: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "default_schema": default_schema,
+            "schema": schema_from_metadata_cache_rows([]),
+        }
+
+    def cached_run_id(
+        self,
+        *,
+        project_id: str,
+        datasource_id: str,
+        dialect: str,
+        source_ref: str,
+        sql_hash: str,
+    ) -> str | None:
+        return self._cached_run_id
+
+    def persist_run(
+        self,
+        *,
+        run_id: str,
+        project_id: str,
+        datasource_id: str,
+        dialect: str,
+        source_ref: str,
+        sql_hash: str,
+        report: LineageReport,
+    ) -> None:
+        self.persisted.append(
+            {
+                "run_id": run_id,
+                "project_id": project_id,
+                "datasource_id": datasource_id,
+                "dialect": dialect,
+                "source_ref": source_ref,
+                "sql_hash": sql_hash,
+                "table_edges": len(report.graph_edges),
+            }
+        )
