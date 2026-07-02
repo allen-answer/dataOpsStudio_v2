@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -144,8 +145,10 @@ def test_parse_dt_handles_iso_and_blank() -> None:
 
 def test_skipped_sources_lists_21_plus_tables() -> None:
     labels = " ".join(label for label, _ in m._SKIPPED_SOURCES)
-    for needle in ("compare_tasks", "workflows", "sql_templates", "ai_configs", "run_index"):
+    for needle in ("compare_tasks", "sql_templates", "ai_configs", "run_index"):
         assert needle in labels
+    assert "workflows" not in labels
+    assert "workflow_templates" not in labels
     # .dataops_secret.key 是输入不是目标
     assert any(".dataops_secret.key" in label for label, _ in m._SKIPPED_SOURCES)
 
@@ -258,3 +261,187 @@ def test_resolve_global_owner_success_and_failure() -> None:
     msg = str(ei.value)
     assert "ghost" in msg
     assert "admin" in msg and "viewer" in msg
+
+
+# ─── Workflow 2.4 迁移───────────────────────────────────────────────────────
+def _workflow_rows() -> list[dict[str, object]]:
+    return [
+        {
+            "id": "wf-1",
+            "name": "Daily Checks",
+            "project_id": "proj-1",
+            "owner": "admin",
+            "status": "active",
+            "schedule_cron": "0 2 * * *",
+            "nodes": [
+                {
+                    "id": "compare",
+                    "type": "compare",
+                    "name": "Compare",
+                    "config": {
+                        "task_id": "task-1",
+                        "source_sql_override": "select 1",
+                    },
+                },
+                {
+                    "id": "lineage",
+                    "type": "lineage",
+                    "config": {"sql": "insert into b select * from a"},
+                    "depends_on": ["compare"],
+                    "when": "nodes.compare.summary.diff_rows == 0",
+                },
+                {
+                    "id": "excel",
+                    "type": "excel_export",
+                    "config": {"sheets": [{"node_id": "compare", "dataset": "summary"}]},
+                    "depends_on": ["lineage"],
+                },
+            ],
+        }
+    ]
+
+
+def test_migrate_workflows_maps_supported_nodes_edges_and_when() -> None:
+    report = m.MigrationReport()
+    conn = _RecordingConn()
+
+    m.migrate_workflows(
+        conn,  # type: ignore[arg-type]
+        _workflow_rows(),
+        known_project_ids={"proj-1"},
+        known_user_ids={"user-admin"},
+        username_to_id={"admin": "user-admin"},
+        report=report,
+    )
+
+    assert report.table("workflows").migrated == 1
+    assert len(conn.inserts) == 1
+    row = conn.inserts[0]
+    dag = cast(dict[str, Any], row["dag_jsonb"])
+    assert row["created_by"] == "user-admin"
+    assert row["schedule_cron"] == "0 2 * * *"
+    assert row["schedule_enabled"] is True
+    assert [node["job_kind"] for node in dag["nodes"]] == [
+        "compare_run",
+        "lineage_analyze",
+        "export_excel",
+    ]
+    assert dag["edges"] == [
+        {"source": "compare", "target": "lineage"},
+        {"source": "lineage", "target": "excel"},
+    ]
+    assert dag["nodes"][1]["when"] == "nodes.compare.summary.diff_rows == 0"
+    assert dag["nodes"][0]["payload"]["task_id"] == "task-1"
+    assert dag["nodes"][0]["payload"]["legacy_node_type"] == "compare"
+    assert any(
+        "legacy config preserved in payload" in item for item in report.table("workflows").warnings
+    )
+
+
+def test_migrate_workflows_http_node_reports_forbidden_without_insert() -> None:
+    report = m.MigrationReport()
+    conn = _RecordingConn()
+    rows = _workflow_rows()
+    rows[0]["nodes"] = [
+        {"id": "notify", "type": "http", "config": {"url": "https://example.invalid"}}
+    ]
+
+    with pytest.raises(m.WorkflowMigrationError):
+        m.migrate_workflows(
+            conn,  # type: ignore[arg-type]
+            rows,
+            known_project_ids={"proj-1"},
+            known_user_ids={"user-admin"},
+            username_to_id={"admin": "user-admin"},
+            report=report,
+        )
+
+    assert conn.inserts == []
+    failures = report.table("workflows").failures
+    assert any("forbidden:" in item and "node id=notify" in item for item in failures)
+
+
+def test_migrate_workflows_params_node_reports_unmappable_without_insert() -> None:
+    report = m.MigrationReport()
+    conn = _RecordingConn()
+    rows = _workflow_rows()
+    rows[0]["nodes"] = [{"id": "params", "type": "params", "config": {"parameters": []}}]
+
+    with pytest.raises(m.WorkflowMigrationError):
+        m.migrate_workflows(
+            conn,  # type: ignore[arg-type]
+            rows,
+            known_project_ids={"proj-1"},
+            known_user_ids={"user-admin"},
+            username_to_id={"admin": "user-admin"},
+            report=report,
+        )
+
+    assert conn.inserts == []
+    failures = report.table("workflows").failures
+    assert any("unmappable:" in item and "node id=params" in item for item in failures)
+
+
+def test_migrate_workflows_cycle_reports_validation_failed_without_insert() -> None:
+    report = m.MigrationReport()
+    conn = _RecordingConn()
+    rows = _workflow_rows()
+    rows[0]["nodes"] = [
+        {"id": "a", "type": "compare", "config": {"task_id": "task-1"}, "depends_on": ["b"]},
+        {"id": "b", "type": "lineage", "config": {"sql": "select 1"}, "depends_on": ["a"]},
+    ]
+
+    with pytest.raises(m.WorkflowMigrationError):
+        m.migrate_workflows(
+            conn,  # type: ignore[arg-type]
+            rows,
+            known_project_ids={"proj-1"},
+            known_user_ids={"user-admin"},
+            username_to_id={"admin": "user-admin"},
+            report=report,
+        )
+
+    assert conn.inserts == []
+    failures = report.table("workflows").failures
+    assert any("validation_failed:" in item and "cycle_detected" in item for item in failures)
+
+
+def test_migrate_workflow_templates_global_migration() -> None:
+    report = m.MigrationReport()
+    conn = _RecordingConn()
+    rows = [
+        {
+            "id": "tpl-1",
+            "name": "Compare Template",
+            "description": "template desc",
+            "workflow": {
+                "name": "Inner",
+                "owner": "admin",
+                "nodes": [
+                    {
+                        "id": "compare",
+                        "type": "compare",
+                        "config": {"task_id": "task-1"},
+                    }
+                ],
+            },
+        }
+    ]
+
+    m.migrate_workflow_templates(
+        conn,  # type: ignore[arg-type]
+        rows,
+        known_user_ids={"user-admin"},
+        username_to_id={"admin": "user-admin"},
+        report=report,
+    )
+
+    assert report.table("workflow_templates").migrated == 1
+    assert len(conn.inserts) == 1
+    row = conn.inserts[0]
+    assert row["id"] == "tpl-1"
+    assert row["name"] == "Compare Template"
+    assert row["description"] == "template desc"
+    assert row["created_by"] == "user-admin"
+    dag = cast(dict[str, Any], row["dag_jsonb"])
+    assert dag["nodes"][0]["job_kind"] == "compare_run"
