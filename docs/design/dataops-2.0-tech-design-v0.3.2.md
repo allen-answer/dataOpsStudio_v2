@@ -1839,7 +1839,7 @@ dataops_worker_up{worker_id}                         gauge
 
 **必做(骨架)**:全形态 PG 启动(含 Portable launcher + Managed Local PG)/ **API-Worker 进程分离 + PG job queue** / 登录 + 用户 + 项目 + datasource CRUD / SQL Workspace 最基本 SELECT(走 spool,还不要求 virtual scroll/历史/模板)/ Job 抽象 + PG queue backend / SecretStore 两层完整 / **日志三管线(structlog 强制脱敏 + audit_logs + Prometheus 基础指标)** / AI Gateway 壳(接 1 provider 可调通)/ License skeleton + Repair Mode / migrate_from_v1.py(可跑通)/ Database Gateway + Adapter(MySQL+DM Certified,Oracle 允许 2.0.x 补,DB2 Preview;接口以 Oracle/DM 为假想验证对象)/ 基础前端。
 
-**不做**:完整 SQL Workspace(→2.1)/ Compare(→2.2)/ Scenario(→2.3)/ Lineage(→2.4)/ Workflow(→2.5)/ AI Assist 具体功能(→2.1+)/ AI Copilot(→2.6)/ 多租户计费(→2.7)。
+**不做**:完整 SQL Workspace(→2.1)/ Compare(→2.2)/ Lineage(→2.3)/ Workflow(→2.4)/ Scenario(→2.6,与 Copilot 一体)/ AI Assist 具体功能(→2.1+)/ AI Copilot(→2.6)/ 多租户计费(→2.7)。
 
 **成功标准**:portable 解压启动 → 登录 → 加 MySQL 数据源 → 跑 SELECT(经 worker + spool)→ 看到结果。docker compose(api+worker+pg)同流程跑通。hosted 单租户跑通。1.x 数据能 migrate 进来(允许个别字段失败)。
 
@@ -1958,10 +1958,10 @@ Charter 3-4 页,只放:一句话定位 / 三形态对照 / 不做清单(SQLite �
 |---|---|---|---|---|---|
 | B1 | AI Agent Loop | **Deferred** | 2.6 前不决策;倾向自写极简 | 2.6.0 | 否 |
 | B2 | Server State | Accepted | 新模块 TanStack Query,1.x 复用模块保留 Pinia,不专门迁移 | 2.0+ | 部分 |
-| B3 | Workflow API | Accepted | Job DAG + 节点白名单 | 2.5.0 | 否 |
-| B4 | Lineage 结构 | Accepted | 沿用 1.x LineageReport(20字段),实现按版本分批;无 aspect 收敛(伪命题已推翻);**持久化部分由 ADR-0020 修订为边表持久化 + sql_hash 缓存** | 2.4.0 | 否 |
-| B5-L | Lineage 子图优先(任务书 B5;历史 B5 已占用) | **Accepted** | 一等公民查询为焦点表 N 跳邻域子图;按需计算/加载;禁止全图计算后过滤;全景图仅作惰性 + 分层聚类次要视图 | 2.4.0 | 否 |
-| B6-L | 基础影响分析前移(任务书 B6;历史 B6 已占用) | **Accepted** | 纯图反向遍历输出下游波及清单(按深度分层),提前到 2.4.0;C3 保留为 2.7.0 的 AI 加权增强 | 2.4.0 | 否 |
+| B3 | Workflow API | Accepted | Job DAG + 节点白名单(ADR-0009,2026-07-02 补写并收录首版拍板:进程内 cron tick / 简单 RetryPolicy / when 旁路 / 首版开放 5 节点) | 2.4.0 | 否 |
+| B4 | Lineage 结构 | Accepted | 沿用 1.x LineageReport(20字段),实现按版本分批;无 aspect 收敛(伪命题已推翻);**持久化部分由 ADR-0020 修订为边表持久化 + sql_hash 缓存** | 2.3.0 | 否 |
+| B5-L | Lineage 子图优先(任务书 B5;历史 B5 已占用) | **Accepted** | 一等公民查询为焦点表 N 跳邻域子图;按需计算/加载;禁止全图计算后过滤;全景图仅作惰性 + 分层聚类次要视图 | 2.3.0 | 否 |
+| B6-L | 基础影响分析前移(任务书 B6;历史 B6 已占用) | **Accepted** | 纯图反向遍历输出下游波及清单(按深度分层),提前到 2.3.0;C3 保留为 2.7.0 的 AI 加权增强 | 2.3.0 | 否 |
 | B7-L | Compare 递归下钻 + 规范化层(任务书 C;历史 B7 已占用) | **Accepted** | 递归 hashdiff 下钻替代固定分块;跨库规范化 SQL + 逐行 MD5 截 8 字节 SUM 为跨库比对基线;采样快检只输出置信度差异率上界 | 2.2.0 | 否 |
 | B5 | Hosted 云 | **Accepted** | 接口中立 + 实现单云:绑腾讯云,全程自管(CVM+Docker,复用 on-prem),AI 辅助运维 | 2.7.0+ | 否 |
 | B6 | AI Copilot Demo | **Accepted** | C1-C5 确认;优先级 1/5/2/4/3;2.6.0=C1+C5基础版,2.7.0=C2/C4/C5进阶/C3 | 2.6-2.7 | 否 |
