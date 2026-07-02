@@ -141,6 +141,77 @@ def test_two_workers_claim_disjoint_jobs(jobbackend: JobBackend) -> None:
     assert c1.id != c2.id  # 不同 job
 
 
+def test_workflow_run_requeue_yields_running_back_to_pending(
+    jobbackend: JobBackend,
+) -> None:
+    """workflow_run 推进器让位:running → pending,可被再次 claim。"""
+    assert isinstance(jobbackend, PostgresJobBackend)
+    job = _make_job("j_wf")
+    jobbackend.enqueue(job)
+    jobbackend.claim_next("worker-1")
+    jobbackend.requeue_workflow_run("j_wf")
+    requeued = jobbackend.get_job("j_wf")
+    assert requeued is not None
+    assert requeued.status == JobStatus.PENDING
+    assert requeued.worker_id is None
+    reclaimed = jobbackend.claim_next("worker-1")
+    assert reclaimed is not None and reclaimed.id == "j_wf"
+
+
+def test_retry_workflow_node_requeues_failed_and_increments_retry_count(
+    jobbackend: JobBackend,
+) -> None:
+    assert isinstance(jobbackend, PostgresJobBackend)
+    job = _make_job("j_node")
+    jobbackend.enqueue(job)
+    jobbackend.claim_next("worker-1")
+    jobbackend.fail("j_node", "boom")
+    jobbackend.retry_workflow_node("j_node")
+    retried = jobbackend.get_job("j_node")
+    assert retried is not None
+    assert retried.status == JobStatus.PENDING
+    assert retried.retry_count == 1
+    assert retried.error is None
+    # 非 failed/timeout 状态不重排(幂等防护)
+    jobbackend.claim_next("worker-1")
+    jobbackend.retry_workflow_node("j_node")
+    running = jobbackend.get_job("j_node")
+    assert running is not None
+    assert running.status == JobStatus.RUNNING
+    assert running.retry_count == 1
+
+
+def test_cancel_pending_job_marks_terminal_without_claim(
+    jobbackend: JobBackend,
+) -> None:
+    assert isinstance(jobbackend, PostgresJobBackend)
+    job = _make_job("j_pending")
+    jobbackend.enqueue(job)
+    jobbackend.cancel_pending_job("j_pending", "workflow aborted")
+    cancelled = jobbackend.get_job("j_pending")
+    assert cancelled is not None
+    assert cancelled.status == JobStatus.CANCELLED
+    assert cancelled.cancel_reason == "workflow aborted"
+    assert jobbackend.claim_next("worker-1") is None
+
+
+def test_list_jobs_by_parent_returns_only_children_in_created_order(
+    jobbackend: JobBackend,
+) -> None:
+    assert isinstance(jobbackend, PostgresJobBackend)
+    run_job = _make_job("j_run")
+    jobbackend.enqueue(run_job)
+    child_a = _make_job("j_child_a").model_copy(update={"parent_workflow_run_id": "j_run"})
+    child_b = _make_job("j_child_b").model_copy(update={"parent_workflow_run_id": "j_run"})
+    unrelated = _make_job("j_other")
+    jobbackend.enqueue(child_a)
+    jobbackend.enqueue(child_b)
+    jobbackend.enqueue(unrelated)
+    children = jobbackend.list_jobs_by_parent("j_run")
+    assert [child.id for child in children] == ["j_child_a", "j_child_b"]
+    assert all(child.parent_workflow_run_id == "j_run" for child in children)
+
+
 def _pg_engine_or_skip() -> Engine:
     url = os.environ.get("DATAOPS_TEST_PG_URL") or os.environ.get("DATAOPS_DATABASE_URL")
     if not url:

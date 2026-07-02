@@ -94,6 +94,9 @@ from app.api.schemas import (
     WorkflowCreateRequest,
     WorkflowListItem,
     WorkflowResponse,
+    WorkflowRunCreateResponse,
+    WorkflowRunNodeItem,
+    WorkflowRunStatusResponse,
     WorkflowUpdateRequest,
 )
 from app.api.security import create_access_token
@@ -153,6 +156,13 @@ from app.domain.result import ResultRef
 from app.domain.schema import Column, Index, Table
 from app.domain.secret import HashedRef, SecretKind, SecretRef
 from app.domain.workflow import WorkflowSpec
+from app.domain.workflow_execution import (
+    TERMINAL_NODE_STATUSES,
+    WorkflowChildJob,
+    WorkflowNodeExecStatus,
+    plan_workflow_step,
+)
+from app.domain.workflow_when import builtin_when_variables
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.result_export import export_content_type, export_extension
 from app.services.ai.default_gateway import (
@@ -2536,6 +2546,261 @@ def _workflow_list_item(row: RowMapping) -> WorkflowListItem:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+# ── Workflow run(2.4.0 PR-4:手动触发 / 状态查询 / 取消;cron tick 属 PR-4b)──
+
+
+@router.post(
+    "/projects/{project_id}/workflows/{workflow_id}/runs",
+    response_model=WorkflowRunCreateResponse,
+    status_code=201,
+)
+def trigger_workflow_run(
+    project_id: str,
+    workflow_id: str,
+    request: Request,
+) -> WorkflowRunCreateResponse:
+    """手动触发:enqueue 一个 workflow_run job(WorkflowRun 本身是 job,ADR-0009)。
+
+    spec 快照进 payload:执行期不再回读 workflows 表,触发后改定义不影响在途 run。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.begin() as conn:
+        _require_project_access(conn, project_id, user.id)
+        row = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+        if not bool(row["enabled"]):
+            raise ApiError(409, "workflow_disabled", "Workflow is disabled")
+        # R7 enqueue 期再校验(ADR-0009 Consequences:创建 + enqueue 双门禁)
+        spec = _validated_workflow_spec(dict(row["dag_jsonb"] or {}))
+        run_id = new_id()
+        timeout_seconds = sum(node.timeout_seconds for node in spec.nodes) + 600
+        job = Job(
+            id=run_id,
+            kind=JobKind.WORKFLOW_RUN,
+            status=JobStatus.PENDING,
+            owner_user_id=user.id,
+            project_id=project_id,
+            datasource_ids=[],
+            priority=0,
+            timeout_seconds=timeout_seconds,
+            resource_profile=ResourceProfile(timeout_seconds=timeout_seconds),
+            audit_id=new_id(),
+            payload={
+                "workflow_id": workflow_id,
+                "workflow_name": str(row["name"]),
+                "trigger": "manual",
+                "spec": spec.model_dump(mode="json"),
+            },
+        )
+        _enqueue_job_txn(conn, services, job)
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="workflow_run_trigger",
+        resource_type="workflow",
+        resource_id=workflow_id,
+        result="accepted",
+        detail={"run_id": run_id, "node_count": len(spec.nodes)},
+    )
+    return WorkflowRunCreateResponse(run_id=run_id, job_id=run_id, workflow_id=workflow_id)
+
+
+@router.get(
+    "/projects/{project_id}/workflow-runs/{run_id}",
+    response_model=WorkflowRunStatusResponse,
+)
+def get_workflow_run(
+    project_id: str,
+    run_id: str,
+    request: Request,
+) -> WorkflowRunStatusResponse:
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        run_row = _workflow_run_row_for_project(conn, project_id=project_id, run_id=run_id)
+        children = _workflow_run_children(conn, run_id)
+    return _workflow_run_status_response(run_row, children)
+
+
+@router.post(
+    "/projects/{project_id}/workflow-runs/{run_id}:cancel",
+    response_model=CancelResponse,
+)
+def cancel_workflow_run(
+    project_id: str,
+    run_id: str,
+    request: Request,
+) -> CancelResponse:
+    """run 取消:软取消 run job 并立即传播到未终态子 job(worker 侧再兜底传播)。"""
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        _workflow_run_row_for_project(conn, project_id=project_id, run_id=run_id)
+        children = _workflow_run_children(conn, run_id)
+    services.job_backend.request_cancel(run_id)
+    for child in children:
+        if str(child["status"]) in {JobStatus.PENDING.value, JobStatus.RUNNING.value}:
+            services.job_backend.request_cancel(str(child["id"]))
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="workflow_run_cancel",
+        resource_type="workflow_run",
+        resource_id=run_id,
+        result="accepted",
+    )
+    return CancelResponse(cancelled=True)
+
+
+def _enqueue_job_txn(conn: Connection, services: ApiServices, job: Job) -> None:
+    """事务内 enqueue(与 _enqueue_compare_run_job 同款:PG backend 复用当前连接)。"""
+    job_backend = cast(Any, services).job_backend
+    if isinstance(job_backend, PostgresJobBackend):
+        PostgresJobBackend(conn).enqueue(job)
+        return
+    job_backend.enqueue(job)
+
+
+def _workflow_run_row_for_project(
+    conn: Connection,
+    *,
+    project_id: str,
+    run_id: str,
+) -> RowMapping:
+    row = (
+        conn.execute(
+            select(jobs)
+            .where(jobs.c.id == run_id)
+            .where(jobs.c.kind == JobKind.WORKFLOW_RUN.value)
+            .where(jobs.c.project_id == project_id)
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        raise ApiError(404, "not_found", "Workflow run not found")
+    return row
+
+
+def _workflow_run_children(conn: Connection, run_id: str) -> list[RowMapping]:
+    return list(
+        conn.execute(
+            select(jobs)
+            .where(jobs.c.parent_workflow_run_id == run_id)
+            .order_by(jobs.c.created_at.asc(), jobs.c.id.asc())
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _workflow_run_status_response(
+    run_row: RowMapping,
+    children: list[RowMapping],
+) -> WorkflowRunStatusResponse:
+    payload = dict(run_row["payload"] or {})
+    run_status = JobStatus(str(run_row["status"]))
+    nodes = _workflow_run_node_items(payload, children, run_status)
+    return WorkflowRunStatusResponse(
+        run_id=str(run_row["id"]),
+        workflow_id=_optional_str(payload.get("workflow_id")),
+        project_id=str(run_row["project_id"]),
+        status=run_status,
+        error=_optional_str(run_row["error"]),
+        created_at=_row_value_or_none(run_row, "created_at"),
+        started_at=_row_value_or_none(run_row, "started_at"),
+        finished_at=_row_value_or_none(run_row, "finished_at"),
+        nodes=nodes,
+    )
+
+
+def _workflow_run_node_items(
+    payload: dict[str, Any],
+    children: list[RowMapping],
+    run_status: JobStatus,
+) -> list[WorkflowRunNodeItem]:
+    raw_spec = payload.get("spec")
+    try:
+        spec = WorkflowSpec.model_validate(raw_spec)
+    except ValidationError:
+        # spec 快照缺失/损坏时退化为子 job 平铺(不 500,保底可观测)
+        return [
+            WorkflowRunNodeItem(
+                node_id=str(child["payload"].get("workflow_node_id") or child["id"]),
+                job_kind=str(child["kind"]),
+                status=str(child["status"]),
+                job_id=str(child["id"]),
+                attempts=int(child["retry_count"] or 0),
+                error=_optional_str(child["error"]),
+            )
+            for child in children
+            if isinstance(child["payload"], dict)
+        ]
+    snapshots = _workflow_child_snapshots_from_rows(children)
+    now = datetime.now(UTC)
+    # 与 worker 推进器共用同一纯函数,保证节点状态口径一致(只读,不执行计划)
+    plan = plan_workflow_step(
+        spec,
+        snapshots,
+        now=now,
+        when_variables=builtin_when_variables(now),
+    )
+    kinds = {node.id: node.job_kind for node in spec.nodes}
+    items: list[WorkflowRunNodeItem] = []
+    for node in spec.nodes:
+        state = plan.node_states[node.id]
+        status = state.status
+        if (
+            run_status in {JobStatus.FAILED, JobStatus.CANCELLED}
+            and status not in TERMINAL_NODE_STATUSES
+        ):
+            # run 已终态:未终态节点(waiting/running/retry_wait)展示为 cancelled
+            status = WorkflowNodeExecStatus.CANCELLED
+        items.append(
+            WorkflowRunNodeItem(
+                node_id=node.id,
+                job_kind=kinds[node.id],
+                status=status.value,
+                job_id=state.job_id,
+                attempts=state.attempts,
+                error=state.error,
+            )
+        )
+    return items
+
+
+def _workflow_child_snapshots_from_rows(
+    children: list[RowMapping],
+) -> dict[str, WorkflowChildJob]:
+    snapshots: dict[str, WorkflowChildJob] = {}
+    for child in children:
+        child_payload = child["payload"] if isinstance(child["payload"], dict) else {}
+        node_id = child_payload.get("workflow_node_id")
+        if not isinstance(node_id, str) or not node_id:
+            continue
+        finished_at = child["finished_at"]
+        snapshots[node_id] = WorkflowChildJob(
+            node_id=node_id,
+            job_id=str(child["id"]),
+            status=JobStatus(str(child["status"])),
+            retry_count=int(child["retry_count"] or 0),
+            finished_at=finished_at if isinstance(finished_at, datetime) else None,
+            error=_optional_str(child["error"]),
+        )
+    return snapshots
+
+
+def _row_value_or_none(row: RowMapping, key: str) -> datetime | None:
+    value = row[key] if key in row else None
+    return value if isinstance(value, datetime) else None
 
 
 @router.get("/jobs", response_model=list[JobListItem])
