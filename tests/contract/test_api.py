@@ -2232,6 +2232,7 @@ def test_workflow_run_cancel_contract_propagates_to_unfinished_children() -> Non
             [
                 _workflow_child_job_row("n1", status="running", job_id="child-1"),
                 _workflow_child_job_row("n2", status="success", job_id="child-2"),
+                _workflow_child_job_row("n3", status="pending", job_id="child-3"),
             ],
         ]
     )
@@ -2247,7 +2248,8 @@ def test_workflow_run_cancel_contract_propagates_to_unfinished_children() -> Non
     assert response.json() == {"cancelled": True}
     backend = services.job_backend
     # run 软取消 + 未终态子 job 传播;已 success 的子 job 不动
-    assert backend.cancel_requested == ["run-1", "child-1"]
+    assert backend.cancel_requested == ["run-1", "child-1", "child-3"]
+    assert backend.cancelled_pending == [("child-3", "workflow run cancelled")]
     assert any(audit["action"] == "workflow_run_cancel" for audit in services.audits)
 
 
@@ -2581,12 +2583,16 @@ class _JobBackend:
     def __init__(self) -> None:
         self.enqueued: list[Job] = []
         self.cancel_requested: list[str] = []
+        self.cancelled_pending: list[tuple[str, str]] = []
 
     def enqueue(self, job: Job) -> None:
         self.enqueued.append(job)
 
     def request_cancel(self, job_id: str) -> None:
         self.cancel_requested.append(job_id)
+
+    def cancel_pending_job(self, job_id: str, reason: str = "cancelled") -> None:
+        self.cancelled_pending.append((job_id, reason))
 
 
 class _ResultStore:

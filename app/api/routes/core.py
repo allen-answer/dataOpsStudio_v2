@@ -2645,8 +2645,12 @@ def cancel_workflow_run(
         children = _workflow_run_children(conn, run_id)
     services.job_backend.request_cancel(run_id)
     for child in children:
-        if str(child["status"]) in {JobStatus.PENDING.value, JobStatus.RUNNING.value}:
-            services.job_backend.request_cancel(str(child["id"]))
+        child_status = str(child["status"])
+        child_id = str(child["id"])
+        if child_status in {JobStatus.PENDING.value, JobStatus.RUNNING.value}:
+            services.job_backend.request_cancel(child_id)
+        if child_status == JobStatus.PENDING.value:
+            services.job_backend.cancel_pending_job(child_id, "workflow run cancelled")
     _audit_business(
         services,
         request,
