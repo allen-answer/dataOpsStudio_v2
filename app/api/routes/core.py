@@ -162,7 +162,7 @@ from app.domain.workflow_execution import (
     WorkflowNodeExecStatus,
     plan_workflow_step,
 )
-from app.domain.workflow_when import builtin_when_variables
+from app.domain.workflow_when import builtin_when_variables, when_variables_from_payload
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.result_export import export_content_type, export_extension
 from app.services.ai.default_gateway import (
@@ -2592,6 +2592,9 @@ def trigger_workflow_run(
                 "workflow_name": str(row["name"]),
                 "trigger": "manual",
                 "spec": spec.model_dump(mode="json"),
+                # when 变量在触发时刻冻结:执行器每步推进与状态查询共用这份
+                # 快照,when 决策在 run 生命周期内确定(跨午夜不翻转)
+                "when_variables": builtin_when_variables(datetime.now(UTC)),
             },
         )
         _enqueue_job_txn(conn, services, job)
@@ -2750,12 +2753,16 @@ def _workflow_run_node_items(
         ]
     snapshots = _workflow_child_snapshots_from_rows(children)
     now = datetime.now(UTC)
-    # 与 worker 推进器共用同一纯函数,保证节点状态口径一致(只读,不执行计划)
+    # 与 worker 推进器共用同一纯函数 + 同一份触发时冻结的 when 变量快照,
+    # 保证节点状态口径一致且不随查询时刻漂移(只读,不执行计划)
+    frozen_variables = when_variables_from_payload(payload)
     plan = plan_workflow_step(
         spec,
         snapshots,
         now=now,
-        when_variables=builtin_when_variables(now),
+        when_variables=(
+            frozen_variables if frozen_variables is not None else builtin_when_variables(now)
+        ),
     )
     kinds = {node.id: node.job_kind for node in spec.nodes}
     items: list[WorkflowRunNodeItem] = []

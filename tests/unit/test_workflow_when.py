@@ -10,6 +10,7 @@ from app.domain.workflow_when import (
     WhenEvaluationError,
     builtin_when_variables,
     evaluate_when,
+    when_variables_from_payload,
 )
 
 _NOW = datetime(2026, 7, 2, 8, 30, 0, tzinfo=UTC)
@@ -107,3 +108,15 @@ def test_variable_value_is_quoted_not_injected() -> None:
 def test_variable_with_quote_is_escaped_to_plain_string() -> None:
     tricky = {"day": "it's"}
     assert evaluate_when('${day} == "it\'s"', tricky) is True
+
+
+def test_when_variables_from_payload_reads_frozen_snapshot() -> None:
+    payload: dict[str, object] = {"when_variables": {"day": "99", "month": "07"}}
+    assert when_variables_from_payload(payload) == {"day": "99", "month": "07"}
+
+
+def test_when_variables_from_payload_rejects_missing_or_malformed() -> None:
+    # 缺失 / 非 dict / 非 str 值:回退 None(调用方按当前时刻计算)
+    assert when_variables_from_payload({}) is None
+    assert when_variables_from_payload({"when_variables": "not-a-dict"}) is None
+    assert when_variables_from_payload({"when_variables": {"day": 2}}) is None

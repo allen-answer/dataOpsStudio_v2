@@ -26,6 +26,7 @@ __all__ = [
     "WhenEvaluationError",
     "builtin_when_variables",
     "evaluate_when",
+    "when_variables_from_payload",
 ]
 
 
@@ -69,6 +70,23 @@ def builtin_when_variables(now: datetime) -> dict[str, str]:
         "month": f"{now.month:02d}",
         "day": f"{now.day:02d}",
     }
+
+
+def when_variables_from_payload(payload: Mapping[str, object]) -> dict[str, str] | None:
+    """读取 run payload 里触发时冻结的 when 变量快照。
+
+    触发端点把 ``builtin_when_variables(触发时刻)`` 写进 run payload,
+    执行器每步推进与 API 状态查询都用同一份快照 —— when 决策在 run
+    生命周期内确定不变(跨午夜不翻转),两端口径也不漂移。
+    快照缺失/形状不对(在途旧 run / payload 损坏)返回 None,调用方
+    回退为按当前时刻计算。
+    """
+    raw = payload.get("when_variables")
+    if not isinstance(raw, dict):
+        return None
+    if not all(isinstance(key, str) and isinstance(value, str) for key, value in raw.items()):
+        return None
+    return dict(raw)
 
 
 def evaluate_when(expression: str | None, variables: Mapping[str, str]) -> bool:

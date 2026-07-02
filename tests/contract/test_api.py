@@ -2146,6 +2146,11 @@ def test_workflow_run_trigger_contract_enqueues_workflow_run_job() -> None:
     spec = job.payload["spec"]
     assert isinstance(spec, dict)
     assert spec["nodes"][0]["id"] == "n1"
+    # when 变量在触发时刻冻结进 payload:执行器与状态查询同源,决策不随时间漂移
+    frozen = job.payload["when_variables"]
+    assert isinstance(frozen, dict)
+    assert set(frozen) == {"today", "now", "year", "month", "day"}
+    assert all(isinstance(value, str) for value in frozen.values())
     assert any(audit["action"] == "workflow_run_trigger" for audit in services.audits)
 
 

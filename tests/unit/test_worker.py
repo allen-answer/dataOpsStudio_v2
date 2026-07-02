@@ -4,6 +4,8 @@ import re
 from collections.abc import Callable, Iterable
 from typing import Any, BinaryIO, Protocol
 
+from sqlalchemy.exc import IntegrityError
+
 from app.dbclients.factory import UnsupportedDbTypeError
 from app.dbclients.protocol import AdapterConnectionError
 from app.domain.compare import CompareHashExecutionMode, CompareHashPlan
@@ -1260,6 +1262,53 @@ def test_workflow_run_cancel_propagates_to_children() -> None:
     assert ("child-n1", "workflow run cancelled") in backend.cancelled_pending
     assert backend.completed == []
     assert backend.failed == []
+
+
+def test_workflow_run_uses_frozen_when_variables_from_payload() -> None:
+    # 触发时冻结的 when 变量快照优先于按当前时刻计算的 builtin 变量:
+    # day="99" 是真实时钟不可能给出的值,节点被 enqueue 即证明用的是快照
+    spec = _workflow_spec_payload(
+        nodes=[
+            {
+                "id": "n1",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 1", "datasource_id": "ds-9"},
+                "timeout_seconds": 60,
+                "when": "${day} == '99'",
+            }
+        ]
+    )
+    run_job = _make_job(
+        kind=JobKind.WORKFLOW_RUN,
+        payload={"workflow_id": "wf-1", "spec": spec, "when_variables": {"day": "99"}},
+    )
+    backend = _FakeBackend([run_job])
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert len(backend.enqueued) == 1
+    assert backend.enqueued[0].payload["workflow_node_id"] == "n1"
+    assert backend.failed == []
+
+
+def test_workflow_run_skips_duplicate_child_on_integrity_error() -> None:
+    # uq_jobs_workflow_node_per_run 兜底:另一 worker 已 enqueue 同一节点时
+    # 本 worker 的 enqueue 撞唯一索引,应跳过继续推进而不是把 run 打挂
+    class _DuplicateRejectingBackend(_FakeBackend):
+        def enqueue(self, job: Job) -> None:
+            raise IntegrityError(
+                "INSERT INTO jobs", {}, Exception("duplicate key uq_jobs_workflow_node_per_run")
+            )
+
+    backend = _DuplicateRejectingBackend([_workflow_run_job()])
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert backend.enqueued == []
+    assert backend.failed == []
+    assert backend.requeued_workflow_runs == ["job-1"]
 
 
 def test_workflow_run_rejects_spec_with_forbidden_kind_at_execution() -> None:

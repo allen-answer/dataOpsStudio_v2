@@ -16,6 +16,7 @@ from uuid import uuid4
 import structlog
 from sqlalchemy import URL, and_, create_engine, insert, select, update
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 
 from app.config import Settings, load_settings
 from app.db.models import (
@@ -82,7 +83,7 @@ from app.domain.workflow_execution import (
     WorkflowChildJob,
     plan_workflow_step,
 )
-from app.domain.workflow_when import builtin_when_variables
+from app.domain.workflow_when import builtin_when_variables, when_variables_from_payload
 from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.result_export import (
@@ -901,17 +902,32 @@ class WorkerRunner:
         self._check_cancel(job.id)
         children = _workflow_children_snapshots(children_jobs)
         now = datetime.now(UTC)
+        # when 变量优先用触发时冻结的快照(与 API 状态查询同源,决策不随
+        # 推进时刻漂移);在途旧 run 无快照时回退为按当前时刻计算
+        frozen_variables = when_variables_from_payload(job.payload)
         plan = plan_workflow_step(
             spec,
             children,
             now=now,
             default_max_retries=self._config.workflow_node_default_max_retries,
-            when_variables=builtin_when_variables(now),
+            when_variables=(
+                frozen_variables if frozen_variables is not None else builtin_when_variables(now)
+            ),
         )
         nodes_by_id = {node.id: node for node in spec.nodes}
         for node_id in plan.enqueue_node_ids:
             child_job = _build_workflow_child_job(job, nodes_by_id[node_id])
-            self._backend.enqueue(child_job)
+            try:
+                self._backend.enqueue(child_job)
+            except IntegrityError:
+                # uq_jobs_workflow_node_per_run 兜底:stale worker 苏醒等竞态下
+                # 另一 worker 已 enqueue 同一节点,跳过防止节点双跑
+                logger.warning(
+                    "workflow node already enqueued by another worker, skipping",
+                    job_id=job.id,
+                    node_id=node_id,
+                )
+                continue
             logger.info(
                 "workflow node enqueued",
                 job_id=job.id,
