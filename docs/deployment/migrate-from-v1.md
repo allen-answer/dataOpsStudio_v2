@@ -16,17 +16,19 @@ follow this official migration path. (For upgrading a **2.0** instance to a newe
 
 ## What the tool migrates
 
-Only tables that exist in the 2.0.0 skeleton schema (`app/db/models.py`) are
-migrated. 1.x data whose 2.0 target table is a 2.1+ feature (compare tasks,
-workflows, scenarios, sql templates, AI configs, asset aspects, refresh/revoked
-tokens, slow-sql plans, run index, …) is **not** migrated — the tool prints a
-"skipped + reason" line for each and does **not** create any 2.1+ tables.
+Only tables that exist in the current 2.x schema (`app/db/models.py`) are
+migrated. 1.x data whose 2.0 target table has not shipped yet (compare tasks,
+scenarios, sql templates, AI configs, asset aspects, refresh/revoked tokens,
+slow-sql plans, run index, ...) is **not** migrated — the tool prints a
+"skipped + reason" line for each and does **not** create missing feature tables.
 
 | 1.x source | 2.0 PG target | Notes |
 |---|---|---|
 | `config/users.json` | `users` | `password_hash` migrated as-is; `mfa_secret_encrypted` (Fernet) decrypted with the 1.x key and re-encrypted into the 2.0 SecretStore (`mfa_secret_ref`). Recovery codes have no 2.0 column → skipped with a warning. |
 | `config/projects.json` | `projects` + `project_members` | `members` (User.id array) is split into the `project_members` join table; the owner gets the `owner` role. |
 | `config/datasources.json` | `datasources` | Plaintext `password` → 2.0 SecretStore → `password_secret_ref`; `extra` → `capability_profile.connection`; `db_type` lower-cased. A 1.x datasource with an **empty `project_id`** (globally visible) cannot be inserted (2.0 `project_id` is a NOT NULL FK) — by default it is skipped; pass `--global-datasource-project` to migrate it into a dedicated project instead (see [Global datasources](#global-datasources)). |
+| `config/workflows.json` | `workflows` | 1.x `compare` / `lineage` / `excel_export` nodes are mapped into 2.4 Workflow job nodes. Forbidden nodes such as external `http` fail the migration instead of being silently dropped. |
+| `config/workflow_templates.json` | `workflow_templates` | Template DAGs use the same node mapping and failure rules as workflows. |
 | SQLite `jobs` | `jobs` | `running` / `cancelling` are marked `failed` on import. Rows whose `owner_user_id` / `project_id` cannot be resolved from the payload are skipped (those columns are NOT NULL FKs in 2.0). |
 | SQLite `audit_logs` | `audit_logs` | `method`+`path` → `action`; HTTP status → `result` (`401/403` → `denied`, `>=400` → `error`). |
 
@@ -141,8 +143,9 @@ Per the contract, "individual field failures are allowed":
    - A sampled datasource `test_connection` succeeds (password decrypted
      correctly).
    - Historical jobs/audit entries are visible.
-   - (When the relevant 2.1+ features ship: sampled AI provider ping, historical
-     runs viewable, all workflows load with no forbidden nodes.)
+   - (When the relevant follow-up domains ship: sampled AI provider ping,
+     historical runs viewable, and Workflow 2.4 definitions load with no
+     forbidden nodes.)
 7. **Cut over** to the 2.0 instance.
 8. **Keep the 1.x instance for 30 days** as a rollback safety net.
 9. **After 30 days, physically destroy** `config/datasources.json` and the rest
