@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any, cast
 
 from app.domain.lineage.ai_fallback import (
     DEFAULT_INFERRED_CONFIDENCE,
@@ -57,7 +58,10 @@ def test_fallback_statements_empty_when_no_errors_or_bad_indexes() -> None:
         fallback_statements(
             sql_text=sql_text,
             dialect="mysql",
-            parse_errors=[{"statement_index": 99}, {"statement_index": "x"}, "junk"],
+            parse_errors=cast(
+                "list[dict[str, Any]]",
+                [{"statement_index": 99}, {"statement_index": "x"}, "junk"],
+            ),
         )
         == []
     )
