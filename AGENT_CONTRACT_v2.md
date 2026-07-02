@@ -318,7 +318,7 @@ class Job:
 | R4 | PG 连接密码禁止写入 secret_refs 表 | 代码审查 + 测试:store_secret 不接受 PG_*_PASSWORD kind |
 | R5 | 日志禁止出现敏感值 | structlog 脱敏 processor(强制)+ 测试:打印含 password 的 dict 输出必须 REDACTED |
 | R6 | ResultSet 禁止持有 DbCursor | grep `ResultSet` 类定义不得有 cursor 字段;cursor 持有时长 ≤ cursor_max_hold_seconds |
-| R7 | Workflow 节点必须在白名单内 | 校验 job_kind ∈ ALLOWED_WORKFLOW_NODE_KINDS;禁 shell/python/任意HTTP |
+| R7 | Workflow 节点必须在白名单内(**2.4.0 Workflow 域生效;R7 单测已在 CI 激活**,见 `tests/unit/test_redlines.py`;设计见 ADR-0009) | 校验 job_kind ∈ ALLOWED_WORKFLOW_NODE_KINDS;禁 shell/python/任意HTTP |
 | R8 | 配置文件禁止明文密码字段 | gitleaks + `config/*.json|yml` 出现明文 `password:` fail |
 | R9 | CI 不跑 SQLite backend(2.0 不支持) | 测试矩阵只有 PG |
 | R10 | f-string 拼接 `uuid4().hex` / `str(uuid4())` 禁止(拼前缀让 id 长度不可预测,超 schema 字段) | ast-grep:`tools/lint/rules/r10_no_uuid_prefix_concat.yml`(触发案例见 `docs/agent-playbook.md §2`) |
@@ -355,7 +355,7 @@ class Job:
 
 ### 明确不做(写了也会被拒)
 - 完整 SQL Workspace(virtual scroll/历史/模板)→ 2.1
-- Compare → 2.2 / Scenario → 2.3 / Lineage → 2.4 / Workflow → 2.5
+- Compare → 2.2 / Lineage → 2.3 / Workflow → 2.4 / Scenario → 2.6(2026-06-19 roadmap 重排,与 AI Copilot 一体)
 - AI Assist 具体功能 → 2.1+ / AI Copilot → 2.6
 - 多租户 RLS / 计费 → 2.7
 - Redis backend / S3 ResultStore / OTel 完整 trace / 告警引擎
