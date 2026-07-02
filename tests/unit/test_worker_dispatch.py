@@ -1,7 +1,8 @@
 """worker db_type → adapter 分发单测(build_database_adapter)。
 
-2.0.0 Certified:MySQL + DM。DM 不再抛 UnsupportedDbTypeError(本任务核心验收)。
-其余方言(Oracle / DB2 / PostgreSQL)仍无 adapter → UnsupportedDbTypeError。
+Certified:MySQL + DM;DB2 是 Preview(PR-A 起有 adapter,不再抛
+UnsupportedDbTypeError)。其余方言(Oracle / PostgreSQL)仍无 adapter →
+UnsupportedDbTypeError。
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from typing import cast
 
 import pytest
 
+from app.dbclients.db2_adapter import Db2Adapter
 from app.dbclients.dm_adapter import DMAdapter
 from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.mysql_adapter import MySQLAdapter
@@ -29,7 +31,16 @@ def test_dispatch_dm_builds_dm_adapter_not_unsupported() -> None:
     assert isinstance(adapter, DMAdapter)
 
 
-@pytest.mark.parametrize("db_type", [DbType.ORACLE, DbType.DB2, DbType.POSTGRESQL])
+def test_dispatch_db2_builds_db2_adapter_not_unsupported() -> None:
+    # DB2 PR-A 核心验收:DB2 数据源不再抛 UnsupportedDbTypeError,
+    # 且 capabilities 按 Preview 范围声明(select/流式开,introspection 关)。
+    adapter = build_database_adapter(_conn_info(DbType.DB2), cast(SecretStore, _SecretStore()))
+    assert isinstance(adapter, Db2Adapter)
+    assert adapter.capabilities.execute_select is True
+    assert adapter.capabilities.list_schemas is False
+
+
+@pytest.mark.parametrize("db_type", [DbType.ORACLE, DbType.POSTGRESQL])
 def test_dispatch_uncertified_db_types_still_unsupported(db_type: DbType) -> None:
     with pytest.raises(UnsupportedDbTypeError) as exc_info:
         build_database_adapter(_conn_info(db_type), cast(SecretStore, _SecretStore()))
