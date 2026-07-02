@@ -13,6 +13,7 @@ import sqlglot
 import structlog
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from sqlalchemy import Table as SqlaTable
 from sqlalchemy import and_, delete, func, insert, or_, select, text, update
 from sqlalchemy.engine import Connection, RowMapping
 from sqlglot import exp
@@ -55,9 +56,12 @@ from app.api.schemas import (
     JobResponse,
     JobResultResponse,
     LicenseStatusResponse,
+    LineageAiFallbackResult,
     LineageAnalyzeRequest,
     LineageAnalyzeResponse,
     LineageDirection,
+    LineageEdgeInferenceResponse,
+    LineageEdgeInferenceUpdateRequest,
     LineageImpactItem,
     LineageImpactResponse,
     LineageSubgraphEdge,
@@ -128,9 +132,15 @@ from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.lineage import (
     LINEAGE_PARSER_VERSION,
     LineageParseRequest,
+    LineageReport,
     analyze_sql_lineage,
     lineage_sql_hash,
     schema_from_metadata_cache_rows,
+)
+from app.domain.lineage.ai_fallback import (
+    InferredLineageEdges,
+    fallback_statements,
+    parse_inferred_edges,
 )
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
@@ -2023,7 +2033,13 @@ def analyze_project_lineage(
                 sql_hash=sql_hash,
             )
             if cached is not None:
-                return _lineage_analyze_response(conn, cached, cached=True)
+                cached_response = _lineage_analyze_response(conn, cached, cached=True)
+                if body.ai_fallback:
+                    # 缓存命中不重跑 AI(要重跑用 refresh=true);原因对前端可见。
+                    cached_response.ai_fallback = LineageAiFallbackResult(
+                        requested=True, executed=False, reason="cached_run"
+                    )
+                return cached_response
         else:
             _delete_lineage_cache(
                 conn,
@@ -2081,6 +2097,21 @@ def analyze_project_lineage(
         if row is None:
             raise ApiError(404, "not_found", "Lineage run not found")
         response = _lineage_analyze_response(conn, row, cached=False)
+    # ★ AI 兜底在确定性事务提交之后执行:AI 故障 / 慢调用绝不拖垮主路径,
+    # deterministic parse_errors 已落库,AI 只能补充(设计稿 §2.4 第 7 条)。
+    if body.ai_fallback:
+        response.ai_fallback = _run_lineage_ai_fallback(
+            services,
+            request,
+            user_id=user.id,
+            project_id=project_id,
+            run_id=run_id,
+            sql_text=body.sql_text,
+            dialect=dialect,
+            sql_hash=sql_hash,
+            report=report,
+            parse_summary=parse_summary,
+        )
     _audit_business(
         services,
         request,
@@ -2144,6 +2175,65 @@ def get_lineage_impact(
             focus=focus,
             max_depth=min(max_depth, 5),
         )
+
+
+@router.patch(
+    "/projects/{project_id}/lineage/edges/{edge_id}",
+    response_model=LineageEdgeInferenceResponse,
+)
+def update_lineage_edge_inference(
+    project_id: str,
+    edge_id: str,
+    body: LineageEdgeInferenceUpdateRequest,
+    request: Request,
+) -> LineageEdgeInferenceResponse:
+    """AI 推断边状态机(设计稿 §2.4 第 7 条):inferred → confirmed / rejected。
+
+    只允许 inferred 起点;confirmed/rejected 为终态(rejected 保留行以留审计轨迹,
+    子图/影响分析 CTE 已按 inference_status <> 'rejected' 排除)。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.begin() as conn:
+        _require_project_access(conn, project_id, user.id)
+        edge_table, row = _lineage_edge_row(conn, edge_id)
+        if row is None or str(row["project_id"]) != project_id:
+            raise ApiError(404, "not_found", "Lineage edge not found")
+        current_status = str(row["inference_status"])
+        if current_status != "inferred":
+            raise ApiError(
+                409,
+                "invalid_inference_transition",
+                "Only inferred edges can be confirmed or rejected",
+            )
+        conn.execute(
+            update(edge_table)
+            .where(edge_table.c.id == edge_id)
+            .values(inference_status=body.inference_status)
+        )
+    edge_kind: Literal["table", "column"] = "table" if edge_table is lineage_edges else "column"
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="lineage_edge_inference",
+        resource_type="lineage_edge",
+        resource_id=edge_id,
+        result="success",
+        detail={
+            "edge_kind": edge_kind,
+            "from_status": current_status,
+            "to_status": body.inference_status,
+        },
+    )
+    return LineageEdgeInferenceResponse(
+        edge_id=edge_id,
+        edge_kind=edge_kind,
+        inference_status=body.inference_status,
+        inferred=bool(row["inferred"]),
+        confidence=float(row["confidence"]),
+    )
 
 
 @router.get("/jobs", response_model=list[JobListItem])
@@ -3354,6 +3444,249 @@ def _insert_lineage_edges(
     ]
     if column_rows:
         conn.execute(insert(lineage_column_edges), column_rows)
+
+
+_LINEAGE_AI_FALLBACK_PROMPT = (
+    "You are given SQL statements that a deterministic SQL lineage parser failed to "
+    "parse. String and numeric literals have been masked; only statement structure, "
+    "table names and column names remain. Infer data lineage edges. Return strict "
+    'JSON only, no prose: {"table_edges": [{"source_table": string, "target_table": '
+    'string, "confidence": number}], "column_edges": [{"source_table": string, '
+    '"source_column": string, "target_table": string, "target_column": string, '
+    '"confidence": number}]}. Confidence is between 0 and 1. Use table names exactly '
+    "as written (keep schema qualification). Return empty lists when lineage cannot "
+    "be inferred. Never invent tables that do not appear in the statements."
+)
+
+
+def _run_lineage_ai_fallback(
+    services: ApiServices,
+    request: Request,
+    *,
+    user_id: str,
+    project_id: str,
+    run_id: str,
+    sql_text: str,
+    dialect: str,
+    sql_hash: str,
+    report: LineageReport,
+    parse_summary: dict[str, Any],
+) -> LineageAiFallbackResult:
+    """AI 兜底解析(设计稿 §2.4 第 7 条)。
+
+    任何失败(配置缺失 / AI 关闭 / gateway 异常 / 响应不可解析)都优雅降级:
+    analyze 主路径已提交,这里只返回 executed=False + reason;deterministic
+    parse_errors 永不被覆盖,AI 结果只能追加。
+    """
+
+    def skipped(reason: str, *, result: str = "skipped") -> LineageAiFallbackResult:
+        _audit_business(
+            services,
+            request,
+            user_id=user_id,
+            project_id=project_id,
+            action="lineage_ai_fallback",
+            resource_type="lineage_run",
+            resource_id=run_id,
+            result=result,
+            detail={"reason": reason},
+        )
+        return LineageAiFallbackResult(requested=True, executed=False, reason=reason)
+
+    if not report.parse_errors:
+        return skipped("no_parse_errors")
+    try:
+        with services.engine.connect() as conn:
+            ai_row = _ai_config_row_or_none(conn)
+        runtime = _ai_runtime_config(services, ai_row)
+    except Exception as exc:
+        return skipped(type(exc).__name__, result="failed")
+    if not runtime.enabled or runtime.provider in {None, "off"}:
+        return skipped("ai_disabled")
+    fragments = fallback_statements(
+        sql_text=sql_text,
+        dialect=dialect,
+        parse_errors=report.parse_errors,
+    )
+    if not fragments:
+        return skipped("no_failed_statements")
+    # ★ R-AI 姿态同 Compare 先例(profile_for_ai):只送脱敏后的内容,按 L2 出站
+    # (§2.7.3 表格:Lineage AI 兜底最高 egress L2);字面量已在 domain 层遮蔽。
+    context = AiContext(
+        items=[
+            ContextItem(
+                content=json.dumps(
+                    {"dialect": dialect, "statements": fragments},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                egress_level=EgressLevel.L2,
+                redacted=True,
+            )
+        ]
+    )
+    try:
+        ai_response = build_gateway_from_runtime_config(runtime).complete(
+            _LINEAGE_AI_FALLBACK_PROMPT,
+            context,
+            AiOptions(purpose="lineage_ai_fallback", max_tokens=1200),
+        )
+    except AiGatewayError as exc:
+        return skipped(type(exc).__name__, result="failed")
+    edges = parse_inferred_edges(ai_response.content)
+    if edges is None:
+        return skipped("invalid_ai_response", result="failed")
+    table_count, column_count = _persist_inferred_lineage_edges(
+        services,
+        run_id=run_id,
+        project_id=project_id,
+        sql_hash=sql_hash,
+        edges=edges,
+        report=report,
+        parse_summary=parse_summary,
+        provider=ai_response.provider,
+        model=ai_response.model,
+    )
+    _audit_business(
+        services,
+        request,
+        user_id=user_id,
+        project_id=project_id,
+        action="lineage_ai_fallback",
+        resource_type="lineage_run",
+        resource_id=run_id,
+        result="success",
+        detail={
+            "provider": ai_response.provider,
+            "inferred_table_edge_count": table_count,
+            "inferred_column_edge_count": column_count,
+        },
+    )
+    return LineageAiFallbackResult(
+        requested=True,
+        executed=True,
+        inferred_table_edge_count=table_count,
+        inferred_column_edge_count=column_count,
+        provider=ai_response.provider,
+        model=ai_response.model,
+    )
+
+
+def _persist_inferred_lineage_edges(
+    services: ApiServices,
+    *,
+    run_id: str,
+    project_id: str,
+    sql_hash: str,
+    edges: InferredLineageEdges,
+    report: LineageReport,
+    parse_summary: dict[str, Any],
+    provider: str,
+    model: str,
+) -> tuple[int, int]:
+    """落库 AI 推断边(inferred=True / inference_status='inferred')并更新 parse_summary。
+
+    与确定性边去重:AI 返回的边若确定性解析已产出,跳过(不与确定性边同权重混淆)。
+    parse_summary 只追加 ai_fallback 键,deterministic parse_errors 原样保留。
+    """
+    deterministic_table_keys = {
+        (str(edge["source_table"]), str(edge["target_table"]))
+        for edge in report.graph_edges
+        if edge.get("source_table") and edge.get("target_table")
+    }
+    deterministic_column_keys = {
+        (
+            str(mapping["source_table"]),
+            str(mapping["source_column"]),
+            str(mapping["target_table"]),
+            str(mapping["target_column"]),
+        )
+        for mapping in report.insert_mappings
+        if (
+            mapping.get("source_table")
+            and mapping.get("source_column")
+            and mapping.get("target_table")
+            and mapping.get("target_column")
+        )
+    }
+    table_rows = [
+        {
+            "id": new_id(),
+            "run_id": run_id,
+            "project_id": project_id,
+            "source_table": edge.source_table,
+            "target_table": edge.target_table,
+            "edge_kind": "table",
+            "inferred": True,
+            "inference_status": "inferred",
+            "confidence": edge.confidence,
+            "sql_hash": sql_hash,
+        }
+        for edge in edges.table_edges
+        if (edge.source_table, edge.target_table) not in deterministic_table_keys
+    ]
+    column_rows = [
+        {
+            "id": new_id(),
+            "run_id": run_id,
+            "project_id": project_id,
+            "source_table": edge.source_table,
+            "source_column": edge.source_column,
+            "target_table": edge.target_table,
+            "target_column": edge.target_column,
+            "transformation": "DIRECT",
+            "transformation_subtype": "DIRECT",
+            "inferred": True,
+            "inference_status": "inferred",
+            "confidence": edge.confidence,
+            "sql_hash": sql_hash,
+        }
+        for edge in edges.column_edges
+        if (
+            edge.source_table,
+            edge.source_column,
+            edge.target_table,
+            edge.target_column,
+        )
+        not in deterministic_column_keys
+    ]
+    summary = dict(parse_summary)
+    summary["ai_fallback"] = {
+        "executed": True,
+        "provider": provider,
+        "model": model,
+        "inferred_table_edge_count": len(table_rows),
+        "inferred_column_edge_count": len(column_rows),
+    }
+    with services.engine.begin() as conn:
+        if table_rows:
+            conn.execute(insert(lineage_edges), table_rows)
+        if column_rows:
+            conn.execute(insert(lineage_column_edges), column_rows)
+        conn.execute(
+            update(lineage_runs)
+            .where(lineage_runs.c.id == run_id)
+            .values(parse_summary=summary, updated_at=datetime.now(UTC))
+        )
+    return len(table_rows), len(column_rows)
+
+
+def _lineage_edge_row(conn: Connection, edge_id: str) -> tuple[SqlaTable, RowMapping | None]:
+    """按 id 在表级 / 列级边表中定位边;返回 (边表, 行或 None)。"""
+    row = (
+        conn.execute(select(lineage_edges).where(lineage_edges.c.id == edge_id))
+        .mappings()
+        .one_or_none()
+    )
+    if row is not None:
+        return lineage_edges, row
+    column_row = (
+        conn.execute(select(lineage_column_edges).where(lineage_column_edges.c.id == edge_id))
+        .mappings()
+        .one_or_none()
+    )
+    return lineage_column_edges, column_row
 
 
 def _lineage_analyze_response(
