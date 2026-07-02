@@ -1314,7 +1314,20 @@ def test_lineage_analyze_cache_hit_does_not_reinsert_edges() -> None:
                 "sql_hash": "hash-1",
                 "parser_version": "sqlglot-w1-v1",
                 "status": "success",
-                "parse_summary": {"table_edge_count": 1, "column_mapping_count": 0},
+                "parse_summary": {
+                    "table_edge_count": 1,
+                    "column_mapping_count": 0,
+                    "parse_error_count": 1,
+                    "parse_errors": [
+                        {
+                            "statement_index": 0,
+                            "error_type": "unsupported_schema",
+                            "message": "metadata cache missing for table app.src",
+                            "unsupported": True,
+                            "statement_type": "INSERT",
+                        }
+                    ],
+                },
             },
             1,
             0,
@@ -1337,6 +1350,16 @@ def test_lineage_analyze_cache_hit_does_not_reinsert_edges() -> None:
     assert payload["cached"] is True
     assert payload["run_id"] == "run-cached"
     assert payload["table_edge_count"] == 1
+    assert payload["parse_summary"]["parse_error_count"] == 1
+    assert payload["parse_summary"]["parse_errors"] == [
+        {
+            "statement_index": 0,
+            "error_type": "unsupported_schema",
+            "message": "metadata cache missing for table app.src",
+            "unsupported": True,
+            "statement_type": "INSERT",
+        }
+    ]
     assert not any("INSERT INTO lineage_edges" in statement for statement in engine.statements)
 
 
