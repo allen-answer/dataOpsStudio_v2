@@ -11,12 +11,13 @@
         [--global-datasource-project <name> [--global-datasource-owner <username>]]
 
 边界(严守):
-- 只迁 2.0 已建表的源数据(以 app/db/models.py 实测为准):
-    users / projects(+project_members) / datasources / jobs / audit_logs
+- 只迁当前 2.x 已建表的源数据(以 app/db/models.py 实测为准):
+    users / projects(+project_members) / datasources / workflows /
+    workflow_templates / jobs / audit_logs
 - 1.x 全局数据源(project_id 为空)无法满足 2.0 NOT NULL FK:默认跳过 + 报告;
   带 --global-datasource-project 时新建/复用同名承接项目挂入(owner 从已迁移用户
   按 username 解析,默认 admin,解析不到报错退出)。见 docs/deployment/migrate-from-v1.md。
-- 2.1+ 才有的目标表(compare_tasks / workflows / scenario_templates /
+- 尚未建表的后续能力域(compare_tasks / scenario_templates /
   sql_templates / ai_configs / asset_aspects / refresh_tokens / ...)2.0.0
   骨架未建,**不迁、不建 migration**,只在报告里列"跳过 + 原因"。
 - audit_logs / jobs 只从 SQLite 迁,不重复读 jsonl/json(1.x 启动已迁进 SQLite)。
@@ -56,8 +57,11 @@ from app.db.models import (
     project_members,
     projects,
     users,
+    workflow_templates,
+    workflows,
 )
 from app.domain.secret import SecretKind
+from app.domain.workflow import WorkflowSpec
 from app.infrastructure.bootstrap.protocol import BootstrapSecrets
 from app.infrastructure.secretstore.local_file import LocalFileSecretStore
 from app.infrastructure.secretstore.protocol import SecretStore
@@ -91,14 +95,18 @@ _ENVIRONMENT_MAP: dict[str, str] = {
     "dev": "dev",
 }
 
+_WORKFLOW_NODE_KIND_MAP: dict[str, str] = {
+    "compare": "compare_run",
+    "lineage": "lineage_analyze",
+    "excel_export": "export_excel",
+}
+_WORKFLOW_FORBIDDEN_NODE_KINDS: frozenset[str] = frozenset({"http"})
+_WORKFLOW_UNMAPPABLE_NODE_KINDS: frozenset[str] = frozenset({"params"})
+_WORKFLOW_DEFAULT_TIMEOUT_SECONDS = 900
+
 # 2.0.0 骨架未建表的 1.x 源(设计稿 §5.4 含 2.1+ 目标表)。逐项列"跳过 + 原因"。
 _SKIPPED_SOURCES: tuple[tuple[str, str], ...] = (
     ("config/tasks.json → compare_tasks", "2.0.0 骨架未建 compare_tasks 表(2.2 Compare)"),
-    ("config/workflows.json → workflows", "2.0.0 骨架未建 workflows 表(2.4 Workflow)"),
-    (
-        "config/workflow_templates.json → workflow_templates",
-        "2.0.0 骨架未建 workflow_templates 表(2.4 Workflow)",
-    ),
     (
         "config/scenarios/*.yml → scenario_templates",
         "2.0.0 骨架未建 scenario_templates 表(2.6 Scenario)",
@@ -137,12 +145,18 @@ _SKIPPED_SOURCES: tuple[tuple[str, str], ...] = (
 class TableReport:
     table: str
     migrated: int = 0
+    failed_rows: int = 0
     skipped_rows: int = 0
     warnings: list[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
     skips: list[str] = field(default_factory=list)
 
     def warn(self, msg: str) -> None:
         self.warnings.append(msg)
+
+    def fail(self, msg: str) -> None:
+        self.failed_rows += 1
+        self.failures.append(msg)
 
     def skip(self, msg: str) -> None:
         self.skipped_rows += 1
@@ -179,6 +193,10 @@ class MigrationOptions:
 
 class MigrationConfigError(RuntimeError):
     """迁移旗标语义错误(如承接项目 owner 解析不到已迁移用户)。"""
+
+
+class WorkflowMigrationError(RuntimeError):
+    """Workflow 定义含禁止/不可映射/无效节点,必须人工改写后重跑迁移。"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -457,6 +475,244 @@ def migrate_datasources(
     return global_attached
 
 
+def _workflow_created_by(
+    raw_owner: object,
+    known_user_ids: set[str],
+    username_to_id: Mapping[str, str],
+) -> str | None:
+    owner = _coalesce_str(raw_owner)
+    if owner in known_user_ids:
+        return owner
+    return username_to_id.get(owner)
+
+
+def _workflow_timeout_seconds(config: Mapping[str, Any]) -> int:
+    raw_timeout = config.get("timeout_seconds")
+    if isinstance(raw_timeout, int) and raw_timeout > 0:
+        return raw_timeout
+    return _WORKFLOW_DEFAULT_TIMEOUT_SECONDS
+
+
+def _workflow_node_payload(
+    *,
+    legacy_kind: str,
+    legacy_name: str,
+    config: Mapping[str, Any],
+    report: TableReport,
+    workflow_label: str,
+    node_id: str,
+) -> dict[str, Any]:
+    payload = dict(config)
+    payload["legacy_node_type"] = legacy_kind
+    if legacy_name:
+        payload["legacy_node_name"] = legacy_name
+    if config:
+        report.warn(
+            f"{workflow_label} node id={node_id} legacy config preserved in payload "
+            f"(keys={','.join(sorted(str(key) for key in config))})"
+        )
+    return payload
+
+
+def _workflow_spec_from_v1(
+    row: Mapping[str, Any],
+    *,
+    table: str,
+    report: TableReport,
+) -> dict[str, Any] | None:
+    workflow_id = _coalesce_str(row.get("id"))
+    workflow_name = _coalesce_str(row.get("name"))
+    workflow_label = f"{table} id={workflow_id or '<none>'} name={workflow_name or '<none>'}"
+    raw_nodes = row.get("nodes")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+        report.fail(f"validation_failed: {workflow_label} has no nodes")
+        return None
+
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, str]] = []
+    blocked = False
+    for raw_node in raw_nodes:
+        if not isinstance(raw_node, Mapping):
+            report.fail(f"validation_failed: {workflow_label} contains non-object node")
+            blocked = True
+            continue
+        node_id = _coalesce_str(raw_node.get("id"))
+        legacy_kind = _coalesce_str(raw_node.get("type")) or _coalesce_str(raw_node.get("kind"))
+        if not node_id:
+            report.fail(f"validation_failed: {workflow_label} contains node without id")
+            blocked = True
+            continue
+        if legacy_kind in _WORKFLOW_FORBIDDEN_NODE_KINDS:
+            report.fail(f"forbidden: {workflow_label} node id={node_id} type={legacy_kind}")
+            blocked = True
+            continue
+        if legacy_kind in _WORKFLOW_UNMAPPABLE_NODE_KINDS:
+            report.fail(f"unmappable: {workflow_label} node id={node_id} type={legacy_kind}")
+            blocked = True
+            continue
+        job_kind = _WORKFLOW_NODE_KIND_MAP.get(legacy_kind)
+        if job_kind is None:
+            report.fail(
+                f"unmappable: {workflow_label} node id={node_id} type={legacy_kind or '<none>'}"
+            )
+            blocked = True
+            continue
+
+        raw_config = raw_node.get("config")
+        config: Mapping[str, Any] = dict(raw_config) if isinstance(raw_config, Mapping) else {}
+        when = _coalesce_str(raw_node.get("when")) or None
+        legacy_name = _coalesce_str(raw_node.get("name"))
+        nodes.append(
+            {
+                "id": node_id,
+                "job_kind": job_kind,
+                "payload": _workflow_node_payload(
+                    legacy_kind=legacy_kind,
+                    legacy_name=legacy_name,
+                    config=config,
+                    report=report,
+                    workflow_label=workflow_label,
+                    node_id=node_id,
+                ),
+                "timeout_seconds": _workflow_timeout_seconds(config),
+                "when": when,
+            }
+        )
+
+        depends_on = raw_node.get("depends_on")
+        if isinstance(depends_on, list):
+            for source in depends_on:
+                if isinstance(source, str) and source:
+                    edges.append({"source": source, "target": node_id})
+        elif depends_on is not None:
+            report.fail(
+                f"validation_failed: {workflow_label} node id={node_id} depends_on is not a list"
+            )
+            blocked = True
+
+    if blocked:
+        return None
+
+    schedule = None
+    cron = _coalesce_str(row.get("schedule_cron"))
+    if cron:
+        schedule = {
+            "cron": cron,
+            "enabled": _coalesce_str(row.get("status")).lower() == "active",
+        }
+    candidate: dict[str, Any] = {"nodes": nodes, "edges": edges, "schedule": schedule}
+    try:
+        return WorkflowSpec.model_validate(candidate).model_dump(mode="json")
+    except Exception as exc:
+        report.fail(f"validation_failed: {workflow_label}: {exc}")
+        return None
+
+
+def migrate_workflows(
+    conn: Connection,
+    rows: Sequence[Mapping[str, Any]],
+    known_project_ids: set[str],
+    known_user_ids: set[str],
+    username_to_id: Mapping[str, str],
+    report: MigrationReport,
+) -> None:
+    """迁 config/workflows.json → workflows;发现禁止/不可映射/无效节点则整表不写。"""
+    rep = report.table("workflows")
+    inserts: list[dict[str, Any]] = []
+    for row in rows:
+        workflow_id = _coalesce_str(row.get("id"))
+        name = _coalesce_str(row.get("name"))
+        project_id = _coalesce_str(row.get("project_id"))
+        if not (workflow_id and name):
+            rep.skip(f"workflow missing id/name (id={workflow_id or '<none>'})")
+            continue
+        if project_id not in known_project_ids:
+            rep.skip(
+                f"workflow id={workflow_id} project_id not migrated/missing "
+                f"(project={project_id or '<none>'})"
+            )
+            continue
+        dag_jsonb = _workflow_spec_from_v1(row, table="workflows", report=rep)
+        if dag_jsonb is None:
+            continue
+        schedule = dag_jsonb.get("schedule")
+        created = _parse_dt(row.get("created_at"))
+        values: dict[str, Any] = {
+            "id": workflow_id,
+            "project_id": project_id,
+            "name": name,
+            "dag_jsonb": dag_jsonb,
+            "schedule_cron": schedule.get("cron") if isinstance(schedule, dict) else None,
+            "schedule_enabled": (
+                bool(schedule.get("enabled")) if isinstance(schedule, dict) else False
+            ),
+            "enabled": _coalesce_str(row.get("status")).lower() != "archived",
+            "created_by": _workflow_created_by(row.get("owner"), known_user_ids, username_to_id),
+        }
+        if created is not None:
+            values["created_at"] = created
+            values["updated_at"] = created
+        inserts.append(values)
+
+    if rep.failed_rows:
+        raise WorkflowMigrationError("workflows contain forbidden/unmappable/invalid nodes")
+    for values in inserts:
+        conn.execute(insert(workflows).values(**values))
+        rep.migrated += 1
+
+
+def migrate_workflow_templates(
+    conn: Connection,
+    rows: Sequence[Mapping[str, Any]],
+    known_user_ids: set[str],
+    username_to_id: Mapping[str, str],
+    report: MigrationReport,
+) -> None:
+    """迁 config/workflow_templates.json → workflow_templates;模板无项目归属。"""
+    rep = report.table("workflow_templates")
+    inserts: list[dict[str, Any]] = []
+    for row in rows:
+        template_id = _coalesce_str(row.get("id"))
+        name = _coalesce_str(row.get("name"))
+        workflow = row.get("workflow")
+        if not (template_id and name):
+            rep.skip(f"workflow_template missing id/name (id={template_id or '<none>'})")
+            continue
+        if not isinstance(workflow, Mapping):
+            rep.fail(
+                f"validation_failed: workflow_templates id={template_id} has no workflow object"
+            )
+            continue
+        workflow_row = dict(workflow)
+        workflow_row.setdefault("id", template_id)
+        workflow_row.setdefault("name", name)
+        dag_jsonb = _workflow_spec_from_v1(workflow_row, table="workflow_templates", report=rep)
+        if dag_jsonb is None:
+            continue
+        created = _parse_dt(row.get("created_at")) or _parse_dt(workflow.get("created_at"))
+        values: dict[str, Any] = {
+            "id": template_id,
+            "name": name,
+            "description": _coalesce_str(row.get("description")) or None,
+            "dag_jsonb": dag_jsonb,
+            "created_by": _workflow_created_by(
+                workflow.get("owner"), known_user_ids, username_to_id
+            ),
+        }
+        if created is not None:
+            values["created_at"] = created
+            values["updated_at"] = created
+        inserts.append(values)
+
+    if rep.failed_rows:
+        raise WorkflowMigrationError(
+            "workflow_templates contain forbidden/unmappable/invalid nodes"
+        )
+    for values in inserts:
+        conn.execute(insert(workflow_templates).values(**values))
+        rep.migrated += 1
+
+
 def create_global_datasource_project(
     conn: Connection,
     *,
@@ -665,6 +921,8 @@ def run_migration(
     users_rows = load_json_list(source_dir, "users.json")
     projects_rows = load_json_list(source_dir, "projects.json")
     datasources_rows = load_json_list(source_dir, "datasources.json")
+    workflows_rows = load_json_list(source_dir, "workflows.json")
+    workflow_templates_rows = load_json_list(source_dir, "workflow_templates.json")
 
     try:
         with engine.begin() as conn:
@@ -696,6 +954,23 @@ def run_migration(
                 secret_store,
                 report,
                 global_project_id=global_project_id,
+            )
+        with engine.begin() as conn:
+            migrate_workflows(
+                conn,
+                workflows_rows,
+                project_ids,
+                user_ids,
+                username_to_id,
+                report,
+            )
+        with engine.begin() as conn:
+            migrate_workflow_templates(
+                conn,
+                workflow_templates_rows,
+                user_ids,
+                username_to_id,
+                report,
             )
         if global_project_id is not None:
             logger.info(
@@ -733,11 +1008,14 @@ def log_report(report: MigrationReport) -> None:
             "table migrated",
             table=name,
             migrated=rep.migrated,
+            failed_rows=rep.failed_rows,
             skipped_rows=rep.skipped_rows,
             warnings=len(rep.warnings),
         )
         for w in rep.warnings:
             logger.warning("field warning", table=name, detail=w)
+        for f in rep.failures:
+            logger.error("row failed", table=name, detail=f)
         for s in rep.skips:
             logger.warning("row skipped", table=name, detail=s)
     logger.info("secrets re-encrypted", count=report.secrets_created)
