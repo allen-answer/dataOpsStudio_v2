@@ -2,28 +2,6 @@
 
 > review 过程中 surfaced 的"暂不阻塞、但要记得"项。每一条标明**最迟修复版本**和**触发条件**;到该版本前必修的标 ★ 必修。
 
-## 来自 T4 (API + middleware) review
-
-### **F2 正解** — Worker 独立心跳线程(取消 OLAP 取舍)
-
-**位置**:`app/worker.py:WorkerRunner`
-
-**现状**:heartbeat 只在 fetch loop 内每 15s 触发,慢首行 OLAP 期间不触发。2.0.0 通过把 `worker_heartbeat_timeout` 调到 600s 缓解(见 ADR-0018):**避免误杀合法慢查询**优先于 **worker 死亡后更快恢复**。
-
-**Trade-off 痛点**:600s = 10 分钟,实际 worker 崩溃后需 10 分钟才 reaper 接管。对生产场景偏长。
-
-**正解**:独立 heartbeat 线程/定时器,与 fetch loop 解耦。线程每 15s 强制 heartbeat,即使主线程在 driver-level 阻塞首行返回。
-
-**触发条件**:
-- 客户 hosted 形态出现"worker 死了但 reaper 10 分钟才恢复"投诉
-- 或 hosted 上需要把 timeout 压回 90s 提升故障恢复速度(2.6.0 hosted Copilot 上线后)
-
-**优先级**:不阻塞 2.0.0 / 2.0.x,**2.7.0 hosted scale-out 前必修**(那时 worker fleet 规模化,单 worker 死 10 分钟意味着可见的吞吐损失)。
-
-**关联**:ADR-0018 已记录此 trade-off + 引用本 backlog 项。
-
----
-
 ## 来自首次云服务器 dogfood(5f27cc5,§5 真链路跑通)
 
 ### **GA 前安全评审会被点** — `POST /api/datasources` 密码以明文进 request body

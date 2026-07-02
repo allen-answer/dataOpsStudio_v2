@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import signal
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -214,7 +215,7 @@ AdapterFactory = Callable[
 @dataclass(frozen=True)
 class WorkerRunnerConfig:
     worker_id: str
-    heartbeat_interval_seconds: int = 15
+    heartbeat_interval_seconds: float = 15.0
     heartbeat_timeout_seconds: int = 600
     poll_interval_seconds: float = 1.0
     sql_spool_batch_size: int = 1000
@@ -249,6 +250,8 @@ class WorkerRunner:
             raise ValueError("result_gc_interval_seconds must be positive")
         if config.export_limit_mb <= 0:
             raise ValueError("export_limit_mb must be positive")
+        if config.heartbeat_interval_seconds <= 0:
+            raise ValueError("heartbeat_interval_seconds must be positive")
         self._backend = backend
         self._result_store = result_store
         self._datasource_loader = datasource_loader
@@ -293,6 +296,7 @@ class WorkerRunner:
             kind=job.kind.value,
             worker_id=self._config.worker_id,
         )
+        heartbeat_stop, heartbeat_thread = self._start_job_heartbeat_thread(job.id)
         try:
             self._check_cancel(job.id)
             if job.kind is JobKind.TEST_CONNECTION:
@@ -341,6 +345,32 @@ class WorkerRunner:
                 loaded_rows=outcome.loaded_rows,
                 elapsed_seconds=_elapsed_seconds(started_at),
             )
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1.0)
+
+    def _start_job_heartbeat_thread(self, job_id: str) -> tuple[threading.Event, threading.Thread]:
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=self._heartbeat_until_stopped,
+            args=(job_id, stop),
+            name=f"dataops-heartbeat-{job_id}",
+            daemon=True,
+        )
+        thread.start()
+        return stop, thread
+
+    def _heartbeat_until_stopped(self, job_id: str, stop: threading.Event) -> None:
+        while not stop.wait(self._config.heartbeat_interval_seconds):
+            try:
+                self._heartbeat(job_id)
+            except Exception as exc:
+                logger.warning(
+                    "worker job heartbeat failed",
+                    job_id=job_id,
+                    worker_id=self._config.worker_id,
+                    error_type=type(exc).__name__,
+                )
 
     def _execute_sql_query(self, job: Job) -> _ExecutionOutcome:
         payload = job.payload
