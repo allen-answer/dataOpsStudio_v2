@@ -37,6 +37,12 @@ dependencies = [
     "pyotp>=2.9.0",
 ]
 
+[project.optional-dependencies]
+# DB2 driver — 刻意不进主 dependencies:pip 装 ibm_db 会拉 ~30MB clidriver,
+# 离线/portable 部署是最高失败率项(1.x 同款取舍,1.x 直接注释掉了它)。
+# adapter 延迟 import,缺驱动时报错信息指引安装。import 仅允许在 app/dbclients/(R1)。
+db2 = ["ibm_db>=3.2"]
+
 [project.urls]
 Repository = "https://github.com/allen-answer/dataOpsStudio_v2"
 
@@ -104,6 +110,7 @@ select = [
 "pymysql".msg                  = "R1: MySQL 驱动只允许在 app/dbclients/ import"
 "dmPython".msg                 = "R1: DM 驱动只允许在 app/dbclients/ import"
 "ibm_db".msg                   = "R1: DB2 驱动只允许在 app/dbclients/ import"
+"ibm_db_dbi".msg               = "R1: DB2 驱动(DB-API wrapper)只允许在 app/dbclients/ import"
 "cryptography.fernet".msg      = "R3: Fernet 只允许在 app/infrastructure/secretstore/ import"
 "cryptography.hazmat".msg      = "R3: cryptography.hazmat 只允许在 app/infrastructure/secretstore/ 或 app/infrastructure/license/ import"
 "bcrypt".msg                   = "R3: bcrypt 只允许在 app/infrastructure/secretstore/ import"

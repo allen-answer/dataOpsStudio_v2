@@ -1,9 +1,11 @@
 """DatabaseAdapter Protocol 契约测试(契约 §3.2)。
 
 ★ 接口设计以 Oracle/DM 为假想验证对象 —— 故契约测试参数化 MySQL + DM 两个
-2.0.0 Certified adapter,同一套 Protocol 签名两边都过,并覆盖:
+2.0.0 Certified adapter + DB2 Preview adapter,同一套 Protocol 签名全都过,并覆盖:
 - 标识符大小写差异(MySQL 反引号原样 vs DM/Oracle UPPER + 双引号)
 - server_side_cancel 多为 False 的优雅降级
+- capability=False 的能力(DB2 PR-A 的 introspection/compare)按声明降级:
+  调用方先查 capabilities,直调必须抛 NotImplementedError(不静默返回空)
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ from typing import Any, cast
 
 import pytest
 
+from app.dbclients.db2_adapter import Db2Adapter
 from app.dbclients.dm_adapter import DMAdapter
 from app.dbclients.mysql_adapter import MySQLAdapter
 from app.dbclients.protocol import DatabaseAdapter
@@ -24,7 +27,7 @@ from app.infrastructure.secretstore.protocol import SecretStore
 pytestmark = pytest.mark.contract
 
 
-@pytest.fixture(params=["mysql", "dm"])
+@pytest.fixture(params=["mysql", "dm", "db2"])
 def adapter(request: pytest.FixtureRequest) -> DatabaseAdapter:
     secret_store = cast(SecretStore, _SecretStore())
     if request.param == "mysql":
@@ -32,6 +35,13 @@ def adapter(request: pytest.FixtureRequest) -> DatabaseAdapter:
             _conn_info(DbType.MYSQL),
             secret_store,
             pymysql_module=_FakePyMySQL(),
+        )
+    if request.param == "db2":
+        return Db2Adapter(
+            _conn_info(DbType.DB2),
+            secret_store,
+            ibm_db_dbi_module=_FakeIbmDbDbi(),
+            ibm_db_module=_FakeIbmDb(),
         )
     return DMAdapter(
         _conn_info(DbType.DM),
@@ -67,7 +77,15 @@ def test_execute_select_is_iterator(adapter: DatabaseAdapter) -> None:
 
 
 def test_introspection_returns_typed_lists(adapter: DatabaseAdapter) -> None:
-    """list_schemas/tables/columns/indexes 返回 list[Schema/Table/...]。"""
+    """list_schemas/tables/columns/indexes 返回 list[Schema/Table/...]。
+
+    capability=False 的 adapter(DB2 PR-A)直调必须抛 NotImplementedError,
+    不静默返回空列表(调用方按 capabilities 降级)。
+    """
+    if not adapter.capabilities.list_schemas:
+        with pytest.raises(NotImplementedError):
+            adapter.list_schemas()
+        return
     schemas = adapter.list_schemas()
     assert isinstance(schemas, list)
 
@@ -88,6 +106,10 @@ def test_list_columns_returns_typed_column(adapter: DatabaseAdapter) -> None:
 
     MySQL 反引号原样(小写 id);DM/Oracle 默认大写(ID)。两边都过同一签名。
     """
+    if not adapter.capabilities.list_columns:
+        with pytest.raises(NotImplementedError):
+            adapter.list_columns("app", "users")
+        return
     columns = adapter.list_columns("app", "users")
     assert columns
     first = columns[0]
@@ -112,15 +134,20 @@ def test_compare_hash_query_builds_without_connecting(adapter: DatabaseAdapter) 
         key_columns=[CompareColumn(name="id", type=ColumnType.INTEGER)],
     )
 
+    if not adapter.capabilities.compare_db_hash:
+        with pytest.raises(NotImplementedError):
+            adapter.build_compare_hash_query(request)
+        return
+
     plan = adapter.build_compare_hash_query(request)
 
-    assert adapter.capabilities.compare_db_hash is True
     assert plan.uses_database_hash is True
     assert plan.sql is not None
 
 
 def _conn_info(db_type: DbType) -> DatasourceConnInfo:
-    port = 3306 if db_type is DbType.MYSQL else 5236
+    ports = {DbType.MYSQL: 3306, DbType.DM: 5236, DbType.DB2: 50000}
+    port = ports[db_type]
     return DatasourceConnInfo(
         host="127.0.0.1",
         port=port,
@@ -219,6 +246,87 @@ class _FakeCursor:
 
     def fetchall(self) -> list[tuple[Any, ...]]:
         return self._rows
+
+    def close(self) -> None:
+        return None
+
+
+# ──────────────────── DB2 fake driver ────────────────────
+
+
+class _FakeIbmDb:
+    """fake ibm_db C 模块(set_option / errormsg / server_info)。"""
+
+    SQL_ATTR_QUERY_TIMEOUT = 0
+
+    def __init__(self) -> None:
+        self.set_option_calls: list[tuple[Any, dict[Any, Any], int]] = []
+
+    def set_option(self, handle: Any, options: dict[Any, Any], scope: int) -> None:
+        self.set_option_calls.append((handle, dict(options), scope))
+
+    def stmt_errormsg(self) -> str:
+        return ""
+
+    def conn_errormsg(self) -> str:
+        return ""
+
+    def server_info(self, handle: Any) -> Any:
+        class _Info:
+            DBMS_VER = "11.5"
+
+        return _Info()
+
+
+class _FakeIbmDbDbi:
+    """fake ibm_db_dbi(DB-API wrapper):connect(conn_str, "", "")。"""
+
+    def __init__(self) -> None:
+        self.conn_strs: list[str] = []
+
+    def connect(self, conn_str: str, user: str = "", password: str = "") -> _FakeDb2Connection:
+        self.conn_strs.append(conn_str)
+        return _FakeDb2Connection()
+
+
+class _FakeDb2Connection:
+    def __init__(self) -> None:
+        self.closed = False
+        self.conn_handler = object()  # 老版本属性名(新版本是 conn_handle)
+
+    def cursor(self) -> _FakeDb2Cursor:
+        return _FakeDb2Cursor()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeDb2Cursor:
+    def __init__(self) -> None:
+        self.description: tuple[tuple[Any, ...], ...] = (("OK",),)
+        self._rows: list[tuple[Any, ...]] = []
+        self._offset = 0
+
+    def execute(self, sql: str, params: object = None) -> None:
+        # 契约测试只关心 Protocol 形态;DB2 行为细节(连接串/超时/错误反查)
+        # 见 tests/unit/test_db2_adapter.py
+        self.description = (("OK",),)
+        self._rows = [(1,)]
+        self._offset = 0
+
+    def fetchone(self) -> tuple[Any, ...] | None:
+        rows = self.fetchmany(1)
+        return rows[0] if rows else None
+
+    def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
+        batch = self._rows[self._offset : self._offset + size]
+        self._offset += len(batch)
+        return batch
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        rows = self._rows[self._offset :]
+        self._offset = len(self._rows)
+        return rows
 
     def close(self) -> None:
         return None
