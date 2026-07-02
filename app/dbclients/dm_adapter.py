@@ -475,7 +475,7 @@ class DMAdapter(DatabaseAdapter):
                 Column(
                     name=str(item[0]),
                     type=description_item_to_column_type(dm, type_code, scale_value),
-                    driver_type=str(type_code) if type_code is not None else None,
+                    driver_type=_dm_driver_type_name(type_code),
                     nullable=bool(nullable_value) if nullable_value is not None else True,
                     primary_key=False,
                 )
@@ -486,6 +486,17 @@ class DMAdapter(DatabaseAdapter):
 def _validate_identifier(identifier: str) -> None:
     if not identifier or _IDENTIFIER_RE.fullmatch(identifier) is None:
         raise ValueError("Invalid database identifier")
+
+
+def _dm_driver_type_name(type_code: object | None) -> str | None:
+    if type_code is None:
+        return None
+    name = getattr(type_code, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    if isinstance(type_code, type):
+        return type_code.__name__
+    return str(type_code)
 
 
 def _description_columns(description: object) -> list[str]:

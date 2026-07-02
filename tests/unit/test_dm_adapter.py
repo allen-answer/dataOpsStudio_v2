@@ -76,8 +76,8 @@ def test_execute_select_emits_columns_mapped_to_unified_enum() -> None:
 
     list(adapter.execute_select("SELECT N FROM T", {}))
 
-    # description[1] == dmPython.NUMBER (type-object) → DECIMAL;原始码进 driver_type
-    assert captured == [Column(name="N", type=ColumnType.DECIMAL, driver_type=str(_FakeDM.NUMBER))]
+    # description[1] == dmPython.NUMBER (type-object) → DECIMAL;driver_type 使用干净名
+    assert captured == [Column(name="N", type=ColumnType.DECIMAL, driver_type="NUMBER")]
     assert all(not hasattr(column, "cursor") for column in captured)
 
 
