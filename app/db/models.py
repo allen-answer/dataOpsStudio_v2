@@ -724,6 +724,63 @@ lineage_column_edges = Table(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# workflows / workflow_templates —— Workflow 2.4 定义持久化(ADR-0009)
+#   dag_jsonb = WorkflowSpec.model_dump(mode="json")(app/domain/workflow.py)
+#   schedule_cron / schedule_enabled 冗余自 dag_jsonb.schedule,
+#   供 PR-4 调度器 tick 扫表用(避免每 tick 全表解析 JSONB)
+# ─────────────────────────────────────────────────────────────────────────────
+workflows = Table(
+    "workflows",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column(
+        "project_id",
+        String(36),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("name", String(128), nullable=False),
+    Column("dag_jsonb", JSONB(), nullable=False),
+    # ★ 冗余列(权威数据在 dag_jsonb.schedule):调度器扫表专用,写入时同步
+    Column("schedule_cron", String(64), nullable=True),
+    Column("schedule_enabled", Boolean(), nullable=False, server_default=text("false")),
+    # 总开关:false 时调度器不触发(手动运行语义属 PR-3/PR-4)
+    Column("enabled", Boolean(), nullable=False, server_default=text("true")),
+    Column(
+        "created_by",
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    UniqueConstraint("project_id", "name", name="uq_workflows_project_name"),
+    Index("ix_workflows_project_updated", "project_id", "updated_at"),
+)
+
+
+# workflow_templates —— 全局归属(跟随 1.x:config/workflow_templates.json
+# 为全局单文件 JsonStore,无项目命名空间;V1_AS_IS §2.3)
+workflow_templates = Table(
+    "workflow_templates",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column("name", String(128), nullable=False),
+    Column("description", Text(), nullable=True),
+    Column("dag_jsonb", JSONB(), nullable=False),
+    Column(
+        "created_by",
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    UniqueConstraint("name", name="uq_workflow_templates_name"),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # result_sets —— ★ R6 红线 DB 层:无 cursor 字段
 # ─────────────────────────────────────────────────────────────────────────────
 result_sets = Table(
@@ -831,4 +888,6 @@ __all__ = [
     "sql_consoles",
     "sql_templates",
     "users",
+    "workflow_templates",
+    "workflows",
 ]
