@@ -26,10 +26,12 @@ from app.dbclients.db2_adapter import (
 from app.dbclients.db2_types import (
     description_type_to_column_type,
     description_type_to_driver_name,
+    syscat_typename_to_column_type,
+    syscat_typename_to_driver_name,
 )
 from app.dbclients.protocol import AdapterConnectionError
 from app.domain.datasource import DatasourceConnInfo, DbType
-from app.domain.schema import Column, ColumnType, Row
+from app.domain.schema import Column, ColumnType, Index, Row, Schema, Table
 from app.domain.secret import HashedRef, RotationReport, SecretKind, SecretRef
 from app.infrastructure.secretstore.protocol import SecretStore
 
@@ -51,12 +53,13 @@ def test_capabilities_declare_preview_scope() -> None:
     assert caps.stream_rows is True
     # ibm_db 无 driver-level cancel(V1_AS_IS §2.8)
     assert caps.server_side_cancel is False
-    # PR-B/PR-C 才开的能力,PR-A 显式 False(占位)
+    # PR-B 开了 SYSCAT introspection 全套
+    assert caps.list_schemas is True
+    assert caps.list_tables is True
+    assert caps.list_columns is True
+    assert caps.list_indexes is True
+    # 仍占位:explain(EXPLAIN tables 依赖)/ DDL(无稳妥只读途径)/ compare(PR-C)
     assert caps.explain is False
-    assert caps.list_schemas is False
-    assert caps.list_tables is False
-    assert caps.list_columns is False
-    assert caps.list_indexes is False
     assert caps.get_table_ddl is False
     assert caps.compare_db_hash is False
 
@@ -69,10 +72,6 @@ def test_unsupported_operations_raise_not_implemented() -> None:
     adapter = _adapter(_FakeIbmDbDbi(), _FakeIbmDb())
     for call in (
         lambda: adapter.explain("SELECT 1"),
-        adapter.list_schemas,
-        lambda: adapter.list_tables("S"),
-        lambda: adapter.list_columns("S", "T"),
-        lambda: adapter.list_indexes("S", "T"),
         lambda: adapter.get_table_ddl("S", "T"),
     ):
         with pytest.raises(Db2UnsupportedOperationError) as excinfo:
@@ -324,6 +323,219 @@ def test_description_type_mapping_units() -> None:
     assert description_type_to_driver_name(object()) is None
 
 
+# ──────────────────── PR-B:SYSCAT introspection ────────────────────
+
+
+def test_list_schemas_uses_syscat_and_filters_system_prefixes() -> None:
+    rows = [
+        ("APPDATA ",),  # CHAR 定长右补空格 → strip
+        ("DB2GSE",),
+        ("ERRSCHEMA",),
+        ("NULLID",),
+        ("SQLJ",),
+        ("ST_INFORMTN_SCHEMA",),
+        ("SYSCAT",),
+        ("SYSIBM",),
+    ]
+    fake_dbi = _FakeIbmDbDbi(rows=rows, description=(("NAME",),))
+    adapter = _adapter(fake_dbi, _FakeIbmDb())
+
+    schemas = adapter.list_schemas()
+
+    # 1.x metadata.py:37 实证前缀清单:SYS/DB2/ERR/NULLID/SQLJ/ST_ 全排除
+    assert schemas == [Schema(name="APPDATA")]
+    cursor = fake_dbi.connections[0].cursors[0]
+    sql = " ".join(cursor.executed_sql.split())
+    assert "FROM SYSCAT.SCHEMATA" in sql
+    assert "ORDER BY SCHEMANAME" in sql
+    assert cursor.executed_params is None
+    assert cursor.closed is True
+    assert fake_dbi.connections[0].closed is True
+
+
+def test_list_tables_parameterized_upper_and_maps_type_labels() -> None:
+    description = (("SCHEMA_NAME",), ("NAME",), ("TABLE_TYPE",))
+    rows = [("APPDATA", "USERS", "T"), ("APPDATA", "V_USERS", "V")]
+    fake_dbi = _FakeIbmDbDbi(rows=rows, description=description)
+    adapter = _adapter(fake_dbi, _FakeIbmDb())
+
+    tables = adapter.list_tables("appdata")
+
+    assert tables == [
+        Table(schema_name="APPDATA", name="USERS", table_type="TABLE"),
+        Table(schema_name="APPDATA", name="V_USERS", table_type="VIEW"),
+    ]
+    cursor = fake_dbi.connections[0].cursors[0]
+    sql = " ".join(cursor.executed_sql.split())
+    assert "FROM SYSCAT.TABLES" in sql
+    # 参数化 + UPPER,不字符串拼接用户输入;与 DM 一致连视图一起列
+    assert "TABSCHEMA = UPPER(?)" in sql
+    assert "TYPE IN ('T', 'V')" in sql
+    assert cursor.executed_params == ("appdata",)
+
+
+def test_list_columns_maps_syscat_rows_to_domain_columns() -> None:
+    description = (("NAME",), ("DATA_TYPE",), ("NULLABLE",), ("KEYSEQ",), ("COMMENT",))
+    rows = [
+        ("ID", "BIGINT", "N", 1, None),
+        ("NAME", "VARCHAR", "Y", None, "用户名"),
+        ("CREATED_AT", "TIMESTAMP", "N", 0, None),  # KEYSEQ=0 也算非主键
+        ("PAYLOAD", "BLOB", "Y", None, None),
+    ]
+    fake_dbi = _FakeIbmDbDbi(rows=rows, description=description)
+    adapter = _adapter(fake_dbi, _FakeIbmDb())
+
+    columns = adapter.list_columns("appdata", "users")
+
+    assert columns == [
+        Column(
+            name="ID",
+            type=ColumnType.INTEGER,
+            driver_type="BIGINT",
+            nullable=False,
+            primary_key=True,
+        ),
+        Column(
+            name="NAME",
+            type=ColumnType.STRING,
+            driver_type="VARCHAR",
+            nullable=True,
+            primary_key=False,
+            comment="用户名",
+        ),
+        Column(
+            name="CREATED_AT",
+            type=ColumnType.DATETIME,
+            driver_type="TIMESTAMP",
+            nullable=False,
+            primary_key=False,
+        ),
+        Column(
+            name="PAYLOAD",
+            type=ColumnType.BYTES,
+            driver_type="BLOB",
+            nullable=True,
+            primary_key=False,
+        ),
+    ]
+    cursor = fake_dbi.connections[0].cursors[0]
+    sql = " ".join(cursor.executed_sql.split())
+    assert "FROM SYSCAT.COLUMNS" in sql
+    assert "TABSCHEMA = UPPER(?) AND TABNAME = UPPER(?)" in sql
+    assert "ORDER BY COLNO" in sql
+    assert cursor.executed_params == ("appdata", "users")
+
+
+def test_list_indexes_groups_columns_and_parses_uniquerule() -> None:
+    description = (("NAME",), ("UNIQUERULE",), ("COLUMN_NAME",), ("COLUMN_POSITION",))
+    rows = [
+        ("PK_USERS", "P", "ID", 1),
+        ("UX_EMAIL", "U", "EMAIL", 1),
+        ("IX_NAME_CREATED", "D", "NAME", 1),
+        ("IX_NAME_CREATED", "D", "CREATED_AT", 2),
+    ]
+    fake_dbi = _FakeIbmDbDbi(rows=rows, description=description)
+    adapter = _adapter(fake_dbi, _FakeIbmDb())
+
+    indexes = adapter.list_indexes("appdata", "users")
+
+    # UNIQUERULE:'P' 主键(也算 unique)/ 'U' unique / 'D' 普通
+    assert indexes == [
+        Index(name="PK_USERS", columns=["ID"], is_unique=True, is_primary=True),
+        Index(name="UX_EMAIL", columns=["EMAIL"], is_unique=True, is_primary=False),
+        Index(
+            name="IX_NAME_CREATED",
+            columns=["NAME", "CREATED_AT"],
+            is_unique=False,
+            is_primary=False,
+        ),
+    ]
+    cursor = fake_dbi.connections[0].cursors[0]
+    sql = " ".join(cursor.executed_sql.split())
+    assert "FROM SYSCAT.INDEXES i" in sql
+    assert "JOIN SYSCAT.INDEXCOLUSE c" in sql
+    assert "i.TABSCHEMA = UPPER(?) AND i.TABNAME = UPPER(?)" in sql
+    assert "ORDER BY i.INDNAME, c.COLSEQ" in sql
+    assert cursor.executed_params == ("appdata", "users")
+
+
+def test_introspection_rejects_invalid_identifiers_before_connecting() -> None:
+    fake_dbi = _FakeIbmDbDbi()
+    adapter = _adapter(fake_dbi, _FakeIbmDb())
+
+    for call in (
+        lambda: adapter.list_tables("bad schema"),
+        lambda: adapter.list_columns("app", "users; DROP TABLE x"),
+        lambda: adapter.list_indexes("app'--", "users"),
+    ):
+        with pytest.raises(ValueError):
+            call()
+    # 校验在连接之前,零连接开销
+    assert fake_dbi.connections == []
+
+
+def test_introspection_query_error_enriched_with_sqlcode() -> None:
+    fake_dbi = _FakeIbmDbDbi(execute_exc=RuntimeError("exception set"))
+    fake_ibm_db = _FakeIbmDb(stmt_errormsg="SQLCODE=-551 no SELECT privilege on SYSCAT.SCHEMATA")
+    adapter = _adapter(fake_dbi, fake_ibm_db)
+
+    with pytest.raises(Db2AdapterError) as excinfo:
+        adapter.list_schemas()
+
+    assert "SQLCODE=-551" in str(excinfo.value)
+    assert fake_dbi.connections[0].closed is True
+
+
+def test_syscat_typename_mapping_full_sweep() -> None:
+    cases: dict[str, ColumnType] = {
+        # 字符串系(含 GRAPHIC 家族与大对象)
+        "CHAR": ColumnType.STRING,
+        "CHARACTER": ColumnType.STRING,
+        "VARCHAR": ColumnType.STRING,
+        "LONG VARCHAR": ColumnType.STRING,
+        "CLOB": ColumnType.STRING,
+        "GRAPHIC": ColumnType.STRING,
+        "VARGRAPHIC": ColumnType.STRING,
+        "LONG VARGRAPHIC": ColumnType.STRING,
+        "DBCLOB": ColumnType.STRING,
+        "XML": ColumnType.STRING,
+        # 数值系
+        "SMALLINT": ColumnType.INTEGER,
+        "INTEGER": ColumnType.INTEGER,
+        "BIGINT": ColumnType.INTEGER,
+        "DECIMAL": ColumnType.DECIMAL,
+        "NUMERIC": ColumnType.DECIMAL,
+        "DECFLOAT": ColumnType.DECIMAL,
+        "REAL": ColumnType.FLOAT,
+        "FLOAT": ColumnType.FLOAT,
+        "DOUBLE": ColumnType.FLOAT,
+        "DOUBLE PRECISION": ColumnType.FLOAT,
+        # 布尔 / 时间 / 二进制
+        "BOOLEAN": ColumnType.BOOLEAN,
+        "DATE": ColumnType.DATE,
+        "TIME": ColumnType.TIME,
+        "TIMESTAMP": ColumnType.DATETIME,
+        "BLOB": ColumnType.BYTES,
+        "BINARY": ColumnType.BYTES,
+        "VARBINARY": ColumnType.BYTES,
+    }
+    for typename, expected in cases.items():
+        assert syscat_typename_to_column_type(typename) is expected, typename
+    # CHAR 定长右补空格 / 小写输入统一归一
+    assert syscat_typename_to_column_type("VARCHAR   ") is ColumnType.STRING
+    assert syscat_typename_to_column_type("timestamp") is ColumnType.DATETIME
+    # 带修饰的复合名按首词回退
+    assert syscat_typename_to_column_type("TIMESTAMP WITH TIME ZONE") is ColumnType.DATETIME
+    # distinct UDT / 未知类型不臆造
+    assert syscat_typename_to_column_type("MY_MONEY_TYPE") is ColumnType.UNKNOWN
+    assert syscat_typename_to_column_type(None) is ColumnType.UNKNOWN
+    # driver_type 干净大写名(空白折叠),拿不到返回 None
+    assert syscat_typename_to_driver_name(" long  varchar ") == "LONG VARCHAR"
+    assert syscat_typename_to_driver_name("VARCHAR ") == "VARCHAR"
+    assert syscat_typename_to_driver_name(None) is None
+    assert syscat_typename_to_driver_name("   ") is None
+
+
 def test_add_db2_dll_directories_is_idempotent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -539,6 +751,7 @@ class _FakeDb2Cursor:
     ) -> None:
         self.closed = False
         self.executed_sql = ""
+        self.executed_params: object = None
         self.fetchmany_sizes: list[int] = []
         self.description: tuple[tuple[Any, ...], ...] = (("OK",),)
         self._configured_rows = rows
@@ -550,6 +763,7 @@ class _FakeDb2Cursor:
 
     def execute(self, sql: str, params: object = None) -> None:
         self.executed_sql = sql
+        self.executed_params = params
         if self._execute_exc is not None:
             raise self._execute_exc
         self._rows = list(self._configured_rows)

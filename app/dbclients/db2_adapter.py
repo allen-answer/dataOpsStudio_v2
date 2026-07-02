@@ -15,10 +15,11 @@
 - DLL 注入:`add_db2_dll_directories()` 必须幂等(1.x 踩过每次连接前缀 PATH
   把 32767 上限撑爆的坑)
 
-PR-A capabilities 只开 execute_select / stream_rows / test_connection;
-explain / introspection / DDL / compare 占位(PR-B/PR-C 再开),对应方法
-raise Db2UnsupportedOperationError(NotImplementedError 子类,调用方按
-capabilities 先行降级本不应触达)。
+PR-A 开 execute_select / stream_rows / test_connection;PR-B 开 introspection
+(SYSCAT.SCHEMATA/TABLES/COLUMNS/INDEXES+INDEXCOLUSE,元数据 SQL 全部
+UPPER(?) 参数化,系统 schema 按 1.x 实证前缀清单排除);explain / DDL /
+compare 仍占位(后续 PR 再开),对应方法 raise Db2UnsupportedOperationError
+(NotImplementedError 子类,调用方按 capabilities 先行降级本不应触达)。
 
 R1:ibm_db / ibm_db_dbi 只允许在 app/dbclients/ import(banned-api 拦截别处)。
 R2:密码只从 SecretStore 解出后进连接串;连接串不落日志,错误信息统一走
@@ -39,6 +40,8 @@ from typing import Any
 from app.dbclients.db2_types import (
     description_type_to_column_type,
     description_type_to_driver_name,
+    syscat_typename_to_column_type,
+    syscat_typename_to_driver_name,
 )
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
@@ -50,6 +53,7 @@ from app.domain.schema import Column, Index, Row, Schema, Table
 from app.domain.secret import SecretKind
 from app.infrastructure.secretstore.protocol import SecretStore
 
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.$-]+$")
 _PASSWORD_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(password|passwd|pwd)\s*[:=]\s*['\"]?[^'\",\s)]+['\"]?"
 )
@@ -57,6 +61,12 @@ _URL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s'\")]+")
 _MAX_ERROR_SUMMARY_LENGTH = 240
 
 _PING_SQL = "select 1 as ok from sysibm.sysdummy1"
+
+# DB2 系统 schema 前缀(列 schema 时排除;1.x metadata.py:37 现场实证过的清单)。
+_SYSTEM_SCHEMA_PREFIXES = ("SYS", "DB2", "ERR", "NULLID", "SQLJ", "ST_")
+
+# SYSCAT.TABLES.TYPE 单字母 → 与 DM adapter 一致的 table_type 标签。
+_TABLE_TYPE_LABELS = {"T": "TABLE", "V": "VIEW"}
 
 _DRIVER_INSTALL_HINT = (
     "DB2 driver (ibm_db/ibm_db_dbi) is not installed. "
@@ -156,14 +166,14 @@ class Db2Adapter(DatabaseAdapter):
 
     capabilities = AdapterCapabilities(
         execute_select=True,
-        explain=False,  # PR-B 再开(EXPLAIN tables 依赖,1.x 有安全降级先例)
+        explain=False,  # 后续 PR 再开(EXPLAIN tables 依赖,1.x 有安全降级先例)
         stream_rows=True,
         server_side_cancel=False,  # ibm_db 无 driver-level cancel(V1_AS_IS §2.8)
-        list_schemas=False,  # PR-B
-        list_tables=False,  # PR-B
-        list_columns=False,  # PR-B
-        list_indexes=False,  # PR-B
-        get_table_ddl=False,  # PR-C
+        list_schemas=True,  # PR-B:SYSCAT.SCHEMATA
+        list_tables=True,  # PR-B:SYSCAT.TABLES(TYPE IN ('T','V'),与 DM 同列视图)
+        list_columns=True,  # PR-B:SYSCAT.COLUMNS(KEYSEQ 判 PK)
+        list_indexes=True,  # PR-B:SYSCAT.INDEXES + INDEXCOLUSE(UNIQUERULE 解析)
+        get_table_ddl=False,  # DB2 无单条 SELECT 出 DDL 的途径(见 get_table_ddl 注释)
         compare_db_hash=False,  # PR-C
     )
 
@@ -244,18 +254,132 @@ class Db2Adapter(DatabaseAdapter):
             _safe_close(conn)
 
     def list_schemas(self) -> list[Schema]:
-        raise self._unsupported("list_schemas")
+        # SYSCAT.SCHEMATA(1.x metadata.py:54 同款);系统 schema 客户端按
+        # 前缀排除(1.x _is_system_schema 同款,SQL 里省一串 NOT LIKE)。
+        rows = self._query_dicts(
+            """
+            SELECT SCHEMANAME AS name
+            FROM SYSCAT.SCHEMATA
+            ORDER BY SCHEMANAME
+            """
+        )
+        schemas: list[Schema] = []
+        for row in rows:
+            # SYSCAT 老版本 CHAR 定长列右补空格 → strip
+            name = str(row["name"]).strip()
+            if not name or name.upper().startswith(_SYSTEM_SCHEMA_PREFIXES):
+                continue
+            schemas.append(Schema(name=name))
+        return schemas
 
     def list_tables(self, schema: str) -> list[Table]:
-        raise self._unsupported("list_tables")
+        _validate_identifier(schema)
+        # SYSCAT.TABLES(1.x metadata.py:104 同款,TYPE='T');DM adapter 也列
+        # 视图(ALL_VIEWS UNION),行为对齐加 TYPE='V'(单表 IN 即可,不必 UNION)。
+        rows = self._query_dicts(
+            """
+            SELECT TABSCHEMA AS schema_name, TABNAME AS name, TYPE AS table_type
+            FROM SYSCAT.TABLES
+            WHERE TABSCHEMA = UPPER(?) AND TYPE IN ('T', 'V')
+            ORDER BY TABNAME
+            """,
+            (schema,),
+        )
+        tables: list[Table] = []
+        for row in rows:
+            raw_type = str(row["table_type"]).strip().upper() if row["table_type"] else ""
+            tables.append(
+                Table(
+                    schema_name=str(row["schema_name"]).strip(),
+                    name=str(row["name"]).strip(),
+                    table_type=_TABLE_TYPE_LABELS.get(raw_type, raw_type or None),
+                )
+            )
+        return tables
 
     def list_columns(self, schema: str, table: str) -> list[Column]:
-        raise self._unsupported("list_columns")
+        _validate_identifier(schema)
+        _validate_identifier(table)
+        # SYSCAT.COLUMNS(弃用 1.x SYSIBM.SYSCOLUMNS 那套 —— 标着"待验证",
+        # SYSCAT 是 LUW 官方 catalog 口径)。PK 用 KEYSEQ(列在主键内的序号,
+        # 非主键列为 NULL/0,IBM SYSCAT.COLUMNS 文档),单表免 KEYCOLUSE join。
+        rows = self._query_dicts(
+            """
+            SELECT
+                COLNAME AS name,
+                TYPENAME AS data_type,
+                NULLS AS nullable,
+                KEYSEQ AS keyseq,
+                REMARKS AS "COMMENT"
+            FROM SYSCAT.COLUMNS
+            WHERE TABSCHEMA = UPPER(?) AND TABNAME = UPPER(?)
+            ORDER BY COLNO
+            """,
+            (schema, table),
+        )
+        return [
+            Column(
+                name=str(row["name"]).strip(),
+                type=syscat_typename_to_column_type(row["data_type"]),
+                driver_type=syscat_typename_to_driver_name(row["data_type"]),
+                # SYSCAT.COLUMNS.NULLS 编码 'Y'/'N'
+                nullable=str(row["nullable"]).strip().upper() == "Y",
+                primary_key=_keyseq_marks_primary(row.get("keyseq")),
+                comment=_optional_str(row.get("comment")),
+            )
+            for row in rows
+        ]
 
     def list_indexes(self, schema: str, table: str) -> list[Index]:
-        raise self._unsupported("list_indexes")
+        _validate_identifier(schema)
+        _validate_identifier(table)
+        # SYSCAT.INDEXES + SYSCAT.INDEXCOLUSE join(1.x datasource_introspect
+        # .py:293-328 同款,改参数化);UNIQUERULE:'P' 主键 / 'U' unique /
+        # 'D' duplicates(普通索引),P 也算 unique。
+        rows = self._query_dicts(
+            """
+            SELECT
+                i.INDNAME AS name,
+                i.UNIQUERULE AS uniquerule,
+                c.COLNAME AS column_name,
+                c.COLSEQ AS column_position
+            FROM SYSCAT.INDEXES i
+            JOIN SYSCAT.INDEXCOLUSE c
+              ON c.INDSCHEMA = i.INDSCHEMA AND c.INDNAME = i.INDNAME
+            WHERE i.TABSCHEMA = UPPER(?) AND i.TABNAME = UPPER(?)
+            ORDER BY i.INDNAME, c.COLSEQ
+            """,
+            (schema, table),
+        )
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            name = str(row["name"]).strip()
+            rule = str(row["uniquerule"]).strip().upper()
+            item = grouped.setdefault(
+                name,
+                {
+                    "columns": [],
+                    "is_unique": rule in ("P", "U"),
+                    "is_primary": rule == "P",
+                },
+            )
+            item["columns"].append(str(row["column_name"]).strip())
+        return [
+            Index(
+                name=name,
+                columns=list(item["columns"]),
+                is_unique=bool(item["is_unique"]),
+                is_primary=bool(item["is_primary"]),
+            )
+            for name, item in grouped.items()
+        ]
 
     def get_table_ddl(self, schema: str, table: str) -> str:
+        # 保持 capability=False:DB2 无 SHOW CREATE TABLE,也无 DM 那种
+        # DBMS_METADATA.GET_DDL 单条 SELECT 等价物。官方途径是 db2look(外部
+        # 工具)或 SYSPROC.DB2LK_GENERATE_DDL(CALL 存储过程 + 写 SYSTOOLS 表
+        # + 高权限,只读 adapter 不合适);从 SYSCAT 手拼 DDL 易失真(默认值/
+        # 分区/表空间/标识列),两条路都不稳妥 → 不做,调用方按 capabilities 降级。
         raise self._unsupported("get_table_ddl")
 
     def build_compare_hash_query(self, request: CompareHashRequest) -> CompareHashPlan:
@@ -295,6 +419,37 @@ class Db2Adapter(DatabaseAdapter):
                     break
                 for raw_row in batch:
                     yield _to_row(raw_row)
+        finally:
+            _safe_close(cursor)
+            _safe_close(conn)
+
+    def _query_dicts(
+        self,
+        sql: str,
+        params: Sequence[Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """introspection 用的一次性小查询:执行 + fetchall + 行转 dict。
+
+        DB2 把不带引号的别名(AS name)折叠成大写,description 列名因而是
+        NAME / SCHEMA_NAME 等;introspection 全程按小写键取值,故统一小写化
+        (DM adapter 同款处理)。执行错误经 _driver_error 反查 SQLCODE 增强。
+        """
+        conn = None
+        cursor = None
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            raise AdapterConnectionError("adapter connection failed") from exc
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+            except Exception as exc:
+                raise self._driver_error("DB2 introspection query failed", exc) from exc
+            raw_columns = _description_columns(getattr(cursor, "description", None))
+            columns = [name.lower() for name in raw_columns]
+            return [_row_to_dict(row, columns) for row in rows]
         finally:
             _safe_close(cursor)
             _safe_close(conn)
@@ -462,9 +617,48 @@ class Db2Adapter(DatabaseAdapter):
     def _unsupported(self, operation: str) -> Db2UnsupportedOperationError:
         return Db2UnsupportedOperationError(
             f"Db2Adapter does not support {operation} in this build "
-            "(DB2 Preview PR-A; planned for PR-B/PR-C). "
-            "Check adapter.capabilities before calling."
+            "(DB2 Preview). Check adapter.capabilities before calling."
         )
+
+
+def _validate_identifier(identifier: str) -> None:
+    if not identifier or _IDENTIFIER_RE.fullmatch(identifier) is None:
+        raise ValueError("Invalid database identifier")
+
+
+def _description_columns(description: object) -> list[str]:
+    if not isinstance(description, Sequence) or isinstance(description, (str, bytes, bytearray)):
+        return []
+    columns: list[str] = []
+    for item in description:
+        if isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray)) and item:
+            columns.append(str(item[0]))
+    return columns
+
+
+def _row_to_dict(row: object, columns: list[str]) -> dict[str, Any]:
+    if isinstance(row, dict):
+        return {str(key).lower(): value for key, value in row.items()}
+    if not isinstance(row, Sequence) or isinstance(row, (str, bytes, bytearray)):
+        return {}
+    return {columns[index]: value for index, value in enumerate(row) if index < len(columns)}
+
+
+def _keyseq_marks_primary(value: object) -> bool:
+    """SYSCAT.COLUMNS.KEYSEQ:主键内序号(>0);NULL/0 = 非主键列。"""
+    if value is None:
+        return False
+    try:
+        return int(str(value)) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text if text else None
 
 
 def _connection_error_summary(exc: Exception) -> str:

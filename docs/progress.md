@@ -17,6 +17,7 @@
 | Workflow PR-2 持久化(workflows/workflow_templates 表 + 0016 迁移) | Claude 子代理(Fable 5 复核) | #86 | 已合并 | [#87](https://github.com/allen-answer/dataOpsStudio_v2/pull/87) |
 | Workflow PR-3 定义 API(CRUD + R7 门禁) | Claude 子代理(Fable 5 复核) | #87 | 已合并 | [#88](https://github.com/allen-answer/dataOpsStudio_v2/pull/88) |
 | DB2 PR-A adapter 核心(连接/流式/超时/探活/factory 分发) | Claude 子代理(Fable 5 复核) | 1.x 移植 | PR 待审 | 本 PR |
+| DB2 PR-B introspection(SYSCAT.* 元数据 + 类型映射) | Claude 子代理(Fable 5 复核) | #89 | PR 待审 | 本 PR |
 
 > **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,
 > 安全项全闭环/落档)。**DM 已 Certified**:真实例验证 8/8 + 修复 3 个 adapter bug,
