@@ -238,7 +238,7 @@ wheels = [
 
 [[package]]
 name = "dataops-studio"
-version = "2.0.0a0"
+version = "2.0.1"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
@@ -262,6 +262,11 @@ dependencies = [
     { name = "uvicorn", extra = ["standard"] },
 ]
 
+[package.optional-dependencies]
+db2 = [
+    { name = "ibm-db" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "ast-grep-cli" },
@@ -280,6 +285,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=43" },
     { name = "dmpython", specifier = ">=2.5" },
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "ibm-db", marker = "extra == 'db2'", specifier = ">=3.2" },
     { name = "pandas", specifier = ">=2.2" },
     { name = "prometheus-client", specifier = ">=0.21" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
@@ -295,6 +301,7 @@ requires-dist = [
     { name = "structlog", specifier = ">=24.4" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]
+provides-extras = ["db2"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -372,6 +379,20 @@ wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/9e/2d/0c9ac76dd2c893841fbf6498d6acec4f2442e1b7067f6e3e316a80e494e8/httptools-0.8.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:ef7c3c97f4311c7be57e2986629df89d49cb434dbff78eafcd48c2bff986b15a" },
     { url = "https://mirrors.aliyun.com/pypi/packages/ca/42/906adc91ae3a5fa9c59c0a2f21c139725bd7e5b41ae6acd485cd14123ebf/httptools-0.8.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:a1afd7c9fbff0d9f5d489c4ce2768bd09c84a46ddefc7161e6aa82ae35c85745" },
     { url = "https://mirrors.aliyun.com/pypi/packages/05/0b/4240efeb672751ee5b9b380cb0e3fdc050bc05f68adc7a8aefc4fcd9a69a/httptools-0.8.0-cp312-cp312-win_amd64.whl", hash = "sha256:cd96f29b4bab1d42fa6e3d008711c75e0f79e94e06827330160e3a304227f150" },
+]
+
+[[package]]
+name = "ibm-db"
+version = "3.2.9"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/6c/36/8cd1503b7f947293bb045ec86e6fa60a0bef3bacf1a601840ea65c4b78de/ibm_db-3.2.9.tar.gz", hash = "sha256:0ad6dc4575519a5563fd7f845fc6bc00d688020e1d3ae78d382e79183bc32b0b" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/0d/19/e4664a631cf69c2aa6684c03073b732ccbd41ed440a9d5d94f3700b979cb/ibm_db-3.2.9-cp312-cp312-macosx_10_15_x86_64.whl", hash = "sha256:5432ef9103c094631ebb7e534a72dfd8324f265c3695e79698eb5c09fa28cddb" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/40/23/5f9388f5ee2148a0ca5c372c4124415bbf7aaba5b64cd13ef5fb801becde/ibm_db-3.2.9-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:d4b650ac1e3a9161090234821a655adb767baa52764e839c1a5ff306cd967de5" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/77/02/e1226db9f19ae1672098027cbb0fab7bea8c29e9b802e4337a9651595c09/ibm_db-3.2.9-cp312-cp312-manylinux2014_i686.manylinux_2_17_i686.whl", hash = "sha256:4b3d8d707a9cf3bf633c7742fffc557d9c71e6555f0c9733a0f9b8ed7f874ffe" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/23/26/3bf46353bb850d0ab71b8f9cc396da4e76d41e54abad26bc5f2fed95c8f7/ibm_db-3.2.9-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:e60e1a12fa8e36510384944e1b438e6e9a353bc92d1d496a66acc8e1cb853a5e" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/fe/75/c0506dc89c4da674adb40aa038729b1513d90a1ef3e2e6e34faaa00a5981/ibm_db-3.2.9-cp312-cp312-win32.whl", hash = "sha256:a0b395c0f770627bbb6765f45d9fe99ed990fc4801c1adeeaa872d599ccc3b9d" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/e9/fa/730129a0169d4986c3af351617051a2fbcc73858de21f141ef8978f502a4/ibm_db-3.2.9-cp312-cp312-win_amd64.whl", hash = "sha256:2353c0b968ec337ee4d4111dc4f8fe15a56818b3c399939de952f9a1f2589840" },
 ]
 
 [[package]]

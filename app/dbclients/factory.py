@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from app.dbclients.db2_adapter import Db2Adapter
 from app.dbclients.dm_adapter import DMAdapter
 from app.dbclients.mysql_adapter import MySQLAdapter
 from app.dbclients.protocol import DatabaseAdapter
@@ -26,7 +27,8 @@ def build_database_adapter(
 ) -> DatabaseAdapter:
     """db_type -> DatabaseAdapter dispatch.
 
-    2.1.0 Certified backends: MySQL + DM. Other datasource types are explicit
+    Certified backends: MySQL + DM;DB2 是 Preview(PR-A 只开 select/流式/探活,
+    capabilities 声明其余能力 False)。Other datasource types are explicit
     structured unsupported errors instead of best-effort driver guesses.
     """
 
@@ -42,6 +44,16 @@ def build_database_adapter(
         )
     if conn_info.db_type is DbType.DM:
         return DMAdapter(
+            conn_info,
+            secret_store,
+            cancel_check=cancel_check,
+            column_sink=column_sink,
+            cursor_max_hold_seconds=cursor_max_hold_seconds,
+            statement_timeout_seconds=statement_timeout_seconds,
+            connect_timeout_seconds=connect_timeout_seconds,
+        )
+    if conn_info.db_type is DbType.DB2:
+        return Db2Adapter(
             conn_info,
             secret_store,
             cancel_check=cancel_check,
