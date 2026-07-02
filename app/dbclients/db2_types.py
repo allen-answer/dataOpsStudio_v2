@@ -1,7 +1,11 @@
-"""DB2(ibm_db_dbi)driver 类型 → 统一 ColumnType 保守映射(契约 §3.2 ColumnType)。
+"""DB2 driver / SYSCAT 类型 → 统一 ColumnType 映射(契约 §3.2 ColumnType)。
 
-PR-A 范围:只做字符串 / 数值 / 时间 / 二进制 / 布尔 的保守归类,
-细化类型映射表(GRAPHIC 家族、DECFLOAT 精度语义等)留 DB2 PR-B。
+两条入口:
+1. `description_type_to_*`(PR-A):cursor.description[1](字符串或
+   DB-API type-object)→ 保守归类,查询结果列用;
+2. `syscat_typename_to_*`(PR-B):SYSCAT.COLUMNS.TYPENAME(内置类型名
+   字符串,如 "VARCHAR" / "LONG VARCHAR" / "DECFLOAT")→ 全量映射,
+   introspection(list_columns)用。
 
 ibm_db_dbi 的 `cursor.description[1]` 形态因版本而异:
 - 可能是小写类型名字符串(`ibm_db.field_type` 直出,如 "string" / "int" /
@@ -72,6 +76,81 @@ _NAME_TO_COLUMN_TYPE: dict[str, ColumnType] = {
 }
 
 
+# SYSCAT.COLUMNS.TYPENAME(DB2 LUW 内置类型全量,IBM SYSCAT.DATATYPES 文档口径)
+# → 统一 ColumnType(DB2 PR-B introspection 用)。
+# TYPENAME 是干净的大写类型名字符串;带空格的复合名("LONG VARCHAR" /
+# "DOUBLE PRECISION")按全名精确匹配,精确不中再按首词回退
+# ("TIMESTAMP WITH TIME ZONE" 之类带修饰的名字归 TIMESTAMP 桶)。
+_SYSCAT_TYPENAME_TO_COLUMN_TYPE: dict[str, ColumnType] = {
+    # 字符串系(含 GRAPHIC 双字节家族与 CLOB/DBCLOB/XML 大对象)
+    "CHAR": ColumnType.STRING,
+    "CHARACTER": ColumnType.STRING,
+    "VARCHAR": ColumnType.STRING,
+    "LONG VARCHAR": ColumnType.STRING,
+    "CLOB": ColumnType.STRING,
+    "GRAPHIC": ColumnType.STRING,
+    "VARGRAPHIC": ColumnType.STRING,
+    "LONG VARGRAPHIC": ColumnType.STRING,
+    "DBCLOB": ColumnType.STRING,
+    "NCHAR": ColumnType.STRING,
+    "NVARCHAR": ColumnType.STRING,
+    "NCLOB": ColumnType.STRING,
+    "XML": ColumnType.STRING,
+    # 数值系
+    "SMALLINT": ColumnType.INTEGER,
+    "INTEGER": ColumnType.INTEGER,
+    "INT": ColumnType.INTEGER,
+    "BIGINT": ColumnType.INTEGER,
+    "DECIMAL": ColumnType.DECIMAL,
+    "DEC": ColumnType.DECIMAL,
+    "NUMERIC": ColumnType.DECIMAL,
+    "DECFLOAT": ColumnType.DECIMAL,
+    "REAL": ColumnType.FLOAT,
+    "FLOAT": ColumnType.FLOAT,
+    "DOUBLE": ColumnType.FLOAT,
+    "DOUBLE PRECISION": ColumnType.FLOAT,
+    # 布尔(DB2 11.1+)
+    "BOOLEAN": ColumnType.BOOLEAN,
+    # 时间系
+    "DATE": ColumnType.DATE,
+    "TIME": ColumnType.TIME,
+    "TIMESTAMP": ColumnType.DATETIME,
+    # 二进制系(BINARY/VARBINARY 是 DB2 11.1+;BLOB 全版本)
+    "BLOB": ColumnType.BYTES,
+    "BINARY": ColumnType.BYTES,
+    "VARBINARY": ColumnType.BYTES,
+}
+
+
+def syscat_typename_to_column_type(typename: object) -> ColumnType:
+    """SYSCAT.COLUMNS.TYPENAME → 统一 ColumnType。
+
+    distinct UDT(TYPENAME 是用户类型名)等无法识别的一律 UNKNOWN(不臆造,
+    driver_type 保留原名供人工核对)。
+    """
+    normalized = syscat_typename_to_driver_name(typename)
+    if normalized is None:
+        return ColumnType.UNKNOWN
+    mapped = _SYSCAT_TYPENAME_TO_COLUMN_TYPE.get(normalized)
+    if mapped is not None:
+        return mapped
+    # 带修饰的复合名回退按首词归类("TIMESTAMP WITH TIME ZONE" → TIMESTAMP)
+    head = normalized.split(" ", 1)[0]
+    return _SYSCAT_TYPENAME_TO_COLUMN_TYPE.get(head, ColumnType.UNKNOWN)
+
+
+def syscat_typename_to_driver_name(typename: object) -> str | None:
+    """SYSCAT.COLUMNS.TYPENAME → 干净大写类型名(空白折叠 + strip + upper)。
+
+    SYSCAT 老版本 CHAR 定长列右补空格,这里统一归一;拿不到非空名返回 None
+    (driver_type 宁缺毋滥,不塞原始 repr —— DM 踩过的坑)。
+    """
+    if typename is None:
+        return None
+    text = " ".join(str(typename).split()).upper()
+    return text or None
+
+
 def description_type_to_column_type(type_code: object) -> ColumnType:
     """description[1](字符串或 type-object)→ 统一 ColumnType。无法识别落 UNKNOWN。"""
     names = _normalized_names(type_code)
@@ -129,4 +208,6 @@ def _normalize(name: str) -> str | None:
 __all__ = [
     "description_type_to_column_type",
     "description_type_to_driver_name",
+    "syscat_typename_to_column_type",
+    "syscat_typename_to_driver_name",
 ]

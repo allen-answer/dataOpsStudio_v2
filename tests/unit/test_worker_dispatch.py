@@ -34,11 +34,14 @@ def test_dispatch_dm_builds_dm_adapter_not_unsupported() -> None:
 
 def test_dispatch_db2_builds_db2_adapter_not_unsupported() -> None:
     # DB2 PR-A 核心验收:DB2 数据源不再抛 UnsupportedDbTypeError,
-    # 且 capabilities 按 Preview 范围声明(select/流式开,introspection 关)。
+    # 且 capabilities 按 Preview 范围声明(select/流式/introspection 开,
+    # DDL/compare 仍关 —— PR-B 起 introspection 翻 True)。
     adapter = build_database_adapter(_conn_info(DbType.DB2), cast(SecretStore, _SecretStore()))
     assert isinstance(adapter, Db2Adapter)
     assert adapter.capabilities.execute_select is True
-    assert adapter.capabilities.list_schemas is False
+    assert adapter.capabilities.list_schemas is True
+    assert adapter.capabilities.get_table_ddl is False
+    assert adapter.capabilities.compare_db_hash is False
 
 
 def test_dispatch_postgresql_builds_postgresql_adapter_not_unsupported() -> None:
