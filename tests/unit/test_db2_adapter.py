@@ -454,6 +454,8 @@ def test_list_indexes_groups_columns_and_parses_uniquerule() -> None:
     sql = " ".join(cursor.executed_sql.split())
     assert "FROM SYSCAT.INDEXES i" in sql
     assert "JOIN SYSCAT.INDEXCOLUSE c" in sql
+    # INCLUDE 列(COLORDER='I')不是 key 列,必须被 SQL 侧排除
+    assert "AND c.COLORDER <> 'I'" in sql
     assert "i.TABSCHEMA = UPPER(?) AND i.TABNAME = UPPER(?)" in sql
     assert "ORDER BY i.INDNAME, c.COLSEQ" in sql
     assert cursor.executed_params == ("appdata", "users")

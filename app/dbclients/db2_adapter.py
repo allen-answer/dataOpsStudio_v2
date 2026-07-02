@@ -336,6 +336,7 @@ class Db2Adapter(DatabaseAdapter):
         # SYSCAT.INDEXES + SYSCAT.INDEXCOLUSE join(1.x datasource_introspect
         # .py:293-328 同款,改参数化);UNIQUERULE:'P' 主键 / 'U' unique /
         # 'D' duplicates(普通索引),P 也算 unique。
+        # COLORDER='I' 是 unique index 的 INCLUDE 列,不属于 key 列,排除。
         rows = self._query_dicts(
             """
             SELECT
@@ -346,6 +347,7 @@ class Db2Adapter(DatabaseAdapter):
             FROM SYSCAT.INDEXES i
             JOIN SYSCAT.INDEXCOLUSE c
               ON c.INDSCHEMA = i.INDSCHEMA AND c.INDNAME = i.INDNAME
+             AND c.COLORDER <> 'I'
             WHERE i.TABSCHEMA = UPPER(?) AND i.TABNAME = UPPER(?)
             ORDER BY i.INDNAME, c.COLSEQ
             """,
