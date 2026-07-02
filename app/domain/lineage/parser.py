@@ -31,6 +31,10 @@ LineageSchema = dict[str, dict[str, dict[str, str]]]
 # signals truncation without an extra field.
 PARSE_ERRORS_SUMMARY_LIMIT = 50
 
+# Bound iterative CTE / derived-table resolution so a pathological alias cycle
+# cannot loop forever.
+_RESOLUTION_DEPTH_LIMIT = 8
+
 
 class LineageParseRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
@@ -147,6 +151,12 @@ def _analyze_statement(
         return
     if isinstance(qualified, exp.Insert):
         _analyze_insert(qualified, context, report)
+    elif isinstance(qualified, exp.Create) and _create_query(qualified) is not None:
+        _analyze_ctas(qualified, context, report)
+    elif isinstance(qualified, exp.Merge):
+        _analyze_merge(qualified, context, report)
+    elif isinstance(qualified, exp.Update):
+        _analyze_update(qualified, context, report)
     else:
         report.warnings.append(
             LineageWarning(
@@ -163,67 +173,319 @@ def _analyze_insert(
     report: LineageReport,
 ) -> None:
     target_table_expr = _target_table(expression)
-    select_expr = expression.expression if isinstance(expression.expression, exp.Select) else None
-    if target_table_expr is None or select_expr is None:
-        report.parse_errors.append(
-            LineageParseError(
-                statement_index=context.index,
-                error_type="unsupported_insert",
-                message="INSERT statement is not INSERT ... SELECT",
-                unsupported=True,
-                statement_type="INSERT",
-            ).model_dump(mode="json")
+    query = _query_expression(expression.expression)
+    if target_table_expr is None or query is None:
+        _append_unsupported(
+            report,
+            context,
+            "unsupported_insert",
+            "INSERT statement is not INSERT ... SELECT",
+            "INSERT",
         )
         return
+    _analyze_query_write(
+        report,
+        qualified_expression=expression,
+        target_table_expr=target_table_expr,
+        query=query,
+        target_columns=_target_columns(expression, query),
+        operation="insert",
+        statement_type="INSERT",
+        context=context,
+    )
+
+
+def _analyze_ctas(
+    expression: exp.Create,
+    context: _StatementContext,
+    report: LineageReport,
+) -> None:
+    query = _create_query(expression)
+    target = expression.this
+    explicit_columns: list[str | None] = []
+    if isinstance(target, exp.Schema):
+        explicit_columns = [item.name or None for item in target.expressions]
+        target = target.this
+    if not isinstance(target, exp.Table) or query is None:
+        _append_unsupported(
+            report,
+            context,
+            "unsupported_create",
+            "CREATE TABLE ... AS without resolvable target table or SELECT",
+            "CREATE",
+        )
+        return
+    target_columns = explicit_columns if any(explicit_columns) else _derived_target_columns(query)
+    _analyze_query_write(
+        report,
+        qualified_expression=expression,
+        target_table_expr=target,
+        query=query,
+        target_columns=target_columns,
+        operation="create",
+        statement_type="CREATE",
+        context=context,
+    )
+
+
+def _analyze_query_write(
+    report: LineageReport,
+    *,
+    qualified_expression: exp.Expression,
+    target_table_expr: exp.Table,
+    query: exp.Select | exp.SetOperation,
+    target_columns: list[str | None],
+    operation: str,
+    statement_type: str,
+    context: _StatementContext,
+) -> None:
     target_table = _table_name(target_table_expr, context.default_schema)
     report.target_summary.append(
-        TargetSummary(table=target_table, operation="insert", statement_index=context.index)
+        TargetSummary(table=target_table, operation=operation, statement_index=context.index)
     )
+    cte_map = _cte_map(qualified_expression)
     source_tables = {
         _table_name(table, context.default_schema)
-        for table in select_expr.find_all(exp.Table)
-        if _table_name(table, context.default_schema) != target_table
+        for table in query.find_all(exp.Table)
+        if not _is_cte_reference(table, cte_map)
+        and _table_name(table, context.default_schema) != target_table
     }
-    for source_table in sorted(source_tables):
-        _append_unique(
-            report.graph_edges,
-            TableLineageEdge(
-                source_table=source_table,
-                target_table=target_table,
-                statement_index=context.index,
-            ).model_dump(mode="json"),
-        )
+    _append_edges(report, target_table, source_tables, context.index)
     _append_tables(report, target_table, source_tables, context.index)
-    _append_columns(report, select_expr, context.default_schema)
-    _append_clause_details(report, select_expr, context.index, context.default_schema)
-    target_columns = _target_columns(expression, select_expr)
-    for select_item, target_column in zip(select_expr.expressions, target_columns, strict=False):
+    branches = _query_branches(query)
+    for branch in branches:
+        _append_columns(report, branch, context.default_schema, cte_map)
+        _append_clause_details(report, branch, context.index, context.default_schema, cte_map)
+    if isinstance(query, exp.SetOperation):
+        report.unions.append({"statement_index": context.index})
+        _append_set_operation_mappings(
+            report,
+            qualified_expression=qualified_expression,
+            branches=branches,
+            target_table=target_table,
+            target_columns=target_columns,
+            context=context,
+            statement_type=statement_type,
+            cte_map=cte_map,
+        )
+        return
+    for select_item, target_column in zip(query.expressions, target_columns, strict=False):
+        if not target_column:
+            continue
         _append_output_mappings(
             report,
-            qualified_expression=expression,
+            qualified_expression=qualified_expression,
             select_item=select_item,
             target_table=target_table,
             target_column=target_column,
             context=context,
+            statement_type=statement_type,
         )
         _append_indirect_mappings(
             report,
             select_item=select_item,
-            select_expr=select_expr,
+            select_expr=query,
             target_table=target_table,
             target_column=target_column,
             context=context,
+            cte_map=cte_map,
+        )
+
+
+def _analyze_merge(
+    expression: exp.Merge,
+    context: _StatementContext,
+    report: LineageReport,
+) -> None:
+    target_expr = expression.this
+    using = expression.args.get("using")
+    if not isinstance(target_expr, exp.Table) or not isinstance(using, (exp.Table, exp.Subquery)):
+        _append_unsupported(
+            report,
+            context,
+            "unsupported_merge",
+            "MERGE without resolvable target or USING source",
+            "MERGE",
+        )
+        return
+    target_table = _table_name(target_expr, context.default_schema)
+    report.target_summary.append(
+        TargetSummary(table=target_table, operation="merge", statement_index=context.index)
+    )
+    cte_map = _cte_map(expression)
+    source_tables = {
+        _table_name(table, context.default_schema)
+        for table in using.find_all(exp.Table)
+        if not _is_cte_reference(table, cte_map)
+        and _table_name(table, context.default_schema) != target_table
+    }
+    _append_edges(report, target_table, source_tables, context.index)
+    _append_tables(report, target_table, source_tables, context.index)
+    whens = expression.args.get("whens")
+    when_list = list(whens.expressions) if isinstance(whens, exp.Whens) else []
+    target_columns: set[str] = set()
+    for when in when_list:
+        then = when.args.get("then")
+        if isinstance(then, exp.Update):
+            for assignment in then.expressions:
+                if isinstance(assignment, exp.EQ) and isinstance(assignment.this, exp.Column):
+                    target_columns.add(assignment.this.name)
+                    _append_value_mappings(
+                        report,
+                        value=assignment.expression,
+                        scope=expression,
+                        target_table=target_table,
+                        target_column=assignment.this.name,
+                        context=context,
+                        cte_map=cte_map,
+                    )
+                else:
+                    _append_unsupported(
+                        report,
+                        context,
+                        "unsupported_merge",
+                        "MERGE UPDATE SET assignment is not column = expression",
+                        "MERGE",
+                    )
+        elif isinstance(then, exp.Insert):
+            columns = then.this
+            values = then.expression
+            if isinstance(columns, exp.Tuple) and isinstance(values, exp.Tuple):
+                for column_expr, value in zip(
+                    columns.expressions, values.expressions, strict=False
+                ):
+                    if not isinstance(column_expr, exp.Column):
+                        continue
+                    target_columns.add(column_expr.name)
+                    _append_value_mappings(
+                        report,
+                        value=value,
+                        scope=expression,
+                        target_table=target_table,
+                        target_column=column_expr.name,
+                        context=context,
+                        cte_map=cte_map,
+                    )
+            else:
+                _append_unsupported(
+                    report,
+                    context,
+                    "unsupported_merge",
+                    "MERGE INSERT without explicit column list",
+                    "MERGE",
+                )
+    predicates: list[tuple[exp.Column, TransformationSubtype]] = []
+    on_expr = expression.args.get("on")
+    if isinstance(on_expr, exp.Expression):
+        predicates.extend(
+            (column, TransformationSubtype.JOIN) for column in on_expr.find_all(exp.Column)
+        )
+    for when in when_list:
+        condition = when.args.get("condition")
+        if isinstance(condition, exp.Expression):
+            predicates.extend(
+                (column, TransformationSubtype.FILTER) for column in condition.find_all(exp.Column)
+            )
+    for target_column in sorted(target_columns):
+        _append_predicate_mappings(
+            report,
+            predicates=predicates,
+            scope=expression,
+            target_table=target_table,
+            target_column=target_column,
+            context=context,
+            cte_map=cte_map,
+        )
+
+
+def _analyze_update(
+    expression: exp.Update,
+    context: _StatementContext,
+    report: LineageReport,
+) -> None:
+    target_expr = expression.this
+    if not isinstance(target_expr, exp.Table):
+        _append_unsupported(
+            report,
+            context,
+            "unsupported_update",
+            "UPDATE without resolvable target table",
+            "UPDATE",
+        )
+        return
+    target_table = _table_name(target_expr, context.default_schema)
+    report.target_summary.append(
+        TargetSummary(table=target_table, operation="update", statement_index=context.index)
+    )
+    cte_map = _cte_map(expression)
+    source_tables = {
+        _table_name(table, context.default_schema)
+        for table in expression.find_all(exp.Table)
+        if not _is_cte_reference(table, cte_map)
+        and _table_name(table, context.default_schema) != target_table
+    }
+    _append_edges(report, target_table, source_tables, context.index)
+    _append_tables(report, target_table, source_tables, context.index)
+    predicates: list[tuple[exp.Column, TransformationSubtype]] = []
+    where_expr = expression.args.get("where")
+    if isinstance(where_expr, exp.Expression):
+        predicates.extend(
+            (column, TransformationSubtype.FILTER) for column in where_expr.find_all(exp.Column)
+        )
+    # MySQL multi-table UPDATE nests JOINs inside the target table expression.
+    for join_expr in target_expr.args.get("joins") or []:
+        on_expr = join_expr.args.get("on")
+        if isinstance(on_expr, exp.Expression):
+            predicates.extend(
+                (column, TransformationSubtype.JOIN) for column in on_expr.find_all(exp.Column)
+            )
+    for assignment in expression.expressions:
+        if not (isinstance(assignment, exp.EQ) and isinstance(assignment.this, exp.Column)):
+            _append_unsupported(
+                report,
+                context,
+                "unsupported_update",
+                "UPDATE SET assignment is not column = expression",
+                "UPDATE",
+            )
+            continue
+        lhs = assignment.this
+        set_target_table = target_table
+        if lhs.table:
+            resolved_target = _resolve_column_source(
+                lhs, expression, cte_map, context.default_schema
+            )
+            if resolved_target is not None:
+                set_target_table = resolved_target[0]
+        _append_value_mappings(
+            report,
+            value=assignment.expression,
+            scope=expression,
+            target_table=set_target_table,
+            target_column=lhs.name,
+            context=context,
+            cte_map=cte_map,
+        )
+        _append_predicate_mappings(
+            report,
+            predicates=predicates,
+            scope=expression,
+            target_table=set_target_table,
+            target_column=lhs.name,
+            context=context,
+            cte_map=cte_map,
         )
 
 
 def _append_output_mappings(
     report: LineageReport,
     *,
-    qualified_expression: exp.Insert,
+    qualified_expression: exp.Expression,
     select_item: exp.Expression,
     target_table: str,
     target_column: str,
     context: _StatementContext,
+    statement_type: str,
 ) -> None:
     subtype = _transformation_subtype(select_item)
     try:
@@ -234,7 +496,7 @@ def _append_output_mappings(
             dialect=context.dialect,
         )
     except Exception as exc:  # sqlglot can raise OptimizeError here too
-        _append_parse_error(report, context, "lineage_error", exc, statement_type="INSERT")
+        _append_parse_error(report, context, "lineage_error", exc, statement_type=statement_type)
         return
     for source_table, source_column in _source_columns_from_node(node, context.default_schema):
         mapping = InsertMapping(
@@ -249,6 +511,81 @@ def _append_output_mappings(
         _append_unique(report.insert_mappings, mapping.model_dump(mode="json"))
 
 
+def _append_set_operation_mappings(
+    report: LineageReport,
+    *,
+    qualified_expression: exp.Expression,
+    branches: list[exp.Select],
+    target_table: str,
+    target_columns: list[str | None],
+    context: _StatementContext,
+    statement_type: str,
+    cte_map: Mapping[str, exp.Expression],
+) -> None:
+    if not branches:
+        return
+    for item_index, target_column in enumerate(target_columns):
+        if not target_column or item_index >= len(branches[0].expressions):
+            continue
+        first_item = branches[0].expressions[item_index]
+        try:
+            node = lineage(
+                first_item.alias_or_name,
+                qualified_expression,
+                schema=context.schema,
+                dialect=context.dialect,
+            )
+        except Exception as exc:  # sqlglot can raise OptimizeError here too
+            _append_parse_error(
+                report, context, "lineage_error", exc, statement_type=statement_type
+            )
+            return
+        branch_items = [
+            branch.expressions[item_index]
+            for branch in branches
+            if item_index < len(branch.expressions)
+        ]
+        downstream = list(node.downstream)
+        if len(downstream) == len(branch_items):
+            per_branch = list(zip(branch_items, downstream, strict=False))
+        else:
+            # Cannot align lineage sub-nodes with branches; fall back to the
+            # merged node and a shared subtype when all branches agree.
+            subtypes = {_transformation_subtype(item) for item in branch_items}
+            merged_item = branch_items[0] if len(subtypes) == 1 else None
+            per_branch = [(merged_item, node)]
+        for item, branch_node in per_branch:
+            subtype = (
+                _transformation_subtype(item)
+                if item is not None
+                else TransformationSubtype.EXPRESSION
+            )
+            for source_table, source_column in _source_columns_from_node(
+                branch_node, context.default_schema
+            ):
+                mapping = InsertMapping(
+                    target_table=target_table,
+                    target_column=target_column,
+                    source_table=source_table,
+                    source_column=source_column,
+                    statement_index=context.index,
+                    transformation=TransformationKind.DIRECT,
+                    transformation_subtype=subtype,
+                )
+                _append_unique(report.insert_mappings, mapping.model_dump(mode="json"))
+        for branch in branches:
+            if item_index < len(branch.expressions):
+                _append_indirect_mappings(
+                    report,
+                    select_item=branch.expressions[item_index],
+                    select_expr=branch,
+                    target_table=target_table,
+                    target_column=target_column,
+                    context=context,
+                    cte_map=cte_map,
+                )
+
+
 def _append_indirect_mappings(
     report: LineageReport,
     *,
@@ -257,17 +594,110 @@ def _append_indirect_mappings(
     target_table: str,
     target_column: str,
     context: _StatementContext,
+    cte_map: Mapping[str, exp.Expression],
 ) -> None:
     output_columns = {_column_key(column) for column in select_item.find_all(exp.Column)}
     for source_column, subtype in _predicate_columns(select_expr):
         if _column_key(source_column) in output_columns:
             continue
-        source_table = _source_table_for_column(source_column, select_expr, context.default_schema)
+        resolved = _resolve_column_source(
+            source_column, select_expr, cte_map, context.default_schema
+        )
+        if resolved is None:
+            continue
+        source_table, source_name, _ = resolved
         mapping = InsertMapping(
             target_table=target_table,
             target_column=target_column,
             source_table=source_table,
-            source_column=source_column.name,
+            source_column=source_name,
+            statement_index=context.index,
+            transformation=TransformationKind.INDIRECT,
+            transformation_subtype=subtype,
+        )
+        _append_unique(report.insert_mappings, mapping.model_dump(mode="json"))
+
+
+def _append_value_mappings(
+    report: LineageReport,
+    *,
+    value: exp.Expression,
+    scope: exp.Expression,
+    target_table: str,
+    target_column: str,
+    context: _StatementContext,
+    cte_map: Mapping[str, exp.Expression],
+) -> None:
+    value_subtype = _transformation_subtype(value)
+    predicate_pairs: list[tuple[exp.Column, TransformationSubtype]] = []
+    excluded: set[int] = set()
+    for subquery in value.find_all(exp.Subquery):
+        inner = subquery.this
+        if not isinstance(inner, exp.Select):
+            continue
+        pairs = _predicate_columns(inner)
+        predicate_pairs.extend(pairs)
+        excluded.update(id(column) for column, _ in pairs)
+        group_expr = inner.args.get("group")
+        if isinstance(group_expr, exp.Expression):
+            excluded.update(id(column) for column in group_expr.find_all(exp.Column))
+    for column in value.find_all(exp.Column):
+        if id(column) in excluded:
+            continue
+        resolved = _resolve_column_source(column, scope, cte_map, context.default_schema)
+        if resolved is None:
+            continue
+        source_table, source_name, resolved_subtype = resolved
+        if source_table == target_table:
+            continue
+        subtype = (
+            value_subtype
+            if value_subtype is not TransformationSubtype.DIRECT
+            else (resolved_subtype or value_subtype)
+        )
+        mapping = InsertMapping(
+            target_table=target_table,
+            target_column=target_column,
+            source_table=source_table,
+            source_column=source_name,
+            statement_index=context.index,
+            transformation=TransformationKind.DIRECT,
+            transformation_subtype=subtype,
+        )
+        _append_unique(report.insert_mappings, mapping.model_dump(mode="json"))
+    _append_predicate_mappings(
+        report,
+        predicates=predicate_pairs,
+        scope=scope,
+        target_table=target_table,
+        target_column=target_column,
+        context=context,
+        cte_map=cte_map,
+    )
+
+
+def _append_predicate_mappings(
+    report: LineageReport,
+    *,
+    predicates: list[tuple[exp.Column, TransformationSubtype]],
+    scope: exp.Expression,
+    target_table: str,
+    target_column: str,
+    context: _StatementContext,
+    cte_map: Mapping[str, exp.Expression],
+) -> None:
+    for column, subtype in predicates:
+        resolved = _resolve_column_source(column, scope, cte_map, context.default_schema)
+        if resolved is None:
+            continue
+        source_table, source_name, _ = resolved
+        if source_table == target_table:
+            continue
+        mapping = InsertMapping(
+            target_table=target_table,
+            target_column=target_column,
+            source_table=source_table,
+            source_column=source_name,
             statement_index=context.index,
             transformation=TransformationKind.INDIRECT,
             transformation_subtype=subtype,
@@ -307,6 +737,7 @@ def _append_clause_details(
     select_expr: exp.Select,
     statement_index: int,
     default_schema: str | None,
+    cte_map: Mapping[str, exp.Expression],
 ) -> None:
     for join_expr in select_expr.args.get("joins") or []:
         on_expr = join_expr.args.get("on")
@@ -314,7 +745,11 @@ def _append_clause_details(
             {
                 "statement_index": statement_index,
                 "tables": sorted(
-                    {_table_name(table, default_schema) for table in join_expr.find_all(exp.Table)}
+                    {
+                        _table_name(table, default_schema)
+                        for table in join_expr.find_all(exp.Table)
+                        if not _is_cte_reference(table, cte_map)
+                    }
                 ),
                 "columns": sorted({column.name for column in on_expr.find_all(exp.Column)})
                 if isinstance(on_expr, exp.Expression)
@@ -341,6 +776,23 @@ def _append_clause_details(
         report.unions.append({"statement_index": statement_index})
 
 
+def _append_edges(
+    report: LineageReport,
+    target_table: str,
+    source_tables: set[str],
+    statement_index: int,
+) -> None:
+    for source_table in sorted(source_tables):
+        _append_unique(
+            report.graph_edges,
+            TableLineageEdge(
+                source_table=source_table,
+                target_table=target_table,
+                statement_index=statement_index,
+            ).model_dump(mode="json"),
+        )
+
+
 def _append_tables(
     report: LineageReport,
     target_table: str,
@@ -362,8 +814,11 @@ def _append_columns(
     report: LineageReport,
     select_expr: exp.Select,
     default_schema: str | None,
+    cte_map: Mapping[str, exp.Expression],
 ) -> None:
     for table in select_expr.find_all(exp.Table):
+        if _is_cte_reference(table, cte_map):
+            continue
         table_name = _table_name(table, default_schema)
         for column in select_expr.find_all(exp.Column):
             if column.table and column.table != table.alias_or_name:
@@ -378,12 +833,52 @@ def _target_table(expression: exp.Insert) -> exp.Table | None:
     return expression.this if isinstance(expression.this, exp.Table) else None
 
 
-def _target_columns(expression: exp.Insert, select_expr: exp.Select) -> list[str]:
+def _query_expression(
+    expression: exp.Expression | None,
+) -> exp.Select | exp.SetOperation | None:
+    if isinstance(expression, exp.Subquery):
+        expression = expression.this
+    if isinstance(expression, (exp.Select, exp.SetOperation)):
+        return expression
+    return None
+
+
+def _create_query(expression: exp.Create) -> exp.Select | exp.SetOperation | None:
+    if str(expression.args.get("kind") or "").upper() != "TABLE":
+        return None
+    return _query_expression(expression.expression)
+
+
+def _query_branches(query: exp.Expression | None) -> list[exp.Select]:
+    if isinstance(query, exp.SetOperation):
+        return _query_branches(query.this) + _query_branches(query.expression)
+    if isinstance(query, exp.Subquery):
+        return _query_branches(query.this)
+    return [query] if isinstance(query, exp.Select) else []
+
+
+def _target_columns(
+    expression: exp.Insert,
+    query: exp.Select | exp.SetOperation,
+) -> list[str | None]:
     if isinstance(expression.this, exp.Schema):
         columns = [item.name for item in expression.this.expressions if item.name]
         if columns:
-            return columns
-    return [item.alias_or_name for item in select_expr.expressions]
+            return list(columns)
+    return _derived_target_columns(query)
+
+
+def _derived_target_columns(query: exp.Select | exp.SetOperation) -> list[str | None]:
+    branches = _query_branches(query)
+    if not branches:
+        return []
+    columns: list[str | None] = []
+    for item in branches[0].expressions:
+        name = item.alias_or_name
+        # qualify() auto-aliases unaliased expressions as _col_N; those names do
+        # not exist on the target table, so the mapping target is underivable.
+        columns.append(name if name and not name.startswith("_col_") else None)
+    return columns
 
 
 def _transformation_subtype(expression: exp.Expression) -> TransformationSubtype:
@@ -400,16 +895,94 @@ def _transformation_subtype(expression: exp.Expression) -> TransformationSubtype
     return TransformationSubtype.EXPRESSION
 
 
-def _source_table_for_column(
+def _cte_map(expression: exp.Expression) -> dict[str, exp.Expression]:
+    return {
+        cte.alias_or_name.lower(): cte.this
+        for cte in expression.find_all(exp.CTE)
+        if cte.alias_or_name
+    }
+
+
+def _is_cte_reference(table: exp.Table, cte_map: Mapping[str, Any]) -> bool:
+    return not table.db and table.name.lower() in cte_map
+
+
+def _resolve_column_source(
     column: exp.Column,
-    select_expr: exp.Select,
+    scope: exp.Expression,
+    cte_map: Mapping[str, exp.Expression],
     default_schema: str | None,
-) -> str:
-    table_alias = column.table
-    for table in select_expr.find_all(exp.Table):
-        if not table_alias or table.alias_or_name == table_alias:
-            return _table_name(table, default_schema)
-    return table_alias or ""
+) -> tuple[str, str, TransformationSubtype | None] | None:
+    """Resolve a column to its physical (table, column), traversing CTEs and
+    derived tables (e.g. MERGE USING subqueries). Returns the strongest
+    non-DIRECT transformation subtype seen on traversed projections, if any."""
+    name = column.name
+    alias = column.table
+    subtype: TransformationSubtype | None = None
+    current = scope
+    for _ in range(_RESOLUTION_DEPTH_LIMIT):
+        relation = _relation_for_alias(current, alias)
+        if relation is None:
+            return None
+        if isinstance(relation, exp.Table) and not _is_cte_reference(relation, cte_map):
+            return (_table_name(relation, default_schema), name, subtype)
+        inner_query = (
+            relation.this if isinstance(relation, exp.Subquery) else cte_map[relation.name.lower()]
+        )
+        branches = _query_branches(inner_query)
+        if not branches:
+            return None
+        item = _projection_named(branches[0], name)
+        if item is None:
+            return None
+        item_subtype = _transformation_subtype(item)
+        if subtype is None and item_subtype is not TransformationSubtype.DIRECT:
+            subtype = item_subtype
+        inner_columns = list(item.find_all(exp.Column))
+        if not inner_columns:
+            return None
+        column = inner_columns[0]
+        name = column.name
+        alias = column.table
+        current = branches[0]
+    return None
+
+
+def _relation_for_alias(
+    scope: exp.Expression,
+    alias: str,
+) -> exp.Table | exp.Subquery | None:
+    relations: list[exp.Table | exp.Subquery] = []
+    for candidate in scope.find_all(exp.Table, exp.Subquery):
+        if isinstance(candidate, exp.Table) or (
+            isinstance(candidate, exp.Subquery) and candidate.alias_or_name
+        ):
+            relations.append(candidate)
+    if not alias:
+        for node in relations:
+            if isinstance(node, exp.Table):
+                return node
+        return None
+    for node in relations:
+        if node.alias_or_name == alias:
+            return node
+    lowered = alias.lower()
+    for node in relations:
+        if node.alias_or_name.lower() == lowered:
+            return node
+    return None
+
+
+def _projection_named(select_expr: exp.Select, name: str) -> exp.Expression | None:
+    lowered = name.lower()
+    for item in select_expr.expressions:
+        if (
+            isinstance(item, exp.Expression)
+            and item.alias_or_name
+            and item.alias_or_name.lower() == lowered
+        ):
+            return item
+    return None
 
 
 def _missing_tables(
@@ -417,8 +990,19 @@ def _missing_tables(
     schema: LineageSchema,
     default_schema: str | None,
 ) -> list[str]:
+    cte_map = _cte_map(expression)
+    exempt: set[int] = set()
+    if isinstance(expression, exp.Create):
+        # A CTAS target is a new table that legitimately has no metadata cache.
+        target = expression.this
+        if isinstance(target, exp.Schema):
+            target = target.this
+        if isinstance(target, exp.Table):
+            exempt.add(id(target))
     missing: list[str] = []
     for table in expression.find_all(exp.Table):
+        if id(table) in exempt or _is_cte_reference(table, cte_map):
+            continue
         if not _table_in_schema(table, schema, default_schema):
             missing.append(_table_name(table, default_schema))
     return sorted(set(missing))
@@ -479,6 +1063,24 @@ def _append_parse_error(
             statement_index=context.index,
             error_type=error_type,
             message=type(exc).__name__,
+            unsupported=True,
+            statement_type=statement_type,
+        ).model_dump(mode="json")
+    )
+
+
+def _append_unsupported(
+    report: LineageReport,
+    context: _StatementContext,
+    error_type: str,
+    message: str,
+    statement_type: str,
+) -> None:
+    report.parse_errors.append(
+        LineageParseError(
+            statement_index=context.index,
+            error_type=error_type,
+            message=message,
             unsupported=True,
             statement_type=statement_type,
         ).model_dump(mode="json")
