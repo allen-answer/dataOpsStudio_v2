@@ -15,6 +15,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 
 from app.db.models import metadata
 from app.domain.job import Job, JobKind, JobStatus
@@ -139,6 +140,145 @@ def test_two_workers_claim_disjoint_jobs(jobbackend: JobBackend) -> None:
     c2 = jobbackend.claim_next("worker-2")
     assert c1 is not None and c2 is not None
     assert c1.id != c2.id  # 不同 job
+
+
+def test_workflow_run_requeue_yields_running_back_to_pending(
+    jobbackend: JobBackend,
+) -> None:
+    """workflow_run 推进器让位:running → pending,可被再次 claim。"""
+    assert isinstance(jobbackend, PostgresJobBackend)
+    job = _make_job("j_wf")
+    jobbackend.enqueue(job)
+    jobbackend.claim_next("worker-1")
+    jobbackend.requeue_workflow_run("j_wf")
+    requeued = jobbackend.get_job("j_wf")
+    assert requeued is not None
+    assert requeued.status == JobStatus.PENDING
+    assert requeued.worker_id is None
+    reclaimed = jobbackend.claim_next("worker-1")
+    assert reclaimed is not None and reclaimed.id == "j_wf"
+
+
+def test_retry_workflow_node_requeues_failed_and_increments_retry_count(
+    jobbackend: JobBackend,
+) -> None:
+    assert isinstance(jobbackend, PostgresJobBackend)
+    job = _make_job("j_node")
+    jobbackend.enqueue(job)
+    jobbackend.claim_next("worker-1")
+    jobbackend.fail("j_node", "boom")
+    jobbackend.retry_workflow_node("j_node")
+    retried = jobbackend.get_job("j_node")
+    assert retried is not None
+    assert retried.status == JobStatus.PENDING
+    assert retried.retry_count == 1
+    assert retried.error is None
+    # 非 failed/timeout 状态不重排(幂等防护)
+    jobbackend.claim_next("worker-1")
+    jobbackend.retry_workflow_node("j_node")
+    running = jobbackend.get_job("j_node")
+    assert running is not None
+    assert running.status == JobStatus.RUNNING
+    assert running.retry_count == 1
+
+
+def test_cancel_pending_job_marks_terminal_without_claim(
+    jobbackend: JobBackend,
+) -> None:
+    assert isinstance(jobbackend, PostgresJobBackend)
+    job = _make_job("j_pending")
+    jobbackend.enqueue(job)
+    jobbackend.cancel_pending_job("j_pending", "workflow aborted")
+    cancelled = jobbackend.get_job("j_pending")
+    assert cancelled is not None
+    assert cancelled.status == JobStatus.CANCELLED
+    assert cancelled.cancel_reason == "workflow aborted"
+    assert jobbackend.claim_next("worker-1") is None
+
+
+def test_list_jobs_by_parent_returns_only_children_in_created_order(
+    jobbackend: JobBackend,
+) -> None:
+    assert isinstance(jobbackend, PostgresJobBackend)
+    run_job = _make_job("j_run")
+    jobbackend.enqueue(run_job)
+    child_a = _make_job("j_child_a").model_copy(update={"parent_workflow_run_id": "j_run"})
+    child_b = _make_job("j_child_b").model_copy(update={"parent_workflow_run_id": "j_run"})
+    unrelated = _make_job("j_other")
+    jobbackend.enqueue(child_a)
+    jobbackend.enqueue(child_b)
+    jobbackend.enqueue(unrelated)
+    children = jobbackend.list_jobs_by_parent("j_run")
+    assert [child.id for child in children] == ["j_child_a", "j_child_b"]
+    assert all(child.parent_workflow_run_id == "j_run" for child in children)
+
+
+def test_reap_requeues_stale_workflow_run_and_fails_stale_normal_job(
+    jobbackend: JobBackend,
+) -> None:
+    """worker 崩溃后:stale workflow_run 恢复 pending(推进器幂等可续),普通 job 仍 fail。"""
+    assert isinstance(jobbackend, PostgresJobBackend)
+    engine = _pg_engine_or_skip()
+    run_job = _make_job("j_wf_stale").model_copy(update={"kind": JobKind.WORKFLOW_RUN})
+    normal_job = _make_job("j_sql_stale")
+    jobbackend.enqueue(run_job)
+    jobbackend.enqueue(normal_job)
+    assert jobbackend.claim_next("worker-1") is not None
+    assert jobbackend.claim_next("worker-1") is not None
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE jobs SET last_heartbeat = now() - interval '1 hour' "
+                "WHERE id IN ('j_wf_stale', 'j_sql_stale')"
+            )
+        )
+
+    report = jobbackend.reap_stale_running_jobs(60)
+
+    assert getattr(report, "requeued", None) == 1
+    assert getattr(report, "failed", None) == 1
+    resumed = jobbackend.get_job("j_wf_stale")
+    assert resumed is not None
+    assert resumed.status == JobStatus.PENDING
+    assert resumed.retry_count == 0  # 恢复不占重试预算
+    assert resumed.worker_id is None
+    failed = jobbackend.get_job("j_sql_stale")
+    assert failed is not None
+    assert failed.status == JobStatus.FAILED
+
+
+def test_duplicate_workflow_node_child_rejected_by_unique_index(
+    jobbackend: JobBackend,
+) -> None:
+    """uq_jobs_workflow_node_per_run:同 run 同节点第二个子 job 被唯一索引拒绝。"""
+    assert isinstance(jobbackend, PostgresJobBackend)
+    run_job = _make_job("j_run_uq")
+    jobbackend.enqueue(run_job)
+    child = _make_job("j_uq_child_1").model_copy(
+        update={
+            "parent_workflow_run_id": "j_run_uq",
+            "payload": {"sql": "SELECT 1", "workflow_node_id": "n1"},
+        }
+    )
+    duplicate = _make_job("j_uq_child_2").model_copy(
+        update={
+            "parent_workflow_run_id": "j_run_uq",
+            "payload": {"sql": "SELECT 1", "workflow_node_id": "n1"},
+        }
+    )
+    jobbackend.enqueue(child)
+    with pytest.raises(IntegrityError):
+        jobbackend.enqueue(duplicate)
+    # 不同节点不受影响
+    other_node = _make_job("j_uq_child_3").model_copy(
+        update={
+            "parent_workflow_run_id": "j_run_uq",
+            "payload": {"sql": "SELECT 1", "workflow_node_id": "n2"},
+        }
+    )
+    jobbackend.enqueue(other_node)
+    children = jobbackend.list_jobs_by_parent("j_run_uq")
+    assert [c.id for c in children] == ["j_uq_child_1", "j_uq_child_3"]
 
 
 def _pg_engine_or_skip() -> Engine:

@@ -809,3 +809,35 @@ class WorkflowListItem(BaseModel):
     created_by: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+# ── Workflow run(2.4.0 PR-4:手动触发 / 状态查询 / 取消;cron tick 属 PR-4b)──
+
+
+class WorkflowRunCreateResponse(BaseModel):
+    # WorkflowRun 本身就是 job(ADR-0009):run_id == job_id,双字段便于前端对齐 jobs API
+    run_id: str
+    job_id: str
+    workflow_id: str
+
+
+class WorkflowRunNodeItem(BaseModel):
+    node_id: str
+    job_kind: str
+    # 节点执行态:waiting / running / retry_wait / success / failed / skipped / cancelled
+    status: str
+    job_id: str | None = None
+    attempts: int = 0
+    error: str | None = None
+
+
+class WorkflowRunStatusResponse(BaseModel):
+    run_id: str
+    workflow_id: str | None = None
+    project_id: str
+    status: JobStatus
+    error: str | None = None
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    nodes: list[WorkflowRunNodeItem]
