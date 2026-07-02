@@ -109,9 +109,9 @@ const ACTIVE: ReadonlySet<JobStatus> = new Set<JobStatus>(['pending', 'running']
 const PAGE_SIZE = 1000
 const POLL_MS = 500
 const SAVE_DEBOUNCE_MS = 650
-const SUPPORTED_EXECUTION_DB_TYPES = new Set(['mysql', 'dm'])
-// EXPLAIN / expand-star 依赖 sqlglot 方言 + 元数据缓存,与执行同口径(mysql / dm)。
-const SUPPORTED_TOOL_DB_TYPES = new Set(['mysql', 'dm'])
+const SUPPORTED_EXECUTION_DB_TYPES = new Set(['mysql', 'dm', 'db2', 'postgresql'])
+// EXPLAIN / expand-star 依赖 sqlglot 方言 + 元数据缓存,与执行同口径(mysql / dm / postgresql)。
+const SUPPORTED_TOOL_DB_TYPES = new Set(['mysql', 'dm', 'postgresql'])
 const EXPORT_FORMATS: ExportFormat[] = ['csv', 'excel', 'json', 'sql']
 
 type SidebarTab = 'consoles' | 'history' | 'templates' | 'metadata'
