@@ -31,21 +31,6 @@
 > 能支撑的全部范围**。下列 PRD 功能**全部卡在后端缺端点 / 缺字段**,不是前端漏做 ——
 > 前端侧已用 `★ 后补` 注释在对应位置标好,后端补齐即可直接接上(多数无需前端二次改)。
 
-### **DM 列头 driver_type 显示原始 Python 类名** — dm_adapter 美化
-
-**位置**:`app/dbclients/dm_adapter.py`(Column.driver_type 赋值处)
-
-**现状**:DM 查询结果列头的 driver_type 显示为 `<class 'dmPython.STRING'>` 原始 repr
-(2.1.0 W1 真机走查发现,PR #63 评论已记)。归一化 ColumnType(string/datetime)正确,
-仅 driver_type 原样透传了 dmPython 类型对象的 repr。
-
-**修法**:dm_adapter 侧把 dmPython 类型对象映射为干净名(STRING / TIMESTAMP / NUMBER …),
-对齐 MySQL adapter 的 driver_type 风格。
-
-**触发条件**:2.1.x 任意顺手窗口。**优先级**:低(纯显示,不影响功能)。
-
----
-
 ### **T7 §4 SQL 跑非 MySQL/DM 需要** — worker 仅支持 MySQL / DM
 
 **位置**:`app/worker.py:build_database_adapter`(MySQL / DM 分发,其余 raise UnsupportedDbTypeError)
@@ -75,25 +60,6 @@
 口径发布;正式密钥对与签发流程推迟到首个商业交付前。
 
 **触发条件**:首个需要正式 license 的对外交付。**优先级**:中(商业化前必做)。
-
----
-
-## 来自 1.x 切换后 dogfood(2026-06-12)
-
-### **2.0.x 应修** — 终态 test_connection job 不应阻塞数据源删除
-
-**位置**:`app/api/routes/core.py:_datasource_job_references`
-
-**现状**:DELETE /datasources/{id} 的 409 引用检查把**所有** kind 的 job 计入引用,
-包括已终态(failed/success)的 test_connection。后果:任何被"测试连接"过一次的
-数据源永远无法删除 —— 测连本身就会创建 job。真机实锤:删除两个废弃 DM 数据源时
-被各自的一条失败测连 job 挡死,只能人工授权清 job 行后才删掉。
-
-**修法**:引用检查排除 `kind='test_connection'` 的终态 job(或仅统计
-sql_query 等业务 job);保留对业务 job 的保护语义。补单测:测过连的数据源可删,
-有 sql_query 历史的仍 409。
-
-**触发条件**:下一个 2.0.x 补丁窗口。**优先级**:中(影响日常管理操作)。
 
 ---
 

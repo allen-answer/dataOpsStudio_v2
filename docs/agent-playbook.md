@@ -257,6 +257,30 @@ npm run dev
 - 后端能力域合并上线 ≠ 全链路验过;**接它的前端真机走查是最后一道真 DB 闸**——这也是
   "每棒前端都真机走查"的复利:它逼出了后端测试替身掩盖的约束违约。
 
+### 本地 check-redlines 绿,CI mypy 仍红(2.3.0 Lineage,#82/#83)
+
+**症状**
+- Lineage parser/AI fallback PR 本地跑 `check-redlines` / 单点测试通过,推到 GitHub 后 CI
+  的 `Lint & Format & Type & AST Red Lines` 首轮仍红。
+- 红点集中在 mypy,且不是新业务路径跑挂,而是测试/跨模块类型检查暴露的注解与类型收窄问题。
+
+**根因**
+- 本地验证习惯把 `make check-redlines` 当作“CI 同等覆盖”,但 CI 实际执行的是更宽的
+  `mypy app tests`。
+- PR 改动触到 parser/lineage 的共享类型后,测试 helper、fake 对象、跨模块返回值一起进入
+  strict type check;窄范围命令没有覆盖这些边角。
+
+**修法**
+- #82/#83 按 CI mypy 输出逐项补齐测试/实现的类型注解与分支收窄,重新推送到绿。
+- 后续涉及 parser、worker、API schema、job backend 这类跨模块契约时,本地直接跑与 CI
+  同形的 `mypy app tests`,不要只跑红线脚本或单文件 mypy。
+
+**教训**
+- **红线脚本不是完整 CI 替身**。报告“类型检查过了”前,要说清楚跑的是哪条命令。
+- 共享类型或测试 fake 有改动时,最小可信验证是 `mypy app tests` + 对应测试集;
+  只跑局部 mypy 容易把 CI 的 tests 范围漏掉。
+- PR 描述里的验证命令要尽量贴近 CI 原命令,否则 reviewer 会误以为本地覆盖与 CI 等价。
+
 ---
 
 ## 3. 设计背景
