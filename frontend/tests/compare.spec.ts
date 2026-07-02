@@ -321,6 +321,39 @@ test('run a compare, poll the job, then render 4 buckets with split cells', asyn
     }),
   )
 
+  await page.route('**/api/compare/runs/run-1/export', (r) =>
+    json(r, 202, {
+      job_id: 'export-job-1',
+      download_token: 'tok-compare',
+      expires_at: '2026-06-12T07:00:00Z',
+      format: 'excel',
+      filename: 'compare-run-1.xlsx',
+    }),
+  )
+  await page.route('**/api/jobs/export-job-1', (r) =>
+    json(r, 200, {
+      id: 'export-job-1',
+      kind: 'result_export',
+      status: 'success',
+      created_at: now,
+      finished_at: now,
+      error: null,
+      error_code: null,
+      message: null,
+      result_set_id: null,
+    }),
+  )
+  await page.route('**/api/exports/tok-compare', (r) =>
+    r.fulfill({
+      status: 200,
+      headers: {
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': 'attachment; filename="compare-run-1.xlsx"',
+      },
+      body: 'xlsx',
+    }),
+  )
+
   await page.goto('/projects/project-1/compare')
   await page.getByRole('button', { name: 'Start compare' }).click()
 
@@ -332,6 +365,13 @@ test('run a compare, poll the job, then render 4 buckets with split cells', asyn
   await expect(page.getByText('11.00')).toBeVisible()
   // 进度摘要
   await expect(page.getByText(/Scanned segments/)).toBeVisible()
+
+  await page.getByRole('button', { name: 'Export' }).click()
+  await expect(page.getByText(/Export ready: compare-run-1\.xlsx/)).toBeVisible()
+  const downloadPromise = page.waitForEvent('download')
+  await page.getByRole('button', { name: 'Download', exact: true }).click()
+  const download = await downloadPromise
+  expect(download.suggestedFilename()).toBe('compare-run-1.xlsx')
   expectNoConsoleErrors()
 })
 

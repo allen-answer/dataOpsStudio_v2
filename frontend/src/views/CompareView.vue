@@ -17,6 +17,7 @@ import {
   ArrowRight,
   Bot,
   Check,
+  Download,
   GitCompareArrows,
   Play,
   Plus,
@@ -31,8 +32,10 @@ import {
 import { listDatasources } from '../api/datasources'
 import {
   COMPARE_BUCKETS,
+  createCompareExport,
   createCompareTask,
   deleteCompareTask,
+  downloadCompareExport,
   draftCompareTask,
   explainCompareRun,
   getCompareRunProfile,
@@ -211,6 +214,7 @@ interface RunState {
 }
 const run = reactive<RunState>({ jobId: null, runId: null, status: null, error: null, cancelling: false })
 let pollTimer: ReturnType<typeof setTimeout> | null = null
+let exportPollTimer: ReturnType<typeof setTimeout> | null = null
 
 const resultBucket = ref<CompareBucket>('diff')
 const resultData = ref<CompareRunResultResponse | null>(null)
@@ -226,6 +230,12 @@ const aiResult = ref<CompareAiAttributionResponse | null>(null)
 const aiBusy = ref(false)
 
 const runActive = computed<boolean>(() => (run.status ? ACTIVE.has(run.status) : false))
+const exportBusy = ref(false)
+const exportError = ref<string | null>(null)
+const exportReady = ref<{ token: string; filename: string } | null>(null)
+const exportableRunId = computed<string | null>(() =>
+  run.runId && run.status === 'success' ? run.runId : null,
+)
 
 const bucketCounts = computed<Record<CompareBucket, number>>(
   () =>
@@ -258,6 +268,7 @@ onMounted(() => {
 })
 onUnmounted(() => {
   if (pollTimer) clearTimeout(pollTimer)
+  if (exportPollTimer) clearTimeout(exportPollTimer)
 })
 
 watch(activeTask, (task) => {
@@ -516,6 +527,14 @@ async function onCreateDraftFromPair(pair: TablePairSuggestion): Promise<void> {
 }
 
 // ── run + poll ──────────────────────────────────────────────────────
+function resetExportState(): void {
+  if (exportPollTimer) clearTimeout(exportPollTimer)
+  exportPollTimer = null
+  exportBusy.value = false
+  exportError.value = null
+  exportReady.value = null
+}
+
 function resetRunState(): void {
   if (pollTimer) clearTimeout(pollTimer)
   pollTimer = null
@@ -527,6 +546,7 @@ function resetRunState(): void {
   resultData.value = null
   profileData.value = null
   aiResult.value = null
+  resetExportState()
 }
 
 async function onRun(): Promise<void> {
@@ -583,6 +603,69 @@ async function onCancelRun(): Promise<void> {
   } catch (e) {
     run.cancelling = false
     run.error = errorMessage(e)
+  }
+}
+
+async function onCreateCompareExport(): Promise<void> {
+  const runId = exportableRunId.value
+  if (!runId || exportBusy.value) return
+  resetExportState()
+  exportBusy.value = true
+  try {
+    const res = await createCompareExport(runId)
+    await pollCompareExportJob(res.job_id, res.download_token, res.filename)
+  } catch (e) {
+    exportBusy.value = false
+    exportError.value = compareExportErrorMessage(e)
+  }
+}
+
+function compareExportErrorMessage(e: unknown): string {
+  if (e instanceof ApiError) {
+    if (e.status === 429) return t('compare.export_rate_limited')
+    if (e.status === 404 || e.status === 409) return t('compare.export_source_gone')
+    if (e.status === 410) return t('compare.export_token_spent')
+  }
+  return errorMessage(e)
+}
+
+async function pollCompareExportJob(
+  jobId: string,
+  token: string,
+  filename: string,
+): Promise<void> {
+  try {
+    const job = await getJob(jobId)
+    if (TERMINAL.has(job.status)) {
+      exportPollTimer = null
+      exportBusy.value = false
+      if (job.status === 'success') {
+        exportReady.value = { token, filename }
+      } else {
+        exportError.value = job.error || t('compare.export_failed')
+      }
+      return
+    }
+  } catch (e) {
+    exportPollTimer = null
+    exportBusy.value = false
+    exportError.value = errorMessage(e)
+    return
+  }
+  exportPollTimer = setTimeout(() => {
+    void pollCompareExportJob(jobId, token, filename)
+  }, POLL_MS)
+}
+
+async function onDownloadCompareExport(): Promise<void> {
+  if (!exportReady.value) return
+  const ready = exportReady.value
+  try {
+    await downloadCompareExport(ready.token, ready.filename)
+    exportReady.value = null
+  } catch (e) {
+    exportError.value = compareExportErrorMessage(e)
+    exportReady.value = null
   }
 }
 
@@ -830,6 +913,17 @@ const missingTarget = computed(
         <div class="flex-1" />
 
         <button
+          type="button"
+          class="chrome-btn-secondary text-xs"
+          :disabled="!exportableRunId || exportBusy"
+          :title="!exportableRunId ? t('compare.export_needs_success') : t('compare.export')"
+          @click="onCreateCompareExport"
+        >
+          <Download class="w-3.5 h-3.5" :class="exportBusy && 'animate-pulse'" />
+          {{ exportBusy ? t('compare.export_running') : t('compare.export') }}
+        </button>
+
+        <button
           v-if="runActive"
           type="button"
           class="chrome-btn-secondary text-xs"
@@ -846,6 +940,25 @@ const missingTarget = computed(
           @click="onRun"
         >
           <Play class="w-3.5 h-3.5" /> {{ runActive ? t('compare.running') : t('compare.run') }}
+        </button>
+      </div>
+
+      <div
+        v-if="exportError"
+        class="flex items-center gap-2 px-5 py-2 border-b chrome-border-subtle text-xs"
+        style="background-color: rgb(239 68 68 / 0.08); color: rgb(185 28 28);"
+      >
+        <AlertTriangle class="w-3.5 h-3.5 shrink-0" />
+        <span class="flex-1">{{ exportError }}</span>
+      </div>
+      <div
+        v-if="exportReady"
+        class="flex items-center gap-2 px-5 py-2 border-b chrome-border-subtle text-xs chrome-accent-light-bg"
+      >
+        <Download class="w-3.5 h-3.5 shrink-0 chrome-accent" />
+        <span class="flex-1 chrome-text-heading">{{ t('compare.export_ready', { file: exportReady.filename }) }}</span>
+        <button type="button" class="chrome-btn-secondary text-xs" @click="onDownloadCompareExport">
+          {{ t('compare.export_download') }}
         </button>
       </div>
 
