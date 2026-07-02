@@ -19,6 +19,7 @@
 | DB2 PR-A adapter 核心(连接/流式/超时/探活/factory 分发) | Claude 子代理(Fable 5 复核) | 1.x 移植 | 已合并 | [#89](https://github.com/allen-answer/dataOpsStudio_v2/pull/89) |
 | DB2 PR-B introspection(SYSCAT.* 元数据 + 类型映射) | Claude 子代理(Fable 5 复核) | #89 | 已合并 | [#91](https://github.com/allen-answer/dataOpsStudio_v2/pull/91) |
 | Workflow PR-5 migrate 实迁 workflows(禁止节点报错不静默丢弃) | Codex(Fable 5 复核) | #86 #87 | 已合并 | [#90](https://github.com/allen-answer/dataOpsStudio_v2/pull/90) |
+| Workflow PR-4 DAG 执行器 + run 端点(cron tick 归 PR-4b) | Claude 子代理(Fable 5 复核) | #88 | 已合并 | [#92](https://github.com/allen-answer/dataOpsStudio_v2/pull/92) |
 | Worker 独立心跳线程(F2) | Codex(Fable 5 复核) | docs/backlog.md F2 | PR 待审 | [#97](https://github.com/allen-answer/dataOpsStudio_v2/pull/97) |
 
 > **2.0.0 GA 已发布**:回归走查 + 安全自审见 `docs/acceptance-2.0.0-ga.md`(10/10,

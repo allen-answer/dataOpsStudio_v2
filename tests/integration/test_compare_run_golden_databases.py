@@ -458,6 +458,26 @@ class _FakeBackend:
         del heartbeat_timeout_seconds, limit
         return object()
 
+    # workflow_run 编排接口(BackendLike PR-4 扩展;本集成测试不跑 workflow)
+    def enqueue(self, job: Job) -> None:
+        del job
+
+    def request_cancel(self, job_id: str) -> None:
+        del job_id
+
+    def list_jobs_by_parent(self, parent_workflow_run_id: str) -> list[Job]:
+        del parent_workflow_run_id
+        return []
+
+    def requeue_workflow_run(self, job_id: str) -> None:
+        del job_id
+
+    def retry_workflow_node(self, job_id: str) -> None:
+        del job_id
+
+    def cancel_pending_job(self, job_id: str, reason: str = "cancelled") -> None:
+        del job_id, reason
+
 
 class _EnvSecretStore:
     def __init__(self, password: str) -> None:
