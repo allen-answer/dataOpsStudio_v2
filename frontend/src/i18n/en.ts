@@ -405,6 +405,7 @@ export default {
     save_task: 'Save task',
     saving: 'Saving…',
     delete_task: 'Delete task',
+    clone_task: 'Clone task',
     run: 'Start compare',
     running: 'Comparing…',
     cancel_run: 'Cancel run',

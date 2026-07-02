@@ -1676,6 +1676,81 @@ def get_compare_task(task_id: str, request: Request) -> CompareTaskResponse:
     return _compare_task_response(_compare_task_for_current_user(request, task_id))
 
 
+@router.post(
+    "/compare/tasks/{task_id}/clone",
+    response_model=CompareTaskResponse,
+    status_code=201,
+)
+def clone_compare_task(task_id: str, request: Request) -> CompareTaskResponse:
+    """复制对比任务:配置全量拷贝,名字自动去重(`{name} (copy)` / `(copy N)`)。"""
+    services = services_from(request)
+    user = current_user_from(request)
+    source_row = _compare_task_for_current_user(request, task_id)
+    project_id = str(source_row["project_id"])
+    now = datetime.now(UTC)
+    clone_id = new_id()
+    with services.engine.begin() as conn:
+        name = _next_copy_name(conn, project_id=project_id, base_name=str(source_row["name"]))
+        conn.execute(
+            insert(compare_tasks).values(
+                id=clone_id,
+                project_id=project_id,
+                name=name,
+                source_id=source_row["source_id"],
+                target_id=source_row["target_id"],
+                source_ref=source_row["source_ref"],
+                target_ref=source_row["target_ref"],
+                columns=source_row["columns"],
+                compare_rules=source_row["compare_rules"],
+                run_limits=source_row["run_limits"],
+                created_by=user.id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        row = (
+            conn.execute(select(compare_tasks).where(compare_tasks.c.id == clone_id))
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise ApiError(404, "not_found", "Compare task not found")
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="compare_task_clone",
+        resource_type="compare_task",
+        resource_id=clone_id,
+        result="success",
+        detail={"cloned_from": task_id},
+    )
+    return _compare_task_response(row)
+
+
+def _next_copy_name(conn: Connection, *, project_id: str, base_name: str) -> str:
+    """在项目内生成不撞 uq_compare_tasks_project_name 的副本名。
+
+    name 列宽 128:先给 " (copy N)" 后缀留够余量再拼,避免超宽被 DB 拒。
+    """
+    existing = {
+        str(row["name"])
+        for row in conn.execute(
+            select(compare_tasks.c.name).where(compare_tasks.c.project_id == project_id)
+        )
+        .mappings()
+        .all()
+    }
+    trimmed = base_name[:110]
+    candidate = f"{trimmed} (copy)"
+    suffix = 2
+    while candidate in existing:
+        candidate = f"{trimmed} (copy {suffix})"
+        suffix += 1
+    return candidate
+
+
 @router.patch("/compare/tasks/{task_id}", response_model=CompareTaskResponse)
 def update_compare_task(
     task_id: str,

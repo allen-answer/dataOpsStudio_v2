@@ -398,6 +398,7 @@ export default {
     save_task: '保存任务',
     saving: '保存中…',
     delete_task: '删除任务',
+    clone_task: '复制任务',
     run: '开始对比',
     running: '对比中…',
     cancel_run: '取消运行',
