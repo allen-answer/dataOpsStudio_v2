@@ -14,6 +14,9 @@
  *      direction 默认 downstream;max_depth 默认 3(ge=1 le=5,后端再 min(,5))
  *      focus 未知不 404 —— 返回只含焦点节点的空图(edge_count=0)
  *    GET /projects/{pid}/lineage/impact?focus=&max_depth=  (纯下游遍历,按 depth 分组)
+ *    PATCH /projects/{pid}/lineage/edges/{edge_id} body {"inference_status": ...}
+ *      AI 推断边状态机(inferred → confirmed / rejected);非 inferred 起点返回
+ *      409 invalid_inference_transition;rejected 边被子图/影响 CTE 排除
  * 契约测试权威来源:tests/contract/test_api.py(搜 test_lineage_*)。
  */
 import { apiClient } from './client'
@@ -147,6 +150,33 @@ export function getLineageSubgraph(
   if (params.includeColumns != null) qs.set('include_columns', String(params.includeColumns))
   return apiClient.get<LineageSubgraphResponse>(
     `/projects/${projectId}/lineage/subgraph?${qs.toString()}`,
+  )
+}
+
+/** PATCH body 只接受两个终态(schemas.py LineageEdgeInferenceUpdateRequest)。 */
+export type LineageInferenceDecision = 'confirmed' | 'rejected'
+
+/** 锚 schemas.py LineageEdgeInferenceResponse。 */
+export interface LineageEdgeInferenceResponse {
+  edge_id: string
+  edge_kind: 'table' | 'column'
+  inference_status: string
+  inferred: boolean
+  confidence: number
+}
+
+/**
+ * PATCH /projects/{pid}/lineage/edges/{edge_id} —— 确认 / 拒绝 AI 推断边。
+ * 非 inferred 起点(已确认/已拒绝/确定性边)→ 409 invalid_inference_transition。
+ */
+export function updateLineageEdge(
+  projectId: string,
+  edgeId: string,
+  status: LineageInferenceDecision,
+): Promise<LineageEdgeInferenceResponse> {
+  return apiClient.patch<LineageEdgeInferenceResponse>(
+    `/projects/${projectId}/lineage/edges/${edgeId}`,
+    { inference_status: status },
   )
 }
 
