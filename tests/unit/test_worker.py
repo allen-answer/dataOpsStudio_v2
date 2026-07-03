@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import re
 import threading
 import time
@@ -849,6 +850,8 @@ class _FakeResultStore:
         self.rows_by_result_set: dict[str, list[Row]] = {}
         self.columns_by_result_set: dict[str, list[Column]] = {}
         self.export_artifacts: dict[tuple[str, str], bytes] = {}
+        self.run_artifacts: dict[tuple[str, str], bytes] = {}
+        self.downloads: dict[str, bytes] = {}
         self.deleted_spools: list[str] = []
         self.gc_calls = 0
 
@@ -862,6 +865,16 @@ class _FakeResultStore:
         data = stream.read()
         self.export_artifacts[(export_id, name)] = data
         return ResultRef(backend="local_fs", uri=f"exports/{export_id}/{name}")
+
+    def put_artifact(self, run_id: str, name: str, stream: BinaryIO) -> ResultRef:
+        data = stream.read()
+        self.run_artifacts[(run_id, name)] = data
+        return ResultRef(backend="local_fs", uri=f"runs/{run_id}/artifacts/{name}")
+
+    def open_download(self, ref: ResultRef) -> io.BytesIO:
+        if ref.uri not in self.downloads:
+            raise FileNotFoundError(ref.uri)
+        return io.BytesIO(self.downloads[ref.uri])
 
     def set_spool_columns(self, result_set_id: str, columns: list[Column]) -> None:
         self.columns_by_result_set[result_set_id] = list(columns)
@@ -914,6 +927,13 @@ class _CountingResultStore:
     def put_export_artifact(self, export_id: str, name: str, stream: BinaryIO) -> ResultRef:
         del stream
         return ResultRef(backend="local_fs", uri=f"exports/{export_id}/{name}")
+
+    def put_artifact(self, run_id: str, name: str, stream: BinaryIO) -> ResultRef:
+        del stream
+        return ResultRef(backend="local_fs", uri=f"runs/{run_id}/artifacts/{name}")
+
+    def open_download(self, ref: ResultRef) -> io.BytesIO:
+        raise FileNotFoundError(ref.uri)
 
     def get_spool_manifest(self, result_set_id: str) -> dict[str, object]:
         return {
@@ -1491,6 +1511,61 @@ def test_worker_runs_lineage_analyze_with_thin_catalog_handler() -> None:
     _, result_ref = backend.completed[0]
     assert result_ref.backend == "lineage_run"
     assert result_ref.metadata["cached"] is False
+
+
+def test_worker_runs_lineage_batch_over_zip_with_lenient_parsing() -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "etl/a.sql",
+            "insert into kgrp.mid select * from kgrp.src a where a.p = ${v_period}",
+        )
+        archive.writestr("etl/b.txt", "insert into kgrp.tgt select * from kgrp.mid")
+        archive.writestr("readme.md", "not sql")
+    job = _make_job(
+        kind=JobKind.LINEAGE_BATCH,
+        payload={
+            "upload_id": "up-1",
+            "storage_uri": "uploads/up-1/scripts.zip",
+            "datasource_id": "ds-9",
+            "dialect": "oracle",
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    result_store.downloads["uploads/up-1/scripts.zip"] = buffer.getvalue()
+    catalog = _FakeLineageCatalog()
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=catalog,
+    )
+
+    assert runner.run_once() is True
+
+    # 两个 SQL 文件都在空元数据下走宽松路径落了 run(readme.md 被跳过)
+    assert len(catalog.persisted) == 2
+    assert {item["source_ref"] for item in catalog.persisted} == {"etl/a.sql", "etl/b.txt"}
+    assert all(item["table_edges"] == 1 for item in catalog.persisted)
+    assert len(backend.completed) == 1
+    _, result_ref = backend.completed[0]
+    assert result_ref.backend == "lineage_batch"
+    assert result_ref.metadata["file_count"] == 2
+    assert result_ref.metadata["parsed"] == 2
+    assert result_ref.metadata["failed"] == 0
+    assert result_ref.metadata["script_edge_count"] == 1
+    report = json.loads(result_store.run_artifacts[("job-1", "lineage_batch_report.json")])
+    assert report["skipped"]["non_sql"] == 1
+    assert report["script_edges"] == [
+        {"source_file": "etl/a.sql", "target_file": "etl/b.txt", "tables": ["kgrp.mid"]}
+    ]
+    file_a = next(item for item in report["files"] if item["source_ref"] == "etl/a.sql")
+    assert file_a["tables_written"] == ["kgrp.mid"]
+    assert file_a["tables_read"] == ["kgrp.src"]
+    assert file_a["lenient_statement_count"] == 1
 
 
 def test_worker_lineage_analyze_reuses_cached_run() -> None:
