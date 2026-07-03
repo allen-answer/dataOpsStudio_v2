@@ -72,6 +72,7 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("POST", "/api/projects/{project_id}/lineage/analyze") in routes
     assert ("GET", "/api/projects/{project_id}/lineage/subgraph") in routes
     assert ("GET", "/api/projects/{project_id}/lineage/impact") in routes
+    assert ("POST", "/api/projects/{project_id}/lineage/export") in routes
     assert ("PATCH", "/api/projects/{project_id}/lineage/edges/{edge_id}") in routes
     assert ("GET", "/api/projects/{project_id}/workflows") in routes
     assert ("POST", "/api/projects/{project_id}/workflows") in routes
@@ -1847,6 +1848,95 @@ def test_lineage_impact_contract_returns_downstream_paths() -> None:
     }
 
 
+def test_lineage_export_writes_artifact_token_and_audit_synchronously() -> None:
+    walk_row = {
+        "edge_id": "edge-1",
+        "source_table": "app.src",
+        "target_table": "app.mid",
+        "source_column": None,
+        "target_column": None,
+        "source": "app.src",
+        "target": "app.mid",
+        "edge_kind": "table",
+        "transformation": None,
+        "transformation_subtype": None,
+        "inferred": False,
+        "inference_status": "confirmed",
+        "confidence": 1,
+        "depth": 1,
+        "path": ["app.src", "app.mid"],
+        "direction": "downstream",
+    }
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},  # project access
+            0,  # export rate limit count
+            [dict(walk_row)],  # subgraph downstream walk
+            "edge-exists",  # impact focus_ref table exists
+            [dict(walk_row)],  # impact downstream walk
+        ]
+    )
+    job_backend = _JobBackend()
+    result_store = _ResultStore()
+    services = _Services(engine, job_backend=job_backend, result_store=result_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/export",
+        headers=_auth_headers(),
+        json_body={"focus": "app.src", "direction": "downstream", "max_depth": 3},
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["job_id"]
+    assert payload["download_token"]
+    assert payload["format"] == "excel"
+    assert payload["filename"] == f"lineage-{payload['job_id']}.xlsx"
+    # 同步生成:artifact 已落 result_store,不入 job 队列
+    assert job_backend.enqueued == []
+    export_id, name, content = result_store.export_artifacts[0]
+    assert export_id == payload["job_id"]
+    assert name == payload["filename"]
+    assert content.startswith(b"PK")  # xlsx = zip
+    # jobs 落 success 行 + token 落库(下载端点 join jobs 依赖)
+    assert any(statement.startswith("INSERT INTO jobs") for statement in engine.statements)
+    assert any(
+        statement.startswith("INSERT INTO export_download_tokens")
+        for statement in engine.statements
+    )
+    audit = next(item for item in services.audits if item["action"] == "lineage_export")
+    detail = cast(dict[str, object], audit["detail"])
+    assert detail["focus"] == "app.src"
+    assert detail["direction"] == "downstream"
+    assert detail["table_edge_count"] == 1
+    assert detail["impact_count"] == 1
+    assert "download_token" not in str(services.audits[-1])
+
+
+def test_lineage_export_rate_limit_returns_429_without_artifact() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            10,  # 已到每小时上限
+        ]
+    )
+    result_store = _ResultStore()
+    services = _Services(engine, result_store=result_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/export",
+        headers=_auth_headers(),
+        json_body={"focus": "app.src"},
+    )
+
+    assert response.status_code == 429
+    assert response.json()["error"] == "export_rate_limited"
+    assert result_store.export_artifacts == []
+    assert not any(statement.startswith("INSERT INTO") for statement in engine.statements)
+
+
 def test_lineage_column_trace_contract_returns_hop_chain() -> None:
     engine = _FakeEngine(
         [
@@ -3006,6 +3096,11 @@ class _ResultStore:
         self._downloads = downloads or {}
         self._spool_exists = spool_exists
         self._rows = rows or []
+        self.export_artifacts: list[tuple[str, str, bytes]] = []
+
+    def put_export_artifact(self, export_id: str, name: str, stream: Any) -> ResultRef:
+        self.export_artifacts.append((export_id, name, stream.read()))
+        return ResultRef(backend="local_fs", uri=f"exports/{export_id}/{name}")
 
     def spool_ref(self, result_set_id: str) -> ResultRef:
         return ResultRef(backend="local_fs", uri=f"spool/{result_set_id}")

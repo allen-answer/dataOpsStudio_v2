@@ -494,6 +494,11 @@ export default {
     subgraph_empty_hint: '该焦点当前没有任何血缘边。可能项目还没有解析过 SQL —— 先在「SQL 解析」提交语句生成边,或换一个焦点表。',
     go_analyze: '去 SQL 解析',
     error_focus_required: '请输入焦点表',
+    // 子图导出(L-5)
+    export_excel: '导出 Excel',
+    exporting: '导出中…',
+    export_rate_limited: '已达导出限额(每小时 10 次),请稍后再试。',
+    export_token_spent: '下载链接已使用或已过期,请重新导出。',
     // 影响分析
     impact_focus: '焦点表 / 列',
     impact_run: '分析下游影响',

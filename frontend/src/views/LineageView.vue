@@ -17,6 +17,7 @@ import { useQuery } from '@tanstack/vue-query'
 import {
   AlertTriangle,
   Check,
+  Download,
   FileSearch,
   Network,
   Play,
@@ -27,8 +28,10 @@ import {
   X,
 } from 'lucide-vue-next'
 import { listDatasources } from '../api/datasources'
+import { downloadExport } from '../api/metadata'
 import {
   analyzeLineage,
+  exportLineage,
   getLineageImpact,
   getLineageSubgraph,
   updateLineageEdge,
@@ -105,6 +108,39 @@ async function runSubgraph(): Promise<void> {
 function onNodeClick(node: LineageSubgraphNode): void {
   subgraphFocus.value = node.id
   void runSubgraph()
+}
+
+// ── 子图导出(L-5:POST /lineage/export,同步 201 + 一次性 token)─────
+const exportBusy = ref(false)
+const exportError = ref<string | null>(null)
+
+/** 用「已查出的子图」的参数导出(与画面一致),拿到 token 后立即触发下载。 */
+async function onExportSubgraph(): Promise<void> {
+  const data = subgraphData.value
+  if (!projectId.value || !data || exportBusy.value) return
+  exportBusy.value = true
+  exportError.value = null
+  try {
+    const res = await exportLineage(projectId.value, {
+      focus: data.focus,
+      direction: data.direction,
+      max_depth: data.max_depth,
+      include_columns: data.include_columns,
+    })
+    await downloadExport(res.download_token, res.filename)
+  } catch (e) {
+    exportError.value = exportErrorMessage(e)
+  } finally {
+    exportBusy.value = false
+  }
+}
+
+function exportErrorMessage(e: unknown): string {
+  if (e instanceof ApiError) {
+    if (e.status === 429) return t('lineage.export_rate_limited')
+    if (e.status === 410) return t('lineage.export_token_spent')
+  }
+  return errorMessage(e)
 }
 
 const depthChips = computed<[string, number][]>(() =>
@@ -484,6 +520,19 @@ function errorMessage(e: unknown): string {
             <span v-for="[depth, count] in depthChips" :key="depth">
               {{ t('lineage.depth_chip', { depth, count }) }}
             </span>
+            <button
+              v-if="subgraphData.edge_count > 0"
+              type="button"
+              class="chrome-btn-secondary text-xs ml-auto"
+              :disabled="exportBusy"
+              @click="onExportSubgraph"
+            >
+              <Download class="w-3.5 h-3.5" :class="exportBusy && 'animate-pulse'" />
+              {{ exportBusy ? t('lineage.exporting') : t('lineage.export_excel') }}
+            </button>
+          </div>
+          <div v-if="exportError" class="text-xs text-red-600 dark:text-red-400">
+            {{ exportError }}
           </div>
           <div
             v-if="subgraphData.truncated"
