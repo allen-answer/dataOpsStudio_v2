@@ -32,9 +32,11 @@ import { downloadExport } from '../api/metadata'
 import {
   analyzeLineage,
   exportLineage,
+  getLineageEdgeDetail,
   getLineageImpact,
   getLineageSubgraph,
   updateLineageEdge,
+  type LineageEdgeDetailResponse,
   type LineageAnalyzeResponse,
   type LineageDirection,
   type LineageImpactItem,
@@ -247,6 +249,66 @@ function edgeTitle(edge: LineageSubgraphEdge): string {
   }
   if (edge.inferred) parts.push(`inferred (${edge.inference_status}, ${edge.confidence})`)
   return parts.join(' · ')
+}
+
+// ── 边详情抽屉(UX P0-L1:点边看"这条边为什么存在")──────────────
+const edgeDetailOpen = ref(false)
+const edgeDetailLoading = ref(false)
+const edgeDetailError = ref<string | null>(null)
+const edgeDetail = ref<LineageEdgeDetailResponse | null>(null)
+const edgeSqlCopied = ref(false)
+
+async function onEdgeClick(edge: LineageSubgraphEdge): Promise<void> {
+  if (!projectId.value) return
+  edgeDetailOpen.value = true
+  edgeDetailLoading.value = true
+  edgeDetailError.value = null
+  edgeDetail.value = null
+  edgeSqlCopied.value = false
+  try {
+    edgeDetail.value = await getLineageEdgeDetail(projectId.value, edge.id)
+  } catch (e) {
+    edgeDetailError.value = errorMessage(e)
+  } finally {
+    edgeDetailLoading.value = false
+  }
+}
+
+async function copyEdgeSql(): Promise<void> {
+  const sql = edgeDetail.value?.run?.sql_text
+  if (!sql) return
+  await navigator.clipboard.writeText(sql)
+  edgeSqlCopied.value = true
+  window.setTimeout(() => {
+    edgeSqlCopied.value = false
+  }, 1500)
+}
+
+// ── 图内定位(UX P0-L3:Find in canvas)────────────────────────────
+const canvasQuery = ref('')
+const canvasMatchId = ref<string | null>(null)
+const canvasMiss = ref(false)
+const svgScroller = ref<HTMLDivElement | null>(null)
+
+function locateInCanvas(): void {
+  canvasMiss.value = false
+  canvasMatchId.value = null
+  const query = canvasQuery.value.trim().toLowerCase()
+  if (!query || !graphLayout.value) return
+  const hit = graphLayout.value.nodes.find((ln) => ln.node.id.toLowerCase().includes(query))
+  if (!hit) {
+    canvasMiss.value = true
+    return
+  }
+  canvasMatchId.value = hit.node.id
+  const scroller = svgScroller.value
+  if (scroller) {
+    scroller.scrollTo({
+      left: Math.max(0, hit.x - scroller.clientWidth / 2 + NODE_W / 2),
+      top: Math.max(0, hit.y - scroller.clientHeight / 2 + NODE_H / 2),
+      behavior: 'smooth',
+    })
+  }
 }
 
 // ── AI 推断边审核(L-6:PATCH /lineage/edges/{edge_id})────────────
@@ -559,9 +621,26 @@ function errorMessage(e: unknown): string {
             </button>
           </div>
 
-          <!-- 子图 SVG(按 depth 分列,焦点列高亮;点节点切焦点)-->
+          <!-- 子图 SVG(按 depth 分列,焦点列高亮;点节点切焦点,点边开抽屉)-->
           <template v-else-if="graphLayout">
+            <!-- 图内定位(UX P0-L3)-->
+            <div class="flex items-center gap-2">
+              <input
+                v-model="canvasQuery"
+                type="text"
+                class="chrome-input text-xs w-56"
+                :placeholder="t('lineage.canvas_search_ph')"
+                @keydown.enter.prevent="locateInCanvas"
+              />
+              <button type="button" class="chrome-btn-secondary text-xs" @click="locateInCanvas">
+                <Target class="w-3.5 h-3.5" /> {{ t('lineage.canvas_locate') }}
+              </button>
+              <span v-if="canvasMiss" class="text-[11px] text-amber-600 dark:text-amber-400">
+                {{ t('lineage.canvas_search_miss') }}
+              </span>
+            </div>
             <div
+              ref="svgScroller"
               class="rounded-card border chrome-border chrome-bg-panel overflow-auto"
               style="max-height: 62vh"
             >
@@ -579,20 +658,27 @@ function errorMessage(e: unknown): string {
                     <path d="M 0 0 L 8 4 L 0 8 z" class="lineage-arrow" />
                   </marker>
                 </defs>
-                <path
+                <!-- 每条边 = 透明加宽 hit-area(承接点击/悬浮)+ 可见细线(不接事件) -->
+                <g
                   v-for="le in graphLayout.edges"
                   :key="`${le.edge.id}-${le.edge.direction}`"
-                  :d="le.d"
-                  fill="none"
-                  marker-end="url(#lineage-arrow)"
-                  class="lineage-edge"
-                  :class="{
-                    'lineage-edge-column': le.edge.edge_kind === 'column',
-                    'lineage-edge-inferred': le.edge.inferred,
-                  }"
+                  class="lineage-edge-group"
+                  @click="onEdgeClick(le.edge)"
                 >
-                  <title>{{ edgeTitle(le.edge) }}</title>
-                </path>
+                  <path :d="le.d" fill="none" stroke="transparent" stroke-width="12">
+                    <title>{{ edgeTitle(le.edge) }}</title>
+                  </path>
+                  <path
+                    :d="le.d"
+                    fill="none"
+                    marker-end="url(#lineage-arrow)"
+                    class="lineage-edge pointer-events-none"
+                    :class="{
+                      'lineage-edge-column': le.edge.edge_kind === 'column',
+                      'lineage-edge-inferred': le.edge.inferred,
+                    }"
+                  />
+                </g>
                 <g
                   v-for="ln in graphLayout.nodes"
                   :key="ln.node.id"
@@ -609,6 +695,13 @@ function errorMessage(e: unknown): string {
                       'lineage-node-rect-focus': ln.node.id === subgraphData.focus,
                       'lineage-node-rect-column': ln.node.kind === 'column',
                     }"
+                  />
+                  <rect
+                    v-if="ln.node.id === canvasMatchId"
+                    :width="NODE_W"
+                    :height="NODE_H"
+                    rx="6"
+                    class="lineage-node-locate-ring"
                   />
                   <text :x="10" :y="NODE_H / 2 + 4" class="lineage-node-text">
                     {{ nodeText(ln.node) }}
@@ -636,7 +729,85 @@ function errorMessage(e: unknown): string {
                 {{ t('lineage.legend_inferred') }}
               </span>
               <span>{{ t('lineage.node_click_hint') }}</span>
+              <span>{{ t('lineage.edge_click_hint') }}</span>
             </div>
+
+            <!-- 边详情抽屉(UX P0-L1)-->
+            <Teleport to="body">
+              <div
+                v-if="edgeDetailOpen"
+                class="fixed inset-0 z-40 bg-black/30"
+                @click="edgeDetailOpen = false"
+              />
+              <aside
+                v-if="edgeDetailOpen"
+                class="fixed right-0 top-0 z-50 h-full w-[440px] max-w-[92vw] chrome-bg-panel border-l chrome-border shadow-xl flex flex-col"
+              >
+                <div class="flex items-center justify-between px-4 py-3 border-b chrome-border-subtle">
+                  <span class="text-sm font-medium chrome-text-heading">
+                    {{ t('lineage.edge_detail_title') }}
+                  </span>
+                  <button
+                    type="button"
+                    class="chrome-btn-ghost"
+                    :aria-label="t('common.close')"
+                    @click="edgeDetailOpen = false"
+                  >
+                    <X class="w-4 h-4" />
+                  </button>
+                </div>
+                <div class="flex-1 overflow-auto p-4 space-y-3 text-xs">
+                  <LoadingDots v-if="edgeDetailLoading" />
+                  <div v-else-if="edgeDetailError" class="text-red-600 dark:text-red-400">
+                    {{ edgeDetailError }}
+                  </div>
+                  <template v-else-if="edgeDetail">
+                    <div class="font-mono chrome-text-heading break-all">
+                      {{ edgeDetail.source_column ? `${edgeDetail.source_table}.${edgeDetail.source_column}` : edgeDetail.source_table }}
+                      →
+                      {{ edgeDetail.target_column ? `${edgeDetail.target_table}.${edgeDetail.target_column}` : edgeDetail.target_table }}
+                    </div>
+                    <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 chrome-text-muted">
+                      <dt>{{ t('lineage.edge_kind') }}</dt>
+                      <dd class="chrome-text-heading">{{ edgeDetail.edge_kind }}</dd>
+                      <template v-if="edgeDetail.transformation">
+                        <dt>{{ t('lineage.edge_transformation') }}</dt>
+                        <dd class="chrome-text-heading">
+                          {{ edgeDetail.transformation
+                          }}<template v-if="edgeDetail.transformation_subtype && edgeDetail.transformation_subtype !== edgeDetail.transformation">
+                            / {{ edgeDetail.transformation_subtype }}</template>
+                        </dd>
+                      </template>
+                      <dt>{{ t('lineage.edge_status') }}</dt>
+                      <dd class="chrome-text-heading">
+                        {{ edgeDetail.inference_status }}
+                        <template v-if="edgeDetail.inferred">
+                          · {{ t('lineage.inferred_confidence', { confidence: edgeDetail.confidence.toFixed(2) }) }}
+                        </template>
+                      </dd>
+                      <template v-if="edgeDetail.run">
+                        <dt>{{ t('lineage.edge_run_source_ref') }}</dt>
+                        <dd class="chrome-text-heading break-all">{{ edgeDetail.run.source_ref }}</dd>
+                        <dt>{{ t('lineage.edge_run_dialect') }}</dt>
+                        <dd class="chrome-text-heading">{{ edgeDetail.run.dialect }}</dd>
+                        <dt>{{ t('lineage.edge_run_created') }}</dt>
+                        <dd class="chrome-text-heading">{{ edgeDetail.run.created_at }}</dd>
+                      </template>
+                    </dl>
+                    <div v-if="edgeDetail.run?.sql_text" class="space-y-1.5">
+                      <div class="flex items-center justify-between">
+                        <span class="font-medium chrome-text-heading">{{ t('lineage.edge_sql') }}</span>
+                        <button type="button" class="chrome-btn-secondary text-xs" @click="copyEdgeSql">
+                          {{ edgeSqlCopied ? t('common.copied') : t('common.copy') }}
+                        </button>
+                      </div>
+                      <pre class="font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-all rounded-card border chrome-border chrome-bg-elevated p-3 max-h-[48vh] overflow-auto">{{ edgeDetail.run.sql_text }}</pre>
+                    </div>
+                    <p v-else class="chrome-text-muted">{{ t('lineage.edge_sql_missing') }}</p>
+                  </template>
+                </div>
+              </aside>
+            </Teleport>
 
             <!-- AI 推断边审核面板(L-6):inferred 边逐条 确认/拒绝 -->
             <div v-if="inferenceError" class="text-xs text-red-600 dark:text-red-400">
@@ -970,6 +1141,21 @@ function errorMessage(e: unknown): string {
   stroke: rgb(var(--text-muted));
   stroke-width: 1.25;
   opacity: 0.75;
+}
+.lineage-edge-group {
+  cursor: pointer;
+}
+.lineage-edge-group:hover .lineage-edge {
+  stroke: rgb(var(--accent));
+  opacity: 1;
+}
+/* 图内定位命中环(amber 虚线,盖在节点框上) */
+.lineage-node-locate-ring {
+  fill: none;
+  stroke: rgb(245 158 11);
+  stroke-width: 2;
+  stroke-dasharray: 4 3;
+  pointer-events: none;
 }
 .lineage-edge-column {
   stroke-width: 1;

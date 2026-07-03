@@ -1555,6 +1555,7 @@ class _FakeLineageCatalog:
         dialect: str,
         source_ref: str,
         sql_hash: str,
+        sql_text: str,
         report: LineageReport,
     ) -> None:
         self.persisted.append(
@@ -1565,6 +1566,7 @@ class _FakeLineageCatalog:
                 "dialect": dialect,
                 "source_ref": source_ref,
                 "sql_hash": sql_hash,
+                "sql_text": sql_text,
                 "table_edges": len(report.graph_edges),
             }
         )
