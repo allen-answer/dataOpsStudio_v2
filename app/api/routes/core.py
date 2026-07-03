@@ -32,6 +32,8 @@ from app.api.schemas import (
     CompareExportCreateRequest,
     CompareInferRequest,
     CompareInferResponse,
+    ComparePreviewRequest,
+    ComparePreviewResponse,
     CompareResultRow,
     CompareRulesPayload,
     CompareRunCreateResponse,
@@ -41,6 +43,8 @@ from app.api.schemas import (
     CompareSuggestedTaskCreateRequest,
     CompareTaskCreateRequest,
     CompareTaskResponse,
+    CompareTaskRunItem,
+    CompareTaskRunsResponse,
     CompareTaskSuggestionResponse,
     CompareTaskUpdateRequest,
     DatasourceCreateRequest,
@@ -127,6 +131,7 @@ from app.db.models import (
 )
 from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
+from app.dbclients.sql_build import limit_clause, quote_identifier
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.ai import AiContext, AiOptions, ContextItem, EgressLevel
 from app.domain.compare_infer import (
@@ -1752,6 +1757,164 @@ def _next_copy_name(conn: Connection, *, project_id: str, base_name: str) -> str
         candidate = f"{trimmed} (copy {suffix})"
         suffix += 1
     return candidate
+
+
+@router.get("/compare/tasks/{task_id}/runs", response_model=CompareTaskRunsResponse)
+def list_compare_task_runs(
+    task_id: str,
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> CompareTaskRunsResponse:
+    """任务历史 run 列表(1.x history 的 2.0 形态):倒序分页,读 run_index 一表即得。"""
+    _compare_task_for_current_user(request, task_id)
+    services = services_from(request)
+    with services.engine.connect() as conn:
+        rows = (
+            conn.execute(
+                select(run_index)
+                .where(run_index.c.task_id == task_id)
+                .order_by(run_index.c.created_at.desc(), run_index.c.run_id.desc())
+                .limit(limit + 1)
+                .offset(offset)
+            )
+            .mappings()
+            .all()
+        )
+    has_more = len(rows) > limit
+    items = [
+        CompareTaskRunItem(
+            run_id=str(row["run_id"]),
+            job_id=str(row["job_id"]),
+            status=str(row["status"]),
+            created_at=row["created_at"],
+            finished_at=row["finished_at"],
+            bucket_counts={
+                str(key): int(value)
+                for key, value in dict(row["bucket_counts"] or {}).items()
+                if isinstance(value, int)
+            },
+            sampled=row["sample_result"] is not None,
+        )
+        for row in rows[:limit]
+    ]
+    return CompareTaskRunsResponse(
+        task_id=task_id,
+        limit=limit,
+        offset=offset,
+        has_more=has_more,
+        runs=items,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/compare/preview",
+    response_model=ComparePreviewResponse,
+)
+def preview_compare_data(
+    project_id: str,
+    body: ComparePreviewRequest,
+    request: Request,
+) -> ComparePreviewResponse:
+    """不落任务先看数据(1.x preview 的 2.0 形态):表引用或只读 SQL 预览前 N 行。
+
+    与元数据探测同通道:API 进程直连 adapter,探测级超时;上限 200 行 +
+    SQL 侧 limit 双保险。kind=sql 必须过 sql_guard 只读校验;kind=table
+    标识符过白名单正则后按方言引用 —— 两条路都无拼接注入面。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        ds_row = (
+            conn.execute(
+                select(datasources).where(
+                    and_(
+                        datasources.c.id == body.datasource_id,
+                        datasources.c.project_id == project_id,
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    if ds_row is None:
+        raise ApiError(404, "not_found", "Datasource not found")
+    policy = dict(ds_row["operation_policy"] or {})
+    if not bool(policy.get("allow_select", False)):
+        raise ApiError(403, "select_not_allowed", "Datasource operation policy denies SELECT")
+    db_type = DbType(str(ds_row["db_type"]))
+    if body.ref.kind == "sql":
+        try:
+            inner_sql = validate_readonly_sql(body.ref.sql or "")
+        except SqlGuardError as exc:
+            raise ApiError(400, "invalid_sql", "Only read-only SELECT/WITH SQL is allowed") from exc
+        # 与 worker _compare_table_expression 同形:子查询别名不带引用
+        source_expr = f"({inner_sql}) DATAOPS_PREVIEW"
+    else:
+        identifier = (
+            f"{body.ref.schema_name}.{body.ref.table_name}"
+            if body.ref.schema_name
+            else str(body.ref.table_name)
+        )
+        try:
+            source_expr = quote_identifier(db_type, identifier)
+        except ValueError as exc:
+            raise ApiError(400, "invalid_identifier", "Invalid schema or table name") from exc
+    # SQL 侧取 limit+1 行:多出的一行只用来判断 truncated,不返回
+    sql = f"SELECT * FROM {source_expr}{limit_clause(db_type, body.limit + 1)}"
+    columns: list[str] = []
+    adapter = build_database_adapter(
+        _datasource_conn_info(ds_row),
+        services.secret_store,
+        column_sink=lambda cols: columns.extend(column.name for column in cols),
+        connect_timeout_seconds=services.metadata_probe_timeout_seconds,
+        statement_timeout_seconds=services.metadata_probe_timeout_seconds,
+    )
+    fetched: list[list[Any]] = []
+    try:
+        for data_row in adapter.execute_select(sql, {}):
+            fetched.append([_preview_value(value) for value in data_row.values])
+            if len(fetched) > body.limit:
+                break
+    except UnsupportedDbTypeError as exc:
+        raise ApiError(400, "unsupported_db_type", "Datasource type is not supported") from exc
+    except AdapterConnectionError as exc:
+        raise ApiError(502, "datasource_unreachable", "Datasource connection failed") from exc
+    except Exception as exc:
+        # R5:driver 原始错误可能含 SQL 片段,不透传给客户端,只记类型
+        logger.info(
+            "compare preview query failed",
+            request_id=request_id_from(request),
+            datasource_id=body.datasource_id,
+            error_type=type(exc).__name__,
+        )
+        raise ApiError(400, "preview_failed", "Preview query failed") from exc
+    truncated = len(fetched) > body.limit
+    rows_out = fetched[: body.limit]
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="compare_preview",
+        resource_type="datasource",
+        resource_id=body.datasource_id,
+        result="success",
+        detail={"kind": body.ref.kind, "limit": body.limit, "row_count": len(rows_out)},
+    )
+    return ComparePreviewResponse(
+        columns=columns,
+        rows=rows_out,
+        row_count=len(rows_out),
+        truncated=truncated,
+    )
+
+
+def _preview_value(value: object) -> object:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
 
 
 @router.patch("/compare/tasks/{task_id}", response_model=CompareTaskResponse)

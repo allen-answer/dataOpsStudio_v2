@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import signal
 import tempfile
 import threading
@@ -32,6 +31,9 @@ from app.db.models import (
 )
 from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.protocol import AdapterConnectionError
+from app.dbclients.sql_build import limit_clause as _limit_clause
+from app.dbclients.sql_build import quote_alias as _quote_alias
+from app.dbclients.sql_build import quote_identifier as _quote_identifier
 from app.domain.compare import (
     CompareColumn,
     CompareDiffBucket,
@@ -98,7 +100,6 @@ from app.infrastructure.secretstore.local_file import LocalFileSecretStore
 from app.observability.logging import configure_logging
 
 logger = structlog.get_logger(__name__)
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.$-]+$")
 
 
 class JobCancelled(RuntimeError):
@@ -2370,32 +2371,8 @@ def _select_identifier(db_type: DbType, name: str, *, alias: str) -> str:
     return f"{_quote_identifier(db_type, name)} AS {_quote_alias(db_type, alias)}"
 
 
-def _quote_identifier(db_type: DbType, identifier: str) -> str:
-    if not identifier or _IDENTIFIER_RE.fullmatch(identifier) is None:
-        raise ValueError("Invalid database identifier")
-    if db_type is DbType.MYSQL:
-        return ".".join(f"`{part.replace('`', '``')}`" for part in identifier.split("."))
-    return ".".join(
-        f'"{part.replace(chr(34), chr(34) + chr(34)).upper()}"' for part in identifier.split(".")
-    )
-
-
-def _quote_alias(db_type: DbType, alias: str) -> str:
-    if not alias or _IDENTIFIER_RE.fullmatch(alias) is None:
-        raise ValueError("Invalid database identifier")
-    if db_type is DbType.MYSQL:
-        return f"`{alias.replace('`', '``')}`"
-    return f'"{alias.replace(chr(34), chr(34) + chr(34))}"'
-
-
-def _limit_clause(db_type: DbType, limit: int | None) -> str:
-    if limit is None:
-        return ""
-    if limit <= 0:
-        raise ValueError("limit must be positive")
-    if db_type is DbType.MYSQL:
-        return f" LIMIT {limit}"
-    return f" FETCH FIRST {limit} ROWS ONLY"
+# 标识符引用 / limit 子句抽至 app/dbclients/sql_build.py(API 预览端复用),
+# 语义未变(compare 黄金一致性行为)。
 
 
 def _optional_int(value: object) -> int | None:
