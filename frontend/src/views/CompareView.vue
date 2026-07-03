@@ -17,6 +17,8 @@ import {
   ArrowRight,
   Bot,
   Check,
+  ChevronDown,
+  ChevronRight,
   Copy,
   Download,
   Eye,
@@ -246,6 +248,13 @@ const resultData = ref<CompareRunResultResponse | null>(null)
 const resultLoading = ref(false)
 const resultError = ref<string | null>(null)
 
+// ── P0-C1/C2:results tab 信息架构(四状态卡片 + 逐列匹配率 + 只看差异列)──
+const matchRateOpen = ref(true)
+/** 从匹配率条点进来的"聚焦列":diff 桶只显示主键列 + 该列。 */
+const focusColumn = ref<string | null>(null)
+/** diff 桶"显示全部列"开关(默认只显示主键列 + 当前页出现过差异的列)。 */
+const showAllColumns = ref(false)
+
 const profileData = ref<CompareRunProfileResponse | null>(null)
 const profileLoading = ref(false)
 const profileError = ref<string | null>(null)
@@ -301,6 +310,86 @@ const compareColumns = computed<string[]>(() =>
     .map((c) => c.name)
     .filter((name) => name.trim().length > 0 && !draft.ignoreColumns.includes(name)),
 )
+
+// ── P0-C1:四状态卡片占比 + 逐列匹配率(diff_profile 核心信息前置到 results)──
+const bucketTotal = computed<number>(() =>
+  COMPARE_BUCKETS.reduce((sum, bucket) => sum + (bucketCounts.value[bucket] ?? 0), 0),
+)
+
+/** 占比 = 该桶 / 四桶总和;总和为 0 显示 —。 */
+function bucketPct(bucket: CompareBucket): string {
+  if (bucketTotal.value === 0) return '—'
+  const pct = ((bucketCounts.value[bucket] ?? 0) / bucketTotal.value) * 100
+  return `${pct.toFixed(1).replace(/\.0$/, '')}%`
+}
+
+interface ColumnMatchRate {
+  name: string
+  matchRate: number
+  changedRows: number
+}
+
+/** 匹配率 = 1 - diff_rate;按匹配率升序(最脏的列在最上,SQLMesh 三段式第三层)。 */
+const columnMatchRates = computed<ColumnMatchRate[]>(() => {
+  const cols = diffProfile.value.columns ?? {}
+  return Object.entries(cols)
+    .map(([name, info]) => ({
+      name,
+      matchRate: Math.min(Math.max(1 - (info.diff_rate ?? 0), 0), 1),
+      changedRows: info.changed_rows ?? 0,
+    }))
+    .sort((a, b) => a.matchRate - b.matchRate)
+})
+const hasDiffProfile = computed<boolean>(
+  () => Boolean(diffProfile.value.generated) || columnMatchRates.value.length > 0,
+)
+const allColumnsMatch = computed<boolean>(
+  () => hasDiffProfile.value && columnMatchRates.value.every((c) => c.matchRate >= 1),
+)
+
+/** 阈值:≥99.9% 绿、99–99.9% 黄、<99% 红。 */
+function matchBarClass(rate: number): string {
+  if (rate >= 0.999) return 'bg-emerald-500'
+  if (rate >= 0.99) return 'bg-amber-500'
+  return 'bg-red-500'
+}
+
+/** 非 100% 时封顶显示 99.99%,避免四舍五入出现假 100%。 */
+function formatMatchPct(rate: number): string {
+  if (rate >= 1) return '100%'
+  const pct = Math.min(rate * 100, 99.99)
+  return `${pct.toFixed(2).replace(/\.?0+$/, '')}%`
+}
+
+/** 点匹配率条列名 → 切 diff 桶并聚焦该列(与 C2 过滤联动)。 */
+function focusProfileColumn(name: string): void {
+  focusColumn.value = name
+  showAllColumns.value = false
+  if (resultBucket.value !== 'diff') void loadResults('diff')
+}
+
+// ── P0-C2:diff 桶默认只渲染 主键列 + 当前页 cells 里出现过的列 ──
+const diffPageColumns = computed<Set<string>>(() => {
+  const set = new Set<string>()
+  for (const row of resultData.value?.rows ?? []) {
+    for (const cell of row.cells) set.add(cell.column)
+  }
+  return set
+})
+
+const visibleColumns = computed<string[]>(() => {
+  if (resultBucket.value !== 'diff') return compareColumns.value
+  if (focusColumn.value) return compareColumns.value.filter((c) => c === focusColumn.value)
+  if (showAllColumns.value) return compareColumns.value
+  const filtered = compareColumns.value.filter((c) => diffPageColumns.value.has(c))
+  // 当前页无 cell 差异信息(极端降级)时回退全列,避免只剩主键列的空表头。
+  return filtered.length > 0 ? filtered : compareColumns.value
+})
+
+function onToggleShowAllColumns(event: Event): void {
+  showAllColumns.value = (event.target as HTMLInputElement).checked
+  if (showAllColumns.value) focusColumn.value = null
+}
 
 // ── SQL 引用(C-2)────────────────────────────────────────────────────
 /** 单 SQL 模式下两侧都是 sql;否则按各自 kind。 */
@@ -733,6 +822,9 @@ function resetRunState(): void {
   resultData.value = null
   profileData.value = null
   aiResult.value = null
+  matchRateOpen.value = true
+  focusColumn.value = null
+  showAllColumns.value = false
   resetExportState()
 }
 
@@ -872,6 +964,8 @@ async function loadResults(bucket: CompareBucket): Promise<void> {
 }
 
 async function onSelectBucket(bucket: CompareBucket): Promise<void> {
+  // 聚焦列是 diff 桶专属过滤:切去别的桶即清除,避免切回时暗藏过滤。
+  if (bucket !== 'diff') focusColumn.value = null
   await loadResults(bucket)
 }
 
@@ -1747,6 +1841,80 @@ const missingTarget = computed(
             </span>
           </div>
 
+          <!-- P0-C1:四状态卡片(dbt-audit-helper 四状态词表;点卡片 = 切换明细桶过滤) -->
+          <div class="px-4 pt-3 grid grid-cols-4 gap-2">
+            <button
+              v-for="bucket in COMPARE_BUCKETS"
+              :key="bucket"
+              type="button"
+              class="rounded-card border px-3 py-2 text-left transition-colors"
+              :class="
+                resultBucket === bucket
+                  ? BUCKET_STYLE[bucket].active
+                  : 'chrome-border hover:chrome-bg-elevated'
+              "
+              @click="onSelectBucket(bucket)"
+            >
+              <div class="flex items-center gap-1.5 text-xs font-medium" :class="resultBucket !== bucket && 'chrome-text-muted'">
+                <span class="w-2 h-2 rounded-full shrink-0" :class="BUCKET_STYLE[bucket].dot" />
+                {{ t(`compare.bucket_${bucket}`) }}
+              </div>
+              <div class="mt-1 flex items-baseline gap-2">
+                <span class="text-lg font-semibold tabular-nums" :class="BUCKET_STYLE[bucket].badge">
+                  {{ bucketCounts[bucket] ?? 0 }}
+                </span>
+                <span class="text-[11px] chrome-text-muted tabular-nums">{{ bucketPct(bucket) }}</span>
+              </div>
+            </button>
+          </div>
+
+          <!-- P0-C1:逐列匹配率条(SQLMesh 三段式第三层,diff_profile 前置到 results) -->
+          <div class="mx-4 mt-3 rounded-card border chrome-border">
+            <div v-if="!hasDiffProfile" class="px-3 py-2 text-xs chrome-text-muted">
+              {{ t('compare.match_rates') }} — {{ t('compare.profile_empty') }}
+            </div>
+            <div v-else-if="allColumnsMatch" class="px-3 py-2 flex items-center gap-2 text-xs">
+              <Check class="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+              <span class="font-medium chrome-text-heading">{{ t('compare.match_all_ok') }}</span>
+            </div>
+            <template v-else>
+              <button
+                type="button"
+                class="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium chrome-text-heading"
+                @click="matchRateOpen = !matchRateOpen"
+              >
+                <component :is="matchRateOpen ? ChevronDown : ChevronRight" class="w-3.5 h-3.5 shrink-0" />
+                {{ t('compare.match_rates') }}
+                <span class="font-normal chrome-text-muted">{{ t('compare.match_focus_hint') }}</span>
+              </button>
+              <div v-if="matchRateOpen" class="px-3 pb-3 space-y-1.5">
+                <div v-for="col in columnMatchRates" :key="col.name" class="flex items-center gap-2">
+                  <button
+                    type="button"
+                    class="w-44 shrink-0 truncate text-left text-xs font-mono chrome-text-heading hover:chrome-accent hover:underline"
+                    :title="t('compare.match_focus_title', { column: col.name })"
+                    @click="focusProfileColumn(col.name)"
+                  >
+                    {{ col.name }}
+                  </button>
+                  <div class="flex-1 h-2 rounded-full chrome-bg-elevated overflow-hidden">
+                    <div
+                      class="h-full rounded-full"
+                      :class="matchBarClass(col.matchRate)"
+                      :style="{ width: col.matchRate * 100 + '%' }"
+                    />
+                  </div>
+                  <span class="w-16 shrink-0 text-right text-xs tabular-nums chrome-text-heading">
+                    {{ formatMatchPct(col.matchRate) }}
+                  </span>
+                  <span class="w-24 shrink-0 text-right text-[11px] tabular-nums chrome-text-muted">
+                    {{ t('compare.match_changed_rows', { count: col.changedRows }) }}
+                  </span>
+                </div>
+              </div>
+            </template>
+          </div>
+
           <!-- 采样快检卡 -->
           <div
             v-if="sampleResult?.enabled"
@@ -1765,26 +1933,6 @@ const missingTarget = computed(
             <div class="text-[11px] italic text-amber-700 dark:text-amber-300">{{ t('compare.sample_not_full') }}</div>
           </div>
 
-          <!-- 4 桶 tab(徽章计数) -->
-          <div class="px-4 pt-3 flex flex-wrap items-center gap-2">
-            <button
-              v-for="bucket in COMPARE_BUCKETS"
-              :key="bucket"
-              type="button"
-              class="inline-flex items-center gap-2 rounded-card border px-3 py-1.5 text-xs font-medium transition-colors"
-              :class="
-                resultBucket === bucket
-                  ? BUCKET_STYLE[bucket].active
-                  : 'chrome-border chrome-text-muted hover:chrome-bg-elevated'
-              "
-              @click="onSelectBucket(bucket)"
-            >
-              <span class="w-2 h-2 rounded-full" :class="BUCKET_STYLE[bucket].dot" />
-              {{ t(`compare.bucket_${bucket}`) }}
-              <span class="tabular-nums">{{ bucketCounts[bucket] ?? 0 }}</span>
-            </button>
-          </div>
-
           <div class="flex-1 min-h-0 overflow-auto p-4">
             <div v-if="resultError" class="text-xs text-red-600 dark:text-red-400">{{ resultError }}</div>
             <div v-else-if="resultLoading" class="chrome-text-muted text-sm"><LoadingDots /></div>
@@ -1793,7 +1941,29 @@ const missingTarget = computed(
             </div>
 
             <!-- diff tab:单元格分裂(主键列固定左侧) -->
-            <table v-else class="text-xs border chrome-border rounded-card overflow-hidden">
+            <template v-else>
+              <!-- P0-C2:diff 桶列过滤工具行(聚焦列 chip + 显示全部列开关) -->
+              <div v-if="resultBucket === 'diff'" class="mb-2 flex items-center gap-2">
+                <span
+                  v-if="focusColumn"
+                  class="inline-flex items-center gap-1 rounded-input px-2 py-0.5 text-[11px] font-medium chrome-accent-light-bg chrome-accent"
+                >
+                  {{ t('compare.focus_chip', { column: focusColumn }) }}
+                  <button type="button" class="chrome-btn-ghost" :title="t('compare.focus_clear')" @click="focusColumn = null">
+                    <X class="w-3 h-3" />
+                  </button>
+                </span>
+                <span v-else-if="!showAllColumns" class="text-[11px] chrome-text-muted">
+                  {{ t('compare.diff_columns_hint') }}
+                </span>
+                <div class="flex-1" />
+                <label class="flex items-center gap-1.5 text-[11px] chrome-text-muted cursor-pointer">
+                  <input type="checkbox" :checked="showAllColumns" @change="onToggleShowAllColumns" />
+                  {{ t('compare.show_all_columns') }}
+                </label>
+              </div>
+
+              <table class="text-xs border chrome-border rounded-card overflow-hidden">
               <thead class="chrome-bg-elevated">
                 <tr class="text-left chrome-text-muted">
                   <th
@@ -1806,7 +1976,7 @@ const missingTarget = computed(
                     </span>
                   </th>
                   <th
-                    v-for="col in compareColumns"
+                    v-for="col in visibleColumns"
                     :key="`c-${col}`"
                     class="px-3 py-2 font-medium"
                   >
@@ -1824,7 +1994,7 @@ const missingTarget = computed(
                     {{ fmtCell(row.pk[kc]) }}
                   </td>
                   <td
-                    v-for="col in compareColumns"
+                    v-for="col in visibleColumns"
                     :key="`c-${ri}-${col}`"
                     class="px-3 py-2 font-mono"
                   >
@@ -1849,7 +2019,8 @@ const missingTarget = computed(
                   </td>
                 </tr>
               </tbody>
-            </table>
+              </table>
+            </template>
           </div>
         </div>
 
