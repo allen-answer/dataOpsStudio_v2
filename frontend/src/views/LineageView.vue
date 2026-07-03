@@ -16,22 +16,27 @@ import { useI18n } from 'vue-i18n'
 import { useQuery } from '@tanstack/vue-query'
 import {
   AlertTriangle,
+  Check,
   FileSearch,
   Network,
   Play,
   RefreshCw,
+  Sparkles,
   Target,
   Waypoints,
+  X,
 } from 'lucide-vue-next'
 import { listDatasources } from '../api/datasources'
 import {
   analyzeLineage,
   getLineageImpact,
   getLineageSubgraph,
+  updateLineageEdge,
   type LineageAnalyzeResponse,
   type LineageDirection,
   type LineageImpactItem,
   type LineageImpactResponse,
+  type LineageInferenceDecision,
   type LineageSubgraphEdge,
   type LineageSubgraphNode,
   type LineageSubgraphResponse,
@@ -206,6 +211,50 @@ function edgeTitle(edge: LineageSubgraphEdge): string {
   }
   if (edge.inferred) parts.push(`inferred (${edge.inference_status}, ${edge.confidence})`)
   return parts.join(' · ')
+}
+
+// ── AI 推断边审核(L-6:PATCH /lineage/edges/{edge_id})────────────
+// 待审核 = inference_status 仍是 'inferred' 的推断边;direction=both 时同一条边
+// 可能双向各出现一次(模板 key 用 id+direction),这里按 id 去重。
+const inferredEdges = computed<LineageSubgraphEdge[]>(() => {
+  const seen = new Set<string>()
+  const list: LineageSubgraphEdge[] = []
+  for (const edge of subgraphData.value?.edges ?? []) {
+    if (!edge.inferred || edge.inference_status !== 'inferred' || seen.has(edge.id)) continue
+    seen.add(edge.id)
+    list.push(edge)
+  }
+  return list
+})
+
+const inferencePendingId = ref<string | null>(null)
+const inferenceError = ref<string | null>(null)
+
+/**
+ * 确认 / 拒绝一条 AI 推断边,成功后重查子图(rejected 边被后端 CTE 排除,
+ * 会直接从图里消失)。409 invalid_inference_transition = 状态已被别处改过,
+ * 给友好提示并刷新子图对齐真实状态。
+ */
+async function decideEdge(
+  edge: LineageSubgraphEdge,
+  status: LineageInferenceDecision,
+): Promise<void> {
+  if (!projectId.value || inferencePendingId.value) return
+  inferencePendingId.value = edge.id
+  inferenceError.value = null
+  try {
+    await updateLineageEdge(projectId.value, edge.id, status)
+    await runSubgraph()
+  } catch (e) {
+    if (e instanceof ApiError && e.code === 'invalid_inference_transition') {
+      inferenceError.value = t('lineage.inference_conflict')
+      await runSubgraph()
+    } else {
+      inferenceError.value = errorMessage(e)
+    }
+  } finally {
+    inferencePendingId.value = null
+  }
 }
 
 // ── 影响分析 ────────────────────────────────────────────────────────
@@ -538,6 +587,49 @@ function errorMessage(e: unknown): string {
                 {{ t('lineage.legend_inferred') }}
               </span>
               <span>{{ t('lineage.node_click_hint') }}</span>
+            </div>
+
+            <!-- AI 推断边审核面板(L-6):inferred 边逐条 确认/拒绝 -->
+            <div v-if="inferenceError" class="text-xs text-red-600 dark:text-red-400">
+              {{ inferenceError }}
+            </div>
+            <div
+              v-if="inferredEdges.length > 0"
+              class="rounded-card border chrome-border chrome-bg-panel p-3 space-y-2"
+            >
+              <div class="flex items-center gap-2 text-xs font-medium chrome-text-heading">
+                <Sparkles class="w-4 h-4 text-amber-500" />
+                {{ t('lineage.inferred_panel_title', { count: inferredEdges.length }) }}
+              </div>
+              <p class="text-[11px] chrome-text-muted">{{ t('lineage.inferred_panel_hint') }}</p>
+              <div
+                v-for="edge in inferredEdges"
+                :key="edge.id"
+                class="flex flex-wrap items-center gap-2 rounded-card border chrome-border px-3 py-2"
+              >
+                <span class="flex-1 min-w-[12rem] text-xs font-mono chrome-text-heading">
+                  {{ edge.source }} → {{ edge.target }}
+                </span>
+                <span class="text-[11px] chrome-text-muted tabular-nums">
+                  {{ t('lineage.inferred_confidence', { confidence: edge.confidence.toFixed(2) }) }}
+                </span>
+                <button
+                  type="button"
+                  class="chrome-btn-secondary text-xs"
+                  :disabled="inferencePendingId !== null"
+                  @click="decideEdge(edge, 'confirmed')"
+                >
+                  <Check class="w-3.5 h-3.5" /> {{ t('lineage.inference_confirm') }}
+                </button>
+                <button
+                  type="button"
+                  class="chrome-btn-secondary text-xs"
+                  :disabled="inferencePendingId !== null"
+                  @click="decideEdge(edge, 'rejected')"
+                >
+                  <X class="w-3.5 h-3.5" /> {{ t('lineage.inference_reject') }}
+                </button>
+              </div>
             </div>
           </template>
         </template>
