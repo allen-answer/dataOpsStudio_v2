@@ -21,6 +21,8 @@
  *    PATCH  /compare/tasks/{id}                       -> CompareTaskResponse
  *    DELETE /compare/tasks/{id}                       -> 204
  *    POST   /compare/tasks/{id}/run                   -> { job_id, run_id } (202)
+ *    GET    /compare/tasks/{id}/runs?limit=&offset=   -> CompareTaskRunsResponse
+ *    POST   /projects/{pid}/compare/preview           -> ComparePreviewResponse
  *    GET    /compare/runs/{run_id}/results?bucket=&offset=&limit= -> CompareRunResultResponse
  *    GET    /compare/runs/{run_id}/profile            -> CompareRunProfileResponse
  *    POST   /compare/runs/{run_id}/ai-attribution     -> CompareAiAttributionResponse
@@ -190,6 +192,39 @@ export interface CompareRunCreateResponse {
   run_id: string
 }
 
+// ── 历史 run(schemas.py CompareTaskRunItem / CompareTaskRunsResponse)─
+export interface CompareTaskRunItem {
+  run_id: string
+  job_id: string
+  status: string
+  created_at: string
+  finished_at: string | null
+  bucket_counts: Record<string, number>
+  sampled: boolean
+}
+
+export interface CompareTaskRunsResponse {
+  task_id: string
+  limit: number
+  offset: number
+  has_more: boolean
+  runs: CompareTaskRunItem[]
+}
+
+// ── 数据预览(schemas.py ComparePreviewRequest / ComparePreviewResponse)─
+export interface ComparePreviewRequest {
+  datasource_id: string
+  ref: CompareDataRef
+  limit?: number
+}
+
+export interface ComparePreviewResponse {
+  columns: string[]
+  rows: unknown[][]
+  row_count: number
+  truncated: boolean
+}
+
 export interface CompareCellDiff {
   column: string
   source?: unknown
@@ -354,6 +389,30 @@ export function draftCompareTask(
 /** POST /compare/tasks/{id}/run —— 202 异步入队 COMPARE_RUN job,返回 job_id + run_id。 */
 export function runCompareTask(taskId: string): Promise<CompareRunCreateResponse> {
   return apiClient.post<CompareRunCreateResponse>(`/compare/tasks/${taskId}/run`)
+}
+
+/** GET /compare/tasks/{id}/runs —— 历史 run 倒序分页(limit 1–100,默认 20)。 */
+export function listCompareTaskRuns(
+  taskId: string,
+  limit = 20,
+  offset = 0,
+): Promise<CompareTaskRunsResponse> {
+  const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+  return apiClient.get<CompareTaskRunsResponse>(
+    `/compare/tasks/${encodeURIComponent(taskId)}/runs?${qs.toString()}`,
+  )
+}
+
+/**
+ * POST /projects/{pid}/compare/preview —— 不落任务先看数据(表引用或只读 SQL,limit<=200)。
+ * 错误码:400 invalid_sql / invalid_identifier / preview_failed、403 select_not_allowed、
+ * 502 datasource_unreachable。
+ */
+export function previewCompareData(
+  projectId: string,
+  req: ComparePreviewRequest,
+): Promise<ComparePreviewResponse> {
+  return apiClient.post<ComparePreviewResponse>(`/projects/${projectId}/compare/preview`, req)
 }
 
 export function createCompareExport(runId: string): Promise<CompareExportCreateResponse> {
