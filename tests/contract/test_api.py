@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -826,6 +827,150 @@ def test_compare_task_clone_copies_config_with_deduped_name() -> None:
     )
     assert insert_statement
     assert any(audit["action"] == "compare_task_clone" for audit in services.audits)
+
+
+def test_compare_task_runs_lists_history_with_pagination() -> None:
+    engine = _FakeEngine(
+        [
+            _compare_task_row(),
+            {"id": "project-1"},
+            [
+                {
+                    "run_id": "run-2",
+                    "job_id": "job-2",
+                    "status": "success",
+                    "created_at": _dt(2),
+                    "finished_at": _dt(3),
+                    "bucket_counts": {"diff": 2, "same": 10},
+                    "sample_result": None,
+                },
+                {
+                    "run_id": "run-1",
+                    "job_id": "job-1",
+                    "status": "failed",
+                    "created_at": _dt(1),
+                    "finished_at": None,
+                    "bucket_counts": {},
+                    "sample_result": {"mode": "quick_check"},
+                },
+            ],
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/compare/tasks/task-1/runs",
+        headers=_auth_headers(),
+        params={"limit": 1, "offset": 0},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["task_id"] == "task-1"
+    assert payload["has_more"] is True  # limit+1 探测:取回 2 行说明还有下一页
+    assert len(payload["runs"]) == 1
+    assert payload["runs"][0]["run_id"] == "run-2"
+    assert payload["runs"][0]["bucket_counts"] == {"diff": 2, "same": 10}
+    assert payload["runs"][0]["sampled"] is False
+
+
+def test_compare_preview_returns_bounded_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_sql: list[str] = []
+
+    class _PreviewAdapter:
+        def __init__(self, column_sink: Callable[[list[Column]], None]) -> None:
+            self._column_sink = column_sink
+
+        def execute_select(self, sql: str, params: dict[str, object]) -> Iterator[Row]:
+            del params
+            captured_sql.append(sql)
+            self._column_sink(
+                [
+                    Column(name="id", type=ColumnType.INTEGER),
+                    Column(name="name", type=ColumnType.STRING),
+                ]
+            )
+            yield Row(values=[1, "alice"])
+            yield Row(values=[2, "bob"])
+            yield Row(values=[3, "carol"])  # limit+1 行 → truncated
+
+    monkeypatch.setattr(
+        core_routes,
+        "build_database_adapter",
+        lambda conn_info, secret_store, **kwargs: _PreviewAdapter(kwargs["column_sink"]),
+    )
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _datasource_row(operation_policy=_policy(allow_select=True)),
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/preview",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "ref": {"kind": "table", "schema_name": "app", "table_name": "orders"},
+            "limit": 2,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["columns"] == ["id", "name"]
+    assert payload["rows"] == [[1, "alice"], [2, "bob"]]
+    assert payload["row_count"] == 2
+    assert payload["truncated"] is True
+    # mysql 反引号 + SQL 侧 limit+1
+    assert captured_sql == ["SELECT * FROM `app`.`orders` LIMIT 3"]
+    assert any(audit["action"] == "compare_preview" for audit in services.audits)
+
+
+def test_compare_preview_rejects_non_readonly_sql() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _datasource_row(operation_policy=_policy(allow_select=True)),
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/preview",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "ref": {"kind": "sql", "sql": "DELETE FROM app.orders"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_sql"
+
+
+def test_compare_preview_denied_without_allow_select() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _datasource_row(operation_policy=_policy(allow_select=False)),
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/preview",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "ref": {"kind": "table", "schema_name": "app", "table_name": "orders"},
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "select_not_allowed"
 
 
 def test_compare_infer_contract_returns_mapping_confidence_and_pk_draft() -> None:
