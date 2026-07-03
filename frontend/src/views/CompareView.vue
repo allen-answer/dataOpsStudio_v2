@@ -17,6 +17,7 @@ import {
   ArrowRight,
   Bot,
   Check,
+  Copy,
   Download,
   GitCompareArrows,
   Play,
@@ -32,6 +33,7 @@ import {
 import { listDatasources } from '../api/datasources'
 import {
   COMPARE_BUCKETS,
+  cloneCompareTask,
   createCompareExport,
   createCompareTask,
   deleteCompareTask,
@@ -481,6 +483,17 @@ async function onDeleteTask(): Promise<void> {
     tasks.value = tasks.value.filter((task) => task.id !== id)
     activeTaskId.value = tasks.value[0]?.id ?? null
     if (!activeTaskId.value) startNewTask()
+  } catch (e) {
+    editorError.value = errorMessage(e)
+  }
+}
+
+async function onCloneTask(): Promise<void> {
+  if (!activeTask.value) return
+  try {
+    const cloned = await cloneCompareTask(activeTask.value.id)
+    tasks.value = [cloned, ...tasks.value]
+    activeTaskId.value = cloned.id // watch(activeTask) 负责灌 draft + 切 editor tab
   } catch (e) {
     editorError.value = errorMessage(e)
   }
@@ -1183,6 +1196,14 @@ const missingTarget = computed(
           <div class="flex items-center gap-2">
             <button type="button" class="chrome-btn-primary text-sm" :disabled="savingTask" @click="onSaveTask">
               <Save class="w-4 h-4" /> {{ savingTask ? t('compare.saving') : t('compare.save_task') }}
+            </button>
+            <button
+              v-if="activeTask"
+              type="button"
+              class="chrome-btn-secondary text-sm"
+              @click="onCloneTask"
+            >
+              <Copy class="w-4 h-4" /> {{ t('compare.clone_task') }}
             </button>
             <button
               v-if="activeTask"
