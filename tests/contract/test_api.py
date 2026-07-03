@@ -1669,6 +1669,90 @@ def test_lineage_impact_contract_returns_downstream_paths() -> None:
     }
 
 
+def test_lineage_column_trace_contract_returns_hop_chain() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            [
+                {
+                    "edge_id": "col-edge-1",
+                    "source_table": "app.src",
+                    "target_table": "app.mid",
+                    "source_column": "id",
+                    "target_column": "id",
+                    "source": "app.src.id",
+                    "target": "app.mid.id",
+                    "edge_kind": "column",
+                    "transformation": "DIRECT",
+                    "transformation_subtype": "DIRECT",
+                    "inferred": False,
+                    "inference_status": "confirmed",
+                    "confidence": 1,
+                    "depth": 1,
+                    "path": ["app.mid.id", "app.src.id"],
+                    "direction": "upstream",
+                },
+                {
+                    "edge_id": "col-edge-2",
+                    "source_table": "app.origin",
+                    "target_table": "app.src",
+                    "source_column": "id",
+                    "target_column": "id",
+                    "source": "app.origin.id",
+                    "target": "app.src.id",
+                    "edge_kind": "column",
+                    "transformation": "TRANSFORMATION",
+                    "transformation_subtype": "CAST",
+                    "inferred": True,
+                    "inference_status": "inferred",
+                    "confidence": 0.8,
+                    "depth": 2,
+                    "path": ["app.mid.id", "app.src.id", "app.origin.id"],
+                    "direction": "upstream",
+                },
+            ],
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/lineage/column-trace",
+        headers=_auth_headers(),
+        params={"focus": "app.mid.id", "direction": "upstream", "max_depth": 3},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["focus"] == "app.mid.id"
+    assert payload["hop_count"] == 2
+    hop1, hop2 = payload["hops"]
+    assert hop1["depth"] == 1
+    # 链式语义:上游走向的本跳节点是 source,经由端(from)是 target
+    assert hop1["items"][0]["node"] == "app.src.id"
+    assert hop1["items"][0]["from_node"] == "app.mid.id"
+    assert hop1["items"][0]["table"] == "app.src"
+    assert hop1["items"][0]["column"] == "id"
+    assert hop2["items"][0]["node"] == "app.origin.id"
+    assert hop2["items"][0]["from_node"] == "app.src.id"
+    assert hop2["items"][0]["inferred"] is True
+    assert hop2["items"][0]["confidence"] == 0.8
+    assert any("WITH RECURSIVE walk" in statement for statement in engine.statements)
+
+
+def test_lineage_column_trace_requires_column_focus() -> None:
+    engine = _FakeEngine([{"id": "project-1"}])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/lineage/column-trace",
+        headers=_auth_headers(),
+        params={"focus": "plaintable", "direction": "upstream"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "column_focus_required"
+
+
 def _lineage_run_row(parse_error_count: int = 2) -> dict[str, object]:
     return {
         "id": "run-1",
