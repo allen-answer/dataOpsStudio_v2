@@ -22,6 +22,7 @@ import {
   Eye,
   GitCompareArrows,
   History,
+  ListPlus,
   Play,
   Plus,
   RefreshCw,
@@ -66,7 +67,7 @@ import {
   type TablePairSuggestion,
 } from '../api/compare'
 import { getJob, cancelJob, type JobResponse } from '../api/jobs'
-import { ApiError, type DatasourceListItem, type JobStatus } from '../api/types'
+import { ApiError, type ColumnType, type DatasourceListItem, type JobStatus } from '../api/types'
 import LoadingDots from '../components/LoadingDots.vue'
 import JobStatusBadge from '../components/JobStatusBadge.vue'
 
@@ -296,7 +297,9 @@ const diffProfile = computed(
 // 主键列固定左侧:diff tab 表头依推断/规则的 key_columns 决定。
 const keyColumns = computed<string[]>(() => draft.keyColumns)
 const compareColumns = computed<string[]>(() =>
-  draft.columns.map((c) => c.name).filter((name) => !draft.ignoreColumns.includes(name)),
+  draft.columns
+    .map((c) => c.name)
+    .filter((name) => name.trim().length > 0 && !draft.ignoreColumns.includes(name)),
 )
 
 // ── SQL 引用(C-2)────────────────────────────────────────────────────
@@ -342,6 +345,75 @@ const runBlockedReason = computed<string | null>(() => {
   if (compareColumns.value.length === 0) return t('compare.run_blocked_no_columns')
   return null
 })
+
+// ── 列/主键手动编辑(C-2 补齐:SQL 引用没有 infer 路径,列清单必须可手编)──
+// 选项对齐 app/domain/schema.py ColumnType 11 值(= api/types.ts ColumnType)。
+const COLUMN_TYPE_OPTIONS: ColumnType[] = [
+  'string',
+  'integer',
+  'float',
+  'decimal',
+  'boolean',
+  'datetime',
+  'date',
+  'time',
+  'bytes',
+  'json',
+  'unknown',
+]
+
+function addColumn(): void {
+  draft.columns.push({ name: '', type: 'string' })
+}
+
+function removeColumn(index: number): void {
+  const name = draft.columns[index]?.name
+  draft.columns.splice(index, 1)
+  if (name) {
+    draft.keyColumns = draft.keyColumns.filter((c) => c !== name)
+    draft.ignoreColumns = draft.ignoreColumns.filter((c) => c !== name)
+    delete draft.columnMappings[name]
+  }
+}
+
+/** 改列名时同步 keyColumns / ignoreColumns / columnMappings,避免留下悬空引用。 */
+function renameColumn(index: number, newName: string): void {
+  const old = draft.columns[index]?.name
+  if (old === undefined || old === newName) return
+  draft.columns[index].name = newName
+  draft.keyColumns = draft.keyColumns.map((c) => (c === old ? newName : c))
+  draft.ignoreColumns = draft.ignoreColumns.map((c) => (c === old ? newName : c))
+  if (old in draft.columnMappings) {
+    const mapped = draft.columnMappings[old]
+    delete draft.columnMappings[old]
+    if (newName) draft.columnMappings[newName] = mapped
+  }
+}
+
+function onColumnNameInput(index: number, event: Event): void {
+  renameColumn(index, (event.target as HTMLInputElement).value)
+}
+
+/** 勾选顺序即主键列顺序(与 applyPkCandidate 的候选顺序语义一致)。 */
+function toggleKeyColumn(name: string): void {
+  if (draft.keyColumns.includes(name)) {
+    draft.keyColumns = draft.keyColumns.filter((c) => c !== name)
+  } else {
+    draft.keyColumns = [...draft.keyColumns, name]
+  }
+}
+
+/** 从预览带入列名:type 默认 string 由用户改,同名列跳过不覆盖(预览不返回类型,不自动填)。 */
+function adoptPreviewColumns(side: RefSide): void {
+  const data = previews[side].data
+  if (!data) return
+  const existing = new Set(draft.columns.map((c) => c.name))
+  for (const name of data.columns) {
+    if (!name || existing.has(name)) continue
+    existing.add(name)
+    draft.columns.push({ name, type: 'string' })
+  }
+}
 
 // ── lifecycle ───────────────────────────────────────────────────────
 onMounted(() => {
@@ -544,7 +616,7 @@ async function onSaveTask(): Promise<void> {
         target_id: draft.targetId,
         source_ref: sourceRef,
         target_ref: targetRef,
-        columns: draft.columns.map((c) => ({ name: c.name, type: c.type as never, driver_type: null, nullable: true, primary_key: draft.keyColumns.includes(c.name) })),
+        columns: draft.columns.filter((c) => c.name.trim()).map((c) => ({ name: c.name, type: c.type as never, driver_type: null, nullable: true, primary_key: draft.keyColumns.includes(c.name) })),
         compare_rules: buildRulesPayload(),
         run_limits: buildLimitsPayload(),
       })
@@ -558,7 +630,7 @@ async function onSaveTask(): Promise<void> {
         target_id: draft.targetId,
         source_ref: sourceRef,
         target_ref: targetRef,
-        columns: draft.columns.map((c) => ({ name: c.name, type: c.type as never, driver_type: null, nullable: true, primary_key: draft.keyColumns.includes(c.name) })),
+        columns: draft.columns.filter((c) => c.name.trim()).map((c) => ({ name: c.name, type: c.type as never, driver_type: null, nullable: true, primary_key: draft.keyColumns.includes(c.name) })),
         compare_rules: buildRulesPayload(),
         run_limits: buildLimitsPayload(),
       })
@@ -1282,6 +1354,16 @@ const missingTarget = computed(
                     </table>
                   </div>
                 </template>
+                <div v-if="previews.source.data && previews.source.data.columns.length > 0" class="pt-1">
+                  <button
+                    type="button"
+                    class="chrome-btn-secondary text-xs"
+                    :title="t('compare.preview_adopt_hint')"
+                    @click="adoptPreviewColumns('source')"
+                  >
+                    <ListPlus class="w-3.5 h-3.5" /> {{ t('compare.preview_adopt_columns') }}
+                  </button>
+                </div>
               </div>
             </fieldset>
 
@@ -1368,6 +1450,16 @@ const missingTarget = computed(
                     </table>
                   </div>
                 </template>
+                <div v-if="previews.target.data && previews.target.data.columns.length > 0" class="pt-1">
+                  <button
+                    type="button"
+                    class="chrome-btn-secondary text-xs"
+                    :title="t('compare.preview_adopt_hint')"
+                    @click="adoptPreviewColumns('target')"
+                  >
+                    <ListPlus class="w-3.5 h-3.5" /> {{ t('compare.preview_adopt_columns') }}
+                  </button>
+                </div>
               </div>
             </fieldset>
 
@@ -1489,27 +1581,66 @@ const missingTarget = computed(
             </div>
           </div>
 
-          <!-- 比较列选择(勾掉 ignore) -->
-          <div v-if="draft.columns.length > 0">
+          <!-- 列与主键配置:table 模式 infer 灌入后可微调;SQL 模式手动添加或从预览带入 -->
+          <div>
             <div class="text-xs font-medium chrome-text-heading mb-2">{{ t('compare.compare_columns') }}</div>
-            <div class="flex flex-wrap gap-1.5">
-              <button
-                v-for="col in draft.columns"
-                :key="col.name"
-                type="button"
-                class="inline-flex items-center gap-1 rounded-input border px-2 py-1 text-xs"
-                :class="
-                  draft.ignoreColumns.includes(col.name)
-                    ? 'border-dashed chrome-border chrome-text-muted line-through'
-                    : 'chrome-border chrome-text-heading'
-                "
-                :title="t('compare.toggle_ignore')"
-                @click="toggleIgnoreColumn(col.name)"
-              >
-                {{ col.name }}
-                <span class="text-[10px] chrome-text-muted">{{ col.type }}</span>
-              </button>
+            <div v-if="draft.columns.length === 0" class="text-xs chrome-text-muted mb-2">
+              {{ t('compare.columns_empty') }}
             </div>
+            <table v-else class="w-full text-xs border chrome-border rounded-card overflow-hidden mb-2">
+              <thead class="chrome-bg-elevated">
+                <tr class="text-left chrome-text-muted">
+                  <th class="px-2 py-1.5 font-medium w-12">{{ t('compare.pk_column') }}</th>
+                  <th class="px-2 py-1.5 font-medium">{{ t('compare.col_name') }}</th>
+                  <th class="px-2 py-1.5 font-medium w-32">{{ t('compare.col_type') }}</th>
+                  <th class="px-2 py-1.5 font-medium w-12">{{ t('compare.col_ignore') }}</th>
+                  <th class="px-2 py-1.5 w-10"></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(col, ci) in draft.columns" :key="ci" class="border-t chrome-border-subtle">
+                  <td class="px-2 py-1.5">
+                    <input
+                      type="checkbox"
+                      :checked="draft.keyColumns.includes(col.name)"
+                      :disabled="!col.name.trim()"
+                      :title="t('compare.col_pk_hint')"
+                      @change="toggleKeyColumn(col.name)"
+                    />
+                  </td>
+                  <td class="px-2 py-1.5">
+                    <input
+                      :value="col.name"
+                      class="chrome-input w-full text-xs font-mono"
+                      :placeholder="t('compare.col_name')"
+                      @input="onColumnNameInput(ci, $event)"
+                    />
+                  </td>
+                  <td class="px-2 py-1.5">
+                    <select v-model="col.type" class="chrome-input w-full text-xs">
+                      <option v-for="ct in COLUMN_TYPE_OPTIONS" :key="ct" :value="ct">{{ ct }}</option>
+                    </select>
+                  </td>
+                  <td class="px-2 py-1.5">
+                    <input
+                      type="checkbox"
+                      :checked="draft.ignoreColumns.includes(col.name)"
+                      :disabled="!col.name.trim()"
+                      :title="t('compare.toggle_ignore')"
+                      @change="toggleIgnoreColumn(col.name)"
+                    />
+                  </td>
+                  <td class="px-2 py-1.5 text-right">
+                    <button type="button" class="chrome-btn-ghost" :title="t('compare.col_remove')" @click="removeColumn(ci)">
+                      <Trash2 class="w-3.5 h-3.5" />
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <button type="button" class="chrome-btn-secondary text-xs" @click="addColumn">
+              <Plus class="w-3.5 h-3.5" /> {{ t('compare.col_add') }}
+            </button>
           </div>
 
           <!-- 规则 + 限制 -->

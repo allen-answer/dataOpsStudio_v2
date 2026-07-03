@@ -448,6 +448,18 @@ export default {
     preview_err_select_not_allowed: 'Datasource operation policy denies SELECT.',
     preview_err_unreachable: 'Datasource connection failed.',
     preview_err_failed: 'Preview query failed.',
+    preview_adopt_columns: 'Adopt column names from preview',
+    preview_adopt_hint:
+      'Adopts names only; type defaults to string — adjust manually. Existing columns with the same name are skipped.',
+    // manual column / key editor (C-2)
+    columns_empty:
+      'No columns yet. Table refs can use auto-infer; for SQL refs add columns manually or preview first and adopt the names.',
+    col_name: 'Column',
+    col_type: 'Type',
+    col_ignore: 'Ignore',
+    col_pk_hint: 'Checked = use as key column (in check order)',
+    col_add: 'Add column',
+    col_remove: 'Remove column',
     // suggestions
     suggestions: 'Task suggestions',
     suggestions_hint: 'Same-named / normalized table pairs across the two datasources.',
