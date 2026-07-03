@@ -416,6 +416,15 @@ class LineageImpactResponse(BaseModel):
     impacts: list[LineageImpactItem] = Field(default_factory=list)
 
 
+class LineageExportRequest(BaseModel):
+    """血缘报告基础导出请求(L-5)—— 与 subgraph 端点同参,POST body 形态。"""
+
+    focus: str = Field(min_length=1)
+    direction: LineageDirection = "downstream"
+    max_depth: int = Field(default=3, ge=1, le=5)
+    include_columns: bool = False
+
+
 class LineageColumnTraceItem(BaseModel):
     """字段链上的一跳:node 为本跳字段,from_node 为它经由的上一跳字段。"""
 

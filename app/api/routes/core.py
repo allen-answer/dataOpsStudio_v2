@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from secrets import token_urlsafe
-from typing import Any, Literal, cast
+from typing import Any, BinaryIO, Literal, cast
 
 import sqlglot
 import structlog
@@ -67,6 +68,7 @@ from app.api.schemas import (
     LineageDirection,
     LineageEdgeInferenceResponse,
     LineageEdgeInferenceUpdateRequest,
+    LineageExportRequest,
     LineageImpactItem,
     LineageImpactResponse,
     LineageSubgraphEdge,
@@ -157,7 +159,7 @@ from app.domain.lineage.ai_fallback import (
 )
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
-from app.domain.schema import Column, Index, Table
+from app.domain.schema import Column, Index, Row, Table
 from app.domain.secret import HashedRef, SecretKind, SecretRef
 from app.domain.workflow import WorkflowSpec
 from app.domain.workflow_execution import (
@@ -168,7 +170,12 @@ from app.domain.workflow_execution import (
 )
 from app.domain.workflow_when import builtin_when_variables, when_variables_from_payload
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
-from app.infrastructure.result_export import export_content_type, export_extension
+from app.infrastructure.result_export import (
+    ExportSizeLimitExceeded,
+    export_content_type,
+    export_extension,
+    write_xlsx_workbook,
+)
 from app.services.ai.default_gateway import (
     AI_API_KEY_ENV,
     AiGatewayRuntimeConfig,
@@ -191,6 +198,9 @@ _METADATA_LEVEL_TABLES = "tables"
 _METADATA_LEVEL_COLUMNS = "columns"
 _METADATA_LEVEL_INDEXES = "indexes"
 _EXPORT_FORMATS = frozenset({"csv", "excel", "json", "sql"})
+# 血缘导出同步生成(子图 depth<=5 数据量小),不复用 worker 的 export_limit_mb 配置;
+# 50MB 上限只是防御性护栏,正常子图导出远小于此。
+_LINEAGE_EXPORT_LIMIT_BYTES = 50 * 1024 * 1024
 _COMPARE_BUCKET_QUERY = Query(default="diff")
 _LINEAGE_FOCUS_QUERY = Query(min_length=1)
 _LINEAGE_DIRECTION_QUERY = Query(default="downstream")
@@ -2362,6 +2372,138 @@ def get_lineage_impact(
             focus=focus,
             max_depth=min(max_depth, 5),
         )
+
+
+@router.post(
+    "/projects/{project_id}/lineage/export",
+    response_model=ExportCreateResponse,
+    status_code=201,
+)
+def create_lineage_export(
+    project_id: str,
+    body: LineageExportRequest,
+    request: Request,
+) -> ExportCreateResponse:
+    """血缘报告基础导出(L-5):焦点子图 + 影响分析同步生成一个 xlsx
+    (三 sheet:table_edges / column_edges / impact)。
+
+    与 sql/compare 导出复用同一 artifact 存储 + 一次性下载 token 通道
+    (GET /exports/{token} / GC / 每小时限额);差别是子图 depth<=5 数据量小,
+    同步生成不走 job 队列 —— jobs 表直接落 status=success 的 RESULT_EXPORT 行,
+    让下载端点的 join 与限额计数照常工作。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    max_depth = min(body.max_depth, 5)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+    _enforce_export_rate_limit(services, user.id)
+    with services.engine.connect() as conn:
+        subgraph = _lineage_subgraph_response(
+            conn,
+            project_id=project_id,
+            focus=body.focus,
+            direction=body.direction,
+            max_depth=max_depth,
+            include_columns=body.include_columns,
+        )
+        impact = _lineage_impact_response(
+            conn,
+            project_id=project_id,
+            focus=body.focus,
+            max_depth=max_depth,
+        )
+
+    export_job_id = new_id()
+    filename = f"lineage-{export_job_id}.xlsx"
+    content_type = export_content_type("excel")
+    try:
+        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as stream:
+            binary_stream = cast(BinaryIO, stream)
+            exported_bytes = write_xlsx_workbook(
+                stream=binary_stream,
+                sheets=_lineage_export_sheets(
+                    subgraph, impact, include_columns=body.include_columns
+                ),
+                limit_bytes=_LINEAGE_EXPORT_LIMIT_BYTES,
+            )
+            binary_stream.seek(0)
+            result_ref = services.result_store.put_export_artifact(
+                export_job_id, filename, binary_stream
+            )
+    except ExportSizeLimitExceeded as exc:
+        raise ApiError(413, "export_limit_exceeded", "Lineage export exceeds size limit") from exc
+    result_ref = result_ref.model_copy(
+        update={"metadata": {"format": "excel", "filename": filename, "bytes": exported_bytes}}
+    )
+
+    download_token = token_urlsafe(32)
+    token_hash = _download_token_hash(download_token)
+    now = datetime.now(UTC)
+    expires_at = now + timedelta(seconds=services.download_url_ttl_seconds)
+    table_edge_count = sum(1 for edge in subgraph.edges if edge.edge_kind != "column")
+    column_edge_count = subgraph.edge_count - table_edge_count
+    with services.engine.begin() as conn:
+        conn.execute(
+            insert(jobs).values(
+                id=export_job_id,
+                kind=JobKind.RESULT_EXPORT.value,
+                status=JobStatus.SUCCESS.value,
+                owner_user_id=user.id,
+                project_id=project_id,
+                datasource_ids=[],
+                priority=0,
+                timeout_seconds=300,
+                resource_profile={},
+                result_ref=result_ref.model_dump(),
+                audit_id=new_id(),
+                payload={
+                    "lineage_export": True,
+                    "focus": body.focus,
+                    "direction": body.direction,
+                    "format": "excel",
+                    "filename": filename,
+                },
+                created_at=now,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        conn.execute(
+            insert(export_download_tokens).values(
+                token_hash=token_hash,
+                job_id=export_job_id,
+                owner_user_id=user.id,
+                format="excel",
+                filename=filename,
+                content_type=content_type,
+                expires_at=expires_at,
+            )
+        )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="lineage_export",
+        resource_type="lineage_export",
+        resource_id=export_job_id,
+        result="success",
+        detail={
+            "focus": body.focus,
+            "direction": body.direction,
+            "table_edge_count": table_edge_count,
+            "column_edge_count": column_edge_count,
+            "impact_count": impact.impact_count,
+        },
+    )
+    return ExportCreateResponse(
+        job_id=export_job_id,
+        download_token=download_token,
+        expires_at=expires_at,
+        format="excel",
+        filename=filename,
+    )
 
 
 @router.get(
@@ -4619,6 +4761,80 @@ def _lineage_impact_response(
         impact_count=len(impacts),
         impacts=impacts,
     )
+
+
+def _lineage_export_sheets(
+    subgraph: LineageSubgraphResponse,
+    impact: LineageImpactResponse,
+    *,
+    include_columns: bool,
+) -> list[tuple[str, list[Column], list[Row]]]:
+    """血缘导出三 sheet(公式注入防护由 write_xlsx_workbook 内置)。
+
+    impact 的 paths 每条用 " -> " 连成链,多条路径用 "; " 合并到一格。
+    """
+    table_columns = [
+        Column(name="source"),
+        Column(name="target"),
+        Column(name="depth"),
+        Column(name="direction"),
+        Column(name="inferred"),
+        Column(name="inference_status"),
+        Column(name="confidence"),
+    ]
+    table_rows = [
+        Row(
+            values=[
+                edge.source,
+                edge.target,
+                edge.depth,
+                edge.direction,
+                edge.inferred,
+                edge.inference_status,
+                edge.confidence,
+            ]
+        )
+        for edge in subgraph.edges
+        if edge.edge_kind != "column"
+    ]
+    sheets: list[tuple[str, list[Column], list[Row]]] = [("table_edges", table_columns, table_rows)]
+    if include_columns:
+        column_columns = [
+            Column(name="source"),
+            Column(name="target"),
+            Column(name="transformation"),
+            Column(name="subtype"),
+            Column(name="inferred"),
+            Column(name="confidence"),
+        ]
+        column_rows = [
+            Row(
+                values=[
+                    edge.source,
+                    edge.target,
+                    edge.transformation,
+                    edge.transformation_subtype,
+                    edge.inferred,
+                    edge.confidence,
+                ]
+            )
+            for edge in subgraph.edges
+            if edge.edge_kind == "column"
+        ]
+        sheets.append(("column_edges", column_columns, column_rows))
+    impact_columns = [Column(name="node"), Column(name="depth"), Column(name="paths")]
+    impact_rows = [
+        Row(
+            values=[
+                item.node,
+                item.depth,
+                "; ".join(" -> ".join(path) for path in item.paths),
+            ]
+        )
+        for item in impact.impacts
+    ]
+    sheets.append(("impact", impact_columns, impact_rows))
+    return sheets
 
 
 def _lineage_column_trace_response(
