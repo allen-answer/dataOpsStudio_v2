@@ -19,7 +19,10 @@ import {
   Check,
   Copy,
   Download,
+  Eye,
   GitCompareArrows,
+  History,
+  ListPlus,
   Play,
   Plus,
   RefreshCw,
@@ -43,24 +46,30 @@ import {
   getCompareRunProfile,
   getCompareRunResults,
   inferCompareTask,
+  listCompareTaskRuns,
   listCompareTasks,
+  previewCompareData,
   runCompareTask,
   suggestCompareTasks,
   updateCompareTask,
   type ColumnMappingCandidate,
   type CompareAiAttributionResponse,
   type CompareBucket,
+  type CompareDataRef,
   type CompareInferResponse,
+  type ComparePreviewResponse,
   type CompareResultRow,
   type CompareRunProfileResponse,
   type CompareRunResultResponse,
   type CompareTaskResponse,
+  type CompareTaskRunItem,
   type PrimaryKeyCandidate,
   type TablePairSuggestion,
 } from '../api/compare'
 import { getJob, cancelJob, type JobResponse } from '../api/jobs'
-import { ApiError, type DatasourceListItem, type JobStatus } from '../api/types'
+import { ApiError, type ColumnType, type DatasourceListItem, type JobStatus } from '../api/types'
 import LoadingDots from '../components/LoadingDots.vue'
+import JobStatusBadge from '../components/JobStatusBadge.vue'
 
 const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>([
   'success',
@@ -71,8 +80,11 @@ const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>([
 const ACTIVE: ReadonlySet<JobStatus> = new Set<JobStatus>(['pending', 'running'])
 const POLL_MS = 800
 const PAGE_SIZE = 100
+const HISTORY_PAGE = 20
+const PREVIEW_LIMIT = 50
 
-type RightTab = 'editor' | 'results' | 'profile'
+type RightTab = 'editor' | 'results' | 'profile' | 'history'
+type RefSide = 'source' | 'target'
 
 interface BucketStyle {
   dot: string
@@ -134,10 +146,16 @@ interface EditorDraft {
   name: string
   sourceId: string
   targetId: string
+  sourceKind: 'table' | 'sql'
+  targetKind: 'table' | 'sql'
   sourceSchema: string
   sourceTable: string
   targetSchema: string
   targetTable: string
+  sourceSql: string
+  targetSql: string
+  /** 单 SQL 便捷模式:同一段 SQL 同时填进 source_ref / target_ref(绑 sourceSql)。 */
+  singleSql: boolean
   keyColumns: string[]
   columnMappings: Record<string, string>
   ignoreColumns: string[]
@@ -163,10 +181,15 @@ function emptyDraft(): EditorDraft {
     name: '',
     sourceId: '',
     targetId: '',
+    sourceKind: 'table',
+    targetKind: 'table',
     sourceSchema: '',
     sourceTable: '',
     targetSchema: '',
     targetTable: '',
+    sourceSql: '',
+    targetSql: '',
+    singleSql: false,
     keyColumns: [],
     columnMappings: {},
     ignoreColumns: [],
@@ -227,6 +250,25 @@ const profileData = ref<CompareRunProfileResponse | null>(null)
 const profileLoading = ref(false)
 const profileError = ref<string | null>(null)
 
+// ── run history (C-3) ───────────────────────────────────────────────
+const historyRuns = ref<CompareTaskRunItem[]>([])
+const historyLoading = ref(false)
+const historyError = ref<string | null>(null)
+const historyHasMore = ref(false)
+const historyOffset = ref(0)
+
+// ── data preview (C-4) ──────────────────────────────────────────────
+interface PreviewState {
+  open: boolean
+  loading: boolean
+  error: string | null
+  data: ComparePreviewResponse | null
+}
+const previews = reactive<Record<RefSide, PreviewState>>({
+  source: { open: false, loading: false, error: null, data: null },
+  target: { open: false, loading: false, error: null, data: null },
+})
+
 // ── AI attribution ──────────────────────────────────────────────────
 const aiResult = ref<CompareAiAttributionResponse | null>(null)
 const aiBusy = ref(false)
@@ -255,14 +297,123 @@ const diffProfile = computed(
 // 主键列固定左侧:diff tab 表头依推断/规则的 key_columns 决定。
 const keyColumns = computed<string[]>(() => draft.keyColumns)
 const compareColumns = computed<string[]>(() =>
-  draft.columns.map((c) => c.name).filter((name) => !draft.ignoreColumns.includes(name)),
+  draft.columns
+    .map((c) => c.name)
+    .filter((name) => name.trim().length > 0 && !draft.ignoreColumns.includes(name)),
 )
 
+// ── SQL 引用(C-2)────────────────────────────────────────────────────
+/** 单 SQL 模式下两侧都是 sql;否则按各自 kind。 */
+function refKind(side: RefSide): 'table' | 'sql' {
+  if (draft.singleSql) return 'sql'
+  return side === 'source' ? draft.sourceKind : draft.targetKind
+}
+
+function refSql(side: RefSide): string {
+  if (draft.singleSql) return draft.sourceSql
+  return side === 'source' ? draft.sourceSql : draft.targetSql
+}
+
+/** 该侧引用是否可用:table 要 table_name,sql 要非空 SQL。 */
+function refReady(side: RefSide): boolean {
+  if (refKind(side) === 'sql') return refSql(side).trim().length > 0
+  return side === 'source' ? Boolean(draft.sourceTable) : Boolean(draft.targetTable)
+}
+
+/** 按 kind 构造 CompareDataRef(schemas.py:kind=table 要 table_name,kind=sql 要 sql)。 */
+function buildDataRef(side: RefSide): CompareDataRef {
+  if (refKind(side) === 'sql') return { kind: 'sql', sql: refSql(side).trim() }
+  return side === 'source'
+    ? { kind: 'table', schema_name: draft.sourceSchema || null, table_name: draft.sourceTable }
+    : { kind: 'table', schema_name: draft.targetSchema || null, table_name: draft.targetTable }
+}
+
+// 任一侧 kind=sql 时列推断/表对建议无意义 —— infer 按钮禁用并提示手动配置。
+const sqlMode = computed<boolean>(() => refKind('source') === 'sql' || refKind('target') === 'sql')
+
+function onSingleSqlToggle(): void {
+  if (draft.singleSql) {
+    draft.sourceKind = 'sql'
+    draft.targetKind = 'sql'
+    if (!draft.sourceSql && draft.targetSql) draft.sourceSql = draft.targetSql
+  }
+}
+
 const runBlockedReason = computed<string | null>(() => {
+  if (!refReady('source') || !refReady('target')) return t('compare.run_blocked_ref_incomplete')
   if (draft.keyColumns.length === 0 && !draft.sampleQuickCheck) return t('compare.run_blocked_no_pk')
   if (compareColumns.value.length === 0) return t('compare.run_blocked_no_columns')
   return null
 })
+
+// ── 列/主键手动编辑(C-2 补齐:SQL 引用没有 infer 路径,列清单必须可手编)──
+// 选项对齐 app/domain/schema.py ColumnType 11 值(= api/types.ts ColumnType)。
+const COLUMN_TYPE_OPTIONS: ColumnType[] = [
+  'string',
+  'integer',
+  'float',
+  'decimal',
+  'boolean',
+  'datetime',
+  'date',
+  'time',
+  'bytes',
+  'json',
+  'unknown',
+]
+
+function addColumn(): void {
+  draft.columns.push({ name: '', type: 'string' })
+}
+
+function removeColumn(index: number): void {
+  const name = draft.columns[index]?.name
+  draft.columns.splice(index, 1)
+  if (name) {
+    draft.keyColumns = draft.keyColumns.filter((c) => c !== name)
+    draft.ignoreColumns = draft.ignoreColumns.filter((c) => c !== name)
+    delete draft.columnMappings[name]
+  }
+}
+
+/** 改列名时同步 keyColumns / ignoreColumns / columnMappings,避免留下悬空引用。 */
+function renameColumn(index: number, newName: string): void {
+  const old = draft.columns[index]?.name
+  if (old === undefined || old === newName) return
+  draft.columns[index].name = newName
+  draft.keyColumns = draft.keyColumns.map((c) => (c === old ? newName : c))
+  draft.ignoreColumns = draft.ignoreColumns.map((c) => (c === old ? newName : c))
+  if (old in draft.columnMappings) {
+    const mapped = draft.columnMappings[old]
+    delete draft.columnMappings[old]
+    if (newName) draft.columnMappings[newName] = mapped
+  }
+}
+
+function onColumnNameInput(index: number, event: Event): void {
+  renameColumn(index, (event.target as HTMLInputElement).value)
+}
+
+/** 勾选顺序即主键列顺序(与 applyPkCandidate 的候选顺序语义一致)。 */
+function toggleKeyColumn(name: string): void {
+  if (draft.keyColumns.includes(name)) {
+    draft.keyColumns = draft.keyColumns.filter((c) => c !== name)
+  } else {
+    draft.keyColumns = [...draft.keyColumns, name]
+  }
+}
+
+/** 从预览带入列名:type 默认 string 由用户改,同名列跳过不覆盖(预览不返回类型,不自动填)。 */
+function adoptPreviewColumns(side: RefSide): void {
+  const data = previews[side].data
+  if (!data) return
+  const existing = new Set(draft.columns.map((c) => c.name))
+  for (const name of data.columns) {
+    if (!name || existing.has(name)) continue
+    existing.add(name)
+    draft.columns.push({ name, type: 'string' })
+  }
+}
 
 // ── lifecycle ───────────────────────────────────────────────────────
 onMounted(() => {
@@ -278,8 +429,14 @@ watch(activeTask, (task) => {
     loadDraftFromTask(task)
     isNewTask.value = false
     resetRunState()
+    resetHistory()
     rightTab.value = 'editor'
   }
+})
+
+// 切到 history tab 时拉当前任务的 run 历史(activeTask 变化会重置到 editor + 清空历史)。
+watch(rightTab, (tab) => {
+  if (tab === 'history') void loadHistory(true)
 })
 
 watch(datasources, (list) => {
@@ -309,10 +466,19 @@ function loadDraftFromTask(task: CompareTaskResponse): void {
   draft.name = task.name
   draft.sourceId = task.source_id
   draft.targetId = task.target_id
+  draft.sourceKind = task.source_ref.kind
+  draft.targetKind = task.target_ref.kind
   draft.sourceSchema = task.source_ref.schema_name ?? ''
   draft.sourceTable = task.source_ref.table_name ?? ''
   draft.targetSchema = task.target_ref.schema_name ?? ''
   draft.targetTable = task.target_ref.table_name ?? ''
+  draft.sourceSql = task.source_ref.sql ?? ''
+  draft.targetSql = task.target_ref.sql ?? ''
+  draft.singleSql =
+    task.source_ref.kind === 'sql' &&
+    task.target_ref.kind === 'sql' &&
+    draft.sourceSql !== '' &&
+    draft.sourceSql === draft.targetSql
   draft.columns = task.columns.map((c) => ({ name: c.name, type: c.type }))
   draft.keyColumns = [...task.compare_rules.key_columns]
   draft.columnMappings = { ...task.compare_rules.column_mappings }
@@ -333,6 +499,7 @@ function loadDraftFromTask(task: CompareTaskResponse): void {
   draft.streamCompare = task.run_limits.stream_compare
   draft.persistSame = task.run_limits.persist_same_bucket
   inferResult.value = null
+  resetPreviews()
 }
 
 function startNewTask(): void {
@@ -345,11 +512,18 @@ function startNewTask(): void {
   inferResult.value = null
   inferError.value = null
   resetRunState()
+  resetHistory()
+  resetPreviews()
   rightTab.value = 'editor'
 }
 
 // ── inference ───────────────────────────────────────────────────────
 async function onInfer(): Promise<void> {
+  // 列推断只对 table ref 有意义;SQL 引用需手动配置列与主键(按钮已禁用,双保险)。
+  if (sqlMode.value) {
+    inferError.value = t('compare.infer_sql_disabled')
+    return
+  }
   if (!draft.sourceId || !draft.targetId || !draft.sourceTable || !draft.targetTable) {
     inferError.value = t('compare.infer_hint')
     return
@@ -425,14 +599,14 @@ function buildLimitsPayload() {
 }
 
 async function onSaveTask(): Promise<void> {
-  if (!draft.name.trim() || !draft.sourceTable || !draft.targetTable) {
-    editorError.value = t('compare.infer_hint')
+  if (!draft.name.trim() || !refReady('source') || !refReady('target')) {
+    editorError.value = t('compare.save_incomplete')
     return
   }
   editorError.value = null
   savingTask.value = true
-  const sourceRef = { kind: 'table' as const, schema_name: draft.sourceSchema || null, table_name: draft.sourceTable }
-  const targetRef = { kind: 'table' as const, schema_name: draft.targetSchema || null, table_name: draft.targetTable }
+  const sourceRef = buildDataRef('source')
+  const targetRef = buildDataRef('target')
   try {
     if (isNewTask.value || !activeTask.value) {
       const created = await createCompareTask({
@@ -442,7 +616,7 @@ async function onSaveTask(): Promise<void> {
         target_id: draft.targetId,
         source_ref: sourceRef,
         target_ref: targetRef,
-        columns: draft.columns.map((c) => ({ name: c.name, type: c.type as never, driver_type: null, nullable: true, primary_key: draft.keyColumns.includes(c.name) })),
+        columns: draft.columns.filter((c) => c.name.trim()).map((c) => ({ name: c.name, type: c.type as never, driver_type: null, nullable: true, primary_key: draft.keyColumns.includes(c.name) })),
         compare_rules: buildRulesPayload(),
         run_limits: buildLimitsPayload(),
       })
@@ -456,7 +630,7 @@ async function onSaveTask(): Promise<void> {
         target_id: draft.targetId,
         source_ref: sourceRef,
         target_ref: targetRef,
-        columns: draft.columns.map((c) => ({ name: c.name, type: c.type as never, driver_type: null, nullable: true, primary_key: draft.keyColumns.includes(c.name) })),
+        columns: draft.columns.filter((c) => c.name.trim()).map((c) => ({ name: c.name, type: c.type as never, driver_type: null, nullable: true, primary_key: draft.keyColumns.includes(c.name) })),
         compare_rules: buildRulesPayload(),
         run_limits: buildLimitsPayload(),
       })
@@ -714,6 +888,99 @@ async function loadProfile(): Promise<void> {
   }
 }
 
+// ── run history (C-3) ───────────────────────────────────────────────
+function resetHistory(): void {
+  historyRuns.value = []
+  historyError.value = null
+  historyHasMore.value = false
+  historyOffset.value = 0
+}
+
+async function loadHistory(reset: boolean): Promise<void> {
+  if (!activeTask.value) return
+  if (reset) resetHistory()
+  historyLoading.value = true
+  historyError.value = null
+  try {
+    const res = await listCompareTaskRuns(activeTask.value.id, HISTORY_PAGE, historyOffset.value)
+    historyRuns.value = reset ? res.runs : [...historyRuns.value, ...res.runs]
+    historyOffset.value += res.runs.length
+    historyHasMore.value = res.has_more
+  } catch (e) {
+    historyError.value = errorMessage(e)
+  } finally {
+    historyLoading.value = false
+  }
+}
+
+const JOB_STATUS_VALUES: ReadonlySet<string> = new Set([
+  'pending',
+  'running',
+  'success',
+  'failed',
+  'cancelled',
+  'timeout',
+])
+function isKnownJobStatus(status: string): boolean {
+  return JOB_STATUS_VALUES.has(status)
+}
+function asJobStatus(status: string): JobStatus {
+  return (isKnownJobStatus(status) ? status : 'pending') as JobStatus
+}
+
+/** 点一条 success 的历史 run:设为当前 run 并切 results tab(复用既有结果拉取路径)。 */
+function openHistoryRun(item: CompareTaskRunItem): void {
+  if (item.status !== 'success') return
+  resetRunState()
+  run.jobId = item.job_id
+  run.runId = item.run_id
+  run.status = 'success'
+  rightTab.value = 'results'
+  void Promise.all([loadResults(resultBucket.value), loadProfile()])
+}
+
+// ── data preview (C-4) ──────────────────────────────────────────────
+function resetPreviews(): void {
+  for (const side of ['source', 'target'] as const) {
+    previews[side].open = false
+    previews[side].loading = false
+    previews[side].error = null
+    previews[side].data = null
+  }
+}
+
+async function onPreview(side: RefSide): Promise<void> {
+  const state = previews[side]
+  if (state.loading || !refReady(side)) return
+  state.open = true
+  state.loading = true
+  state.error = null
+  state.data = null
+  try {
+    state.data = await previewCompareData(projectId.value, {
+      datasource_id: side === 'source' ? draft.sourceId : draft.targetId,
+      ref: buildDataRef(side),
+      limit: PREVIEW_LIMIT,
+    })
+  } catch (e) {
+    state.error = previewErrorMessage(e)
+  } finally {
+    state.loading = false
+  }
+}
+
+/** 预览错误码映射(core.py preview_compare_data):400/403/502 → i18n 文案。 */
+function previewErrorMessage(e: unknown): string {
+  if (e instanceof ApiError) {
+    if (e.code === 'invalid_sql') return t('compare.preview_err_invalid_sql')
+    if (e.code === 'invalid_identifier') return t('compare.preview_err_invalid_identifier')
+    if (e.code === 'select_not_allowed') return t('compare.preview_err_select_not_allowed')
+    if (e.code === 'datasource_unreachable') return t('compare.preview_err_unreachable')
+    if (e.code === 'preview_failed') return t('compare.preview_err_failed')
+  }
+  return errorMessage(e)
+}
+
 async function onAiExplain(): Promise<void> {
   if (!run.runId || aiBusy.value) return
   aiBusy.value = true
@@ -922,6 +1189,15 @@ const missingTarget = computed(
         >
           <Sparkles class="w-4 h-4" /> {{ t('compare.profile') }}
         </button>
+        <button
+          type="button"
+          class="chrome-tab"
+          :class="rightTab === 'history' && 'chrome-accent-light-bg chrome-accent'"
+          :disabled="!activeTask"
+          @click="rightTab = 'history'"
+        >
+          <History class="w-4 h-4" /> {{ t('compare.history') }}
+        </button>
 
         <div class="flex-1" />
 
@@ -988,30 +1264,231 @@ const missingTarget = computed(
               <span class="block text-xs chrome-text-muted mb-1">{{ t('compare.task_name') }}</span>
               <input v-model="draft.name" class="chrome-input w-full" />
             </label>
+
+            <!-- 单 SQL 便捷模式:同一段 SQL 两侧各跑一遍 -->
+            <label class="col-span-2 flex items-center gap-2 text-xs chrome-text-muted">
+              <input v-model="draft.singleSql" type="checkbox" @change="onSingleSqlToggle" />
+              {{ t('compare.single_sql') }}
+            </label>
+
             <fieldset class="space-y-2 rounded-card border chrome-border p-3">
               <legend class="px-1 text-xs font-medium chrome-text-heading">{{ t('compare.source') }}</legend>
               <select v-model="draft.sourceId" class="chrome-input w-full text-sm">
                 <option v-for="ds in datasources" :key="ds.id" :value="ds.id">{{ ds.name }}</option>
               </select>
-              <input v-model="draft.sourceSchema" class="chrome-input w-full text-sm" :placeholder="t('compare.schema')" />
-              <input v-model="draft.sourceTable" class="chrome-input w-full text-sm" :placeholder="t('compare.table')" />
+              <div v-if="!draft.singleSql" class="flex items-center gap-1">
+                <button
+                  type="button"
+                  class="chrome-btn-secondary text-xs"
+                  :class="draft.sourceKind === 'table' && 'chrome-accent-light-bg chrome-accent'"
+                  @click="draft.sourceKind = 'table'"
+                >
+                  {{ t('compare.ref_kind_table') }}
+                </button>
+                <button
+                  type="button"
+                  class="chrome-btn-secondary text-xs"
+                  :class="draft.sourceKind === 'sql' && 'chrome-accent-light-bg chrome-accent'"
+                  @click="draft.sourceKind = 'sql'"
+                >
+                  {{ t('compare.ref_kind_sql') }}
+                </button>
+              </div>
+              <template v-if="!draft.singleSql && draft.sourceKind === 'table'">
+                <input v-model="draft.sourceSchema" class="chrome-input w-full text-sm" :placeholder="t('compare.schema')" />
+                <input v-model="draft.sourceTable" class="chrome-input w-full text-sm" :placeholder="t('compare.table')" />
+              </template>
+              <textarea
+                v-else-if="!draft.singleSql"
+                v-model="draft.sourceSql"
+                rows="5"
+                class="chrome-input w-full text-xs font-mono"
+                :placeholder="t('compare.sql_placeholder')"
+              />
+              <div>
+                <button
+                  type="button"
+                  class="chrome-btn-secondary text-xs"
+                  :disabled="previews.source.loading || !refReady('source')"
+                  @click="onPreview('source')"
+                >
+                  <Eye class="w-3.5 h-3.5" :class="previews.source.loading && 'animate-pulse'" />
+                  {{ previews.source.loading ? t('compare.previewing') : t('compare.preview') }}
+                </button>
+              </div>
+              <!-- 预览折叠面板(源) -->
+              <div v-if="previews.source.open" class="rounded-card border chrome-border-subtle p-2 space-y-1">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="text-[11px] chrome-text-muted">
+                    {{ refKind('source') === 'sql' ? t('compare.preview_sql_note') : t('compare.preview') }}
+                  </span>
+                  <button type="button" class="chrome-btn-ghost" :title="t('compare.preview_close')" @click="previews.source.open = false">
+                    <X class="w-3.5 h-3.5" />
+                  </button>
+                </div>
+                <div v-if="previews.source.error" class="text-xs text-red-600 dark:text-red-400">{{ previews.source.error }}</div>
+                <div v-else-if="previews.source.loading" class="text-xs chrome-text-muted"><LoadingDots /></div>
+                <template v-else-if="previews.source.data">
+                  <div v-if="previews.source.data.truncated" class="text-[11px] text-amber-700 dark:text-amber-300">
+                    {{ t('compare.preview_truncated', { n: PREVIEW_LIMIT }) }}
+                  </div>
+                  <div v-if="previews.source.data.rows.length === 0" class="text-xs chrome-text-muted">
+                    {{ t('compare.preview_empty') }}
+                  </div>
+                  <div v-else class="overflow-auto max-h-56">
+                    <table class="text-[11px] border chrome-border rounded-card">
+                      <thead class="chrome-bg-elevated">
+                        <tr class="text-left chrome-text-muted">
+                          <th v-for="col in previews.source.data.columns" :key="col" class="px-2 py-1 font-medium whitespace-nowrap">
+                            {{ col }}
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="(prow, pi) in previews.source.data.rows" :key="pi" class="border-t chrome-border-subtle">
+                          <td v-for="(cell, ci) in prow" :key="ci" class="px-2 py-1 font-mono whitespace-nowrap">
+                            {{ fmtCell(cell) }}
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </template>
+                <div v-if="previews.source.data && previews.source.data.columns.length > 0" class="pt-1">
+                  <button
+                    type="button"
+                    class="chrome-btn-secondary text-xs"
+                    :title="t('compare.preview_adopt_hint')"
+                    @click="adoptPreviewColumns('source')"
+                  >
+                    <ListPlus class="w-3.5 h-3.5" /> {{ t('compare.preview_adopt_columns') }}
+                  </button>
+                </div>
+              </div>
             </fieldset>
+
             <fieldset class="space-y-2 rounded-card border chrome-border p-3">
               <legend class="px-1 text-xs font-medium chrome-text-heading">{{ t('compare.target') }}</legend>
               <select v-model="draft.targetId" class="chrome-input w-full text-sm">
                 <option v-for="ds in datasources" :key="ds.id" :value="ds.id">{{ ds.name }}</option>
               </select>
-              <input v-model="draft.targetSchema" class="chrome-input w-full text-sm" :placeholder="t('compare.schema')" />
-              <input v-model="draft.targetTable" class="chrome-input w-full text-sm" :placeholder="t('compare.table')" />
+              <div v-if="!draft.singleSql" class="flex items-center gap-1">
+                <button
+                  type="button"
+                  class="chrome-btn-secondary text-xs"
+                  :class="draft.targetKind === 'table' && 'chrome-accent-light-bg chrome-accent'"
+                  @click="draft.targetKind = 'table'"
+                >
+                  {{ t('compare.ref_kind_table') }}
+                </button>
+                <button
+                  type="button"
+                  class="chrome-btn-secondary text-xs"
+                  :class="draft.targetKind === 'sql' && 'chrome-accent-light-bg chrome-accent'"
+                  @click="draft.targetKind = 'sql'"
+                >
+                  {{ t('compare.ref_kind_sql') }}
+                </button>
+              </div>
+              <template v-if="!draft.singleSql && draft.targetKind === 'table'">
+                <input v-model="draft.targetSchema" class="chrome-input w-full text-sm" :placeholder="t('compare.schema')" />
+                <input v-model="draft.targetTable" class="chrome-input w-full text-sm" :placeholder="t('compare.table')" />
+              </template>
+              <textarea
+                v-else-if="!draft.singleSql"
+                v-model="draft.targetSql"
+                rows="5"
+                class="chrome-input w-full text-xs font-mono"
+                :placeholder="t('compare.sql_placeholder')"
+              />
+              <div>
+                <button
+                  type="button"
+                  class="chrome-btn-secondary text-xs"
+                  :disabled="previews.target.loading || !refReady('target')"
+                  @click="onPreview('target')"
+                >
+                  <Eye class="w-3.5 h-3.5" :class="previews.target.loading && 'animate-pulse'" />
+                  {{ previews.target.loading ? t('compare.previewing') : t('compare.preview') }}
+                </button>
+              </div>
+              <!-- 预览折叠面板(目标) -->
+              <div v-if="previews.target.open" class="rounded-card border chrome-border-subtle p-2 space-y-1">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="text-[11px] chrome-text-muted">
+                    {{ refKind('target') === 'sql' ? t('compare.preview_sql_note') : t('compare.preview') }}
+                  </span>
+                  <button type="button" class="chrome-btn-ghost" :title="t('compare.preview_close')" @click="previews.target.open = false">
+                    <X class="w-3.5 h-3.5" />
+                  </button>
+                </div>
+                <div v-if="previews.target.error" class="text-xs text-red-600 dark:text-red-400">{{ previews.target.error }}</div>
+                <div v-else-if="previews.target.loading" class="text-xs chrome-text-muted"><LoadingDots /></div>
+                <template v-else-if="previews.target.data">
+                  <div v-if="previews.target.data.truncated" class="text-[11px] text-amber-700 dark:text-amber-300">
+                    {{ t('compare.preview_truncated', { n: PREVIEW_LIMIT }) }}
+                  </div>
+                  <div v-if="previews.target.data.rows.length === 0" class="text-xs chrome-text-muted">
+                    {{ t('compare.preview_empty') }}
+                  </div>
+                  <div v-else class="overflow-auto max-h-56">
+                    <table class="text-[11px] border chrome-border rounded-card">
+                      <thead class="chrome-bg-elevated">
+                        <tr class="text-left chrome-text-muted">
+                          <th v-for="col in previews.target.data.columns" :key="col" class="px-2 py-1 font-medium whitespace-nowrap">
+                            {{ col }}
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="(prow, pi) in previews.target.data.rows" :key="pi" class="border-t chrome-border-subtle">
+                          <td v-for="(cell, ci) in prow" :key="ci" class="px-2 py-1 font-mono whitespace-nowrap">
+                            {{ fmtCell(cell) }}
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </template>
+                <div v-if="previews.target.data && previews.target.data.columns.length > 0" class="pt-1">
+                  <button
+                    type="button"
+                    class="chrome-btn-secondary text-xs"
+                    :title="t('compare.preview_adopt_hint')"
+                    @click="adoptPreviewColumns('target')"
+                  >
+                    <ListPlus class="w-3.5 h-3.5" /> {{ t('compare.preview_adopt_columns') }}
+                  </button>
+                </div>
+              </div>
             </fieldset>
+
+            <!-- 单 SQL 输入(两侧共用同一段) -->
+            <label v-if="draft.singleSql" class="block col-span-2">
+              <span class="block text-xs chrome-text-muted mb-1">{{ t('compare.ref_kind_sql') }}</span>
+              <textarea
+                v-model="draft.sourceSql"
+                rows="6"
+                class="chrome-input w-full text-xs font-mono"
+                :placeholder="t('compare.sql_placeholder')"
+              />
+            </label>
           </div>
 
           <div class="flex items-center gap-2">
-            <button type="button" class="chrome-btn-secondary text-sm" :disabled="inferring" @click="onInfer">
+            <button
+              type="button"
+              class="chrome-btn-secondary text-sm"
+              :disabled="inferring || sqlMode"
+              :title="sqlMode ? t('compare.infer_sql_disabled') : ''"
+              @click="onInfer"
+            >
               <Wand2 class="w-4 h-4" :class="inferring && 'animate-pulse'" />
               {{ inferring ? t('compare.inferring') : t('compare.infer') }}
             </button>
-            <span class="text-xs chrome-text-muted">{{ t('compare.infer_hint') }}</span>
+            <span class="text-xs chrome-text-muted">
+              {{ sqlMode ? t('compare.infer_sql_disabled') : t('compare.infer_hint') }}
+            </span>
           </div>
           <div v-if="inferError" class="text-xs text-red-600 dark:text-red-400">{{ inferError }}</div>
 
@@ -1104,27 +1581,66 @@ const missingTarget = computed(
             </div>
           </div>
 
-          <!-- 比较列选择(勾掉 ignore) -->
-          <div v-if="draft.columns.length > 0">
+          <!-- 列与主键配置:table 模式 infer 灌入后可微调;SQL 模式手动添加或从预览带入 -->
+          <div>
             <div class="text-xs font-medium chrome-text-heading mb-2">{{ t('compare.compare_columns') }}</div>
-            <div class="flex flex-wrap gap-1.5">
-              <button
-                v-for="col in draft.columns"
-                :key="col.name"
-                type="button"
-                class="inline-flex items-center gap-1 rounded-input border px-2 py-1 text-xs"
-                :class="
-                  draft.ignoreColumns.includes(col.name)
-                    ? 'border-dashed chrome-border chrome-text-muted line-through'
-                    : 'chrome-border chrome-text-heading'
-                "
-                :title="t('compare.toggle_ignore')"
-                @click="toggleIgnoreColumn(col.name)"
-              >
-                {{ col.name }}
-                <span class="text-[10px] chrome-text-muted">{{ col.type }}</span>
-              </button>
+            <div v-if="draft.columns.length === 0" class="text-xs chrome-text-muted mb-2">
+              {{ t('compare.columns_empty') }}
             </div>
+            <table v-else class="w-full text-xs border chrome-border rounded-card overflow-hidden mb-2">
+              <thead class="chrome-bg-elevated">
+                <tr class="text-left chrome-text-muted">
+                  <th class="px-2 py-1.5 font-medium w-12">{{ t('compare.pk_column') }}</th>
+                  <th class="px-2 py-1.5 font-medium">{{ t('compare.col_name') }}</th>
+                  <th class="px-2 py-1.5 font-medium w-32">{{ t('compare.col_type') }}</th>
+                  <th class="px-2 py-1.5 font-medium w-12">{{ t('compare.col_ignore') }}</th>
+                  <th class="px-2 py-1.5 w-10"></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="(col, ci) in draft.columns" :key="ci" class="border-t chrome-border-subtle">
+                  <td class="px-2 py-1.5">
+                    <input
+                      type="checkbox"
+                      :checked="draft.keyColumns.includes(col.name)"
+                      :disabled="!col.name.trim()"
+                      :title="t('compare.col_pk_hint')"
+                      @change="toggleKeyColumn(col.name)"
+                    />
+                  </td>
+                  <td class="px-2 py-1.5">
+                    <input
+                      :value="col.name"
+                      class="chrome-input w-full text-xs font-mono"
+                      :placeholder="t('compare.col_name')"
+                      @input="onColumnNameInput(ci, $event)"
+                    />
+                  </td>
+                  <td class="px-2 py-1.5">
+                    <select v-model="col.type" class="chrome-input w-full text-xs">
+                      <option v-for="ct in COLUMN_TYPE_OPTIONS" :key="ct" :value="ct">{{ ct }}</option>
+                    </select>
+                  </td>
+                  <td class="px-2 py-1.5">
+                    <input
+                      type="checkbox"
+                      :checked="draft.ignoreColumns.includes(col.name)"
+                      :disabled="!col.name.trim()"
+                      :title="t('compare.toggle_ignore')"
+                      @change="toggleIgnoreColumn(col.name)"
+                    />
+                  </td>
+                  <td class="px-2 py-1.5 text-right">
+                    <button type="button" class="chrome-btn-ghost" :title="t('compare.col_remove')" @click="removeColumn(ci)">
+                      <Trash2 class="w-3.5 h-3.5" />
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <button type="button" class="chrome-btn-secondary text-xs" @click="addColumn">
+              <Plus class="w-3.5 h-3.5" /> {{ t('compare.col_add') }}
+            </button>
           </div>
 
           <!-- 规则 + 限制 -->
@@ -1412,6 +1928,52 @@ const missingTarget = computed(
               </div>
             </div>
           </template>
+        </div>
+
+        <!-- ============ 历史 tab ============ -->
+        <div v-show="rightTab === 'history'" class="p-4 space-y-2 max-w-4xl">
+          <div v-if="historyError" class="text-xs text-red-600 dark:text-red-400">{{ historyError }}</div>
+          <div v-if="historyLoading && historyRuns.length === 0" class="chrome-text-muted text-sm"><LoadingDots /></div>
+          <div v-else-if="historyRuns.length === 0" class="chrome-text-muted text-sm">
+            {{ t('compare.history_empty') }}
+          </div>
+          <button
+            v-for="item in historyRuns"
+            :key="item.run_id"
+            type="button"
+            class="w-full text-left rounded-card border chrome-border px-3 py-2 flex flex-wrap items-center gap-x-3 gap-y-1 transition-colors"
+            :class="item.status === 'success' ? 'hover:chrome-bg-elevated' : 'opacity-50 cursor-not-allowed'"
+            :disabled="item.status !== 'success'"
+            :title="item.status === 'success' ? t('compare.history_open_hint') : t('compare.history_not_openable')"
+            @click="openHistoryRun(item)"
+          >
+            <span class="text-xs chrome-text-heading tabular-nums w-40 shrink-0">{{ formatDate(item.created_at) }}</span>
+            <JobStatusBadge v-if="isKnownJobStatus(item.status)" :status="asJobStatus(item.status)" />
+            <span v-else class="text-xs chrome-text-muted">{{ item.status }}</span>
+            <span class="flex-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] chrome-text-muted">
+              <span v-for="bucket in COMPARE_BUCKETS" :key="bucket" class="inline-flex items-center gap-1">
+                <span class="w-2 h-2 rounded-full" :class="BUCKET_STYLE[bucket].dot" />
+                {{ t(`compare.bucket_${bucket}`) }}
+                <span class="tabular-nums">{{ item.bucket_counts[bucket] ?? 0 }}</span>
+              </span>
+            </span>
+            <span
+              v-if="item.sampled"
+              class="inline-flex items-center gap-1 text-[10px] text-amber-700 dark:text-amber-300"
+            >
+              <AlertTriangle class="w-3 h-3" /> {{ t('compare.history_sampled') }}
+            </span>
+          </button>
+          <button
+            v-if="historyHasMore"
+            type="button"
+            class="chrome-btn-secondary text-xs"
+            :disabled="historyLoading"
+            @click="loadHistory(false)"
+          >
+            <RefreshCw class="w-3.5 h-3.5" :class="historyLoading && 'animate-spin'" />
+            {{ t('compare.history_load_more') }}
+          </button>
         </div>
       </div>
     </section>

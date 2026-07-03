@@ -420,6 +420,46 @@ export default {
     export_token_spent: 'Download link was already used or expired - export again.',
     run_blocked_no_pk: 'Select key columns or enable sample quick check before running.',
     run_blocked_no_columns: 'Select at least one column to compare.',
+    run_blocked_ref_incomplete: 'Complete the source/target refs (table name or SQL) first.',
+    save_incomplete: 'Fill the task name and complete source/target refs (table name or SQL).',
+    // SQL refs (C-2)
+    ref_kind_table: 'Table ref',
+    ref_kind_sql: 'Custom SQL',
+    sql_placeholder: 'SELECT … (read-only query)',
+    single_sql: 'Single SQL (both sides run the same statement)',
+    infer_sql_disabled: 'SQL refs need manual column & key config; auto-infer only supports table refs.',
+    // run history (C-3)
+    history: 'History',
+    history_empty: 'No runs yet.',
+    history_load_more: 'Load more',
+    history_sampled: 'sampled',
+    history_open_hint: 'Open the results of this run',
+    history_not_openable: 'Only successful runs can be opened',
+    // data preview (C-4)
+    preview: 'Preview',
+    previewing: 'Previewing…',
+    preview_close: 'Close preview',
+    preview_truncated: 'Showing only the first {n} rows',
+    preview_empty: 'Query returned no rows.',
+    preview_sql_note:
+      'Preview runs the SQL to inspect its shape; configure columns & keys manually from the result.',
+    preview_err_invalid_sql: 'Only read-only SELECT / WITH SQL is allowed.',
+    preview_err_invalid_identifier: 'Invalid schema or table name.',
+    preview_err_select_not_allowed: 'Datasource operation policy denies SELECT.',
+    preview_err_unreachable: 'Datasource connection failed.',
+    preview_err_failed: 'Preview query failed.',
+    preview_adopt_columns: 'Adopt column names from preview',
+    preview_adopt_hint:
+      'Adopts names only; type defaults to string — adjust manually. Existing columns with the same name are skipped.',
+    // manual column / key editor (C-2)
+    columns_empty:
+      'No columns yet. Table refs can use auto-infer; for SQL refs add columns manually or preview first and adopt the names.',
+    col_name: 'Column',
+    col_type: 'Type',
+    col_ignore: 'Ignore',
+    col_pk_hint: 'Checked = use as key column (in check order)',
+    col_add: 'Add column',
+    col_remove: 'Remove column',
     // suggestions
     suggestions: 'Task suggestions',
     suggestions_hint: 'Same-named / normalized table pairs across the two datasources.',
