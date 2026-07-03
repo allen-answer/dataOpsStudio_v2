@@ -430,6 +430,31 @@ class LineageEdgeInferenceResponse(BaseModel):
     confidence: float
 
 
+class LineageEdgeRunInfo(BaseModel):
+    """边所属解析 run 的溯源信息(边抽屉用)。sql_text 在 0018 前的旧 run 为 NULL。"""
+
+    run_id: str
+    source_ref: str
+    dialect: str
+    created_at: datetime
+    sql_text: str | None = None
+
+
+class LineageEdgeDetailResponse(BaseModel):
+    edge_id: str
+    edge_kind: Literal["table", "column"]
+    source_table: str
+    source_column: str | None = None
+    target_table: str
+    target_column: str | None = None
+    transformation: str | None = None
+    transformation_subtype: str | None = None
+    inferred: bool
+    inference_status: str
+    confidence: float
+    run: LineageEdgeRunInfo | None = None
+
+
 class LineageImpactItem(BaseModel):
     node: str
     table: str
