@@ -223,6 +223,37 @@ class CompareRunCreateResponse(BaseModel):
     run_id: str
 
 
+class CompareTaskRunItem(BaseModel):
+    run_id: str
+    job_id: str
+    status: str
+    created_at: datetime
+    finished_at: datetime | None = None
+    bucket_counts: dict[str, int] = Field(default_factory=dict)
+    sampled: bool = False
+
+
+class CompareTaskRunsResponse(BaseModel):
+    task_id: str
+    limit: int
+    offset: int
+    has_more: bool
+    runs: list[CompareTaskRunItem] = Field(default_factory=list)
+
+
+class ComparePreviewRequest(BaseModel):
+    datasource_id: str
+    ref: CompareDataRef
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+class ComparePreviewResponse(BaseModel):
+    columns: list[str] = Field(default_factory=list)
+    rows: list[list[Any]] = Field(default_factory=list)
+    row_count: int
+    truncated: bool
+
+
 class CompareCellDiff(BaseModel):
     column: str
     source: Any | None = None
