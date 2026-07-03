@@ -416,6 +416,37 @@ class LineageImpactResponse(BaseModel):
     impacts: list[LineageImpactItem] = Field(default_factory=list)
 
 
+class LineageColumnTraceItem(BaseModel):
+    """字段链上的一跳:node 为本跳字段,from_node 为它经由的上一跳字段。"""
+
+    node: str
+    table: str
+    column: str
+    from_node: str
+    direction: Literal["upstream", "downstream"]
+    edge_id: str
+    transformation: str | None = None
+    transformation_subtype: str | None = None
+    inferred: bool = False
+    inference_status: str = "confirmed"
+    confidence: float = 1.0
+
+
+class LineageColumnTraceHop(BaseModel):
+    depth: int
+    items: list[LineageColumnTraceItem] = Field(default_factory=list)
+
+
+class LineageColumnTraceResponse(BaseModel):
+    project_id: str
+    focus: str
+    direction: Literal["upstream", "downstream", "both"]
+    max_depth: int
+    truncated: bool
+    hop_count: int
+    hops: list[LineageColumnTraceHop] = Field(default_factory=list)
+
+
 class JobResponse(BaseModel):
     id: str
     kind: str
