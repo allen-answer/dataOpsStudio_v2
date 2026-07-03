@@ -1588,6 +1588,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
         spool_max_bytes=actual_settings.result_store.spool_max_bytes,
         result_ttl_days=actual_settings.result_store.result_ttl_days,
         sql_export_ttl_hours=actual_settings.result_store.sql_export_ttl_hours,
+        upload_ttl_hours=actual_settings.result_store.upload_ttl_hours,
     )
     datasource_loader = PostgresDatasourceLoader(engine)
 

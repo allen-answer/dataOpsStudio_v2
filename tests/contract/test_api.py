@@ -1937,6 +1937,65 @@ def test_lineage_export_rate_limit_returns_429_without_artifact() -> None:
     assert not any(statement.startswith("INSERT INTO") for statement in engine.statements)
 
 
+def test_upload_stores_artifact_and_registers_row() -> None:
+    engine = _FakeEngine([{"id": "project-1"}])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+    content = b"PK\x03\x04-demo-zip-bytes"
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/uploads",
+        headers={**_auth_headers(), "content-type": "application/zip"},
+        params={"purpose": "lineage_batch", "filename": "scripts.zip"},
+        raw_body=content,
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["purpose"] == "lineage_batch"
+    assert payload["filename"] == "scripts.zip"
+    assert payload["bytes"] == len(content)
+    upload_id, name, stored = services.result_store.upload_artifacts[0]
+    assert upload_id == payload["upload_id"]
+    assert name == "scripts.zip"
+    assert stored == content
+    assert any(statement.startswith("INSERT INTO uploads") for statement in engine.statements)
+    assert any(audit["action"] == "upload_create" for audit in services.audits)
+
+
+def test_upload_too_large_returns_413_without_side_effects() -> None:
+    engine = _FakeEngine([{"id": "project-1"}])
+    services = _Services(engine, upload_max_mb=1)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/uploads",
+        headers=_auth_headers(),
+        params={"purpose": "compare_source", "filename": "big.csv"},
+        raw_body=b"x" * (1024 * 1024 + 1),
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"] == "upload_too_large"
+    assert services.result_store.upload_artifacts == []
+    assert not any(statement.startswith("INSERT INTO") for statement in engine.statements)
+
+
+def test_upload_empty_body_rejected() -> None:
+    engine = _FakeEngine([{"id": "project-1"}])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/uploads",
+        headers=_auth_headers(),
+        params={"purpose": "lineage_batch", "filename": "empty.zip"},
+        raw_body=b"",
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "empty_upload"
+
+
 def test_lineage_edge_detail_returns_run_provenance() -> None:
     engine = _FakeEngine(
         [
@@ -3069,6 +3128,7 @@ class _Services:
         metadata_probe_timeout_seconds: int = 5,
         export_per_user_per_hour: int = 10,
         download_url_ttl_seconds: int = 300,
+        upload_max_mb: int = 100,
     ) -> None:
         self.engine = engine
         self.rate_limiter = _RateLimiter()
@@ -3078,6 +3138,7 @@ class _Services:
         self.metadata_probe_timeout_seconds = metadata_probe_timeout_seconds
         self.export_per_user_per_hour = export_per_user_per_hour
         self.download_url_ttl_seconds = download_url_ttl_seconds
+        self.upload_max_mb = upload_max_mb
         self.audits: list[dict[str, object]] = []
 
     def current_license_mode(self) -> LicenseMode:
@@ -3193,10 +3254,15 @@ class _ResultStore:
         self._spool_exists = spool_exists
         self._rows = rows or []
         self.export_artifacts: list[tuple[str, str, bytes]] = []
+        self.upload_artifacts: list[tuple[str, str, bytes]] = []
 
     def put_export_artifact(self, export_id: str, name: str, stream: Any) -> ResultRef:
         self.export_artifacts.append((export_id, name, stream.read()))
         return ResultRef(backend="local_fs", uri=f"exports/{export_id}/{name}")
+
+    def put_upload_artifact(self, upload_id: str, name: str, stream: Any) -> ResultRef:
+        self.upload_artifacts.append((upload_id, name, stream.read()))
+        return ResultRef(backend="local_fs", uri=f"uploads/{upload_id}/{name}")
 
     def spool_ref(self, result_set_id: str) -> ResultRef:
         return ResultRef(backend="local_fs", uri=f"spool/{result_set_id}")

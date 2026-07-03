@@ -82,7 +82,7 @@ def test_all_alembic_revision_ids_under_32_chars() -> None:
     assert not violations, f"revision ID 超 32 字符: {violations}"
 
 
-def test_metadata_has_24_tables() -> None:
+def test_metadata_has_25_tables() -> None:
     expected = {
         "ai_configs",
         "compare_tasks",
@@ -106,6 +106,7 @@ def test_metadata_has_24_tables() -> None:
         "lineage_column_edges",
         "lineage_edges",
         "lineage_runs",
+        "uploads",  # 0019:用户上传登记(血缘批量 ZIP / 对比文件源)
         "workflows",
         "workflow_templates",
     }

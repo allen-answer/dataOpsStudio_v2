@@ -607,6 +607,40 @@ run_index = Table(
 # ─────────────────────────────────────────────────────────────────────────────
 # lineage_runs / lineage_edges / lineage_column_edges —— Lineage 2.3 edge store
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# uploads —— 用户上传文件登记(血缘批量 ZIP / 对比文件源;文件本体在
+# result_store uploads/ 目录,由 upload_ttl_hours GC;行随文件语义过期)
+# ─────────────────────────────────────────────────────────────────────────────
+uploads = Table(
+    "uploads",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column(
+        "project_id",
+        String(36),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "owner_user_id",
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("purpose", String(32), nullable=False),
+    Column("filename", String(255), nullable=False),
+    Column("content_type", String(128), nullable=False),
+    Column("bytes", BigInteger(), nullable=False),
+    Column("storage_uri", Text(), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    CheckConstraint(
+        "purpose IN ('lineage_batch', 'compare_source')",
+        name="purpose_is_supported",
+    ),
+    Index("ix_uploads_project_created", "project_id", "created_at"),
+)
+
+
 lineage_runs = Table(
     "lineage_runs",
     metadata,
@@ -899,6 +933,7 @@ __all__ = [
     "secret_refs",
     "sql_consoles",
     "sql_templates",
+    "uploads",
     "users",
     "workflow_templates",
     "workflows",
