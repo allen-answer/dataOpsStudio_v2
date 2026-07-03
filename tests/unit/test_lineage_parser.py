@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.domain.lineage import (
     LineageParseRequest,
     TransformationKind,
@@ -218,6 +220,54 @@ def test_dm_dialect_parses_oracle_compatible_dml() -> None:
 
     assert report.parse_errors == []
     assert _mapping(report.insert_mappings, "ID", "APP.ORDERS", "ID")
+
+
+def test_postgres_dialect_parses_pg_specific_syntax() -> None:
+    # ::cast 与 ON CONFLICT 是 postgres 专属语法,mysql/oracle reader 均无法解析,
+    # 解析成功即证明真走了 sqlglot postgres 方言(而非白名单外回退)
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text=(
+                "INSERT INTO app.target_orders (id, amount2) "
+                "SELECT o.id::int, o.amount FROM app.orders o "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
+            dialect="postgres",
+            schema=_schema(),
+            default_schema="app",
+        )
+    )
+
+    assert report.parse_errors == []
+    assert _mapping(report.insert_mappings, "id", "app.orders", "id")
+    assert _mapping(report.insert_mappings, "amount2", "app.orders", "amount")
+
+
+def test_postgresql_alias_normalizes_to_postgres() -> None:
+    # datasource.db_type 值是 "postgresql",必须与 sqlglot 方言名 "postgres" 等价
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text="INSERT INTO app.target_orders (id) SELECT id FROM app.orders",
+            dialect="postgresql",
+            schema=_schema(),
+            default_schema="app",
+        )
+    )
+
+    assert report.parse_errors == []
+    assert _mapping(report.insert_mappings, "id", "app.orders", "id")
+
+
+def test_unsupported_dialect_rejected() -> None:
+    with pytest.raises(ValueError, match="lineage dialect"):
+        analyze_sql_lineage(
+            LineageParseRequest(
+                sql_text="SELECT 1",
+                dialect="sqlite",
+                schema=_schema(),
+                default_schema="app",
+            )
+        )
 
 
 def test_ctas_emits_edges_and_column_mappings_for_new_target_table() -> None:

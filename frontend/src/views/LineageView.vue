@@ -42,7 +42,7 @@ import LoadingDots from '../components/LoadingDots.vue'
 type Tab = 'subgraph' | 'impact' | 'analyze'
 
 // 血缘解析器支持的方言(app/domain/lineage/parser.py _normalize_dialect)
-const LINEAGE_DIALECTS: ReadonlySet<string> = new Set(['mysql', 'oracle', 'dm'])
+const LINEAGE_DIALECTS: ReadonlySet<string> = new Set(['mysql', 'oracle', 'dm', 'postgresql'])
 
 // ── SVG 布局常量 ────────────────────────────────────────────────────
 const NODE_W = 176

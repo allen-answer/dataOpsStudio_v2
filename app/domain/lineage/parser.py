@@ -1106,8 +1106,10 @@ def _normalize_dialect(dialect: str) -> str:
     normalized = dialect.lower()
     if normalized in {"dameng"}:
         return "dm"
-    if normalized not in {"mysql", "oracle", "dm"}:
-        raise ValueError("lineage dialect must be mysql, oracle, or dm")
+    if normalized == "postgresql":
+        return "postgres"  # sqlglot 原生方言名
+    if normalized not in {"mysql", "oracle", "dm", "postgres"}:
+        raise ValueError("lineage dialect must be mysql, oracle, dm, or postgres")
     return normalized
 
 
