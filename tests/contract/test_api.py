@@ -1937,6 +1937,102 @@ def test_lineage_export_rate_limit_returns_429_without_artifact() -> None:
     assert not any(statement.startswith("INSERT INTO") for statement in engine.statements)
 
 
+def test_lineage_edge_detail_returns_run_provenance() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            {
+                "id": "edge-1",
+                "run_id": "run-1",
+                "project_id": "project-1",
+                "source_table": "app.src",
+                "target_table": "app.mid",
+                "edge_kind": "table",
+                "inferred": False,
+                "inference_status": "confirmed",
+                "confidence": 1.0,
+                "sql_hash": "hash-1",
+            },
+            {
+                "id": "run-1",
+                "project_id": "project-1",
+                "datasource_id": "ds-1",
+                "dialect": "mysql",
+                "source_ref": "etl/orders.sql",
+                "sql_hash": "hash-1",
+                "sql_text": "INSERT INTO app.mid SELECT * FROM app.src",
+                "parser_version": "sqlglot-w1-v2",
+                "status": "success",
+                "parse_summary": {},
+                "created_at": _dt(1),
+                "updated_at": _dt(1),
+            },
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/lineage/edges/edge-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["edge_id"] == "edge-1"
+    assert payload["edge_kind"] == "table"
+    assert payload["source_table"] == "app.src"
+    assert payload["target_table"] == "app.mid"
+    assert payload["run"]["run_id"] == "run-1"
+    assert payload["run"]["source_ref"] == "etl/orders.sql"
+    assert payload["run"]["sql_text"] == "INSERT INTO app.mid SELECT * FROM app.src"
+
+
+def test_lineage_edge_detail_null_sql_text_for_legacy_runs() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            {
+                "id": "edge-1",
+                "run_id": "run-1",
+                "project_id": "project-1",
+                "source_table": "app.src",
+                "target_table": "app.mid",
+                "edge_kind": "table",
+                "inferred": True,
+                "inference_status": "inferred",
+                "confidence": 0.8,
+                "sql_hash": "hash-1",
+            },
+            {
+                "id": "run-1",
+                "project_id": "project-1",
+                "datasource_id": "ds-1",
+                "dialect": "mysql",
+                "source_ref": "etl/orders.sql",
+                "sql_hash": "hash-1",
+                "sql_text": None,  # 0018 前的旧 run
+                "parser_version": "sqlglot-w1-v2",
+                "status": "success",
+                "parse_summary": {},
+                "created_at": _dt(1),
+                "updated_at": _dt(1),
+            },
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/lineage/edges/edge-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["inferred"] is True
+    assert payload["confidence"] == 0.8
+    assert payload["run"]["sql_text"] is None
+
+
 def test_lineage_column_trace_contract_returns_hop_chain() -> None:
     engine = _FakeEngine(
         [

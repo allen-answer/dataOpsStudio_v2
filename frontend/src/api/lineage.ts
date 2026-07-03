@@ -183,6 +183,44 @@ export function updateLineageEdge(
   )
 }
 
+/** 锚 schemas.py LineageEdgeRunInfo(sql_text 在 0018 前的旧 run 为 null)。 */
+export interface LineageEdgeRunInfo {
+  run_id: string
+  source_ref: string
+  dialect: string
+  created_at: string
+  sql_text: string | null
+}
+
+/** 锚 schemas.py LineageEdgeDetailResponse。 */
+export interface LineageEdgeDetailResponse {
+  edge_id: string
+  edge_kind: 'table' | 'column'
+  source_table: string
+  source_column: string | null
+  target_table: string
+  target_column: string | null
+  transformation: string | null
+  transformation_subtype: string | null
+  inferred: boolean
+  inference_status: string
+  confidence: number
+  run: LineageEdgeRunInfo | null
+}
+
+/**
+ * GET /projects/{pid}/lineage/edges/{edge_id} —— 边详情(边抽屉):
+ * 边元数据 + 所属解析 run 溯源(source_ref / dialect / SQL 原文)。
+ */
+export function getLineageEdgeDetail(
+  projectId: string,
+  edgeId: string,
+): Promise<LineageEdgeDetailResponse> {
+  return apiClient.get<LineageEdgeDetailResponse>(
+    `/projects/${projectId}/lineage/edges/${edgeId}`,
+  )
+}
+
 /** 锚 schemas.py LineageExportRequest —— 与 subgraph 端点同参(POST body 形态)。 */
 export interface LineageExportRequest {
   focus: string

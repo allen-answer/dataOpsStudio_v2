@@ -70,8 +70,10 @@ from app.api.schemas import (
     LineageColumnTraceItem,
     LineageColumnTraceResponse,
     LineageDirection,
+    LineageEdgeDetailResponse,
     LineageEdgeInferenceResponse,
     LineageEdgeInferenceUpdateRequest,
+    LineageEdgeRunInfo,
     LineageExportRequest,
     LineageImpactItem,
     LineageImpactResponse,
@@ -2434,6 +2436,7 @@ def analyze_project_lineage(
                 dialect=dialect,
                 source_ref=body.source_ref,
                 sql_hash=sql_hash,
+                sql_text=body.sql_text,
                 parser_version=LINEAGE_PARSER_VERSION,
                 status="success",
                 parse_summary=parse_summary,
@@ -2706,6 +2709,60 @@ def get_lineage_column_trace(
             direction=direction,
             max_depth=min(max_depth, 5),
         )
+
+
+@router.get(
+    "/projects/{project_id}/lineage/edges/{edge_id}",
+    response_model=LineageEdgeDetailResponse,
+)
+def get_lineage_edge_detail(
+    project_id: str,
+    edge_id: str,
+    request: Request,
+) -> LineageEdgeDetailResponse:
+    """边详情(UX P0-L1 边抽屉):边元数据 + 所属解析 run 的溯源(含 SQL 原文)。
+
+    回答"这条边为什么存在"——对标 OpenMetadata 边详情 / Atlan process 侧栏。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        edge_table, row = _lineage_edge_row(conn, edge_id)
+        if row is None or str(row["project_id"]) != project_id:
+            raise ApiError(404, "not_found", "Lineage edge not found")
+        run_row = (
+            conn.execute(select(lineage_runs).where(lineage_runs.c.id == str(row["run_id"])))
+            .mappings()
+            .one_or_none()
+        )
+    edge = dict(row)
+    edge_kind: Literal["table", "column"] = "table" if edge_table is lineage_edges else "column"
+    run_info = (
+        LineageEdgeRunInfo(
+            run_id=str(run_row["id"]),
+            source_ref=str(run_row["source_ref"]),
+            dialect=str(run_row["dialect"]),
+            created_at=run_row["created_at"],
+            sql_text=_optional_str(run_row.get("sql_text")),
+        )
+        if run_row is not None
+        else None
+    )
+    return LineageEdgeDetailResponse(
+        edge_id=edge_id,
+        edge_kind=edge_kind,
+        source_table=str(edge["source_table"]),
+        source_column=_optional_str(edge.get("source_column")),
+        target_table=str(edge["target_table"]),
+        target_column=_optional_str(edge.get("target_column")),
+        transformation=_optional_str(edge.get("transformation")),
+        transformation_subtype=_optional_str(edge.get("transformation_subtype")),
+        inferred=bool(edge["inferred"]),
+        inference_status=str(edge["inference_status"]),
+        confidence=float(edge["confidence"]),
+        run=run_info,
+    )
 
 
 @router.patch(

@@ -626,6 +626,8 @@ lineage_runs = Table(
     Column("dialect", String(32), nullable=False),
     Column("source_ref", Text(), nullable=False),
     Column("sql_hash", String(64), nullable=False),
+    # 边抽屉"这条边为什么存在"的 SQL 原文;0018 前的旧 run 为 NULL(前端显示未存档)
+    Column("sql_text", Text(), nullable=True),
     Column("parser_version", String(64), nullable=False),
     Column("status", String(32), nullable=False),
     Column("parse_summary", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),

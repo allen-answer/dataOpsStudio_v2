@@ -278,6 +278,7 @@ class LineageCatalogLike(Protocol):
         dialect: str,
         source_ref: str,
         sql_hash: str,
+        sql_text: str,
         report: LineageReport,
     ) -> None: ...
 
@@ -948,6 +949,7 @@ class WorkerRunner:
             dialect=dialect,
             source_ref=source_ref,
             sql_hash=sql_hash,
+            sql_text=sql_text,
             report=report,
         )
         self._heartbeat(job.id)
@@ -1485,6 +1487,7 @@ class PostgresLineageCatalog:
         dialect: str,
         source_ref: str,
         sql_hash: str,
+        sql_text: str,
         report: LineageReport,
     ) -> None:
         now = datetime.now(UTC)
@@ -1539,6 +1542,7 @@ class PostgresLineageCatalog:
                     dialect=dialect,
                     source_ref=source_ref,
                     sql_hash=sql_hash,
+                    sql_text=sql_text,
                     parser_version=LINEAGE_PARSER_VERSION,
                     status="success",
                     parse_summary=parse_summary,
