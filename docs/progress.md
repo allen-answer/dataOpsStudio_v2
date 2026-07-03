@@ -11,21 +11,29 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| 生产部署 433f087(Lineage/Workflow/DB2/PG/导出/心跳全量上线) | Fable 5 | #78–#98 全部已合并 | 已完成(2026-07-02) | 本 PR 记录 |
-| 2.3.0 Lineage + 2.4.0 Workflow 真机走查(带登录深走) | 待人排期(需 admin 凭据) | 生产部署 433f087 | 未开工 | — |
-| Workflow PR-4b cron tick(定时触发) | 待出任务书 | #92 | 未开工 | — |
-| Workflow PR-0 ADR-0009 + 版本口径订正 | Claude 子代理(Fable 5 复核) | — | 已合并 | [#85](https://github.com/allen-answer/dataOpsStudio_v2/pull/85) |
-| Workflow PR-1 领域模型(WorkflowSpec/Node/Edge/RetryPolicy + R7 构造期校验) | Claude 子代理(Fable 5 复核) | ADR-0009 | 已合并 | [#86](https://github.com/allen-answer/dataOpsStudio_v2/pull/86) |
-| Workflow PR-2 持久化(workflows/workflow_templates 表 + 0016 迁移) | Claude 子代理(Fable 5 复核) | #86 | 已合并 | [#87](https://github.com/allen-answer/dataOpsStudio_v2/pull/87) |
-| Workflow PR-3 定义 API(CRUD + R7 门禁) | Claude 子代理(Fable 5 复核) | #87 | 已合并 | [#88](https://github.com/allen-answer/dataOpsStudio_v2/pull/88) |
-| DB2 PR-A adapter 核心(连接/流式/超时/探活/factory 分发) | Claude 子代理(Fable 5 复核) | 1.x 移植 | 已合并 | [#89](https://github.com/allen-answer/dataOpsStudio_v2/pull/89) |
-| DB2 PR-B introspection(SYSCAT.* 元数据 + 类型映射) | Claude 子代理(Fable 5 复核) | #89 | 已合并 | [#91](https://github.com/allen-answer/dataOpsStudio_v2/pull/91) |
-| Workflow PR-5 migrate 实迁 workflows(禁止节点报错不静默丢弃) | Codex(Fable 5 复核) | #86 #87 | 已合并 | [#90](https://github.com/allen-answer/dataOpsStudio_v2/pull/90) |
-| Workflow PR-4 DAG 执行器 + run 端点(cron tick 归 PR-4b) | Claude 子代理(Fable 5 复核) | #88 | 已合并 | [#92](https://github.com/allen-answer/dataOpsStudio_v2/pull/92) |
-| Compare 结果导出端点 + 前端按钮 | Codex(Fable 5 复核) | docs/backlog.md 2.2.x debt | 已合并 | [#96](https://github.com/allen-answer/dataOpsStudio_v2/pull/96) |
-| PostgreSQL worker adapter | Codex(Fable 5 复核) | docs/backlog.md T7 section 4 | 已合并 | [#98](https://github.com/allen-answer/dataOpsStudio_v2/pull/98) |
-| Worker 独立心跳线程(F2) | Codex(Fable 5 复核) | docs/backlog.md F2 | 已合并 | [#97](https://github.com/allen-answer/dataOpsStudio_v2/pull/97) |
+| UX-1 Compare 结果页重构(三层漏斗+四状态卡+差异列开关) | Claude 子代理(Fable 5 复核) | #107 方案 P0-C1/C2 | 进行中 | — |
+| UX-2 批次(懒展开 / 差异行 SQL / 主键预检) | Fable 5 | #107 方案 | 未开工 | — |
+| 真机深走查(Lineage/Workflow/Compare 新面,带登录) | 待人排期(需 admin 凭据) | 下次生产部署 | 未开工 | — |
+| 生产部署(#99–#109 增量:收口件+UX-1,含迁移 0018) | 待排期 | UX-1 合并后 | 未开工 | — |
+| Workflow PR-4b cron tick(定时触发) | 任务书已出,待转 Codex | #92 | 未开工 | — |
+| 2.5.0 两大档拍板(Lineage 深度报告 vs Compare 文件源) | 待人拍板 | 差距矩阵 §三 | 未开工 | — |
 
+> **★ 差距收口 + UX 优化第一波(2026-07-02/03 全部合并)**:
+> 1.x vs 2.0 差距测绘立项底稿([#100](https://github.com/allen-answer/dataOpsStudio_v2/pull/100),
+> 三路考古,含两处伪差距更正);收口件七连 —— 血缘 postgres 方言
+> ([#101](https://github.com/allen-answer/dataOpsStudio_v2/pull/101))、任务复制
+> ([#102](https://github.com/allen-answer/dataOpsStudio_v2/pull/102))、推断边确认/拒绝 UI
+> ([#103](https://github.com/allen-answer/dataOpsStudio_v2/pull/103))、字段多跳追溯 API
+> ([#104](https://github.com/allen-answer/dataOpsStudio_v2/pull/104))、历史列表+数据预览后端
+> ([#105](https://github.com/allen-answer/dataOpsStudio_v2/pull/105),顺带抽 sql_build 共享模块)、
+> 血缘 xlsx 导出([#106](https://github.com/allen-answer/dataOpsStudio_v2/pull/106))、
+> Compare 前端收口 SQL 引用/历史/预览/列编辑器
+> ([#109](https://github.com/allen-answer/dataOpsStudio_v2/pull/109),纯 SQL 任务闭环打通)。
+> 体验优化:对标调研方案落档([#107](https://github.com/allen-answer/dataOpsStudio_v2/pull/107),
+> Datafold/SQLMesh/OpenMetadata/DataHub 等 11 家)+ UX-1 血缘边详情抽屉/图内定位
+> ([#108](https://github.com/allen-answer/dataOpsStudio_v2/pull/108),迁移 0018 存 SQL 原文)。
+> 全部 Claude 侧完成(子代理开发 + Fable 5 复核/代修),Codex 未参与本波。
+>
 > **★ 生产部署 433f087(2026-07-02,Fable 5 按 upgrade-in-place.md 执行)**:
 > d7218ef → 433f087(#78–#98 全量:2.3.0 Lineage、2.4.0 Workflow PR0–5、DB2 PR-A/B、
 > PostgreSQL adapter、Compare 导出、Worker 心跳线程)。迁移 0015/0016/0017 干净应用;
