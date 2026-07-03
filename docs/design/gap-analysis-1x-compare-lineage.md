@@ -32,9 +32,9 @@
 | # | 1.x 功能 | 1.x 位置 | 2.0 现状 | 建议 |
 |---|---|---|---|---|
 | C-1 | **文件源对比**:Excel/CSV/Parquet 与 SQL 任意两两组合(上传+sheet/编码/表头行配置) | `app/models/compare.py:59-95`、`app/readers/` | 只支持库↔库 | 独立 wave:readers 层移植(Excel/CSV 优先,Parquet 次之),复用现 4 桶内核 |
-| C-2 | **自定义 SQL 对比的前端入口 + 单 SQL 便捷模式** | `compare.py:135-192` | 后端 `kind="sql"` 已通(见上表),但前端 editor 只有表引用编辑;1.x"单 SQL 双库各跑"便捷模式无对应 | 小件:前端 ref 编辑加 table/sql 切换;单 SQL 模式=前端把同段 SQL 填两侧 |
-| C-3 | **历史记录管理**:run 列表/分页/按任务过滤/删除/多 run 合并导出一个多 sheet Excel | `app/api/history.py`、`HistoryView.vue` | 只能按 run_id 单查,无任务历史列表端点与页面 | 小件:GET tasks/{id}/runs + 历史页;合并导出复用 #96 通道 |
-| C-4 | **数据预览**:不落任务先预览两侧前 N 行/列名(选主键/映射前先看数据) | `app/api/uploads.py:43-177` | 无 | 小件:preview 端点(≤200 行,复用 adapter 流式) |
+| C-2 | 自定义 SQL 对比前端入口 + 单 SQL 便捷模式 + 列/主键编辑器 | `compare.py:135-192` | **已补**([#109](https://github.com/allen-answer/dataOpsStudio_v2/pull/109),纯 SQL 任务闭环打通) | 已完成 |
+| C-3 | 历史记录管理:run 列表/分页/复用结果页 | `app/api/history.py` | **已补**(后端 [#105](https://github.com/allen-answer/dataOpsStudio_v2/pull/105) + 前端 [#109](https://github.com/allen-answer/dataOpsStudio_v2/pull/109));多 run 合并导出未做,需求出现再议 | 主体完成 |
+| C-4 | 数据预览(≤200 行,选主键/映射前先看数据) | `app/api/uploads.py:43-177` | **已补**(后端 [#105](https://github.com/allen-answer/dataOpsStudio_v2/pull/105) + 前端 [#109](https://github.com/allen-answer/dataOpsStudio_v2/pull/109)) | 已完成 |
 | ~~C-5~~ | ~~规则补齐~~ | — | **撤销:复核实证 2.0 已全有**(见上表) | — |
 | C-6 | **任务复制**(clone) | `api/tasks.py` | ~~无~~ → **已补**([#102](https://github.com/allen-answer/dataOpsStudio_v2/pull/102)) | 已完成 |
 
@@ -75,10 +75,10 @@
 | L-2 | **多脚本批量分析**:多文件/ZIP 上传、每文件读写表、跨脚本依赖 script_edges、汇总数据流 | `app/lineage/batch_analyzer.py` | 单 SQL 粘贴 | 2.5.0 主件:批量是 1.x 用户的核心工作流 |
 | L-3 | **存储过程深度解析**:PROCEDURE/PACKAGE 体按 DML 段切开(保留业务标题注释+行号)、`FOR rec IN(SELECT)` 游标补链、动态 SQL(EXECUTE IMMEDIATE)识别告警、脚本变量 `${var}`/PL/SQL 局部变量识别 | `app/lineage/segments.py`(1099 行)、`variables.py` | 仅 `split_plsql_statements` 简单拆分 | 2.5.0 主件:与 L-2 同 wave(1.x 语义逐条对照移植) |
 | L-4 | **语义血缘视图**:目标表整合视图、刷新模式识别(DELETE+INSERT 全量重刷/append/merge)、表角色标注(target/intermediate/source_fact/remote_dblink + config/reference/dimension)、observations 人话观察、风险点 | `semantic.py`、`roles.py`、`aggregation.py` | 无 | 2.5.0:报告深度的差距大头 |
-| L-5 | **报告导出**:JSON + 多 sheet Excel(12 类 sheet:总览/脚本/过程段/解析失败/动态SQL/数据流/跨脚本依赖/字段映射/风险/AI 推断) | `services/lineage_exporter.py` | 无任何导出 | 2.3.x:先复用 #96 导出通道出基础版(边/影响/parse_errors 三 sheet) |
+| L-5 | 报告导出(1.x 是 12 类 sheet 的批量版) | `services/lineage_exporter.py` | **基础版已补**([#106](https://github.com/allen-answer/dataOpsStudio_v2/pull/106),子图+影响三 sheet);12 类 sheet 完整版随 L-2/L-3 批量档一起 | 基础版完成 |
 | L-6 | **边 confirm/reject 前端入口** | (2.0 独有后端) | ~~前端零调用~~ → **已补**([#103](https://github.com/allen-answer/dataOpsStudio_v2/pull/103),子图 tab 待审核面板) | 已完成 |
 | L-7 | **AI 增强(enrichment)**:整份报告的 AI 解读,严格只增不改;AI 配置管理页(provider/model/key Fernet 落盘 + step-up 认证) | `lineage_ai.py`(988 行)、`lineage_ai_config.py` | 只有 AI 兜底解析;AI Gateway 有但无 admin 配置 UI | 2.6.0 Copilot 域顺延(与 Copilot 共用配置面) |
-| L-8 | **字段多跳追溯 API**:给定(表,字段)返回上下游字段链(hop/from 链式) | `api/assets.py` column-lineage | 列级子图有,链式形态无 | 2.3.x 小件:CTE 已有,加个输出形态;同时是 C-8 trace_compare 的前置 |
+| L-8 | 字段多跳追溯 API(hop/from 链式) | `api/assets.py` column-lineage | **已补**([#104](https://github.com/allen-answer/dataOpsStudio_v2/pull/104),column-trace 端点);前端视图归 UX P2-L7 | API 完成 |
 
 ### 缺失 — P2(可视化/生态,独立排期)
 
@@ -100,7 +100,7 @@ A→B 路径查询、真正的跨源血缘图(DB Link 仅识别标注)、血缘�
 
 | 档 | 内容 | 版本建议 | 体量 |
 |---|---|---|---|
-| **立即(收口窗口)** | ~~L-1 postgres~~(#101 ✅)、~~L-6 confirm/reject UI~~(#103 ✅)、~~C-6 复制~~(#102 ✅)、~~C-5~~(伪差距撤销);剩 L-5 基础导出、L-8 字段链 API、C-2 前端 SQL ref 入口、C-3 历史页、C-4 预览 | 2.3.x + 2.2.x 补丁 | 全是小件,1–2 个 PR 批 |
+| **立即(收口窗口)** | **全部完成(2026-07-03)**:L-1 #101、L-6 #103、C-6 #102、L-8 #104、C-3/C-4 #105+#109、L-5 基础版 #106、C-2 #109;C-5 伪差距撤销 | ✅ 收口档清零 | — |
 | **Workflow 域顺延** | PR-4b cron tick(已出任务书)、C-7 节点参数化、C-9 通知、C-10 sensor | 2.4.0–2.4.x | 中 |
 | **批量血缘大档** | L-2 批量/ZIP、L-3 存储过程深度、L-4 语义视图 | **2.5.0 立项**(建议命名"Lineage 深度报告") | 大(1.x 对照移植,segments.py 1099 行) |
 | **对比输入形态大档** | C-1 文件源(Excel/CSV/Parquet) | **2.5.0 或 2.5.x** | 大(readers 层) |
