@@ -203,6 +203,7 @@ def test_lineage_edge_store_schema_supports_adjacency_traversal() -> None:
         "dialect",
         "source_ref",
         "sql_hash",
+        "sql_text",  # 0018:边抽屉溯源用的 SQL 原文
         "parser_version",
         "status",
         "parse_summary",
