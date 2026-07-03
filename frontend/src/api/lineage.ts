@@ -14,6 +14,9 @@
  *      direction 默认 downstream;max_depth 默认 3(ge=1 le=5,后端再 min(,5))
  *      focus 未知不 404 —— 返回只含焦点节点的空图(edge_count=0)
  *    GET /projects/{pid}/lineage/impact?focus=&max_depth=  (纯下游遍历,按 depth 分组)
+ *    POST /projects/{pid}/lineage/export body {focus, direction, max_depth, include_columns}
+ *      同步生成 xlsx(三 sheet:table_edges / column_edges / impact),201 返回
+ *      一次性下载 token(GET /exports/{token} 取文件;429 export_rate_limited)
  *    PATCH /projects/{pid}/lineage/edges/{edge_id} body {"inference_status": ...}
  *      AI 推断边状态机(inferred → confirmed / rejected);非 inferred 起点返回
  *      409 invalid_inference_transition;rejected 边被子图/影响 CTE 排除
@@ -178,6 +181,34 @@ export function updateLineageEdge(
     `/projects/${projectId}/lineage/edges/${edgeId}`,
     { inference_status: status },
   )
+}
+
+/** 锚 schemas.py LineageExportRequest —— 与 subgraph 端点同参(POST body 形态)。 */
+export interface LineageExportRequest {
+  focus: string
+  direction?: LineageDirection
+  max_depth?: number
+  include_columns?: boolean
+}
+
+/** 锚 schemas.py ExportCreateResponse(与 sql / compare 导出同形)。 */
+export interface LineageExportResponse {
+  job_id: string
+  download_token: string
+  expires_at: string
+  format: string
+  filename: string
+}
+
+/**
+ * POST /projects/{pid}/lineage/export —— 同步生成焦点子图 + 影响分析 xlsx,
+ * 201 返回一次性 token;下载复用 GET /exports/{token}(api/metadata.ts downloadExport)。
+ */
+export function exportLineage(
+  projectId: string,
+  req: LineageExportRequest,
+): Promise<LineageExportResponse> {
+  return apiClient.post<LineageExportResponse>(`/projects/${projectId}/lineage/export`, req)
 }
 
 export function getLineageImpact(

@@ -507,6 +507,11 @@ export default {
     subgraph_empty_hint: 'This focus has no lineage edges. The project may not have analyzed any SQL yet — submit statements in "SQL analyze" first, or try another focus table.',
     go_analyze: 'Go to SQL analyze',
     error_focus_required: 'Enter a focus table',
+    // subgraph export (L-5)
+    export_excel: 'Export Excel',
+    exporting: 'Exporting…',
+    export_rate_limited: 'Export rate limit reached (10/hour). Try again later.',
+    export_token_spent: 'Download link was already used or expired — export again.',
     // impact
     impact_focus: 'Focus table / column',
     impact_run: 'Analyze downstream impact',
