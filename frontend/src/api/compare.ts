@@ -322,6 +322,10 @@ export function deleteCompareTask(taskId: string): Promise<void> {
   return apiClient.delete<void>(`/compare/tasks/${taskId}`)
 }
 
+export function cloneCompareTask(taskId: string): Promise<CompareTaskResponse> {
+  return apiClient.post<CompareTaskResponse>(`/compare/tasks/${encodeURIComponent(taskId)}/clone`)
+}
+
 export function inferCompareTask(
   projectId: string,
   req: CompareInferRequest,

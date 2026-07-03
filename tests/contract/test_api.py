@@ -795,6 +795,39 @@ def test_compare_task_create_persists_explicit_rules_contract() -> None:
     assert any(audit["action"] == "compare_task_create" for audit in services.audits)
 
 
+def test_compare_task_clone_copies_config_with_deduped_name() -> None:
+    cloned_row = _compare_task_row()
+    cloned_row["id"] = "task-2"
+    cloned_row["name"] = "orders (copy)"
+    engine = _FakeEngine(
+        [
+            _compare_task_row(),  # 源任务(归属校验前查询)
+            {"id": "project-1"},  # 项目授权
+            [{"name": "orders"}],  # 项目内已有任务名(去重用)
+            cloned_row,  # 插入后回读
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/compare/tasks/task-1/clone",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["id"] == "task-2"
+    assert payload["name"] == "orders (copy)"
+    assert payload["compare_rules"]["key_columns"] == ["id"]
+    assert payload["run_limits"]["bisection_factor"] == 8
+    insert_statement = next(
+        statement for statement in engine.statements if "INSERT INTO compare_tasks" in statement
+    )
+    assert insert_statement
+    assert any(audit["action"] == "compare_task_clone" for audit in services.audits)
+
+
 def test_compare_infer_contract_returns_mapping_confidence_and_pk_draft() -> None:
     source_row = _datasource_row()
     source_row["id"] = "ds-source"
