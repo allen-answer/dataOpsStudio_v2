@@ -61,6 +61,9 @@ from app.api.schemas import (
     LineageAiFallbackResult,
     LineageAnalyzeRequest,
     LineageAnalyzeResponse,
+    LineageColumnTraceHop,
+    LineageColumnTraceItem,
+    LineageColumnTraceResponse,
     LineageDirection,
     LineageEdgeInferenceResponse,
     LineageEdgeInferenceUpdateRequest,
@@ -2361,6 +2364,45 @@ def get_lineage_impact(
         )
 
 
+@router.get(
+    "/projects/{project_id}/lineage/column-trace",
+    response_model=LineageColumnTraceResponse,
+)
+def get_lineage_column_trace(
+    project_id: str,
+    request: Request,
+    focus: str = _LINEAGE_FOCUS_QUERY,
+    direction: LineageDirection = _LINEAGE_DIRECTION_QUERY,
+    max_depth: int = _LINEAGE_DEPTH_QUERY,
+) -> LineageColumnTraceResponse:
+    """字段多跳追溯(1.x column-lineage 链式形态):给定 table.column,
+    返回按 hop 分组的上/下游字段链,每项带 from_node(经由的上一跳)。
+
+    与子图端点同一套列级 CTE(ADR-0019:聚焦递归,不整图加载),
+    差别只在输出形态 —— 链式列表(供列表展示与 trace_compare 前置)。
+    """
+    table, column = _lineage_split_column_focus(focus)
+    if column is None:
+        raise ApiError(
+            400,
+            "column_focus_required",
+            "focus must be a table.column reference, e.g. app.orders.id",
+        )
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        return _lineage_column_trace_response(
+            conn,
+            project_id=project_id,
+            focus=focus,
+            focus_table=table,
+            focus_column=column,
+            direction=direction,
+            max_depth=min(max_depth, 5),
+        )
+
+
 @router.patch(
     "/projects/{project_id}/lineage/edges/{edge_id}",
     response_model=LineageEdgeInferenceResponse,
@@ -4576,6 +4618,81 @@ def _lineage_impact_response(
         truncated=truncated,
         impact_count=len(impacts),
         impacts=impacts,
+    )
+
+
+def _lineage_column_trace_response(
+    conn: Connection,
+    *,
+    project_id: str,
+    focus: str,
+    focus_table: str,
+    focus_column: str,
+    direction: str,
+    max_depth: int,
+) -> LineageColumnTraceResponse:
+    focus_ref = {"kind": "column", "table": focus_table, "column": focus_column, "node": focus}
+    directions: list[Literal["upstream", "downstream"]] = (
+        ["upstream", "downstream"]
+        if direction == "both"
+        else [cast(Literal["upstream", "downstream"], direction)]
+    )
+    truncated = False
+    by_depth: dict[int, list[LineageColumnTraceItem]] = {}
+    seen: set[tuple[int, str, str, str]] = set()
+    for walk_direction in directions:
+        rows = _lineage_walk_rows(
+            conn,
+            project_id=project_id,
+            focus_ref=focus_ref,
+            direction=walk_direction,
+            max_depth=max_depth,
+        )
+        truncated = truncated or any(int(row["depth"]) > max_depth for row in rows)
+        for row in rows:
+            depth = int(row["depth"])
+            if depth > max_depth:
+                continue
+            # 链式语义:本跳节点 = 走向端,from = 经由端(上一跳)
+            if walk_direction == "downstream":
+                node, from_node = str(row["target"]), str(row["source"])
+            else:
+                node, from_node = str(row["source"]), str(row["target"])
+            key = (depth, walk_direction, node, from_node)
+            if key in seen:
+                continue
+            seen.add(key)
+            table, column = _lineage_split_column_focus(node)
+            by_depth.setdefault(depth, []).append(
+                LineageColumnTraceItem(
+                    node=node,
+                    table=table,
+                    column=column or "",
+                    from_node=from_node,
+                    direction=walk_direction,
+                    edge_id=str(row["edge_id"]),
+                    transformation=_optional_str(row.get("transformation")),
+                    transformation_subtype=_optional_str(row.get("transformation_subtype")),
+                    inferred=bool(row.get("inferred")),
+                    inference_status=str(row.get("inference_status") or "confirmed"),
+                    confidence=float(row.get("confidence") or 1.0),
+                )
+            )
+    hops = [
+        LineageColumnTraceHop(
+            depth=depth,
+            items=sorted(by_depth[depth], key=lambda item: (item.direction, item.node)),
+        )
+        for depth in sorted(by_depth)
+    ]
+    return LineageColumnTraceResponse(
+        project_id=project_id,
+        focus=focus,
+        direction=cast(Literal["upstream", "downstream", "both"], direction),
+        max_depth=max_depth,
+        truncated=truncated,
+        hop_count=len(hops),
+        hops=hops,
     )
 
 
