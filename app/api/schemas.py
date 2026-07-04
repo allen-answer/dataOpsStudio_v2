@@ -430,6 +430,19 @@ class LineageEdgeInferenceResponse(BaseModel):
     confidence: float
 
 
+UploadPurpose = Literal["lineage_batch", "compare_source"]
+
+
+class UploadResponse(BaseModel):
+    upload_id: str
+    project_id: str
+    purpose: UploadPurpose
+    filename: str
+    content_type: str
+    bytes: int
+    created_at: datetime
+
+
 class LineageEdgeRunInfo(BaseModel):
     """边所属解析 run 的溯源信息(边抽屉用)。sql_text 在 0018 前的旧 run 为 NULL。"""
 

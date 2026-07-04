@@ -103,6 +103,8 @@ from app.api.schemas import (
     SqlTemplateResponse,
     SqlTemplateUpdateRequest,
     TokenResponse,
+    UploadPurpose,
+    UploadResponse,
     WorkflowCreateRequest,
     WorkflowListItem,
     WorkflowResponse,
@@ -130,6 +132,7 @@ from app.db.models import (
     run_index,
     sql_consoles,
     sql_templates,
+    uploads,
     users,
     workflows,
 )
@@ -209,6 +212,8 @@ _EXPORT_FORMATS = frozenset({"csv", "excel", "json", "sql"})
 # 50MB 上限只是防御性护栏,正常子图导出远小于此。
 _LINEAGE_EXPORT_LIMIT_BYTES = 50 * 1024 * 1024
 _COMPARE_BUCKET_QUERY = Query(default="diff")
+_UPLOAD_PURPOSE_QUERY = Query()
+_UPLOAD_FILENAME_QUERY = Query(min_length=1, max_length=255)
 _LINEAGE_FOCUS_QUERY = Query(min_length=1)
 _LINEAGE_DIRECTION_QUERY = Query(default="downstream")
 _LINEAGE_DEPTH_QUERY = Query(default=3, ge=1, le=5)
@@ -1927,6 +1932,83 @@ def _preview_value(value: object) -> object:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     return str(value)
+
+
+@router.post(
+    "/projects/{project_id}/uploads",
+    response_model=UploadResponse,
+    status_code=201,
+)
+async def create_upload(
+    project_id: str,
+    request: Request,
+    purpose: UploadPurpose = _UPLOAD_PURPOSE_QUERY,
+    filename: str = _UPLOAD_FILENAME_QUERY,
+) -> UploadResponse:
+    """通用文件上传(血缘批量 ZIP / 对比文件源共用地基)。
+
+    原始 body 上传(octet-stream + query 传 filename/purpose),不引 multipart
+    依赖 —— 前后端都是自己的,fetch(blob) 即可。流式落盘边写边限额
+    (upload_max_mb,超限 413 不落盘);文件本体进 result_store uploads/
+    目录(upload_ttl_hours GC),uploads 表登记所有权与元信息。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+    limit_bytes = services.upload_max_mb * 1024 * 1024
+    upload_id = new_id()
+    total_bytes = 0
+    with tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024, mode="w+b") as buffer:
+        async for chunk in request.stream():
+            total_bytes += len(chunk)
+            if total_bytes > limit_bytes:
+                raise ApiError(
+                    413,
+                    "upload_too_large",
+                    f"Upload exceeds {services.upload_max_mb} MB limit",
+                )
+            buffer.write(chunk)
+        if total_bytes == 0:
+            raise ApiError(400, "empty_upload", "Upload body is empty")
+        buffer.seek(0)
+        ref = services.result_store.put_upload_artifact(upload_id, filename, cast(BinaryIO, buffer))
+    content_type = (request.headers.get("content-type") or "application/octet-stream")[:128]
+    now = datetime.now(UTC)
+    with services.engine.begin() as conn:
+        conn.execute(
+            insert(uploads).values(
+                id=upload_id,
+                project_id=project_id,
+                owner_user_id=user.id,
+                purpose=purpose,
+                filename=filename,
+                content_type=content_type,
+                bytes=total_bytes,
+                storage_uri=ref.uri,
+                created_at=now,
+            )
+        )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="upload_create",
+        resource_type="upload",
+        resource_id=upload_id,
+        result="success",
+        detail={"purpose": purpose, "filename": filename, "bytes": total_bytes},
+    )
+    return UploadResponse(
+        upload_id=upload_id,
+        project_id=project_id,
+        purpose=purpose,
+        filename=filename,
+        content_type=content_type,
+        bytes=total_bytes,
+        created_at=now,
+    )
 
 
 @router.patch("/compare/tasks/{task_id}", response_model=CompareTaskResponse)
