@@ -527,6 +527,8 @@ export default {
     tab_batch: 'Batch',
     // batch (L-2: upload ZIP -> per-file lenient parse -> summary report)
     batch_hint: 'Upload a ZIP of SQL scripts; each file is parsed for lineage and cross-script dependencies are summarized. Falls back to table-level lineage when metadata is missing.',
+    batch_no_db: 'No database (text-only import)',
+    batch_no_db_hint: 'No datasource — parse scripts to table-level lineage only; the report is not persisted as a queryable subgraph.',
     batch_file: 'SQL scripts ZIP',
     batch_file_too_large: 'File exceeds the 100 MB limit',
     batch_required: 'Select a datasource and upload a ZIP file',

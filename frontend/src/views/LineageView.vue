@@ -480,7 +480,9 @@ const BATCH_POLL_MS = 2000
 
 type BatchPhase = 'idle' | 'uploading' | 'running' | 'done' | 'failed'
 
+// batchDsId === '' 表示「无数据库(纯文本导入)」;此时用 batchManualDialect
 const batchDsId = ref('')
+const batchManualDialect = ref('oracle')
 const batchDefaultSchema = ref('')
 const batchFile = ref<File | null>(null)
 const batchPhase = ref<BatchPhase>('idle')
@@ -491,12 +493,18 @@ const batchReport = ref<LineageBatchReport | null>(null)
 const expandedFiles = ref<Set<string>>(new Set())
 let batchPollTimer: ReturnType<typeof setTimeout> | null = null
 
+const BATCH_DIALECTS = ['mysql', 'oracle', 'dm', 'postgresql'] as const
+
 watch(datasources, (list) => {
   if (!batchDsId.value && list.length > 0) batchDsId.value = list[0].id
 })
 
-const batchDialect = computed(
-  () => datasources.value.find((ds) => ds.id === batchDsId.value)?.db_type ?? '',
+const batchNoDb = computed(() => batchDsId.value === '')
+// 有库:方言跟随数据源;无库:用户手选
+const batchDialect = computed(() =>
+  batchNoDb.value
+    ? batchManualDialect.value
+    : (datasources.value.find((ds) => ds.id === batchDsId.value)?.db_type ?? ''),
 )
 const batchDialectUnsupported = computed(
   () => Boolean(batchDialect.value) && !LINEAGE_DIALECTS.has(batchDialect.value),
@@ -560,7 +568,8 @@ async function pollBatch(): Promise<void> {
 }
 
 async function onBatchSubmit(): Promise<void> {
-  if (!projectId.value || !batchDsId.value || !batchFile.value) {
+  // 数据源可选:无库模式只需文件 + dialect(下拉恒有值);有库模式需选中数据源
+  if (!projectId.value || !batchFile.value) {
     batchError.value = t('lineage.batch_required')
     return
   }
@@ -575,7 +584,9 @@ async function onBatchSubmit(): Promise<void> {
     batchPhase.value = 'running'
     const { job_id } = await createLineageBatch(projectId.value, {
       upload_id: upload.upload_id,
-      datasource_id: batchDsId.value,
+      datasource_id: batchNoDb.value ? null : batchDsId.value,
+      // 无库必须显式 dialect;有库留空由后端按 db_type 推导
+      dialect: batchNoDb.value ? batchManualDialect.value : null,
       default_schema: batchDefaultSchema.value.trim() || null,
     })
     batchJobId.value = job_id
@@ -1269,10 +1280,7 @@ function errorMessage(e: unknown): string {
 
       <!-- ============ 批量分析 tab(L-2:ZIP → job → 报告)============ -->
       <div v-show="tab === 'batch'" class="p-4 space-y-4 max-w-4xl">
-        <div v-if="datasources.length === 0" class="text-sm chrome-text-muted">
-          {{ t('lineage.no_datasource') }}
-        </div>
-        <template v-else>
+        <template>
           <p class="text-xs chrome-text-muted">{{ t('lineage.batch_hint') }}</p>
           <div class="grid grid-cols-2 gap-4">
             <label class="block">
@@ -1282,10 +1290,23 @@ function errorMessage(e: unknown): string {
                 class="chrome-input w-full text-sm"
                 :disabled="batchBusy"
               >
+                <option value="">{{ t('lineage.batch_no_db') }}</option>
                 <option v-for="ds in datasources" :key="ds.id" :value="ds.id">{{ ds.name }}</option>
               </select>
-              <span class="block mt-1 text-[11px] chrome-text-muted">
+              <!-- 无库:手选方言;有库:方言跟随 db_type -->
+              <select
+                v-if="batchNoDb"
+                v-model="batchManualDialect"
+                class="chrome-input w-full text-sm mt-1"
+                :disabled="batchBusy"
+              >
+                <option v-for="d in BATCH_DIALECTS" :key="d" :value="d">{{ d }}</option>
+              </select>
+              <span v-else class="block mt-1 text-[11px] chrome-text-muted">
                 {{ t('lineage.dialect_follow', { dialect: batchDialect }) }}
+              </span>
+              <span v-if="batchNoDb" class="block mt-1 text-[11px] chrome-text-muted">
+                {{ t('lineage.batch_no_db_hint') }}
               </span>
             </label>
             <label class="block">

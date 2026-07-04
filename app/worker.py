@@ -995,14 +995,20 @@ class WorkerRunner:
         if self._lineage_catalog is None:
             raise UnsupportedJobKindError("lineage_batch requires a lineage catalog")
         payload = job.payload
-        datasource_id = _payload_datasource_id(job)
+        # 数据源可选:无库文本导入时 datasource_id 为空 → 纯宽松表级,不落子图
+        datasource_id = _payload_optional_str(payload, "datasource_id")
         storage_uri = _required_payload_str(payload, "storage_uri")
         default_schema = _payload_optional_str(payload, "default_schema")
         dialect = _payload_optional_str(payload, "dialect")
-        if dialect is None:
-            dialect = self._datasource_loader(datasource_id).db_type.value
+        if datasource_id is not None:
+            if dialect is None:
+                dialect = self._datasource_loader(datasource_id).db_type.value
+            schema_context = self._lineage_catalog.schema_context(datasource_id, default_schema)
+        else:
+            # 无数据源:dialect 必给(API 已校验),schema 为空 → 全程宽松表级,不持久化
+            dialect = dialect or "oracle"
+            schema_context = {"schema": {}, "default_schema": default_schema}
         dialect = dialect.lower()
-        schema_context = self._lineage_catalog.schema_context(datasource_id, default_schema)
 
         files_report: list[dict[str, Any]] = []
         skipped: dict[str, int] = {"non_sql": 0, "too_large": 0, "over_file_limit": 0}
@@ -1087,7 +1093,7 @@ class WorkerRunner:
         self,
         *,
         job: Job,
-        datasource_id: str,
+        datasource_id: str | None,
         dialect: str,
         default_schema: str | None,
         schema_context: dict[str, Any],
@@ -1098,12 +1104,6 @@ class WorkerRunner:
         sql_text = _decode_sql_bytes(raw)
         if sql_text is None or not sql_text.strip():
             return {"source_ref": source_ref, "status": "failed", "error": "undecodable_or_empty"}
-        sql_hash = lineage_sql_hash(
-            sql_text=sql_text,
-            dialect=dialect,
-            schema_context=schema_context,
-            parser_version=LINEAGE_PARSER_VERSION,
-        )
         report = analyze_sql_lineage(
             LineageParseRequest.model_validate(
                 {
@@ -1115,28 +1115,40 @@ class WorkerRunner:
                 }
             )
         )
-        cached_run_id = self._lineage_catalog.cached_run_id(
-            project_id=job.project_id,
-            datasource_id=datasource_id,
-            dialect=dialect,
-            source_ref=source_ref,
-            sql_hash=sql_hash,
-        )
-        if cached_run_id is not None:
-            run_id = cached_run_id
-            status = "cached"
-        else:
-            run_id = str(uuid4())
-            self._lineage_catalog.persist_run(
-                run_id=run_id,
+        run_id: str | None = None
+        if datasource_id is not None:
+            # 有数据源:落 lineage_runs/edges(可查询子图),复用 sql_hash 缓存
+            sql_hash = lineage_sql_hash(
+                sql_text=sql_text,
+                dialect=dialect,
+                schema_context=schema_context,
+                parser_version=LINEAGE_PARSER_VERSION,
+            )
+            cached_run_id = self._lineage_catalog.cached_run_id(
                 project_id=job.project_id,
                 datasource_id=datasource_id,
                 dialect=dialect,
                 source_ref=source_ref,
                 sql_hash=sql_hash,
-                sql_text=sql_text,
-                report=report,
             )
+            if cached_run_id is not None:
+                run_id = cached_run_id
+                status = "cached"
+            else:
+                run_id = str(uuid4())
+                self._lineage_catalog.persist_run(
+                    run_id=run_id,
+                    project_id=job.project_id,
+                    datasource_id=datasource_id,
+                    dialect=dialect,
+                    source_ref=source_ref,
+                    sql_hash=sql_hash,
+                    sql_text=sql_text,
+                    report=report,
+                )
+                status = "parsed"
+        else:
+            # 无数据源(纯文本导入):只出报告,不持久化(lineage_runs 需 FK)
             status = "parsed"
         tables_written = sorted({summary.table for summary in report.target_summary})
         tables_read = sorted(
