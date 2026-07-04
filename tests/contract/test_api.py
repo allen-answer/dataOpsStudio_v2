@@ -1996,6 +1996,118 @@ def test_upload_empty_body_rejected() -> None:
     assert response.json()["error"] == "empty_upload"
 
 
+def test_lineage_batch_create_enqueues_job_with_upload_ref() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            {
+                "id": "up-1",
+                "project_id": "project-1",
+                "owner_user_id": "user-1",
+                "purpose": "lineage_batch",
+                "filename": "scripts.zip",
+                "content_type": "application/zip",
+                "bytes": 2048,
+                "storage_uri": "uploads/up-1/scripts.zip",
+                "created_at": _dt(1),
+            },
+            _datasource_row(),
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/batch",
+        headers=_auth_headers(),
+        json_body={"upload_id": "up-1", "datasource_id": "ds-1", "default_schema": "dw"},
+    )
+
+    assert response.status_code == 202
+    payload = response.json()
+    backend = services.job_backend
+    assert len(backend.enqueued) == 1
+    job = backend.enqueued[0]
+    assert job.id == payload["job_id"]
+    assert job.kind.value == "lineage_batch"
+    assert job.payload["storage_uri"] == "uploads/up-1/scripts.zip"
+    assert job.payload["default_schema"] == "dw"
+    assert job.datasource_ids == ["ds-1"]
+    assert any(audit["action"] == "lineage_batch_create" for audit in services.audits)
+
+
+def test_lineage_batch_rejects_wrong_purpose_upload() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            {
+                "id": "up-1",
+                "project_id": "project-1",
+                "owner_user_id": "user-1",
+                "purpose": "compare_source",
+                "filename": "data.csv",
+                "content_type": "text/csv",
+                "bytes": 100,
+                "storage_uri": "uploads/up-1/data.csv",
+                "created_at": _dt(1),
+            },
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/batch",
+        headers=_auth_headers(),
+        json_body={"upload_id": "up-1", "datasource_id": "ds-1"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_upload_purpose"
+
+
+def test_lineage_batch_status_returns_report_on_success() -> None:
+    report_json = json.dumps(
+        {
+            "file_count": 2,
+            "parsed": 2,
+            "failed": 0,
+            "files": [],
+            "script_edges": [],
+        }
+    ).encode("utf-8")
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            {
+                "id": "job-1",
+                "kind": "lineage_batch",
+                "project_id": "project-1",
+                "status": "success",
+                "error": None,
+                "result_ref": {
+                    "backend": "lineage_batch",
+                    "uri": "lineage-batch/job-1",
+                    "metadata": {"report_uri": "runs/job-1/artifacts/lineage_batch_report.json"},
+                },
+            },
+        ]
+    )
+    result_store = _ResultStore(
+        downloads={"runs/job-1/artifacts/lineage_batch_report.json": report_json}
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine, result_store=result_store)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/lineage/batch/job-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "success"
+    assert payload["report"]["file_count"] == 2
+
+
 def test_lineage_edge_detail_returns_run_provenance() -> None:
     engine = _FakeEngine(
         [

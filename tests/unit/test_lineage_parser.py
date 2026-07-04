@@ -258,6 +258,67 @@ def test_postgresql_alias_normalizes_to_postgres() -> None:
     assert _mapping(report.insert_mappings, "id", "app.orders", "id")
 
 
+def test_lenient_mode_emits_table_level_edges_without_metadata() -> None:
+    # 宽松模式:引用表全部不在元数据缓存 → 不判 unsupported_schema,
+    # 降级产出表级边 + lenient_table_level warning(列级跳过)
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text=(
+                "INSERT INTO kgrp.r_cisp_g3001_t "
+                "SELECT * FROM kgrp.m_r_cisp_g3001_t a WHERE a.period = ${v_period_m}"
+            ),
+            dialect="oracle",
+            schema={},
+            default_schema=None,
+            lenient=True,
+        )
+    )
+
+    assert report.parse_errors == []
+    assert {(edge["source_table"], edge["target_table"]) for edge in report.graph_edges} == {
+        ("kgrp.m_r_cisp_g3001_t", "kgrp.r_cisp_g3001_t")
+    }
+    assert report.insert_mappings == []  # 列级诚实跳过
+    assert any(w["code"] == "lenient_table_level" for w in report.warnings)
+    assert report.target_summary[0].table == "kgrp.r_cisp_g3001_t"
+    assert report.target_summary[0].operation == "insert"
+
+
+def test_strict_mode_still_rejects_missing_metadata() -> None:
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text="INSERT INTO kgrp.t1 SELECT * FROM kgrp.t2",
+            dialect="oracle",
+            schema={},
+            default_schema=None,
+        )
+    )
+
+    assert report.graph_edges == []
+    assert any(err["error_type"] == "unsupported_schema" for err in report.parse_errors)
+
+
+def test_alias_prefixed_insert_rewritten_and_parsed() -> None:
+    # Oracle 别名前缀 INSERT(用户真实语料 4 例):insert into t a (a.c1, ...)
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text=(
+                "insert into dw.t_etl_y1_yyb_dlmmzqk a (a.yyb, a.dlmmzqk) "
+                "select b.yyb, b.dlmmzqk from dw.src_yyb b"
+            ),
+            dialect="oracle",
+            schema={},
+            default_schema=None,
+            lenient=True,
+        )
+    )
+
+    assert report.parse_errors == []
+    assert {(edge["source_table"], edge["target_table"]) for edge in report.graph_edges} == {
+        ("dw.src_yyb", "dw.t_etl_y1_yyb_dlmmzqk")
+    }
+
+
 def test_unsupported_dialect_rejected() -> None:
     with pytest.raises(ValueError, match="lineage dialect"):
         analyze_sql_lineage(

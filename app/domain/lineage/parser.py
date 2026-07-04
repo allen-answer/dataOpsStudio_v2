@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
@@ -43,6 +44,9 @@ class LineageParseRequest(BaseModel):
     dialect: str
     metadata_schema: LineageSchema = Field(alias="schema")
     default_schema: str | None = None
+    # 宽松模式(批量分析用):引用的表缺元数据缓存时不再判 unsupported_schema,
+    # 降级只产出表级边(列级跳过,精度诚实降档,warning 标注)——1.x 就是表级精度。
+    lenient: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,7 @@ class _StatementContext:
     dialect: str
     schema: LineageSchema
     default_schema: str | None
+    lenient: bool = False
 
 
 def analyze_sql_lineage(request: LineageParseRequest) -> LineageReport:
@@ -64,6 +69,7 @@ def analyze_sql_lineage(request: LineageParseRequest) -> LineageReport:
             dialect=dialect,
             schema=request.metadata_schema,
             default_schema=request.default_schema,
+            lenient=request.lenient,
         )
         _analyze_statement(statement, context, report)
     report.report = _summary(report)
@@ -120,12 +126,24 @@ def _analyze_statement(
     try:
         expression = cast(exp.Expression, sqlglot.parse_one(statement, read=context.dialect))
     except ParseError as exc:
-        _append_parse_error(report, context, "parse_error", exc, statement_type=None)
-        return
+        # Oracle 别名前缀 INSERT(`insert into t a (a.col…)`)sqlglot 不认,
+        # 仅在直解失败时尝试剥别名重写再解一次(限定爆炸半径)
+        rewritten = _rewrite_insert_alias(statement)
+        if rewritten is None:
+            _append_parse_error(report, context, "parse_error", exc, statement_type=None)
+            return
+        try:
+            expression = cast(exp.Expression, sqlglot.parse_one(rewritten, read=context.dialect))
+        except ParseError:
+            _append_parse_error(report, context, "parse_error", exc, statement_type=None)
+            return
     statement_type = expression.key.upper()
     report.statements.append({"index": context.index, "type": statement_type})
     missing = _missing_tables(expression, context.schema, context.default_schema)
     if missing:
+        if context.lenient:
+            _analyze_statement_table_level(expression, statement_type, context, report)
+            return
         for table in missing:
             report.parse_errors.append(
                 LineageParseError(
@@ -147,6 +165,9 @@ def _analyze_statement(
             validate_qualify_columns=True,
         )
     except OptimizeError as exc:
+        if context.lenient:
+            _analyze_statement_table_level(expression, statement_type, context, report)
+            return
         _append_parse_error(report, context, "qualify_error", exc, statement_type=statement_type)
         return
     if isinstance(qualified, exp.Insert):
@@ -824,6 +845,105 @@ def _append_columns(
             if column.table and column.table != table.alias_or_name:
                 continue
             _append_unique(report.columns, {"table": table_name, "name": column.name})
+
+
+def _analyze_statement_table_level(
+    expression: exp.Expression,
+    statement_type: str,
+    context: _StatementContext,
+    report: LineageReport,
+) -> None:
+    """宽松模式降级路径:不 qualify,直接从 AST 提取表级边(列级跳过)。
+
+    触发条件 = 引用表缺元数据缓存 / qualify 失败。精度 = 1.x 表级水平;
+    每条语句追加 lenient_table_level warning,报告端可据此标注降档。
+    """
+    target_expr: exp.Table | None = None
+    operation = statement_type.lower()
+    if isinstance(expression, exp.Insert):
+        target_expr = _target_table(expression)
+        operation = "insert"
+    elif isinstance(expression, exp.Create):
+        raw_target = expression.this
+        if isinstance(raw_target, exp.Schema):
+            raw_target = raw_target.this
+        if isinstance(raw_target, exp.Table) and _create_query(expression) is not None:
+            target_expr = raw_target
+            operation = "create"
+    elif isinstance(expression, exp.Merge):
+        target_expr = expression.this if isinstance(expression.this, exp.Table) else None
+        operation = "merge"
+    elif isinstance(expression, exp.Update):
+        target_expr = expression.this if isinstance(expression.this, exp.Table) else None
+        operation = "update"
+    if target_expr is None:
+        report.warnings.append(
+            LineageWarning(
+                code="unsupported_statement",
+                message=f"{statement_type} is not emitted as lineage edges in W1",
+                statement_index=context.index,
+            ).model_dump(mode="json")
+        )
+        return
+    target_table = _table_name(target_expr, context.default_schema)
+    cte_map = _cte_map(expression)
+    source_tables = {
+        _table_name(table, context.default_schema)
+        for table in expression.find_all(exp.Table)
+        if not _is_cte_reference(table, cte_map)
+        and id(table) != id(target_expr)
+        and _table_name(table, context.default_schema) != target_table
+    }
+    report.target_summary.append(
+        TargetSummary(table=target_table, operation=operation, statement_index=context.index)
+    )
+    _append_edges(report, target_table, source_tables, context.index)
+    _append_tables(report, target_table, source_tables, context.index)
+    report.warnings.append(
+        LineageWarning(
+            code="lenient_table_level",
+            message=(
+                "metadata cache unavailable; emitted table-level edges only "
+                f"for {target_table} (column lineage skipped)"
+            ),
+            statement_index=context.index,
+        ).model_dump(mode="json")
+    )
+
+
+_INSERT_ALIAS_RE = re.compile(
+    r"^(\s*insert\s+into\s+[\w.$\"]+)\s+([a-zA-Z_]\w*)\s*\(",
+    re.IGNORECASE,
+)
+
+
+def _rewrite_insert_alias(statement: str) -> str | None:
+    """剥 Oracle 别名前缀 INSERT:`insert into t a (a.c1, a.c2…)` → 标准形。
+
+    仅在常规解析失败后调用;别名前缀替换严格限定在目标列清单括号段内,
+    避免误伤 SELECT 侧同名别名。无匹配返回 None。
+    """
+    match = _INSERT_ALIAS_RE.match(statement)
+    if match is None:
+        return None
+    alias = match.group(2)
+    open_paren = match.end() - 1
+    depth = 0
+    close_paren = -1
+    for position in range(open_paren, len(statement)):
+        char = statement[position]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                close_paren = position
+                break
+    if close_paren < 0:
+        return None
+    column_list = statement[open_paren : close_paren + 1]
+    stripped = re.sub(rf"(?<![\w.]){re.escape(alias)}\.", "", column_list)
+    return match.group(1) + " " + stripped + statement[close_paren + 1 :]
 
 
 def _target_table(expression: exp.Insert) -> exp.Table | None:

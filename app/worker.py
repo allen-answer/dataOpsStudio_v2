@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import io
+import json
 import signal
 import tempfile
 import threading
 import time
+import zipfile
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -101,6 +104,12 @@ from app.observability.logging import configure_logging
 
 logger = structlog.get_logger(__name__)
 
+# lineage_batch ZIP 安全限额(zip 炸弹 / 超量防护)
+_LINEAGE_BATCH_MAX_FILES = 500
+_LINEAGE_BATCH_MAX_FILE_BYTES = 2 * 1024 * 1024
+_LINEAGE_BATCH_MAX_TOTAL_BYTES = 100 * 1024 * 1024
+_LINEAGE_BATCH_EXTENSIONS = (".sql", ".txt")
+
 
 class JobCancelled(RuntimeError):
     """Job was cooperatively cancelled."""
@@ -166,6 +175,10 @@ class ResultStoreLike(Protocol):
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None: ...
 
     def put_export_artifact(self, export_id: str, name: str, stream: BinaryIO) -> ResultRef: ...
+
+    def put_artifact(self, run_id: str, name: str, stream: BinaryIO) -> ResultRef: ...
+
+    def open_download(self, ref: ResultRef) -> BinaryIO: ...
 
     def set_spool_columns(self, result_set_id: str, columns: list[Column]) -> None: ...
 
@@ -403,6 +416,8 @@ class WorkerRunner:
                 outcome = self._execute_compare_run(job)
             elif job.kind is JobKind.LINEAGE_ANALYZE:
                 outcome = self._execute_lineage_analyze(job)
+            elif job.kind is JobKind.LINEAGE_BATCH:
+                outcome = self._execute_lineage_batch(job)
             elif job.kind is JobKind.WORKFLOW_RUN:
                 outcome = self._execute_workflow_run(job)
             else:
@@ -966,6 +981,180 @@ class WorkerRunner:
                 },
             )
         )
+
+    def _execute_lineage_batch(self, job: Job) -> _ExecutionOutcome:
+        """ZIP 批量血缘分析(L-2):逐文件宽松解析 + 落边 + 汇总报告。
+
+        - 宽松模式(lenient=True):引用表缺元数据缓存时降级出表级血缘,
+          不再"缺表=零边"(1.x 批量就是表级精度)
+        - 命中 sql_hash 缓存的文件仍在内存重析一次取读写表(供跨脚本依赖),
+          但不重复落 run/edges
+        - 跨脚本依赖 script_edges:文件 A 写的表 ∩ 文件 B 读的表
+        - 汇总报告 JSON 落 job artifact,由 API 报告端点回读
+        """
+        if self._lineage_catalog is None:
+            raise UnsupportedJobKindError("lineage_batch requires a lineage catalog")
+        payload = job.payload
+        datasource_id = _payload_datasource_id(job)
+        storage_uri = _required_payload_str(payload, "storage_uri")
+        default_schema = _payload_optional_str(payload, "default_schema")
+        dialect = _payload_optional_str(payload, "dialect")
+        if dialect is None:
+            dialect = self._datasource_loader(datasource_id).db_type.value
+        dialect = dialect.lower()
+        schema_context = self._lineage_catalog.schema_context(datasource_id, default_schema)
+
+        files_report: list[dict[str, Any]] = []
+        skipped: dict[str, int] = {"non_sql": 0, "too_large": 0, "over_file_limit": 0}
+        total_bytes = 0
+        with self._result_store.open_download(
+            ResultRef(backend="local_fs", uri=storage_uri)
+        ) as stream:
+            with zipfile.ZipFile(stream) as archive:
+                members = [
+                    info
+                    for info in archive.infolist()
+                    if not info.is_dir() and not info.filename.startswith("__MACOSX")
+                ]
+                eligible = [
+                    info
+                    for info in members
+                    if info.filename.lower().endswith(_LINEAGE_BATCH_EXTENSIONS)
+                ]
+                skipped["non_sql"] = len(members) - len(eligible)
+                if len(eligible) > _LINEAGE_BATCH_MAX_FILES:
+                    skipped["over_file_limit"] = len(eligible) - _LINEAGE_BATCH_MAX_FILES
+                    eligible = eligible[:_LINEAGE_BATCH_MAX_FILES]
+                for info in eligible:
+                    self._check_cancel(job.id)
+                    if (
+                        info.file_size > _LINEAGE_BATCH_MAX_FILE_BYTES
+                        or total_bytes + info.file_size > _LINEAGE_BATCH_MAX_TOTAL_BYTES
+                    ):
+                        skipped["too_large"] += 1
+                        continue
+                    raw = archive.read(info)
+                    total_bytes += len(raw)
+                    files_report.append(
+                        self._lineage_batch_file(
+                            job=job,
+                            datasource_id=datasource_id,
+                            dialect=dialect,
+                            default_schema=default_schema,
+                            schema_context=schema_context,
+                            source_ref=info.filename,
+                            raw=raw,
+                        )
+                    )
+        script_edges = _lineage_batch_script_edges(files_report)
+        parsed = sum(1 for item in files_report if item["status"] in {"parsed", "cached"})
+        failed = sum(1 for item in files_report if item["status"] == "failed")
+        report_payload = {
+            "file_count": len(files_report),
+            "parsed": parsed,
+            "failed": failed,
+            "skipped": skipped,
+            "table_edge_total": sum(
+                int(item.get("table_edge_count") or 0) for item in files_report
+            ),
+            "column_mapping_total": sum(
+                int(item.get("column_mapping_count") or 0) for item in files_report
+            ),
+            "files": files_report,
+            "script_edges": script_edges,
+        }
+        artifact_ref = self._result_store.put_artifact(
+            job.id,
+            "lineage_batch_report.json",
+            io.BytesIO(json.dumps(report_payload, ensure_ascii=False).encode("utf-8")),
+        )
+        self._heartbeat(job.id)
+        return _ExecutionOutcome(
+            ResultRef(
+                backend="lineage_batch",
+                uri=f"lineage-batch/{job.id}",
+                metadata={
+                    "file_count": len(files_report),
+                    "parsed": parsed,
+                    "failed": failed,
+                    "script_edge_count": len(script_edges),
+                    "report_uri": artifact_ref.uri,
+                },
+            )
+        )
+
+    def _lineage_batch_file(
+        self,
+        *,
+        job: Job,
+        datasource_id: str,
+        dialect: str,
+        default_schema: str | None,
+        schema_context: dict[str, Any],
+        source_ref: str,
+        raw: bytes,
+    ) -> dict[str, Any]:
+        assert self._lineage_catalog is not None
+        sql_text = _decode_sql_bytes(raw)
+        if sql_text is None or not sql_text.strip():
+            return {"source_ref": source_ref, "status": "failed", "error": "undecodable_or_empty"}
+        sql_hash = lineage_sql_hash(
+            sql_text=sql_text,
+            dialect=dialect,
+            schema_context=schema_context,
+            parser_version=LINEAGE_PARSER_VERSION,
+        )
+        report = analyze_sql_lineage(
+            LineageParseRequest.model_validate(
+                {
+                    "sql_text": sql_text,
+                    "dialect": dialect,
+                    "schema": schema_context["schema"],
+                    "default_schema": default_schema,
+                    "lenient": True,
+                }
+            )
+        )
+        cached_run_id = self._lineage_catalog.cached_run_id(
+            project_id=job.project_id,
+            datasource_id=datasource_id,
+            dialect=dialect,
+            source_ref=source_ref,
+            sql_hash=sql_hash,
+        )
+        if cached_run_id is not None:
+            run_id = cached_run_id
+            status = "cached"
+        else:
+            run_id = str(uuid4())
+            self._lineage_catalog.persist_run(
+                run_id=run_id,
+                project_id=job.project_id,
+                datasource_id=datasource_id,
+                dialect=dialect,
+                source_ref=source_ref,
+                sql_hash=sql_hash,
+                sql_text=sql_text,
+                report=report,
+            )
+            status = "parsed"
+        tables_written = sorted({summary.table for summary in report.target_summary})
+        tables_read = sorted(
+            {str(edge["source_table"]) for edge in report.graph_edges if edge.get("source_table")}
+        )
+        return {
+            "source_ref": source_ref,
+            "status": status,
+            "run_id": run_id,
+            "table_edge_count": len(report.graph_edges),
+            "column_mapping_count": len(report.insert_mappings),
+            "parse_error_count": len(report.parse_errors),
+            "lenient_statement_count": sum(
+                1 for warning in report.warnings if warning.get("code") == "lenient_table_level"
+            ),
+            "tables_written": tables_written,
+            "tables_read": tables_read,
+        }
 
     def _execute_workflow_run(self, job: Job) -> _ExecutionOutcome | None:
         """workflow_run 推进器:claim → 推进 DAG 一步 → 让位(返回 None)。
@@ -1688,6 +1877,38 @@ def _payload_datasource_id(job: Job) -> str:
 def _payload_optional_str(payload: dict[str, object], key: str) -> str | None:
     value = payload.get(key)
     return value if isinstance(value, str) and value else None
+
+
+def _decode_sql_bytes(raw: bytes) -> str | None:
+    """SQL 脚本解码:utf-8 优先,gbk 兜底(用户真实语料两种混存)。"""
+    for encoding in ("utf-8", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def _lineage_batch_script_edges(files_report: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """跨脚本依赖:文件 A 写的表被文件 B 读 → A→B(1.x script_edges 同义)。"""
+    edges: list[dict[str, Any]] = []
+    for producer in files_report:
+        written = set(producer.get("tables_written") or [])
+        if not written:
+            continue
+        for consumer in files_report:
+            if consumer is producer:
+                continue
+            common = written & set(consumer.get("tables_read") or [])
+            if common:
+                edges.append(
+                    {
+                        "source_file": producer["source_ref"],
+                        "target_file": consumer["source_ref"],
+                        "tables": sorted(common),
+                    }
+                )
+    return edges
 
 
 def _workflow_spec_from_payload(payload: dict[str, Any]) -> WorkflowSpec:
