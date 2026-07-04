@@ -2788,20 +2788,23 @@ def create_lineage_batch(
             raise ApiError(404, "not_found", "Upload not found")
         if str(upload_row["purpose"]) != "lineage_batch":
             raise ApiError(400, "invalid_upload_purpose", "Upload purpose must be lineage_batch")
-        datasource_row = (
-            conn.execute(
-                select(datasources).where(
-                    and_(
-                        datasources.c.id == body.datasource_id,
-                        datasources.c.project_id == project_id,
+        # 数据源可选:给了则校验归属(元数据感知 + 落持久化子图);不给
+        # (无库纯文本导入)则要求显式 dialect(schema 层已校验),纯宽松表级。
+        if body.datasource_id is not None:
+            datasource_row = (
+                conn.execute(
+                    select(datasources).where(
+                        and_(
+                            datasources.c.id == body.datasource_id,
+                            datasources.c.project_id == project_id,
+                        )
                     )
                 )
+                .mappings()
+                .one_or_none()
             )
-            .mappings()
-            .one_or_none()
-        )
-        if datasource_row is None:
-            raise ApiError(404, "not_found", "Datasource not found")
+            if datasource_row is None:
+                raise ApiError(404, "not_found", "Datasource not found")
         job_id = new_id()
         job = Job(
             id=job_id,
@@ -2809,7 +2812,7 @@ def create_lineage_batch(
             status=JobStatus.PENDING,
             owner_user_id=user.id,
             project_id=project_id,
-            datasource_ids=[body.datasource_id],
+            datasource_ids=[body.datasource_id] if body.datasource_id else [],
             priority=0,
             timeout_seconds=1800,
             resource_profile=ResourceProfile(timeout_seconds=1800),
