@@ -66,6 +66,9 @@ from app.api.schemas import (
     LineageAiFallbackResult,
     LineageAnalyzeRequest,
     LineageAnalyzeResponse,
+    LineageBatchCreateRequest,
+    LineageBatchCreateResponse,
+    LineageBatchStatusResponse,
     LineageColumnTraceHop,
     LineageColumnTraceItem,
     LineageColumnTraceResponse,
@@ -2751,6 +2754,134 @@ def create_lineage_export(
         expires_at=expires_at,
         format="excel",
         filename=filename,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/lineage/batch",
+    response_model=LineageBatchCreateResponse,
+    status_code=202,
+)
+def create_lineage_batch(
+    project_id: str,
+    body: LineageBatchCreateRequest,
+    request: Request,
+) -> LineageBatchCreateResponse:
+    """ZIP 批量血缘分析(L-2):上传件入队 worker 逐文件宽松解析 + 汇总报告。"""
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.begin() as conn:
+        _require_project_access(conn, project_id, user.id)
+        upload_row = (
+            conn.execute(
+                select(uploads).where(
+                    and_(
+                        uploads.c.id == body.upload_id,
+                        uploads.c.project_id == project_id,
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if upload_row is None:
+            raise ApiError(404, "not_found", "Upload not found")
+        if str(upload_row["purpose"]) != "lineage_batch":
+            raise ApiError(400, "invalid_upload_purpose", "Upload purpose must be lineage_batch")
+        datasource_row = (
+            conn.execute(
+                select(datasources).where(
+                    and_(
+                        datasources.c.id == body.datasource_id,
+                        datasources.c.project_id == project_id,
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if datasource_row is None:
+            raise ApiError(404, "not_found", "Datasource not found")
+        job_id = new_id()
+        job = Job(
+            id=job_id,
+            kind=JobKind.LINEAGE_BATCH,
+            status=JobStatus.PENDING,
+            owner_user_id=user.id,
+            project_id=project_id,
+            datasource_ids=[body.datasource_id],
+            priority=0,
+            timeout_seconds=1800,
+            resource_profile=ResourceProfile(timeout_seconds=1800),
+            audit_id=new_id(),
+            payload={
+                "upload_id": body.upload_id,
+                "storage_uri": str(upload_row["storage_uri"]),
+                "datasource_id": body.datasource_id,
+                "dialect": body.dialect,
+                "default_schema": body.default_schema,
+                "filename": str(upload_row["filename"]),
+            },
+        )
+        _enqueue_job_txn(conn, services, job)
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="lineage_batch_create",
+        resource_type="lineage_batch",
+        resource_id=job_id,
+        result="accepted",
+        detail={"upload_id": body.upload_id, "datasource_id": body.datasource_id},
+    )
+    return LineageBatchCreateResponse(job_id=job_id)
+
+
+@router.get(
+    "/projects/{project_id}/lineage/batch/{job_id}",
+    response_model=LineageBatchStatusResponse,
+)
+def get_lineage_batch(
+    project_id: str,
+    job_id: str,
+    request: Request,
+) -> LineageBatchStatusResponse:
+    """批量分析状态 + success 后回读汇总报告(worker 落的 job artifact)。"""
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        row = (
+            conn.execute(
+                select(jobs).where(
+                    and_(
+                        jobs.c.id == job_id,
+                        jobs.c.kind == JobKind.LINEAGE_BATCH.value,
+                        jobs.c.project_id == project_id,
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    if row is None:
+        raise ApiError(404, "not_found", "Lineage batch job not found")
+    status = JobStatus(str(row["status"]))
+    report: dict[str, Any] | None = None
+    if status is JobStatus.SUCCESS:
+        result_ref = dict(row["result_ref"] or {})
+        report_uri = str((result_ref.get("metadata") or {}).get("report_uri") or "")
+        if report_uri:
+            with services.result_store.open_download(
+                ResultRef(backend="local_fs", uri=report_uri)
+            ) as stream:
+                report = json.loads(stream.read().decode("utf-8"))
+    return LineageBatchStatusResponse(
+        job_id=job_id,
+        status=status,
+        error=_optional_str(row["error"]),
+        report=report,
     )
 
 

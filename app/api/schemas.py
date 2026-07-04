@@ -443,6 +443,26 @@ class UploadResponse(BaseModel):
     created_at: datetime
 
 
+class LineageBatchCreateRequest(BaseModel):
+    upload_id: str
+    datasource_id: str
+    dialect: str | None = Field(default=None, min_length=1, max_length=32)
+    default_schema: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class LineageBatchCreateResponse(BaseModel):
+    job_id: str
+
+
+class LineageBatchStatusResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    error: str | None = None
+    # success 时回读 worker 落的汇总报告(files/script_edges/skipped 等,
+    # 形状由 worker _execute_lineage_batch 决定,前端按已知字段读取)
+    report: dict[str, Any] | None = None
+
+
 class LineageEdgeRunInfo(BaseModel):
     """边所属解析 run 的溯源信息(边抽屉用)。sql_text 在 0018 前的旧 run 为 NULL。"""
 

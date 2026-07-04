@@ -32,6 +32,7 @@ class JobKind(StrEnum):
     AI_ASSIST_CALL = "ai_assist_call"
     AI_COPILOT_RUN = "ai_copilot_run"
     LINEAGE_ANALYZE = "lineage_analyze"
+    LINEAGE_BATCH = "lineage_batch"
 
 
 class JobStatus(StrEnum):
