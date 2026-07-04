@@ -267,7 +267,8 @@ export function getLineageImpact(
 
 export interface LineageBatchCreateRequest {
   upload_id: string
-  datasource_id: string
+  // 数据源可选:不给(无库纯文本导入)时必须显式给 dialect(纯宽松表级,不落子图)
+  datasource_id?: string | null
   dialect?: string | null
   default_schema?: string | null
 }

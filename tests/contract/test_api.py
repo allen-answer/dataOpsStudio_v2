@@ -2036,6 +2036,55 @@ def test_lineage_batch_create_enqueues_job_with_upload_ref() -> None:
     assert any(audit["action"] == "lineage_batch_create" for audit in services.audits)
 
 
+def test_lineage_batch_without_datasource_requires_dialect_and_skips_ds_lookup() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            {
+                "id": "up-1",
+                "project_id": "project-1",
+                "owner_user_id": "user-1",
+                "purpose": "lineage_batch",
+                "filename": "scripts.zip",
+                "content_type": "application/zip",
+                "bytes": 2048,
+                "storage_uri": "uploads/up-1/scripts.zip",
+                "created_at": _dt(1),
+            },
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/batch",
+        headers=_auth_headers(),
+        json_body={"upload_id": "up-1", "dialect": "oracle"},
+    )
+
+    assert response.status_code == 202
+    job = services.job_backend.enqueued[0]
+    assert job.payload["datasource_id"] is None
+    assert job.payload["dialect"] == "oracle"
+    assert job.datasource_ids == []
+    # 未做数据源查询(引擎序列只喂了 project + upload 两行)
+    assert not any("FROM datasources" in statement for statement in engine.statements)
+
+
+def test_lineage_batch_without_datasource_missing_dialect_is_422() -> None:
+    engine = _FakeEngine([{"id": "project-1"}])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/batch",
+        headers=_auth_headers(),
+        json_body={"upload_id": "up-1"},
+    )
+
+    # pydantic 校验:无数据源必须给 dialect
+    assert response.status_code == 422
+
+
 def test_lineage_batch_rejects_wrong_purpose_upload() -> None:
     engine = _FakeEngine(
         [

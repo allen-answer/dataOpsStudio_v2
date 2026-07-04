@@ -1568,6 +1568,48 @@ def test_worker_runs_lineage_batch_over_zip_with_lenient_parsing() -> None:
     assert file_a["lenient_statement_count"] == 1
 
 
+def test_worker_runs_lineage_batch_without_datasource_report_only() -> None:
+    # 无库纯文本导入:datasource_id 为空,dialect 显式给 → 只出报告不落 run
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("a.sql", "insert into kgrp.mid select * from kgrp.src")
+        archive.writestr("b.sql", "insert into kgrp.tgt select * from kgrp.mid")
+    job = _make_job(
+        kind=JobKind.LINEAGE_BATCH,
+        payload={
+            "upload_id": "up-1",
+            "storage_uri": "uploads/up-1/scripts.zip",
+            "datasource_id": None,
+            "dialect": "oracle",
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    result_store.downloads["uploads/up-1/scripts.zip"] = buffer.getvalue()
+    catalog = _FakeLineageCatalog()
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=catalog,
+    )
+
+    assert runner.run_once() is True
+
+    # 无数据源:不落任何 run,但报告与跨脚本依赖照常产出
+    assert catalog.persisted == []
+    _, result_ref = backend.completed[0]
+    assert result_ref.metadata["parsed"] == 2
+    assert result_ref.metadata["script_edge_count"] == 1
+    report = json.loads(result_store.run_artifacts[("job-1", "lineage_batch_report.json")])
+    assert report["table_edge_total"] == 2
+    file_a = next(item for item in report["files"] if item["source_ref"] == "a.sql")
+    assert file_a["run_id"] is None  # 未持久化
+    assert file_a["tables_written"] == ["kgrp.mid"]
+
+
 def test_worker_lineage_analyze_reuses_cached_run() -> None:
     job = _make_job(
         kind=JobKind.LINEAGE_ANALYZE,

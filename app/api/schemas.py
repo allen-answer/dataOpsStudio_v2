@@ -445,9 +445,17 @@ class UploadResponse(BaseModel):
 
 class LineageBatchCreateRequest(BaseModel):
     upload_id: str
-    datasource_id: str
+    # 数据源可选:给了则元数据感知 + 落持久化子图;不给(纯文本导入无库场景)
+    # 则必须显式指定 dialect,走纯宽松表级解析,只出批量报告(不落可查询子图)。
+    datasource_id: str | None = None
     dialect: str | None = Field(default=None, min_length=1, max_length=32)
     default_schema: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def _require_dialect_without_datasource(self) -> LineageBatchCreateRequest:
+        if self.datasource_id is None and not self.dialect:
+            raise ValueError("dialect is required when datasource_id is not provided")
+        return self
 
 
 class LineageBatchCreateResponse(BaseModel):

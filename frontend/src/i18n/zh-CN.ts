@@ -507,6 +507,8 @@ export default {
     tab_batch: '批量分析',
     // 批量分析(L-2:ZIP 上传 → 后台逐文件宽松解析 → 汇总报告)
     batch_hint: '上传 SQL 脚本 ZIP,后台逐文件解析血缘并汇总跨脚本依赖。缺元数据时降级为表级血缘。',
+    batch_no_db: '无数据库(纯文本导入)',
+    batch_no_db_hint: '不连数据源,纯脚本解析出表级血缘 —— 报告不落可查询子图。',
     batch_file: 'SQL 脚本 ZIP',
     batch_file_too_large: '文件超过 100MB 上限',
     batch_required: '请选择数据源并上传 ZIP 文件',
