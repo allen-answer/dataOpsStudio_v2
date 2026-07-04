@@ -259,3 +259,84 @@ export function getLineageImpact(
     `/projects/${projectId}/lineage/impact?${qs.toString()}`,
   )
 }
+
+// ── 批量分析(L-2:ZIP 上传 → job → 报告)────────────────────────────
+// 锚 schemas.py LineageBatchCreateRequest / LineageBatchCreateResponse /
+// LineageBatchStatusResponse;report 形状由 app/worker.py
+// _execute_lineage_batch / _lineage_batch_file / _lineage_batch_script_edges 决定。
+
+export interface LineageBatchCreateRequest {
+  upload_id: string
+  datasource_id: string
+  dialect?: string | null
+  default_schema?: string | null
+}
+
+export type LineageBatchJobStatus =
+  | 'pending'
+  | 'running'
+  | 'success'
+  | 'failed'
+  | 'cancelled'
+  | 'timeout'
+
+/** 单文件结果(worker _lineage_batch_file;failed 项只有 source_ref/status/error)。 */
+export interface LineageBatchFileEntry {
+  source_ref: string
+  status: 'parsed' | 'cached' | 'failed'
+  run_id?: string
+  table_edge_count?: number
+  column_mapping_count?: number
+  parse_error_count?: number
+  lenient_statement_count?: number
+  tables_written?: string[]
+  tables_read?: string[]
+  error?: string
+}
+
+/** 跨脚本依赖:文件 A 写的表被文件 B 读 → A→B(worker _lineage_batch_script_edges)。 */
+export interface LineageBatchScriptEdge {
+  source_file: string
+  target_file: string
+  tables: string[]
+}
+
+export interface LineageBatchReport {
+  file_count: number
+  parsed: number
+  failed: number
+  skipped: { non_sql: number; too_large: number; over_file_limit: number }
+  table_edge_total: number
+  column_mapping_total: number
+  files: LineageBatchFileEntry[]
+  script_edges: LineageBatchScriptEdge[]
+}
+
+export interface LineageBatchStatusResponse {
+  job_id: string
+  status: LineageBatchJobStatus
+  error: string | null
+  /** 仅 success 时非空(API 回读 worker 落的 lineage_batch_report.json)。 */
+  report: LineageBatchReport | null
+}
+
+/**
+ * POST /projects/{pid}/lineage/batch —— 202 入队 worker;
+ * upload purpose 不对 400 invalid_upload_purpose,upload/datasource 不在项目内 404。
+ */
+export function createLineageBatch(
+  projectId: string,
+  req: LineageBatchCreateRequest,
+): Promise<{ job_id: string }> {
+  return apiClient.post<{ job_id: string }>(`/projects/${projectId}/lineage/batch`, req)
+}
+
+/** GET /projects/{pid}/lineage/batch/{job_id} —— 轮询状态;success 附汇总报告。 */
+export function getLineageBatch(
+  projectId: string,
+  jobId: string,
+): Promise<LineageBatchStatusResponse> {
+  return apiClient.get<LineageBatchStatusResponse>(
+    `/projects/${projectId}/lineage/batch/${jobId}`,
+  )
+}

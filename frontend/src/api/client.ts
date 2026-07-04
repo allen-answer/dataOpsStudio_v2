@@ -109,6 +109,45 @@ async function request<T>(
 }
 
 /**
+ * postRaw:鉴权二进制上传(POST /projects/{pid}/uploads?purpose=&filename=)。
+ * 与 request() 的区别仅在于 body 直接透传 Blob/File 不做 JSON.stringify,
+ * Content-Type 用文件真实类型;401 / 非 2xx 错误处理与 request() 一致。
+ */
+async function postRaw<T>(path: string, body: Blob, contentType?: string): Promise<T> {
+  const headers: Record<string, string> = {
+    'Content-Type': contentType || 'application/octet-stream',
+  }
+  const token = getToken()
+  if (token) headers.Authorization = `Bearer ${token}`
+
+  let response: Response
+  try {
+    response = await fetch(`/api${path}`, { method: 'POST', headers, body })
+  } catch (networkError) {
+    throw new ApiError(
+      0,
+      networkError instanceof Error ? networkError.message : 'Network error',
+      'network_error',
+    )
+  }
+
+  if (response.status === 401) {
+    onUnauthenticated()
+    throw new ApiError(401, 'Session expired or invalid', 'unauthenticated')
+  }
+  if (!response.ok) {
+    const errorBody: ApiErrorBody = await response.json().catch(() => ({}))
+    throw new ApiError(
+      response.status,
+      errorBody.message ?? errorBody.error ?? response.statusText,
+      errorBody.error,
+      errorBody,
+    )
+  }
+  return response.json() as Promise<T>
+}
+
+/**
  * downloadBlob:鉴权二进制下载(GET /exports/{token})。
  * 用 fetch 带 Bearer token 取 blob,顺便从 Content-Disposition 解析文件名。
  * 非 2xx 复用 ApiError(status + code) —— 410 download_token_consumed/expired
@@ -155,6 +194,7 @@ async function downloadBlob(
 export const apiClient = {
   get: <T>(path: string): Promise<T> => request<T>('GET', path),
   downloadBlob,
+  postRaw,
   post: <T>(path: string, body?: unknown, options?: RequestOptions): Promise<T> =>
     request<T>('POST', path, body, options),
   put: <T>(path: string, body?: unknown, options?: RequestOptions): Promise<T> =>

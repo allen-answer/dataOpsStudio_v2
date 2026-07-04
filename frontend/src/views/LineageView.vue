@@ -2,28 +2,35 @@
 /**
  * LineageView —— /projects/:id/lineage(2.3.0 血缘,tech-design §2.4 + ADR-0019)
  *
- * 三个 tab:
+ * 四个 tab:
  *  - 子图查询(主视图):焦点表/列 N 跳邻域子图,自定义 SVG 分层布局
  *    (焦点居中,上游在左 / 下游在右,按 depth 分列)。★ 不做全景图(ADR-0019)。
  *  - 影响分析:焦点表 → 下游波及清单,按 depth 分组(纯图遍历,不依赖 AI)。
  *  - SQL 解析:选数据源 + 粘贴 SQL → analyze 端点落边;支持 refresh 绕过 sql_hash 缓存。
+ *  - 批量分析(L-2):上传 SQL 脚本 ZIP → 后台 job 逐文件宽松解析 → 汇总报告
+ *    (文件明细 + 跨脚本依赖);2s 轮询,换 tab / 卸载停轮询。
  *
- * 字段全部锚 api/lineage.ts(锚后端 schemas.py + core.py),不臆造。
+ * 字段全部锚 api/lineage.ts(锚后端 schemas.py + core.py + worker.py),不臆造。
  */
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useQuery } from '@tanstack/vue-query'
 import {
   AlertTriangle,
   Check,
+  ChevronDown,
+  ChevronRight,
   Download,
+  FileArchive,
   FileSearch,
   Network,
   Play,
   RefreshCw,
+  RotateCcw,
   Sparkles,
   Target,
+  Upload,
   Waypoints,
   X,
 } from 'lucide-vue-next'
@@ -31,11 +38,16 @@ import { listDatasources } from '../api/datasources'
 import { downloadExport } from '../api/metadata'
 import {
   analyzeLineage,
+  createLineageBatch,
   exportLineage,
+  getLineageBatch,
   getLineageEdgeDetail,
   getLineageImpact,
   getLineageSubgraph,
   updateLineageEdge,
+  type LineageBatchFileEntry,
+  type LineageBatchJobStatus,
+  type LineageBatchReport,
   type LineageEdgeDetailResponse,
   type LineageAnalyzeResponse,
   type LineageDirection,
@@ -46,10 +58,11 @@ import {
   type LineageSubgraphNode,
   type LineageSubgraphResponse,
 } from '../api/lineage'
+import { uploadFile } from '../api/uploads'
 import { ApiError, type DatasourceListItem } from '../api/types'
 import LoadingDots from '../components/LoadingDots.vue'
 
-type Tab = 'subgraph' | 'impact' | 'analyze'
+type Tab = 'subgraph' | 'impact' | 'analyze' | 'batch'
 
 // 血缘解析器支持的方言(app/domain/lineage/parser.py _normalize_dialect)
 const LINEAGE_DIALECTS: ReadonlySet<string> = new Set(['mysql', 'oracle', 'dm', 'postgresql'])
@@ -461,6 +474,145 @@ const parseErrorCount = computed(
   () => Number(analyzeResult.value?.parse_summary?.parse_error_count ?? 0),
 )
 
+// ── 批量分析(L-2:ZIP 上传 → job → 报告)──────────────────────────
+const MAX_UPLOAD_BYTES = 100 * 1024 * 1024 // 与后端 upload_max_mb 一致(413 前先拦)
+const BATCH_POLL_MS = 2000
+
+type BatchPhase = 'idle' | 'uploading' | 'running' | 'done' | 'failed'
+
+const batchDsId = ref('')
+const batchDefaultSchema = ref('')
+const batchFile = ref<File | null>(null)
+const batchPhase = ref<BatchPhase>('idle')
+const batchError = ref<string | null>(null)
+const batchJobId = ref<string | null>(null)
+const batchJobStatus = ref<LineageBatchJobStatus | null>(null)
+const batchReport = ref<LineageBatchReport | null>(null)
+const expandedFiles = ref<Set<string>>(new Set())
+let batchPollTimer: ReturnType<typeof setTimeout> | null = null
+
+watch(datasources, (list) => {
+  if (!batchDsId.value && list.length > 0) batchDsId.value = list[0].id
+})
+
+const batchDialect = computed(
+  () => datasources.value.find((ds) => ds.id === batchDsId.value)?.db_type ?? '',
+)
+const batchDialectUnsupported = computed(
+  () => Boolean(batchDialect.value) && !LINEAGE_DIALECTS.has(batchDialect.value),
+)
+const batchBusy = computed(
+  () => batchPhase.value === 'uploading' || batchPhase.value === 'running',
+)
+
+function onBatchFileChange(event: Event): void {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0] ?? null
+  batchError.value = null
+  if (file && file.size > MAX_UPLOAD_BYTES) {
+    batchError.value = t('lineage.batch_file_too_large')
+    batchFile.value = null
+    input.value = ''
+    return
+  }
+  batchFile.value = file
+}
+
+function stopBatchPolling(): void {
+  if (batchPollTimer !== null) {
+    clearTimeout(batchPollTimer)
+    batchPollTimer = null
+  }
+}
+
+function toggleFileRow(sourceRef: string): void {
+  const next = new Set(expandedFiles.value)
+  if (next.has(sourceRef)) next.delete(sourceRef)
+  else next.add(sourceRef)
+  expandedFiles.value = next
+}
+
+async function pollBatch(): Promise<void> {
+  const jobId = batchJobId.value
+  if (!projectId.value || !jobId) return
+  try {
+    const res = await getLineageBatch(projectId.value, jobId)
+    batchJobStatus.value = res.status
+    if (res.status === 'success') {
+      batchReport.value = res.report
+      batchPhase.value = 'done'
+      stopBatchPolling()
+      return
+    }
+    if (res.status === 'failed' || res.status === 'cancelled' || res.status === 'timeout') {
+      batchError.value = res.error || t('lineage.batch_job_failed')
+      batchPhase.value = 'failed'
+      stopBatchPolling()
+      return
+    }
+    // pending / running:继续轮询
+    batchPollTimer = setTimeout(() => void pollBatch(), BATCH_POLL_MS)
+  } catch (e) {
+    batchError.value = errorMessage(e)
+    batchPhase.value = 'failed'
+    stopBatchPolling()
+  }
+}
+
+async function onBatchSubmit(): Promise<void> {
+  if (!projectId.value || !batchDsId.value || !batchFile.value) {
+    batchError.value = t('lineage.batch_required')
+    return
+  }
+  stopBatchPolling()
+  batchError.value = null
+  batchReport.value = null
+  batchJobStatus.value = null
+  expandedFiles.value = new Set()
+  batchPhase.value = 'uploading'
+  try {
+    const upload = await uploadFile(projectId.value, batchFile.value, 'lineage_batch')
+    batchPhase.value = 'running'
+    const { job_id } = await createLineageBatch(projectId.value, {
+      upload_id: upload.upload_id,
+      datasource_id: batchDsId.value,
+      default_schema: batchDefaultSchema.value.trim() || null,
+    })
+    batchJobId.value = job_id
+    await pollBatch()
+  } catch (e) {
+    if (e instanceof ApiError && e.code === 'upload_too_large') {
+      batchError.value = t('lineage.batch_file_too_large')
+    } else {
+      batchError.value = errorMessage(e)
+    }
+    batchPhase.value = 'failed'
+  }
+}
+
+function resetBatch(): void {
+  stopBatchPolling()
+  batchFile.value = null
+  batchPhase.value = 'idle'
+  batchError.value = null
+  batchJobId.value = null
+  batchJobStatus.value = null
+  batchReport.value = null
+  expandedFiles.value = new Set()
+}
+
+function batchFileHasDetail(file: LineageBatchFileEntry): boolean {
+  return (
+    file.status === 'failed' ||
+    Number(file.parse_error_count ?? 0) > 0 ||
+    (file.tables_written?.length ?? 0) > 0 ||
+    (file.tables_read?.length ?? 0) > 0
+  )
+}
+
+// 换 tab 离开批量视图不停轮询(job 在后端继续跑,回来仍可看);仅卸载时停
+onBeforeUnmount(stopBatchPolling)
+
 // ── helpers ─────────────────────────────────────────────────────────
 function errorMessage(e: unknown): string {
   if (e instanceof ApiError) return e.message || t('common.error_unknown')
@@ -500,6 +652,14 @@ function errorMessage(e: unknown): string {
         @click="tab = 'analyze'"
       >
         <FileSearch class="w-4 h-4" /> {{ t('lineage.tab_analyze') }}
+      </button>
+      <button
+        type="button"
+        class="chrome-tab"
+        :class="tab === 'batch' && 'chrome-accent-light-bg chrome-accent'"
+        @click="tab = 'batch'"
+      >
+        <FileArchive class="w-4 h-4" /> {{ t('lineage.tab_batch') }}
       </button>
     </div>
 
@@ -1102,6 +1262,250 @@ function errorMessage(e: unknown): string {
               <button type="button" class="chrome-btn-secondary text-xs" @click="tab = 'subgraph'">
                 <Waypoints class="w-3.5 h-3.5" /> {{ t('lineage.tab_subgraph') }}
               </button>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- ============ 批量分析 tab(L-2:ZIP → job → 报告)============ -->
+      <div v-show="tab === 'batch'" class="p-4 space-y-4 max-w-4xl">
+        <div v-if="datasources.length === 0" class="text-sm chrome-text-muted">
+          {{ t('lineage.no_datasource') }}
+        </div>
+        <template v-else>
+          <p class="text-xs chrome-text-muted">{{ t('lineage.batch_hint') }}</p>
+          <div class="grid grid-cols-2 gap-4">
+            <label class="block">
+              <span class="block text-xs chrome-text-muted mb-1">{{ t('lineage.datasource') }}</span>
+              <select
+                v-model="batchDsId"
+                class="chrome-input w-full text-sm"
+                :disabled="batchBusy"
+              >
+                <option v-for="ds in datasources" :key="ds.id" :value="ds.id">{{ ds.name }}</option>
+              </select>
+              <span class="block mt-1 text-[11px] chrome-text-muted">
+                {{ t('lineage.dialect_follow', { dialect: batchDialect }) }}
+              </span>
+            </label>
+            <label class="block">
+              <span class="block text-xs chrome-text-muted mb-1">
+                {{ t('lineage.default_schema') }}
+              </span>
+              <input
+                v-model="batchDefaultSchema"
+                type="text"
+                class="chrome-input w-full text-sm"
+                :placeholder="t('lineage.default_schema_ph')"
+                :disabled="batchBusy"
+              />
+            </label>
+          </div>
+
+          <div
+            v-if="batchDialectUnsupported"
+            class="flex items-center gap-2 rounded-card border border-amber-300 dark:border-amber-500/40 bg-amber-50 dark:bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200"
+          >
+            <AlertTriangle class="w-4 h-4 shrink-0" />
+            {{ t('lineage.dialect_unsupported', { db: batchDialect }) }}
+          </div>
+
+          <label class="block">
+            <span class="block text-xs chrome-text-muted mb-1">{{ t('lineage.batch_file') }}</span>
+            <input
+              type="file"
+              accept=".zip"
+              class="block w-full text-sm chrome-text-heading file:mr-3 file:rounded-card file:border file:chrome-border file:chrome-bg-elevated file:px-3 file:py-1 file:text-xs file:chrome-text-heading"
+              :disabled="batchBusy"
+              @change="onBatchFileChange"
+            />
+            <span v-if="batchFile" class="block mt-1 text-[11px] chrome-text-muted">
+              {{ batchFile.name }} · {{ (batchFile.size / 1024).toFixed(0) }} KB
+            </span>
+          </label>
+
+          <div v-if="batchError" class="text-xs text-red-600 dark:text-red-400">
+            {{ batchError }}
+          </div>
+
+          <div class="flex items-center gap-2">
+            <button
+              type="button"
+              class="chrome-btn-primary text-sm"
+              :disabled="batchBusy || !batchFile"
+              @click="onBatchSubmit"
+            >
+              <Upload class="w-4 h-4" />
+              <template v-if="batchPhase === 'uploading'">{{ t('lineage.batch_uploading') }}</template>
+              <template v-else-if="batchPhase === 'running'">{{ t('lineage.batch_running') }}</template>
+              <template v-else>{{ t('lineage.batch_submit') }}</template>
+            </button>
+            <button
+              v-if="batchPhase === 'done' || batchPhase === 'failed'"
+              type="button"
+              class="chrome-btn-secondary text-sm"
+              @click="resetBatch"
+            >
+              <RotateCcw class="w-4 h-4" /> {{ t('lineage.batch_reset') }}
+            </button>
+            <LoadingDots v-if="batchBusy" />
+          </div>
+
+          <!-- 报告 -->
+          <div v-if="batchReport" class="space-y-4">
+            <!-- 统计卡 -->
+            <div class="grid grid-cols-2 sm:grid-cols-5 gap-2">
+              <div class="rounded-card border chrome-border px-3 py-2">
+                <div class="text-[11px] chrome-text-muted">{{ t('lineage.batch_stat_files') }}</div>
+                <div class="text-lg font-semibold chrome-text-heading">
+                  {{ batchReport.file_count }}
+                </div>
+              </div>
+              <div class="rounded-card border chrome-border px-3 py-2">
+                <div class="text-[11px] chrome-text-muted">{{ t('lineage.batch_stat_parsed') }}</div>
+                <div class="text-lg font-semibold text-emerald-600 dark:text-emerald-400">
+                  {{ batchReport.parsed }}
+                </div>
+              </div>
+              <div class="rounded-card border chrome-border px-3 py-2">
+                <div class="text-[11px] chrome-text-muted">{{ t('lineage.batch_stat_failed') }}</div>
+                <div
+                  class="text-lg font-semibold"
+                  :class="batchReport.failed > 0 ? 'text-red-600 dark:text-red-400' : 'chrome-text-heading'"
+                >
+                  {{ batchReport.failed }}
+                </div>
+              </div>
+              <div class="rounded-card border chrome-border px-3 py-2">
+                <div class="text-[11px] chrome-text-muted">{{ t('lineage.batch_stat_edges') }}</div>
+                <div class="text-lg font-semibold chrome-text-heading">
+                  {{ batchReport.table_edge_total }}
+                </div>
+              </div>
+              <div class="rounded-card border chrome-border px-3 py-2">
+                <div class="text-[11px] chrome-text-muted">
+                  {{ t('lineage.batch_stat_script_edges') }}
+                </div>
+                <div class="text-lg font-semibold chrome-text-heading">
+                  {{ batchReport.script_edges.length }}
+                </div>
+              </div>
+            </div>
+            <div
+              v-if="batchReport.skipped.non_sql + batchReport.skipped.too_large + batchReport.skipped.over_file_limit > 0"
+              class="text-[11px] chrome-text-muted"
+            >
+              {{
+                t('lineage.batch_skipped', {
+                  non_sql: batchReport.skipped.non_sql,
+                  too_large: batchReport.skipped.too_large,
+                  over_limit: batchReport.skipped.over_file_limit,
+                })
+              }}
+            </div>
+
+            <!-- 文件明细表 -->
+            <div class="rounded-card border chrome-border overflow-hidden">
+              <div class="px-3 py-2 text-xs font-medium chrome-text-heading border-b chrome-border-subtle">
+                {{ t('lineage.batch_files_title') }}
+              </div>
+              <div class="max-h-80 overflow-auto divide-y chrome-border-subtle">
+                <div v-for="file in batchReport.files" :key="file.source_ref" class="text-xs">
+                  <div
+                    class="flex items-center gap-2 px-3 py-1.5"
+                    :class="batchFileHasDetail(file) ? 'cursor-pointer hover:chrome-bg-elevated' : ''"
+                    @click="batchFileHasDetail(file) && toggleFileRow(file.source_ref)"
+                  >
+                    <component
+                      :is="expandedFiles.has(file.source_ref) ? ChevronDown : ChevronRight"
+                      v-if="batchFileHasDetail(file)"
+                      class="w-3.5 h-3.5 shrink-0 chrome-text-muted"
+                    />
+                    <span v-else class="w-3.5 shrink-0" />
+                    <span
+                      class="inline-block w-1.5 h-1.5 rounded-full shrink-0"
+                      :class="file.status === 'failed' ? 'bg-red-500' : file.status === 'cached' ? 'bg-sky-400' : 'bg-emerald-500'"
+                    />
+                    <span class="flex-1 min-w-0 truncate font-mono chrome-text-heading" :title="file.source_ref">
+                      {{ file.source_ref }}
+                    </span>
+                    <span class="shrink-0 chrome-text-muted tabular-nums">
+                      {{ t('lineage.batch_file_edges', { count: file.table_edge_count ?? 0 }) }}
+                    </span>
+                    <span
+                      v-if="(file.parse_error_count ?? 0) > 0"
+                      class="shrink-0 text-amber-600 dark:text-amber-400 tabular-nums"
+                    >
+                      {{ t('lineage.batch_file_errors', { count: file.parse_error_count }) }}
+                    </span>
+                    <span
+                      v-if="(file.lenient_statement_count ?? 0) > 0"
+                      class="shrink-0 text-sky-600 dark:text-sky-400 tabular-nums"
+                      :title="t('lineage.batch_lenient_hint')"
+                    >
+                      {{ t('lineage.batch_file_lenient', { count: file.lenient_statement_count }) }}
+                    </span>
+                  </div>
+                  <div
+                    v-if="expandedFiles.has(file.source_ref)"
+                    class="px-3 pb-2 pl-8 space-y-1 chrome-bg-elevated"
+                  >
+                    <div v-if="file.error" class="text-red-600 dark:text-red-400">
+                      {{ file.error }}
+                    </div>
+                    <div v-if="file.tables_written?.length" class="flex flex-wrap items-center gap-1">
+                      <span class="chrome-text-muted">{{ t('lineage.batch_tables_written') }}:</span>
+                      <span
+                        v-for="tbl in file.tables_written"
+                        :key="tbl"
+                        class="rounded px-1.5 py-0.5 chrome-bg-panel font-mono"
+                      >
+                        {{ tbl }}
+                      </span>
+                    </div>
+                    <div v-if="file.tables_read?.length" class="flex flex-wrap items-center gap-1">
+                      <span class="chrome-text-muted">{{ t('lineage.batch_tables_read') }}:</span>
+                      <span
+                        v-for="tbl in file.tables_read"
+                        :key="tbl"
+                        class="rounded px-1.5 py-0.5 chrome-bg-panel font-mono"
+                      >
+                        {{ tbl }}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 跨脚本依赖 -->
+            <div v-if="batchReport.script_edges.length" class="rounded-card border chrome-border overflow-hidden">
+              <div class="px-3 py-2 text-xs font-medium chrome-text-heading border-b chrome-border-subtle">
+                {{ t('lineage.batch_script_edges_title') }}
+              </div>
+              <div class="max-h-64 overflow-auto divide-y chrome-border-subtle">
+                <div
+                  v-for="(edge, ei) in batchReport.script_edges"
+                  :key="ei"
+                  class="flex flex-wrap items-center gap-2 px-3 py-1.5 text-xs"
+                >
+                  <span class="font-mono chrome-text-heading truncate max-w-[14rem]" :title="edge.source_file">
+                    {{ edge.source_file }}
+                  </span>
+                  <span class="chrome-text-muted">→</span>
+                  <span class="font-mono chrome-text-heading truncate max-w-[14rem]" :title="edge.target_file">
+                    {{ edge.target_file }}
+                  </span>
+                  <span class="chrome-text-muted">·</span>
+                  <span
+                    v-for="tbl in edge.tables"
+                    :key="tbl"
+                    class="rounded px-1.5 py-0.5 chrome-bg-elevated font-mono"
+                  >
+                    {{ tbl }}
+                  </span>
+                </div>
+              </div>
             </div>
           </div>
         </template>
