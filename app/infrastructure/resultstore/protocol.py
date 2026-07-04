@@ -24,6 +24,14 @@ class ResultStore(Protocol):
         """写入 SQL Workspace 导出文件,由 sql_export_ttl_hours 单独清理。"""
         raise NotImplementedError
 
+    def put_upload_artifact(self, upload_id: str, name: str, stream: BinaryIO) -> ResultRef:
+        """写入用户上传文件(血缘批量 ZIP / 对比文件源),由 upload_ttl_hours 清理。"""
+        raise NotImplementedError
+
+    def delete_upload(self, upload_id: str) -> bool:
+        """删除一个上传(TTL GC 之外的显式即时释放)。"""
+        raise NotImplementedError
+
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None:
         """流式追加 spool(配合 ResultSet 实现 streaming)。"""
         raise NotImplementedError

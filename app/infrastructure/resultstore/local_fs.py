@@ -61,6 +61,7 @@ class LocalFsResultStore(ResultStore):
         spool_max_bytes: int = 512 * 1024 * 1024,
         result_ttl_days: int = 7,
         sql_export_ttl_hours: int = 24,
+        upload_ttl_hours: int = 72,
     ) -> None:
         if spool_max_rows <= 0:
             raise ValueError("spool_max_rows must be positive")
@@ -68,15 +69,19 @@ class LocalFsResultStore(ResultStore):
             raise ValueError("spool_max_bytes must be positive")
         if sql_export_ttl_hours <= 0:
             raise ValueError("sql_export_ttl_hours must be positive")
+        if upload_ttl_hours <= 0:
+            raise ValueError("upload_ttl_hours must be positive")
         self._root = Path(root)
         self._spool_max_rows = spool_max_rows
         self._spool_max_bytes = spool_max_bytes
         self._result_ttl_days = result_ttl_days
         self._sql_export_ttl_hours = sql_export_ttl_hours
+        self._upload_ttl_hours = upload_ttl_hours
         self._root.mkdir(parents=True, exist_ok=True)
         self._resultsets_dir.mkdir(parents=True, exist_ok=True)
         self._runs_dir.mkdir(parents=True, exist_ok=True)
         self._exports_dir.mkdir(parents=True, exist_ok=True)
+        self._uploads_dir.mkdir(parents=True, exist_ok=True)
 
     def put_artifact(self, run_id: str, name: str, stream: BinaryIO) -> ResultRef:
         safe_name = _safe_artifact_name(name)
@@ -100,6 +105,23 @@ class LocalFsResultStore(ResultStore):
         with target.open("wb") as out:
             shutil.copyfileobj(stream, out)
         return self._ref_for_path(target)
+
+    def put_upload_artifact(self, upload_id: str, name: str, stream: BinaryIO) -> ResultRef:
+        """用户上传文件(血缘批量 ZIP / 对比文件源),由 upload_ttl_hours 清理。"""
+        safe_name = _safe_artifact_name(name)
+        upload_dir = self._upload_dir(upload_id)
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        target = upload_dir / safe_name
+        with target.open("wb") as out:
+            shutil.copyfileobj(stream, out)
+        return self._ref_for_path(target)
+
+    def delete_upload(self, upload_id: str) -> bool:
+        path = self._upload_dir(upload_id)
+        if not path.exists():
+            return False
+        shutil.rmtree(path, ignore_errors=True)
+        return True
 
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None:
         if not rows:
@@ -222,6 +244,8 @@ class LocalFsResultStore(ResultStore):
             removed += self._gc_children_older_than(self._resultsets_dir, cutoff)
         export_cutoff = time.time() - (self._sql_export_ttl_hours * 60 * 60)
         removed += self._gc_children_older_than(self._exports_dir, export_cutoff)
+        upload_cutoff = time.time() - (self._upload_ttl_hours * 60 * 60)
+        removed += self._gc_children_older_than(self._uploads_dir, upload_cutoff)
         return removed
 
     def spool_ref(self, result_set_id: str) -> ResultRef:
@@ -244,6 +268,13 @@ class LocalFsResultStore(ResultStore):
     @property
     def _exports_dir(self) -> Path:
         return self._root / "exports"
+
+    @property
+    def _uploads_dir(self) -> Path:
+        return self._root / "uploads"
+
+    def _upload_dir(self, upload_id: str) -> Path:
+        return self._uploads_dir / _safe_segment(upload_id)
 
     def _run_dir(self, run_id: str) -> Path:
         return self._runs_dir / _safe_segment(run_id)

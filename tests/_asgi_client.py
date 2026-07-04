@@ -39,8 +39,11 @@ class AsgiClient:
         headers: dict[str, str] | None = None,
         json_body: object | None = None,
         params: dict[str, object] | None = None,
+        raw_body: bytes | None = None,
     ) -> AsgiResponse:
-        return self.request("POST", path, headers=headers, json_body=json_body, params=params)
+        return self.request(
+            "POST", path, headers=headers, json_body=json_body, params=params, raw_body=raw_body
+        )
 
     def request(
         self,
@@ -50,9 +53,17 @@ class AsgiClient:
         headers: dict[str, str] | None = None,
         json_body: object | None = None,
         params: dict[str, object] | None = None,
+        raw_body: bytes | None = None,
     ) -> AsgiResponse:
         return asyncio.run(
-            self._request(method, path, headers=headers, json_body=json_body, params=params)
+            self._request(
+                method,
+                path,
+                headers=headers,
+                json_body=json_body,
+                params=params,
+                raw_body=raw_body,
+            )
         )
 
     async def _request(
@@ -63,6 +74,7 @@ class AsgiClient:
         headers: dict[str, str] | None,
         json_body: object | None,
         params: dict[str, object] | None,
+        raw_body: bytes | None = None,
     ) -> AsgiResponse:
         path_only, _, raw_query = path.partition("?")
         query = raw_query
@@ -82,6 +94,12 @@ class AsgiClient:
                     (b"content-length", str(len(body)).encode("ascii")),
                 ]
             )
+        elif raw_body is not None:
+            body = raw_body
+            raw_headers.append((b"content-length", str(len(body)).encode("ascii")))
+            # content-type 由调用方 headers 提供,默认 octet-stream
+            if not any(name.lower() == "content-type" for name in (headers or {})):
+                raw_headers.append((b"content-type", b"application/octet-stream"))
         for name, value in (headers or {}).items():
             raw_headers.append((name.lower().encode("latin-1"), value.encode("latin-1")))
 

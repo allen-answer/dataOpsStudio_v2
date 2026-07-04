@@ -52,6 +52,7 @@ class ApiServices:
     metadata_probe_timeout_seconds: int = 5
     export_per_user_per_hour: int = 10
     download_url_ttl_seconds: int = 300
+    upload_max_mb: int = 100
 
     def current_license_mode(self) -> LicenseMode:
         with self.engine.connect() as conn:
@@ -172,6 +173,7 @@ def build_api_services(settings: Settings | None = None) -> ApiServices:
             spool_max_bytes=actual_settings.result_store.spool_max_bytes,
             result_ttl_days=actual_settings.result_store.result_ttl_days,
             sql_export_ttl_hours=actual_settings.result_store.sql_export_ttl_hours,
+            upload_ttl_hours=actual_settings.result_store.upload_ttl_hours,
         ),
         jwt_secret=bootstrap.get_jwt_secret(),
         max_active_resultsets_per_console=(
@@ -180,6 +182,7 @@ def build_api_services(settings: Settings | None = None) -> ApiServices:
         metadata_probe_timeout_seconds=actual_settings.api.metadata_probe_timeout_seconds,
         export_per_user_per_hour=actual_settings.api.export_per_user_per_hour,
         download_url_ttl_seconds=actual_settings.api.download_url_ttl_seconds,
+        upload_max_mb=actual_settings.result_store.upload_max_mb,
     )
 
 

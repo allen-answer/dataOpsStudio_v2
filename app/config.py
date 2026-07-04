@@ -141,6 +141,9 @@ class ResultStoreConfig(BaseSettings):
     sql_export_ttl_hours: int = 24
     export_limit_mb: int = 1024
     max_active_resultsets_per_console: int = 3
+    # 用户上传(血缘批量 ZIP / 对比文件源)
+    upload_ttl_hours: int = 72
+    upload_max_mb: int = 100
 
 
 class AiGatewayConfig(BaseSettings):
