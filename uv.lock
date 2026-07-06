@@ -246,6 +246,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "dmpython" },
     { name = "fastapi" },
+    { name = "openpyxl" },
     { name = "pandas" },
     { name = "prometheus-client" },
     { name = "psycopg", extra = ["binary"] },
@@ -286,6 +287,7 @@ requires-dist = [
     { name = "dmpython", specifier = ">=2.5" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "ibm-db", marker = "extra == 'db2'", specifier = ">=3.2" },
+    { name = "openpyxl", specifier = ">=3.1" },
     { name = "pandas", specifier = ">=2.2" },
     { name = "prometheus-client", specifier = ">=0.21" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
@@ -323,6 +325,15 @@ wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/21/2c/d9f0f6c39834d73e89ff7e79aa92e677f4e4bea9c07dda917e2e3ad933bd/dmpython-2.5.32-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:bca8530ee0602c8bb4609a3b502cee01025642dbe873acdecc1f249318180ba9" },
     { url = "https://mirrors.aliyun.com/pypi/packages/d2/7b/9a1997e4db3e32c38a332229b5961f1b5f4bec406c959bf8cbc1fab4992f/dmpython-2.5.32-cp312-cp312-manylinux_2_12_x86_64.manylinux2010_x86_64.whl", hash = "sha256:cdeb42cb6f88b46c35dcf9d295c3c8ffe48a8b6f5713dee3fcc3e8cdd7b572ab" },
     { url = "https://mirrors.aliyun.com/pypi/packages/3c/61/fee9c3f631dec012034b5a1ef1ee624b0a44740186d2efa23861db252f80/dmpython-2.5.32-cp312-cp312-win_amd64.whl", hash = "sha256:668da85d874aba561b6c0d6dde183ec294411967d64d671e69e41fb6d5523c39" },
+]
+
+[[package]]
+name = "et-xmlfile"
+version = "2.0.0"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/d3/38/af70d7ab1ae9d4da450eeec1fa3918940a5fafb9055e934af8d6eb0c2313/et_xmlfile-2.0.0.tar.gz", hash = "sha256:dab3f4764309081ce75662649be815c4c9081e88f0837825f90fd28317d4da54" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/c1/8b/5fe2cc11fee489817272089c4203e679c63b570a5aaeb18d852ae3cbba6a/et_xmlfile-2.0.0-py3-none-any.whl", hash = "sha256:7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa" },
 ]
 
 [[package]]
@@ -514,6 +525,18 @@ wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/f6/81/e1b27545deedce7f4a0b348618c6b62d74e36a4dc9ccd42f3eb2f85eee32/numpy-2.4.6-cp312-cp312-win32.whl", hash = "sha256:e3eeb0aabd6bd5ce64faae67e9935203a6991b4bc2a485a767fbafb2c5125f45" },
     { url = "https://mirrors.aliyun.com/pypi/packages/ab/ca/feab00bd44aa5fe1ad2c18f08b4d3bb92e26484b0b1d1443897809ed528c/numpy-2.4.6-cp312-cp312-win_amd64.whl", hash = "sha256:d8e8286dd7cea7895157318d1b91cdacac64c479f3cbc8dce548331728484751" },
     { url = "https://mirrors.aliyun.com/pypi/packages/63/cf/5a6d34850a39d1093558564f77ee8e8e0bee5061151b8f05a55711001ec7/numpy-2.4.6-cp312-cp312-win_arm64.whl", hash = "sha256:4081eb135ac24158bd51cdfbef16f1c64df7063b1143f24731387137c092bec8" },
+]
+
+[[package]]
+name = "openpyxl"
+version = "3.1.5"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+dependencies = [
+    { name = "et-xmlfile" },
+]
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/3d/f9/88d94a75de065ea32619465d2f77b29a0469500e99012523b91cc4141cd1/openpyxl-3.1.5.tar.gz", hash = "sha256:cf0e3cf56142039133628b5acffe8ef0c12bc902d2aadd3e0fe5878dc08d1050" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/c0/da/977ded879c29cbd04de313843e76868e6e13408a94ed6b987245dc7c8506/openpyxl-3.1.5-py2.py3-none-any.whl", hash = "sha256:5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2" },
 ]
 
 [[package]]

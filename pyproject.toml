@@ -24,6 +24,8 @@ dependencies = [
     "sqlglot>=25.0",
     "pyarrow>=18",
     "pandas>=2.2",
+    # File-source readers — C-1 file compare(app/domain/readers/,非 DB 驱动)
+    "openpyxl>=3.1",
     # Secret crypto — import allowed ONLY in app/infrastructure/secretstore/ (R3)
     "cryptography>=43",
     "bcrypt>=4.2",
@@ -136,6 +138,11 @@ python_version = "3.12"
 strict = true
 warn_unreachable = true
 exclude = ["app/db/migrations/versions/"]
+
+# openpyxl 不发布 type stubs(无 py.typed);domain readers 需 import 它。
+[[tool.mypy.overrides]]
+module = ["openpyxl.*"]
+ignore_missing_imports = true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # pytest
