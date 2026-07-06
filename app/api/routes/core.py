@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import time
 from collections.abc import Callable
@@ -31,6 +32,8 @@ from app.api.schemas import (
     CompareBucket,
     CompareDataRef,
     CompareExportCreateRequest,
+    CompareFilePreviewRequest,
+    CompareFilePreviewResponse,
     CompareInferRequest,
     CompareInferResponse,
     ComparePreviewRequest,
@@ -169,6 +172,13 @@ from app.domain.lineage.ai_fallback import (
     InferredLineageEdges,
     fallback_statements,
     parse_inferred_edges,
+)
+from app.domain.readers import (
+    CsvReader,
+    ExcelReader,
+    ReaderError,
+    RowReader,
+    list_sheets,
 )
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
@@ -1935,6 +1945,124 @@ def _preview_value(value: object) -> object:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     return str(value)
+
+
+@router.post(
+    "/projects/{project_id}/compare/file-preview",
+    response_model=CompareFilePreviewResponse,
+)
+def preview_compare_file(
+    project_id: str,
+    body: CompareFilePreviewRequest,
+    request: Request,
+) -> CompareFilePreviewResponse:
+    """文件源上传后预览(C-1 PR2):按 upload_id + 格式参数读 sheet / 列名 / 前 N 行,
+    供前端"选 sheet / 表头 / 编码 + 列映射"用。不落任务、不碰 DB —— 纯 domain reader。
+
+    上传归属校验:upload 必须属本项目且 purpose=compare_source。文件本体经
+    result_store.open_download 落临时文件(openpyxl 需 seek + 复开工作簿),
+    读完即删。reader 原始错误(解码 / 格式失败)可能含文件内容,R5 下不透传,
+    只回通用 preview_failed + 记错误类型。
+    """
+    if body.ref.kind != "file":
+        raise ApiError(400, "invalid_ref_kind", "file-preview requires ref.kind=file")
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        upload_row = (
+            conn.execute(
+                select(uploads).where(
+                    and_(
+                        uploads.c.id == body.ref.upload_id,
+                        uploads.c.project_id == project_id,
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    if upload_row is None:
+        raise ApiError(404, "not_found", "Upload not found")
+    if str(upload_row["purpose"]) != "compare_source":
+        raise ApiError(400, "invalid_upload_purpose", "Upload purpose must be compare_source")
+
+    storage_uri = str(upload_row["storage_uri"])
+    # 保留原始扩展名:openpyxl 靠扩展名判格式,无 .xlsx/.xlsm 后缀会直接拒读。
+    suffix = os.path.splitext(str(upload_row["filename"]))[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp_path = tmp.name
+        with services.result_store.open_download(
+            ResultRef(backend="local_fs", uri=storage_uri)
+        ) as stream:
+            shutil.copyfileobj(stream, tmp)
+    try:
+        result = _read_file_preview(body.ref, tmp_path, body.limit)
+    except ReaderError as exc:
+        logger.info(
+            "compare file preview failed",
+            request_id=request_id_from(request),
+            upload_id=body.ref.upload_id,
+            error_type=type(exc).__name__,
+        )
+        raise ApiError(400, "preview_failed", "File preview failed") from exc
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="compare_file_preview",
+        resource_type="upload",
+        resource_id=str(body.ref.upload_id),
+        result="success",
+        detail={
+            "file_format": body.ref.file_format,
+            "limit": body.limit,
+            "row_count": result.row_count,
+        },
+    )
+    return result
+
+
+def _read_file_preview(ref: CompareDataRef, path: str, limit: int) -> CompareFilePreviewResponse:
+    """按 ref.file_format 装配 reader,取 sheet / 列 / 前 limit 行(多探一行判 truncated)。"""
+    sheets: list[str] = []
+    detected_encoding: str | None = None
+    reader: RowReader
+    if ref.file_format == "excel":
+        sheets = list_sheets(path)
+        reader = ExcelReader(path, sheet=ref.sheet, header_row=ref.header_row)
+    else:  # csv(schema 已把 file_format 限定为 csv|excel)
+        csv_reader = CsvReader(
+            path,
+            encoding=ref.encoding or "utf-8-sig",
+            delimiter=ref.delimiter or ",",
+            header_row=ref.header_row,
+        )
+        detected_encoding = csv_reader.resolved_encoding
+        reader = csv_reader
+    columns = reader.columns()
+    rows: list[list[Any]] = []
+    truncated = False
+    for index, row in enumerate(reader.iter_rows()):
+        if index >= limit:
+            truncated = True
+            break
+        rows.append([_preview_value(row.get(column)) for column in columns])
+    return CompareFilePreviewResponse(
+        sheets=sheets,
+        columns=columns,
+        rows=rows,
+        row_count=len(rows),
+        truncated=truncated,
+        detected_encoding=detected_encoding,
+    )
 
 
 @router.post(
