@@ -302,6 +302,54 @@ export interface LineageBatchScriptEdge {
   tables: string[]
 }
 
+// ── L-4 语义视图(批量 report 顶层新增 semantic_view 段;worker 侧生成)──
+// 后端 JSON 全 snake_case;refresh_mode 可空(单角色/无写入目标为 null)。
+
+/** 单目标表的写入方式计数(缺失键后端补 0)。 */
+export interface LineageTargetCounts {
+  insert: number
+  update: number
+  merge: number
+  delete: number
+  truncate: number
+}
+
+/** 目标表整合视图:该表被哪些源写入 / 以何种刷新模式。 */
+export interface LineageTargetIntegration {
+  table: string
+  primary_role: string
+  roles: string[]
+  /** truncate_insert/delete_insert/delete_insert_partial/merge/update/append/mixed;单角色可空。 */
+  refresh_mode: string | null
+  counts: LineageTargetCounts
+  source_tables: string[]
+  source_files: string[]
+  titles: string[]
+}
+
+/** 表角色汇总(每表在全批次里承担的角色集合)。 */
+export interface LineageTableRole {
+  table: string
+  roles: string[]
+  primary_role: string
+}
+
+/** 语义风险项(按 level 上色展示 message)。 */
+export interface LineageSemanticRisk {
+  level: 'high' | 'medium' | 'low'
+  type: string
+  message: string
+}
+
+/** 顶层语义视图段(挂 batchReport.semantic_view)。 */
+export interface LineageSemanticView {
+  targets: LineageTargetIntegration[]
+  table_roles: LineageTableRole[]
+  /** 中文人话观察,直接展示。 */
+  observations: string[]
+  risks: LineageSemanticRisk[]
+}
+
 export interface LineageBatchReport {
   file_count: number
   parsed: number
@@ -311,6 +359,8 @@ export interface LineageBatchReport {
   column_mapping_total: number
   files: LineageBatchFileEntry[]
   script_edges: LineageBatchScriptEdge[]
+  /** L-4 语义视图(旧 report 无此段,可选守空)。 */
+  semantic_view?: LineageSemanticView
 }
 
 export interface LineageBatchStatusResponse {
