@@ -5,7 +5,13 @@ from app.domain.lineage.models import (
     LineageParseError,
     LineageReport,
     LineageWarning,
+    RefreshMode,
+    SemanticRisk,
+    SemanticView,
     TableLineageEdge,
+    TableRole,
+    TableRoleKind,
+    TargetIntegration,
     TransformationKind,
     TransformationSubtype,
 )
@@ -15,6 +21,7 @@ from app.domain.lineage.parser import (
     schema_from_metadata_cache_rows,
 )
 from app.domain.lineage.plsql import split_plsql_statements
+from app.domain.lineage.semantic import build_semantic_view
 
 __all__ = [
     "LINEAGE_PARSER_VERSION",
@@ -23,10 +30,17 @@ __all__ = [
     "LineageParseRequest",
     "LineageReport",
     "LineageWarning",
+    "RefreshMode",
+    "SemanticRisk",
+    "SemanticView",
     "TableLineageEdge",
+    "TableRole",
+    "TableRoleKind",
+    "TargetIntegration",
     "TransformationKind",
     "TransformationSubtype",
     "analyze_sql_lineage",
+    "build_semantic_view",
     "lineage_sql_hash",
     "register_lineage_dialects",
     "schema_from_metadata_cache_rows",
