@@ -62,6 +62,7 @@ import {
   type LineageTargetCounts,
 } from '../api/lineage'
 import { uploadFile } from '../api/uploads'
+import { createStoredZip } from '../utils/zip'
 import { ApiError, type DatasourceListItem } from '../api/types'
 import LoadingDots from '../components/LoadingDots.vue'
 
@@ -487,7 +488,16 @@ type BatchPhase = 'idle' | 'uploading' | 'running' | 'done' | 'failed'
 const batchDsId = ref('')
 const batchManualDialect = ref('oracle')
 const batchDefaultSchema = ref('')
-const batchFile = ref<File | null>(null)
+const batchFiles = ref<File[]>([])
+const batchFileInput = ref<HTMLInputElement | null>(null)
+
+// 打开文件选择器:显式触发隐藏 input 的 click(恰好一次)。
+// ★ 不用 <label> 包裹 input —— Chrome 下 label 包裹 file input 点击会触发两次
+// 文件对话框(label 默认行为 + click 冒泡到 input),第二个空对话框取消时会
+// setFiles([]) 清空选择,表现为"上传用不了"。故改 div + ref + @click.stop。
+function openBatchFilePicker(): void {
+  if (!batchBusy.value) batchFileInput.value?.click()
+}
 const batchPhase = ref<BatchPhase>('idle')
 const batchError = ref<string | null>(null)
 const batchJobId = ref<string | null>(null)
@@ -516,17 +526,48 @@ const batchBusy = computed(
   () => batchPhase.value === 'uploading' || batchPhase.value === 'running',
 )
 
-function onBatchFileChange(event: Event): void {
-  const input = event.target as HTMLInputElement
-  const file = input.files?.[0] ?? null
+const BATCH_ALLOWED_EXT = ['.zip', '.sql', '.txt'] as const
+const batchTotalBytes = computed(() =>
+  batchFiles.value.reduce((sum, f) => sum + f.size, 0),
+)
+const batchTotalKb = computed(() => `${(batchTotalBytes.value / 1024).toFixed(0)} KB`)
+const batchFilesPreview = computed(() => {
+  const names = batchFiles.value.map((f) => f.name)
+  return names.length <= 3 ? names.join(', ') : `${names.slice(0, 3).join(', ')} …`
+})
+
+// 收多文件 + 校验(change / drop 复用)。校验失败设 batchError,不覆盖既有选择。
+function acceptBatchFiles(files: File[]): void {
   batchError.value = null
-  if (file && file.size > MAX_UPLOAD_BYTES) {
-    batchError.value = t('lineage.batch_file_too_large')
-    batchFile.value = null
-    input.value = ''
+  if (!files.length) return
+  const lower = (f: File) => f.name.toLowerCase()
+  if (files.some((f) => !BATCH_ALLOWED_EXT.some((ext) => lower(f).endsWith(ext)))) {
+    batchError.value = t('lineage.batch_file_ext')
     return
   }
-  batchFile.value = file
+  // ZIP 与散文件不能混、不能多个 ZIP:含 zip 则必须恰好单个文件
+  const hasZip = files.some((f) => lower(f).endsWith('.zip'))
+  if (hasZip && files.length > 1) {
+    batchError.value = t('lineage.batch_file_combo')
+    return
+  }
+  if (files.reduce((sum, f) => sum + f.size, 0) > MAX_UPLOAD_BYTES) {
+    batchError.value = t('lineage.batch_file_too_large')
+    batchFiles.value = []
+    return
+  }
+  batchFiles.value = files
+}
+
+function onBatchFileChange(event: Event): void {
+  const input = event.target as HTMLInputElement
+  acceptBatchFiles(Array.from(input.files ?? []))
+  input.value = '' // 允许再次选同名文件触发 change
+}
+
+function onBatchDrop(event: DragEvent): void {
+  if (batchBusy.value) return
+  acceptBatchFiles(Array.from(event.dataTransfer?.files ?? []))
 }
 
 function stopBatchPolling(): void {
@@ -572,7 +613,7 @@ async function pollBatch(): Promise<void> {
 
 async function onBatchSubmit(): Promise<void> {
   // 数据源可选:无库模式只需文件 + dialect(下拉恒有值);有库模式需选中数据源
-  if (!projectId.value || !batchFile.value) {
+  if (!projectId.value || !batchFiles.value.length) {
     batchError.value = t('lineage.batch_required')
     return
   }
@@ -583,7 +624,22 @@ async function onBatchSubmit(): Promise<void> {
   expandedFiles.value = new Set()
   batchPhase.value = 'uploading'
   try {
-    const upload = await uploadFile(projectId.value, batchFile.value, 'lineage_batch')
+    // 单 ZIP 直传(原行为);多散文件 → 客户端 STORED-zip 打包,复用后端 ZIP 路径
+    const files = batchFiles.value
+    let fileToUpload: File
+    if (files.length === 1 && files[0].name.toLowerCase().endsWith('.zip')) {
+      fileToUpload = files[0]
+    } else {
+      const entries = await Promise.all(
+        files.map(async (f) => ({
+          name: f.name,
+          data: new Uint8Array(await f.arrayBuffer()),
+        })),
+      )
+      const blob = createStoredZip(entries)
+      fileToUpload = new File([blob], 'scripts.zip', { type: 'application/zip' })
+    }
+    const upload = await uploadFile(projectId.value, fileToUpload, 'lineage_batch')
     batchPhase.value = 'running'
     const { job_id } = await createLineageBatch(projectId.value, {
       upload_id: upload.upload_id,
@@ -606,7 +662,7 @@ async function onBatchSubmit(): Promise<void> {
 
 function resetBatch(): void {
   stopBatchPolling()
-  batchFile.value = null
+  batchFiles.value = []
   batchPhase.value = 'idle'
   batchError.value = null
   batchJobId.value = null
@@ -1352,19 +1408,42 @@ function errorMessage(e: unknown): string {
             {{ t('lineage.dialect_unsupported', { db: batchDialect }) }}
           </div>
 
-          <label class="block">
+          <div class="block">
             <span class="block text-xs chrome-text-muted mb-1">{{ t('lineage.batch_file') }}</span>
-            <input
-              type="file"
-              accept=".zip"
-              class="block w-full text-sm chrome-text-heading file:mr-3 file:rounded-card file:border file:chrome-border file:chrome-bg-elevated file:px-3 file:py-1 file:text-xs file:chrome-text-heading"
-              :disabled="batchBusy"
-              @change="onBatchFileChange"
-            />
-            <span v-if="batchFile" class="block mt-1 text-[11px] chrome-text-muted">
-              {{ batchFile.name }} · {{ (batchFile.size / 1024).toFixed(0) }} KB
-            </span>
-          </label>
+            <div
+              class="flex flex-col items-center justify-center gap-2 rounded-card border border-dashed chrome-border chrome-bg-elevated px-4 py-6 text-center"
+              :class="batchBusy ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'"
+              role="button"
+              tabindex="0"
+              @click="openBatchFilePicker"
+              @keydown.enter.prevent="openBatchFilePicker"
+              @keydown.space.prevent="openBatchFilePicker"
+              @dragover.prevent
+              @drop.prevent="onBatchDrop"
+            >
+              <input
+                ref="batchFileInput"
+                type="file"
+                class="hidden"
+                accept=".zip,.sql,.txt"
+                multiple
+                :disabled="batchBusy"
+                @click.stop
+                @change="onBatchFileChange"
+              />
+              <FileArchive class="w-6 h-6 chrome-text-muted" />
+              <span class="text-sm chrome-text-heading">{{ t('lineage.batch_dropzone') }}</span>
+              <span v-if="batchFiles.length === 1" class="text-[11px] chrome-text-muted break-all">
+                {{ batchFiles[0].name }} · {{ batchTotalKb }}
+              </span>
+              <template v-else-if="batchFiles.length > 1">
+                <span class="text-[11px] chrome-text-heading">
+                  {{ t('lineage.batch_files_selected', { count: batchFiles.length, size: batchTotalKb }) }}
+                </span>
+                <span class="text-[11px] chrome-text-muted break-all">{{ batchFilesPreview }}</span>
+              </template>
+            </div>
+          </div>
 
           <div v-if="batchError" class="text-xs text-red-600 dark:text-red-400">
             {{ batchError }}
@@ -1374,7 +1453,7 @@ function errorMessage(e: unknown): string {
             <button
               type="button"
               class="chrome-btn-primary text-sm"
-              :disabled="batchBusy || !batchFile"
+              :disabled="batchBusy || !batchFiles.length"
               @click="onBatchSubmit"
             >
               <Upload class="w-4 h-4" />
