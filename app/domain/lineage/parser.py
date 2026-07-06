@@ -139,6 +139,14 @@ def _analyze_statement(
             return
     statement_type = expression.key.upper()
     report.statements.append({"index": context.index, "type": statement_type})
+    # DELETE/TRUNCATE 无列血缘,不需要 metadata/qualify:在 _missing_tables 之前
+    # 提前短路,strict + lenient 两路共用同一逻辑,避免语义重复(L-4 全量重刷判据)。
+    if isinstance(expression, exp.Delete):
+        _analyze_delete(expression, context, report)
+        return
+    if _is_truncate(expression):
+        _analyze_truncate(expression, context, report)
+        return
     missing = _missing_tables(expression, context.schema, context.default_schema)
     if missing:
         if context.lenient:
@@ -496,6 +504,80 @@ def _analyze_update(
             context=context,
             cte_map=cte_map,
         )
+
+
+def _analyze_delete(
+    expression: exp.Delete,
+    context: _StatementContext,
+    report: LineageReport,
+) -> None:
+    """DELETE:只落 target_summary,不产血缘边(无 source)。
+
+    has_where=False 的 DELETE = 全表清空,供 L-4 判定全量重刷(DELETE+INSERT)。
+    """
+    target_expr = expression.this
+    if not isinstance(target_expr, exp.Table):
+        _append_unsupported_statement_warning(report, context, "DELETE")
+        return
+    has_where = expression.args.get("where") is not None
+    report.target_summary.append(
+        TargetSummary(
+            table=_table_name(target_expr, context.default_schema),
+            operation="delete",
+            has_where=has_where,
+            statement_index=context.index,
+        )
+    )
+
+
+def _analyze_truncate(
+    expression: exp.Expression,
+    context: _StatementContext,
+    report: LineageReport,
+) -> None:
+    """TRUNCATE:每个目标表一条 target_summary(operation=truncate),无血缘边。
+
+    sqlglot 30.x 将 `TRUNCATE TABLE foo` 解析为 exp.TruncateTable,表在
+    .expressions 列表(可多表);兜底 exp.Command 形态用 find_all(Table)。
+    取不到表则退回 warning,不崩。
+    """
+    if isinstance(expression, exp.TruncateTable):
+        tables = [t for t in expression.expressions if isinstance(t, exp.Table)]
+    else:
+        tables = list(expression.find_all(exp.Table))
+    if not tables:
+        _append_unsupported_statement_warning(report, context, "TRUNCATE")
+        return
+    for table in tables:
+        report.target_summary.append(
+            TargetSummary(
+                table=_table_name(table, context.default_schema),
+                operation="truncate",
+                has_where=None,
+                statement_index=context.index,
+            )
+        )
+
+
+def _is_truncate(expression: exp.Expression) -> bool:
+    if isinstance(expression, exp.TruncateTable):
+        return True
+    # 兜底:某些方言/形态下 TRUNCATE 落 exp.Command(表在原始命令串里)。
+    return isinstance(expression, exp.Command) and str(expression.this or "").upper() == "TRUNCATE"
+
+
+def _append_unsupported_statement_warning(
+    report: LineageReport,
+    context: _StatementContext,
+    statement_type: str,
+) -> None:
+    report.warnings.append(
+        LineageWarning(
+            code="unsupported_statement",
+            message=f"{statement_type} target table is not resolvable",
+            statement_index=context.index,
+        ).model_dump(mode="json")
+    )
 
 
 def _append_output_mappings(

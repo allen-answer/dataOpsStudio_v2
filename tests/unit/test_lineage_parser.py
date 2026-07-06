@@ -506,6 +506,91 @@ def test_mysql_multi_table_update_with_join() -> None:
     assert filter_mapping["transformation_subtype"] == TransformationSubtype.FILTER
 
 
+def test_delete_without_where_emits_full_wipe_target_summary() -> None:
+    # 无 WHERE 的 DELETE = 全表清空,供 L-4 判定 DELETE+INSERT 全量重刷。
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text="DELETE FROM app.target_orders",
+            dialect="mysql",
+            schema=_schema(),
+            default_schema="app",
+        )
+    )
+
+    assert report.parse_errors == []
+    assert report.graph_edges == []  # DELETE 无 source,不产血缘边
+    assert len(report.target_summary) == 1
+    summary = report.target_summary[0]
+    assert summary.table == "app.target_orders"
+    assert summary.operation == "delete"
+    assert summary.has_where is False
+
+
+def test_delete_with_where_marks_has_where_true() -> None:
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text="DELETE FROM app.target_orders WHERE customer_id > 0",
+            dialect="mysql",
+            schema=_schema(),
+            default_schema="app",
+        )
+    )
+
+    assert report.parse_errors == []
+    assert report.target_summary[0].operation == "delete"
+    assert report.target_summary[0].has_where is True
+
+
+def test_truncate_table_emits_truncate_target_summary() -> None:
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text="TRUNCATE TABLE app.target_orders",
+            dialect="oracle",
+            schema=_schema(),
+            default_schema="app",
+        )
+    )
+
+    assert report.parse_errors == []
+    assert report.graph_edges == []
+    assert len(report.target_summary) == 1
+    summary = report.target_summary[0]
+    assert summary.table == "app.target_orders"
+    assert summary.operation == "truncate"
+    assert summary.has_where is None
+
+
+def test_lenient_mode_delete_and_truncate_still_land_target_summary() -> None:
+    # 提前短路 → strict/lenient 两路都覆盖;缺元数据也照样落 target_summary。
+    delete_report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text="DELETE FROM kgrp.r_cisp_g3001_t",
+            dialect="oracle",
+            schema={},
+            default_schema=None,
+            lenient=True,
+        )
+    )
+    assert delete_report.parse_errors == []
+    assert delete_report.target_summary[0].table == "kgrp.r_cisp_g3001_t"
+    assert delete_report.target_summary[0].operation == "delete"
+    assert delete_report.target_summary[0].has_where is False
+
+    truncate_report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text="TRUNCATE TABLE kgrp.r_cisp_g3001_t",
+            dialect="oracle",
+            schema={},
+            default_schema=None,
+            lenient=True,
+        )
+    )
+    assert truncate_report.parse_errors == []
+    assert truncate_report.target_summary[0].table == "kgrp.r_cisp_g3001_t"
+    assert truncate_report.target_summary[0].operation == "truncate"
+    assert truncate_report.target_summary[0].has_where is None
+
+
 def test_mysql_multi_table_update_comma_join() -> None:
     report = analyze_sql_lineage(
         LineageParseRequest(

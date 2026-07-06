@@ -58,6 +58,68 @@ class TargetSummary(BaseModel):
     operation: str
     refresh_mode: str | None = None
     statement_index: int = 0
+    # DELETE/TRUNCATE 才有意义:无 WHERE 的 DELETE = 全表清空(全量重刷判据)。
+    # INSERT/CREATE/MERGE/UPDATE 恒为 None。
+    has_where: bool | None = None
+
+
+class RefreshMode(StrEnum):
+    """目标表刷新方式。判定见 domain/lineage/semantic.py:classify_refresh_mode。"""
+
+    TRUNCATE_INSERT = "truncate_insert"  # TRUNCATE+INSERT 全量重刷
+    DELETE_INSERT = "delete_insert"  # 无 WHERE 的 DELETE+INSERT 全量重刷
+    DELETE_INSERT_PARTIAL = "delete_insert_partial"  # 带 WHERE 的 DELETE+INSERT 分区/增量重刷
+    MERGE = "merge"  # 仅 MERGE
+    UPDATE = "update"  # 仅 UPDATE
+    APPEND = "append"  # 仅 INSERT 追加
+    MIXED = "mixed"  # 多种写混合但无删+插序列
+
+
+class TableRoleKind(StrEnum):
+    """表在数据流中的角色。结构角色(读写关系)+ 命名角色(schema/表名关键词)。"""
+
+    TARGET = "target"  # 只写
+    INTERMEDIATE = "intermediate"  # 既写又读(中转/staging)
+    SOURCE_FACT = "source_fact"  # 纯读源(兜底)
+    REMOTE_DBLINK = "remote_dblink"  # Oracle @dblink 远端
+    CONFIG = "config"  # 配置表
+    REFERENCE = "reference"  # 参照/字典/码表
+    DIMENSION = "dimension"  # 维表
+    FILTER = "filter"  # 过滤/黑名单表
+
+
+class TableRole(BaseModel):
+    table: str
+    roles: list[str] = Field(default_factory=list)
+    primary_role: str = TableRoleKind.SOURCE_FACT.value
+
+
+class TargetIntegration(BaseModel):
+    """单个目标表的整合视图(跨脚本聚合)。"""
+
+    table: str
+    primary_role: str = TableRoleKind.TARGET.value
+    roles: list[str] = Field(default_factory=list)
+    refresh_mode: str | None = None
+    counts: dict[str, int] = Field(default_factory=dict)  # insert/update/merge/delete/truncate
+    source_tables: list[str] = Field(default_factory=list)
+    source_files: list[str] = Field(default_factory=list)  # 批量:哪些脚本写本表
+    titles: list[str] = Field(default_factory=list)
+
+
+class SemanticRisk(BaseModel):
+    level: str  # high / medium / low
+    type: str
+    message: str
+
+
+class SemanticView(BaseModel):
+    """L-4 语义血缘视图:目标表整合 + 角色 + 人话观察 + 风险。挂载于批量 report。"""
+
+    targets: list[TargetIntegration] = Field(default_factory=list)
+    table_roles: list[TableRole] = Field(default_factory=list)
+    observations: list[str] = Field(default_factory=list)
+    risks: list[SemanticRisk] = Field(default_factory=list)
 
 
 class LineageReport(BaseModel):

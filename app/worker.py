@@ -76,6 +76,7 @@ from app.domain.lineage import (
     LineageParseRequest,
     LineageReport,
     analyze_sql_lineage,
+    build_semantic_view,
     lineage_sql_hash,
     schema_from_metadata_cache_rows,
 )
@@ -1055,6 +1056,16 @@ class WorkerRunner:
         script_edges = _lineage_batch_script_edges(files_report)
         parsed = sum(1 for item in files_report if item["status"] in {"parsed", "cached"})
         failed = sum(1 for item in files_report if item["status"] == "failed")
+        # L-4 语义视图:跨脚本聚合目标表整合/刷新模式/角色/观察/风险。
+        # 消费内存透传的 _report,序列化前 pop 掉(不进 report JSON)。
+        semantic_reports: list[tuple[str, LineageReport]] = [
+            (str(item["source_ref"]), item["_report"])
+            for item in files_report
+            if isinstance(item.get("_report"), LineageReport)
+        ]
+        semantic_view = build_semantic_view(semantic_reports)
+        for item in files_report:
+            item.pop("_report", None)
         report_payload = {
             "file_count": len(files_report),
             "parsed": parsed,
@@ -1068,6 +1079,7 @@ class WorkerRunner:
             ),
             "files": files_report,
             "script_edges": script_edges,
+            "semantic_view": semantic_view.model_dump(mode="json"),
         }
         artifact_ref = self._result_store.put_artifact(
             job.id,
@@ -1166,6 +1178,8 @@ class WorkerRunner:
             ),
             "tables_written": tables_written,
             "tables_read": tables_read,
+            # 内存透传:供 L-4 语义视图聚合(序列化前 pop,不进 report JSON)
+            "_report": report,
         }
 
     def _execute_workflow_run(self, job: Job) -> _ExecutionOutcome | None:

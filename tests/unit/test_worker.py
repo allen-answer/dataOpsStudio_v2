@@ -1608,6 +1608,50 @@ def test_worker_runs_lineage_batch_without_datasource_report_only() -> None:
     file_a = next(item for item in report["files"] if item["source_ref"] == "a.sql")
     assert file_a["run_id"] is None  # 未持久化
     assert file_a["tables_written"] == ["kgrp.mid"]
+    # 内存透传键不得泄漏进序列化报告
+    assert "_report" not in file_a
+
+
+def test_worker_lineage_batch_emits_semantic_view_with_refresh_and_risk() -> None:
+    # L-4:DELETE(无 WHERE)+ INSERT 同表 → 全量重刷 delete_insert + full_reload 风险
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "refresh.sql",
+            "delete from kgrp.tgt;\ninsert into kgrp.tgt select * from kgrp.src",
+        )
+    job = _make_job(
+        kind=JobKind.LINEAGE_BATCH,
+        payload={
+            "upload_id": "up-1",
+            "storage_uri": "uploads/up-1/scripts.zip",
+            "datasource_id": None,
+            "dialect": "oracle",
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    result_store.downloads["uploads/up-1/scripts.zip"] = buffer.getvalue()
+    catalog = _FakeLineageCatalog()
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=catalog,
+    )
+
+    assert runner.run_once() is True
+
+    report = json.loads(result_store.run_artifacts[("job-1", "lineage_batch_report.json")])
+    semantic = report["semantic_view"]
+    target = next(t for t in semantic["targets"] if t["table"] == "kgrp.tgt")
+    assert target["refresh_mode"] == "delete_insert"
+    assert target["counts"]["delete"] == 1 and target["counts"]["insert"] == 1
+    assert "kgrp.src" in target["source_tables"]
+    assert any(risk["type"] == "full_reload" for risk in semantic["risks"])
+    assert any("全量重刷" in obs for obs in semantic["observations"])
 
 
 def test_worker_lineage_analyze_reuses_cached_run() -> None:
