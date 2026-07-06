@@ -108,7 +108,7 @@
 
 ### 3.2 扫描频率
 
-- 新增 config,建议 `DATAOPS_SCHEDULER_tick_interval_seconds`(默认 **30 或 60s**;cron 最细粒度是分钟,tick ≤ 60s 即可保证每分钟窗口不漏;默认 30s 给一点余量)。放 config.py 新 `SchedulerConfig`(env_prefix `DATAOPS_SCHEDULER_`,照 `WorkerConfig` config.py:111 范式),或并入 `ApiConfig`。
+- 新增 config key `scheduler_tick_seconds`,**默认 30s**(§6.A#5 已定;cron 最细粒度是分钟,30s 稳妥不漏窗口边界)。**并入现有 `ApiConfig`**(不新开 `SchedulerConfig` 类,§6.A#5)。
 - 附一个总开关 `enabled: bool = True`,便于测试/特定部署关闭 tick。
 
 ### 3.3 如何判定"到点"(关键)
@@ -221,14 +221,29 @@ tick 的 enqueue **必须与 `last_triggered_at` 的 UPDATE 在同一事务**(�
 
 ---
 
-## 六、待确认 / 需 Codex 落地时验证
+## 六、决策(owner 委托,已定)+ 落地时验证项
 
-1. **tick 进程归属(最重要)**:ADR-0009 §1 字面要求"API 进程内 tick",本稿据此设计(需新增 lifespan)。**但 worker `run_once` 已有成熟轮询循环 + 单进程 + enqueue 天然属 worker 职责,塞 tick 进去更省事、风险更低。** 请与 owner 确认是否可偏离 ADR 走 worker-loop 方案(若可,4b-4 从"lifespan+线程"改为"worker.run_once 加一步",更简单)。
-2. **首次触发 seed 语义(`last_triggered_at IS NULL`)**:两方案二选一——(a) 首个 tick 只把 `last_triggered_at` 设为 now、不入队,下一窗口起正常;(b) 用 `croniter.get_prev(now)` 判"上个到点是否落在 (基准, now]"。需明确,直接影响"新建 workflow 是否当窗口就触发"。建议 (a)(语义更保守、无意外补触发)。
-3. **时区口径**:全局 UTC vs config `scheduler_timezone` vs 跟随 1.x 的服务器本地时区。需查 1.x 调度用的是哪种时区(`ssh daily-server`,若可访问),对齐用户既有预期,否则用户迁移后 cron 触发时刻会平移。
-4. **croniter 依赖**:确认可引入 croniter(纯 Python、无重依赖、许可 MIT)vs 自研分钟级 matcher。本稿主推 croniter(workflow.py:16 docstring 已把"精确解析"归给 PR-4,隐含预期引库)。落地确认 pyproject 依赖策略与 CI 锁文件。
-5. **tick 间隔默认值**:30s vs 60s(cron 分钟粒度下 60s 够,30s 更稳);config key 命名与归属(新 `SchedulerConfig` vs 并入 `ApiConfig`)。
-6. **候选索引**:`workflows` 表规模预期(每部署几十条?)决定是否需要 `WHERE schedule_enabled` 部分索引,还是全表扫足够。
-7. **迁移链号**:`0016_workflows` 之后是否已有更高编号迁移(head 需 Codex 落地时 `alembic heads` 确认),新迁移 down_revision 接真实 head。
-8. **审计动作命名**:cron 触发用 `workflow_run_trigger` + detail `{trigger:"cron"}`,还是新 action `workflow_run_scheduled`?与前端/审计查询口径对齐后定。
-9. **多 worker / 未来 HA**:首版单 API 进程,行锁是纵深防御非分布式锁承诺。若后续要多实例,需要独立评估(ADR-0009 已列 Deferred)。
+> 下述 §6.A 是 owner 委托后拍定的实现取向,Codex 直接照做,**不必再问**;
+> §6.B 是纯技术性、只能在落地当刻确定的项(如迁移 head 号),Codex 实现时核实即可。
+
+### 6.A 已决策(照此实现)
+
+1. **tick 进程归属 → API 进程内 lifespan 守护线程(遵 ADR-0009 §1)。**
+   ADR-0009 §1 是已记录的架构决策,**默认遵守,不擅自偏离**(worker-loop 虽更省事,但推翻 ADR 属治理动作,应走 ADR 修订而非在任务书里绕过)。§3.6 的 `FOR UPDATE SKIP LOCKED` + `last_triggered_at` 幂等已让"API 多副本同时 tick"也安全,故 API 进程方案无并发隐患。
+   —— 若未来确实想换 worker-loop,**先提 ADR-0009 修订** 再改,不在本 PR 内偷偷切。
+2. **首触发 seed 语义 → 方案 (a):`last_triggered_at IS NULL` 时,首个 tick 只把它设为 `now`、不入队。**
+   语义保守、无意外补触发:开启调度/新建 workflow **不当场触发**,从下一个 cron 窗口起正常。
+3. **时区口径 → 服务器本地时区求值,时间戳一律 tz-aware UTC 落库。**
+   cron 作者写 `0 2 * * *` 期望的是"本地 2 点",用本地时区求值最不意外。暴露 config key `scheduler_timezone`(默认 = 系统本地时区)以备将来需要显式指定。
+   **落地前 Codex 用 `ssh daily-server` 核一下 1.x 调度用的时区**(多半就是服务器本地);若一致,默认值即对齐迁移用户预期,无需改动。
+4. **croniter → 引入(MIT、纯 Python、无重依赖)。** 不自研 matcher。落地把 croniter 加进 pyproject + 锁文件(uv.lock),对齐现有依赖引入方式。
+5. **tick 间隔 → 默认 30s。** cron 分钟粒度下 30s 稳妥不漏窗口边界。config key `scheduler_tick_seconds`,**并入现有 config 模块**(ApiConfig 所在处),不新开 `SchedulerConfig` 类,避免配置类膨胀。
+6. **候选索引 → 首版全表扫 + `WHERE schedule_enabled`,不加部分索引。** `workflows` 表每部署仅几十条,全扫无压力;规模上来再补索引。
+7. **审计动作命名 → 复用现有 `workflow_run_trigger` + detail `{trigger:"cron"}`,不新增 action。** 保持审计查询口径稳定,前端/查询无需适配新 action。
+8. **多 worker / HA → 维持 ADR-0009 Deferred。** 首版单进程,行锁作纵深防御;将来多实例另行评估,不在本 PR 承诺分布式锁。
+
+### 6.B Codex 落地当刻核实(纯技术项)
+
+1. **迁移链 head 号**:落地时 `alembic heads` 取真实 head,新迁移 `down_revision` 接之(不硬编码 `0016` 之后的号)。
+2. **1.x 时区核对**(见 6.A#3):`ssh daily-server` 确认 1.x 调度时区,回填/确认 `scheduler_timezone` 默认值。
+3. **croniter 版本 pin + uv.lock 同步**(见 6.A#4):确认 CI 锁文件更新、无解析告警。
