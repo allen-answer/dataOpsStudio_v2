@@ -13,6 +13,9 @@ export default defineConfig({
           // monaco 单独成 chunk,跟 SqlWorkspaceView 业务代码分开,
           // 缓存命中率更高(编辑业务改不影响 monaco chunk hash)。
           if (id.includes('node_modules/monaco-editor')) return 'monaco'
+          // @antv/g6 血缘图引擎(懒加载),同理单独成 chunk 不进主包,
+          // 只有打开血缘图才下载。
+          if (id.includes('node_modules/@antv/')) return 'g6-vendor'
         },
       },
     },

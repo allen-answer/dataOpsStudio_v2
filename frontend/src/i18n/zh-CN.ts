@@ -536,6 +536,7 @@ export default {
     batch_tables_written: '写入',
     batch_tables_read: '读取',
     batch_script_edges_title: '跨脚本依赖(上游文件 → 下游文件,经由表)',
+    batch_graph_title: '整合数据流图(源表 → 目标表)',
     // L-4 语义视图 / 目标表整合
     semantic_observations_title: '语义观察',
     semantic_risks_title: '风险提示',
@@ -575,6 +576,9 @@ export default {
     legend_inferred: 'AI 推断边(虚线)',
     node_click_hint: '点击节点可将其设为新焦点重查。',
     edge_click_hint: '点击边可查看来源 SQL。',
+    view_mode: '视图',
+    view_mode_graph: '图形',
+    view_mode_layered: '分层',
     edge_detail_title: '血缘边详情',
     edge_kind: '类型',
     edge_transformation: '转换',
