@@ -489,6 +489,15 @@ const batchDsId = ref('')
 const batchManualDialect = ref('oracle')
 const batchDefaultSchema = ref('')
 const batchFiles = ref<File[]>([])
+const batchFileInput = ref<HTMLInputElement | null>(null)
+
+// 打开文件选择器:显式触发隐藏 input 的 click(恰好一次)。
+// ★ 不用 <label> 包裹 input —— Chrome 下 label 包裹 file input 点击会触发两次
+// 文件对话框(label 默认行为 + click 冒泡到 input),第二个空对话框取消时会
+// setFiles([]) 清空选择,表现为"上传用不了"。故改 div + ref + @click.stop。
+function openBatchFilePicker(): void {
+  if (!batchBusy.value) batchFileInput.value?.click()
+}
 const batchPhase = ref<BatchPhase>('idle')
 const batchError = ref<string | null>(null)
 const batchJobId = ref<string | null>(null)
@@ -1401,18 +1410,25 @@ function errorMessage(e: unknown): string {
 
           <div class="block">
             <span class="block text-xs chrome-text-muted mb-1">{{ t('lineage.batch_file') }}</span>
-            <label
+            <div
               class="flex flex-col items-center justify-center gap-2 rounded-card border border-dashed chrome-border chrome-bg-elevated px-4 py-6 text-center"
               :class="batchBusy ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'"
+              role="button"
+              tabindex="0"
+              @click="openBatchFilePicker"
+              @keydown.enter.prevent="openBatchFilePicker"
+              @keydown.space.prevent="openBatchFilePicker"
               @dragover.prevent
               @drop.prevent="onBatchDrop"
             >
               <input
+                ref="batchFileInput"
                 type="file"
-                class="sr-only"
+                class="hidden"
                 accept=".zip,.sql,.txt"
                 multiple
                 :disabled="batchBusy"
+                @click.stop
                 @change="onBatchFileChange"
               />
               <FileArchive class="w-6 h-6 chrome-text-muted" />
@@ -1426,7 +1442,7 @@ function errorMessage(e: unknown): string {
                 </span>
                 <span class="text-[11px] chrome-text-muted break-all">{{ batchFilesPreview }}</span>
               </template>
-            </label>
+            </div>
           </div>
 
           <div v-if="batchError" class="text-xs text-red-600 dark:text-red-400">
