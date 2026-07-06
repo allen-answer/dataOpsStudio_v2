@@ -24,6 +24,8 @@ import {
   Download,
   FileArchive,
   FileSearch,
+  FileStack,
+  Lightbulb,
   Network,
   Play,
   RefreshCw,
@@ -57,6 +59,7 @@ import {
   type LineageSubgraphEdge,
   type LineageSubgraphNode,
   type LineageSubgraphResponse,
+  type LineageTargetCounts,
 } from '../api/lineage'
 import { uploadFile } from '../api/uploads'
 import { ApiError, type DatasourceListItem } from '../api/types'
@@ -619,6 +622,25 @@ function batchFileHasDetail(file: LineageBatchFileEntry): boolean {
     (file.tables_written?.length ?? 0) > 0 ||
     (file.tables_read?.length ?? 0) > 0
   )
+}
+
+// L-4 语义视图:写入计数压成 I/U/M/D/T 简写(全 0 显示破折号)
+function semanticCounts(c: LineageTargetCounts): string {
+  const parts: string[] = []
+  if (c.insert) parts.push(`I${c.insert}`)
+  if (c.update) parts.push(`U${c.update}`)
+  if (c.merge) parts.push(`M${c.merge}`)
+  if (c.delete) parts.push(`D${c.delete}`)
+  if (c.truncate) parts.push(`T${c.truncate}`)
+  return parts.length ? parts.join(' ') : '—'
+}
+
+// refresh_mode → i18n 标签(未知值原样回退,不抛 missing-key)
+function semanticRefreshLabel(mode: string | null): string {
+  if (!mode) return '—'
+  const key = `lineage.semantic_refresh_${mode}`
+  const label = t(key)
+  return label === key ? mode : label
 }
 
 // 换 tab 离开批量视图不停轮询(job 在后端继续跑,回来仍可看);仅卸载时停
@@ -1524,6 +1546,115 @@ function errorMessage(e: unknown): string {
                   >
                     {{ tbl }}
                   </span>
+                </div>
+              </div>
+            </div>
+
+            <!-- L-4 语义视图 / 目标表整合 -->
+            <div v-if="batchReport.semantic_view" class="space-y-4">
+              <!-- observations:人话观察 -->
+              <div
+                v-if="batchReport.semantic_view.observations.length"
+                class="rounded-card border chrome-border overflow-hidden"
+              >
+                <div
+                  class="flex items-center gap-2 px-3 py-2 text-xs font-medium chrome-text-heading border-b chrome-border-subtle"
+                >
+                  <Sparkles class="w-3.5 h-3.5 shrink-0" />
+                  {{ t('lineage.semantic_observations_title') }}
+                </div>
+                <div class="divide-y chrome-border-subtle">
+                  <div
+                    v-for="(obs, oi) in batchReport.semantic_view.observations"
+                    :key="oi"
+                    class="flex items-start gap-2 px-3 py-1.5 text-xs chrome-text-heading"
+                  >
+                    <Lightbulb class="w-3.5 h-3.5 shrink-0 mt-0.5 chrome-text-muted" />
+                    <span class="flex-1 min-w-0">{{ obs }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- risks:按 level 上色 -->
+              <div
+                v-if="batchReport.semantic_view.risks.length"
+                class="rounded-card border chrome-border overflow-hidden"
+              >
+                <div
+                  class="flex items-center gap-2 px-3 py-2 text-xs font-medium chrome-text-heading border-b chrome-border-subtle"
+                >
+                  <AlertTriangle class="w-3.5 h-3.5 shrink-0" />
+                  {{ t('lineage.semantic_risks_title') }}
+                </div>
+                <div class="divide-y chrome-border-subtle">
+                  <div
+                    v-for="(risk, ri) in batchReport.semantic_view.risks"
+                    :key="ri"
+                    class="flex items-start gap-2 px-3 py-1.5 text-xs"
+                    :class="
+                      risk.level === 'high'
+                        ? 'text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-500/10'
+                        : risk.level === 'medium'
+                          ? 'text-amber-800 dark:text-amber-200 bg-amber-50 dark:bg-amber-500/10'
+                          : 'chrome-text-muted'
+                    "
+                  >
+                    <AlertTriangle class="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                    <span class="flex-1 min-w-0">{{ risk.message }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- targets:目标表整合表格 -->
+              <div
+                v-if="batchReport.semantic_view.targets.length"
+                class="rounded-card border chrome-border overflow-hidden"
+              >
+                <div
+                  class="flex items-center gap-2 px-3 py-2 text-xs font-medium chrome-text-heading border-b chrome-border-subtle"
+                >
+                  <FileStack class="w-3.5 h-3.5 shrink-0" />
+                  {{ t('lineage.semantic_targets_title') }}
+                </div>
+                <div class="max-h-80 overflow-auto">
+                  <table class="w-full text-xs">
+                    <thead>
+                      <tr class="text-left chrome-text-muted border-b chrome-border-subtle">
+                        <th class="px-3 py-1.5 font-medium">{{ t('lineage.semantic_col_table') }}</th>
+                        <th class="px-3 py-1.5 font-medium">{{ t('lineage.semantic_col_role') }}</th>
+                        <th class="px-3 py-1.5 font-medium">{{ t('lineage.semantic_col_refresh') }}</th>
+                        <th class="px-3 py-1.5 font-medium">
+                          <span :title="t('lineage.semantic_counts_hint')">
+                            {{ t('lineage.semantic_col_counts') }}
+                          </span>
+                        </th>
+                        <th class="px-3 py-1.5 font-medium">{{ t('lineage.semantic_col_sources') }}</th>
+                      </tr>
+                    </thead>
+                    <tbody class="divide-y chrome-border-subtle">
+                      <tr
+                        v-for="(tgt, ti) in batchReport.semantic_view.targets"
+                        :key="ti"
+                        class="chrome-text-heading"
+                      >
+                        <td class="px-3 py-1.5 font-mono" :title="tgt.table">{{ tgt.table }}</td>
+                        <td class="px-3 py-1.5">
+                          <span class="rounded px-1.5 py-0.5 chrome-bg-elevated">
+                            {{ tgt.primary_role }}
+                          </span>
+                        </td>
+                        <td class="px-3 py-1.5 chrome-text-muted">
+                          {{ semanticRefreshLabel(tgt.refresh_mode) }}
+                        </td>
+                        <td class="px-3 py-1.5 tabular-nums chrome-text-muted">
+                          {{ semanticCounts(tgt.counts) }}
+                        </td>
+                        <td class="px-3 py-1.5 tabular-nums chrome-text-muted">
+                          {{ t('lineage.semantic_source_files', { count: tgt.source_files.length }) }}
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
                 </div>
               </div>
             </div>
