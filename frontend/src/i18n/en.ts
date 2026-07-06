@@ -556,6 +556,7 @@ export default {
     batch_tables_written: 'Writes',
     batch_tables_read: 'Reads',
     batch_script_edges_title: 'Cross-script dependencies (upstream file → downstream file, via tables)',
+    batch_graph_title: 'Integration data-flow graph (source → target tables)',
     // L-4 semantic view / target table integration
     semantic_observations_title: 'Semantic observations',
     semantic_risks_title: 'Risks',
@@ -595,6 +596,9 @@ export default {
     legend_inferred: 'AI-inferred edge (dashed)',
     node_click_hint: 'Click a node to make it the new focus.',
     edge_click_hint: 'Click an edge to see its source SQL.',
+    view_mode: 'View',
+    view_mode_graph: 'Graph',
+    view_mode_layered: 'Layered',
     edge_detail_title: 'Lineage edge detail',
     edge_kind: 'Kind',
     edge_transformation: 'Transformation',

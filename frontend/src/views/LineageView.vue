@@ -12,7 +12,7 @@
  *
  * 字段全部锚 api/lineage.ts(锚后端 schemas.py + core.py + worker.py),不臆造。
  */
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useQuery } from '@tanstack/vue-query'
@@ -128,6 +128,81 @@ function onNodeClick(node: LineageSubgraphNode): void {
   subgraphFocus.value = node.id
   void runSubgraph()
 }
+
+// ── L-9 血缘图(G6 canvas)──────────────────────────────────────────
+// 引擎懒加载:.vue 内部再动态 import @antv/g6(g6-vendor chunk 不进主包)。
+const LineageGraphCanvas = defineAsyncComponent(
+  () => import('../components/LineageGraphCanvas.vue'),
+)
+// 默认走 canvas(治卡顿主视图);保留 SVG 分层作对照/降级,可切换。
+const graphMode = ref<'canvas' | 'svg'>('canvas')
+
+/** canvas 图点节点 → 复用焦点重查(组件只回 id)。 */
+function onGraphNodeClick(id: string): void {
+  subgraphFocus.value = id
+  void runSubgraph()
+}
+
+/** canvas 图点边 → 复用边详情抽屉(按 id 找回边对象)。 */
+function onGraphEdgeClick(edgeId: string): void {
+  const edge = subgraphData.value?.edges.find((e) => e.id === edgeId)
+  if (edge) void onEdgeClick(edge)
+}
+
+// ── L-9 批量整合数据流图 ────────────────────────────────────────────
+// 复用 LineageGraphCanvas:把 semantic_view.targets(源表→目标表)映射成
+// 子图同形的扁平 nodes/edges(表级),让批量分析也有一张流向图。dagre 按边
+// 拓扑排秩,node.depth 仅装饰、不影响布局。
+const showBatchGraph = ref(true)
+const batchGraphData = computed<{
+  nodes: LineageSubgraphNode[]
+  edges: LineageSubgraphEdge[]
+} | null>(() => {
+  const view = batchReport.value?.semantic_view
+  if (!view || view.targets.length === 0) return null
+  const nodeMap = new Map<string, LineageSubgraphNode>()
+  const ensure = (tableName: string, depth: number): void => {
+    if (!nodeMap.has(tableName)) {
+      nodeMap.set(tableName, {
+        id: tableName,
+        label: tableName,
+        kind: 'table',
+        table: tableName,
+        column: null,
+        depth,
+      })
+    }
+  }
+  const edges: LineageSubgraphEdge[] = []
+  const seen = new Set<string>()
+  for (const tgt of view.targets) {
+    ensure(tgt.table, 1)
+    for (const src of tgt.source_tables) {
+      ensure(src, 0)
+      const key = `${src} ${tgt.table}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      edges.push({
+        id: key,
+        source: src,
+        target: tgt.table,
+        source_table: src,
+        target_table: tgt.table,
+        source_column: null,
+        target_column: null,
+        depth: 1,
+        direction: 'downstream',
+        edge_kind: 'table',
+        inferred: false,
+        inference_status: 'confirmed',
+        confidence: 1,
+        transformation: null,
+        transformation_subtype: null,
+      })
+    }
+  }
+  return { nodes: [...nodeMap.values()], edges }
+})
 
 // ── 子图导出(L-5:POST /lineage/export,同步 201 + 一次性 token)─────
 const exportBusy = ref(false)
@@ -870,8 +945,41 @@ function errorMessage(e: unknown): string {
             </button>
           </div>
 
-          <!-- 子图 SVG(按 depth 分列,焦点列高亮;点节点切焦点,点边开抽屉)-->
+          <!-- 子图可视化(L-9:默认 G6 canvas 治卡顿;可切回 SVG 分层对照)-->
           <template v-else-if="graphLayout">
+            <!-- 视图切换 -->
+            <div class="flex items-center gap-2 text-xs">
+              <span class="chrome-text-muted">{{ t('lineage.view_mode') }}</span>
+              <button
+                type="button"
+                class="chrome-btn-secondary text-xs"
+                :class="graphMode === 'canvas' && 'chrome-accent-light-bg chrome-accent'"
+                @click="graphMode = 'canvas'"
+              >
+                <Waypoints class="w-3.5 h-3.5" /> {{ t('lineage.view_mode_graph') }}
+              </button>
+              <button
+                type="button"
+                class="chrome-btn-secondary text-xs"
+                :class="graphMode === 'svg' && 'chrome-accent-light-bg chrome-accent'"
+                @click="graphMode = 'svg'"
+              >
+                {{ t('lineage.view_mode_layered') }}
+              </button>
+            </div>
+
+            <!-- G6 canvas 图(治卡顿主视图):缩放/拖拽/minimap/搜索高亮增量更新 -->
+            <LineageGraphCanvas
+              v-if="graphMode === 'canvas'"
+              :nodes="subgraphData.nodes"
+              :edges="subgraphData.edges"
+              :focus="subgraphData.focus"
+              @node-click="onGraphNodeClick"
+              @edge-click="onGraphEdgeClick"
+            />
+
+            <!-- SVG 分层(降级/对照)-->
+            <template v-else>
             <!-- 图内定位(UX P0-L3)-->
             <div class="flex items-center gap-2">
               <input
@@ -980,8 +1088,9 @@ function errorMessage(e: unknown): string {
               <span>{{ t('lineage.node_click_hint') }}</span>
               <span>{{ t('lineage.edge_click_hint') }}</span>
             </div>
+            </template>
 
-            <!-- 边详情抽屉(UX P0-L1)-->
+            <!-- 边详情抽屉(UX P0-L1;canvas / SVG 两模式共用)-->
             <Teleport to="body">
               <div
                 v-if="edgeDetailOpen"
@@ -1631,6 +1740,29 @@ function errorMessage(e: unknown): string {
 
             <!-- L-4 语义视图 / 目标表整合 -->
             <div v-if="batchReport.semantic_view" class="space-y-4">
+              <!-- L-9 整合数据流图(源表 → 目标表,表级;复用 G6 canvas)-->
+              <div
+                v-if="batchGraphData"
+                class="rounded-card border chrome-border overflow-hidden"
+              >
+                <button
+                  type="button"
+                  class="flex w-full items-center gap-2 px-3 py-2 text-xs font-medium chrome-text-heading border-b chrome-border-subtle"
+                  @click="showBatchGraph = !showBatchGraph"
+                >
+                  <Waypoints class="w-3.5 h-3.5 shrink-0" />
+                  {{ t('lineage.batch_graph_title') }}
+                  <span class="chrome-text-muted ml-auto">{{ showBatchGraph ? '▾' : '▸' }}</span>
+                </button>
+                <div v-show="showBatchGraph" class="p-3">
+                  <LineageGraphCanvas
+                    :nodes="batchGraphData.nodes"
+                    :edges="batchGraphData.edges"
+                    :focus="''"
+                  />
+                </div>
+              </div>
+
               <!-- observations:人话观察 -->
               <div
                 v-if="batchReport.semantic_view.observations.length"
