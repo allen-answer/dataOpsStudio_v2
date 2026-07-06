@@ -44,11 +44,27 @@ def _normalize(name: str) -> str:
 _INSERT_OPS = ("insert", "create")
 
 
-def classify_refresh_mode(ops: list[TargetSummary]) -> str | None:
-    """判定同一张表(已归一同名)所有写操作的刷新方式。
+# 跨脚本聚合时按严重度取最强刷新模式(全量重刷 > 分区重刷 > merge > update > mixed > append)。
+_REFRESH_SEVERITY: dict[str, int] = {
+    RefreshMode.TRUNCATE_INSERT.value: 7,
+    RefreshMode.DELETE_INSERT.value: 6,
+    RefreshMode.DELETE_INSERT_PARTIAL.value: 5,
+    RefreshMode.MERGE.value: 4,
+    RefreshMode.UPDATE.value: 3,
+    RefreshMode.MIXED.value: 2,
+    RefreshMode.APPEND.value: 1,
+}
 
-    ``ops`` 应已按 statement_index 排序。优先级短路,返回第一个命中的
-    ``RefreshMode.*.value``;无写操作返回 ``None``。
+
+def classify_refresh_mode(ops: list[TargetSummary]) -> str | None:
+    """判定**单个作用域(单 report/单脚本)**内一张表所有写操作的刷新方式。
+
+    ``ops`` 必须来自同一 report —— before_insert 用 statement_index 交叉比较,
+    只在同一脚本内有序有意义。跨脚本聚合请走 build_target_integration
+    (它对每个 report 分别 classify 再按严重度取最强),**不要把多 report 的
+    ops 混池传进来**,否则各自从 0 起的 statement_index 串号会误判 before_insert。
+
+    优先级短路,返回第一个命中的 ``RefreshMode.*.value``;无写操作返回 ``None``。
     """
     if not ops:
         return None
@@ -276,14 +292,25 @@ def build_target_integration(
 
     result: list[TargetIntegration] = []
     for norm in sorted(targets):
-        ops = [ts for _fi, ts in sorted(writes[norm], key=lambda x: (x[0], x[1].statement_index))]
+        # ★ 刷新模式必须**逐 report** 判定(each report = 一个作用域),再按严重度
+        # 取最强 —— 不能把多文件 ops 混池,否则各自从 0 起的 statement_index 串号
+        # 会把「文件 A 的 INSERT + 文件 B 的 DELETE」误判成全量重刷。
+        per_file_ops: dict[int, list[TargetSummary]] = defaultdict(list)
+        for file_index, ts in writes[norm]:
+            per_file_ops[file_index].append(ts)
+        modes: list[str] = []
+        for file_ops in per_file_ops.values():
+            mode = classify_refresh_mode(sorted(file_ops, key=lambda t: t.statement_index))
+            if mode is not None:
+                modes.append(mode)
+        refresh_mode = max(modes, key=lambda m: _REFRESH_SEVERITY[m]) if modes else None
         roles = list(roles_by_norm.get(norm, []))
         result.append(
             TargetIntegration(
                 table=display[norm],
                 primary_role=_pick_primary(roles, default=TableRoleKind.TARGET.value),
                 roles=roles,
-                refresh_mode=classify_refresh_mode(ops),
+                refresh_mode=refresh_mode,
                 counts=dict(counts[norm]),
                 source_tables=source_tables.get(norm, []),
                 source_files=source_files.get(norm, []),

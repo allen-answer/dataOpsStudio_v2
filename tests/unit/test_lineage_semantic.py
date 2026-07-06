@@ -209,6 +209,28 @@ def test_target_integration_cross_files() -> None:
     assert tgt.titles == []
 
 
+def test_target_integration_no_cross_file_statement_index_bleed() -> None:
+    # 回归(review Finding 1):文件 A 只 INSERT、文件 B 只 DELETE(各自都不是删+插序列)。
+    # A 的 insert 恰好 statement_index 更大 —— 旧实现把多文件 ops 混池、按裸 index
+    # 比较,会误判 delete(B, idx0) < insert(A, idx2) → 假「全量重刷」。修后逐 report
+    # 判定:A=append、B=None(纯删),取最强 = append,不产 full_reload 风险。
+    report_a = LineageReport(
+        target_summary=[_ts("app.orders", "insert", 2)],  # 前面还有别的无关语句
+        graph_edges=[{"source_table": "app.raw", "target_table": "app.orders"}],
+    )
+    report_b = LineageReport(
+        target_summary=[_ts("app.orders", "delete", 0, has_where=False)],  # 纯 DELETE,无 INSERT
+    )
+    reports = [("a.sql", report_a), ("b.sql", report_b)]
+
+    tgt = _target(build_target_integration(reports), "app.orders")
+    assert tgt.refresh_mode == RefreshMode.APPEND.value  # 不是 delete_insert
+    assert tgt.counts["insert"] == 1 and tgt.counts["delete"] == 1
+
+    view = build_semantic_view(reports)
+    assert not any(risk.type == "full_reload" for risk in view.risks)
+
+
 def test_target_integration_empty_source_file_skipped() -> None:
     report = LineageReport(target_summary=[_ts("t", "insert")])
     targets = build_target_integration([("", report)])
