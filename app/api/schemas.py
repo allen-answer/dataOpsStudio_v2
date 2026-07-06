@@ -134,11 +134,24 @@ class SqlExecuteResponse(BaseModel):
 CompareBucket = Literal["only_source", "only_target", "diff", "same"]
 
 
+# 文件源对比支持的格式(C-1;Parquet 归次版,本域暂不含)。
+CompareFileFormat = Literal["csv", "excel"]
+
+
 class CompareDataRef(BaseModel):
-    kind: Literal["table", "sql"] = "table"
+    kind: Literal["table", "sql", "file"] = "table"
     schema_name: str | None = None
     table_name: str | None = Field(default=None, min_length=1)
     sql: str | None = Field(default=None, min_length=1)
+    # kind="file"(C-1 文件源对比):指向已上传件 + 格式与解析参数。
+    # task 只存 upload_id(不存原始路径),回读时按 uploads 表 storage_uri 定位,
+    # 天然规避路径穿越。以下参数按格式条件生效,非 file kind 忽略。
+    upload_id: str | None = Field(default=None, min_length=1)
+    file_format: CompareFileFormat | None = None
+    sheet: str | None = None  # excel:空=第一个 sheet
+    header_row: int = Field(default=1, ge=1)  # 1-indexed 表头行(表头前导言行被跳过)
+    encoding: str | None = None  # csv:空=utf-8-sig(解码失败自动 GBK 回退)
+    delimiter: str | None = Field(default=None, min_length=1, max_length=4)  # csv 分隔符
 
     @model_validator(mode="after")
     def _validate_ref(self) -> CompareDataRef:
@@ -146,6 +159,11 @@ class CompareDataRef(BaseModel):
             raise ValueError("table ref requires table_name")
         if self.kind == "sql" and not self.sql:
             raise ValueError("sql ref requires sql")
+        if self.kind == "file":
+            if not self.upload_id:
+                raise ValueError("file ref requires upload_id")
+            if self.file_format is None:
+                raise ValueError("file ref requires file_format")
         return self
 
 
@@ -252,6 +270,22 @@ class ComparePreviewResponse(BaseModel):
     rows: list[list[Any]] = Field(default_factory=list)
     row_count: int
     truncated: bool
+
+
+class CompareFilePreviewRequest(BaseModel):
+    # ref.kind 必须为 "file"(端点会校验);复用 CompareDataRef 的 file 分支校验,
+    # 前端拿到的同一个 ref 之后可直接落进 task。
+    ref: CompareDataRef
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+class CompareFilePreviewResponse(BaseModel):
+    sheets: list[str] = Field(default_factory=list)  # excel:工作簿全部 sheet 名;csv 为空
+    columns: list[str] = Field(default_factory=list)
+    rows: list[list[Any]] = Field(default_factory=list)
+    row_count: int
+    truncated: bool
+    detected_encoding: str | None = None  # csv:实际生效编码(GBK 回退回显);excel 为 None
 
 
 class CompareCellDiff(BaseModel):

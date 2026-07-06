@@ -1996,6 +1996,182 @@ def test_upload_empty_body_rejected() -> None:
     assert response.json()["error"] == "empty_upload"
 
 
+def _compare_upload_row(
+    *,
+    upload_id: str = "up-1",
+    purpose: str = "compare_source",
+    storage_uri: str = "uploads/up-1/data.csv",
+    filename: str = "data.csv",
+) -> dict[str, Any]:
+    return {
+        "id": upload_id,
+        "project_id": "project-1",
+        "owner_user_id": "user-1",
+        "purpose": purpose,
+        "filename": filename,
+        "content_type": "application/octet-stream",
+        "bytes": 64,
+        "storage_uri": storage_uri,
+        "created_at": _dt(1),
+    }
+
+
+def _xlsx_bytes(sheets: dict[str, list[list[object]]]) -> bytes:
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    for sheet_name, rows in sheets.items():
+        worksheet = workbook.create_sheet(title=sheet_name)
+        for row in rows:
+            worksheet.append(row)
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def test_compare_file_preview_csv_returns_bounded_rows() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _compare_upload_row()])
+    result_store = _ResultStore(
+        downloads={"uploads/up-1/data.csv": b"id,name\n1,alice\n2,bob\n3,carol\n"}
+    )
+    services = _Services(engine, result_store=result_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/file-preview",
+        headers=_auth_headers(),
+        json_body={
+            "ref": {"kind": "file", "upload_id": "up-1", "file_format": "csv"},
+            "limit": 2,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["sheets"] == []
+    assert payload["columns"] == ["id", "name"]
+    assert payload["rows"] == [["1", "alice"], ["2", "bob"]]
+    assert payload["row_count"] == 2
+    assert payload["truncated"] is True  # 第 3 行探到 → 截断
+    assert payload["detected_encoding"] == "utf-8-sig"
+    assert any(audit["action"] == "compare_file_preview" for audit in services.audits)
+
+
+def test_compare_file_preview_excel_lists_sheets_and_selects() -> None:
+    xlsx = _xlsx_bytes(
+        {
+            "First": [["a"], [1]],
+            "Second": [["b", "c"], [2, 3]],
+        }
+    )
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _compare_upload_row(storage_uri="uploads/up-1/book.xlsx", filename="book.xlsx"),
+        ]
+    )
+    result_store = _ResultStore(downloads={"uploads/up-1/book.xlsx": xlsx})
+    services = _Services(engine, result_store=result_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/file-preview",
+        headers=_auth_headers(),
+        json_body={
+            "ref": {
+                "kind": "file",
+                "upload_id": "up-1",
+                "file_format": "excel",
+                "sheet": "Second",
+            },
+            "limit": 50,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["sheets"] == ["First", "Second"]
+    assert payload["columns"] == ["b", "c"]
+    assert payload["rows"] == [[2, 3]]
+    assert payload["row_count"] == 1
+    assert payload["truncated"] is False
+    assert payload["detected_encoding"] is None  # excel 无编码回显
+
+
+def test_compare_file_preview_rejects_non_file_ref() -> None:
+    engine = _FakeEngine([{"id": "project-1"}])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/file-preview",
+        headers=_auth_headers(),
+        json_body={
+            "ref": {"kind": "table", "table_name": "orders"},
+            "limit": 10,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_ref_kind"
+
+
+def test_compare_file_preview_upload_not_found() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, None])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/file-preview",
+        headers=_auth_headers(),
+        json_body={
+            "ref": {"kind": "file", "upload_id": "missing", "file_format": "csv"},
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "not_found"
+
+
+def test_compare_file_preview_rejects_wrong_purpose() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _compare_upload_row(purpose="lineage_batch")])
+    result_store = _ResultStore(downloads={"uploads/up-1/data.csv": b"id\n1\n"})
+    app = create_app(services=cast(ApiServices, _Services(engine, result_store=result_store)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/file-preview",
+        headers=_auth_headers(),
+        json_body={
+            "ref": {"kind": "file", "upload_id": "up-1", "file_format": "csv"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_upload_purpose"
+
+
+def test_compare_file_preview_reader_failure_returns_400() -> None:
+    # 把非 xlsx 字节当 excel 读 → ReaderError,R5 下不透传内容,只回 preview_failed。
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _compare_upload_row(storage_uri="uploads/up-1/book.xlsx", filename="book.xlsx"),
+        ]
+    )
+    result_store = _ResultStore(downloads={"uploads/up-1/book.xlsx": b"not a real workbook"})
+    app = create_app(services=cast(ApiServices, _Services(engine, result_store=result_store)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/file-preview",
+        headers=_auth_headers(),
+        json_body={
+            "ref": {"kind": "file", "upload_id": "up-1", "file_format": "excel"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "preview_failed"
+
+
 def test_lineage_batch_create_enqueues_job_with_upload_ref() -> None:
     engine = _FakeEngine(
         [
