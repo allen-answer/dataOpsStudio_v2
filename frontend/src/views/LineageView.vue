@@ -1280,8 +1280,7 @@ function errorMessage(e: unknown): string {
 
       <!-- ============ 批量分析 tab(L-2:ZIP → job → 报告)============ -->
       <div v-show="tab === 'batch'" class="p-4 space-y-4 max-w-4xl">
-        <template>
-          <p class="text-xs chrome-text-muted">{{ t('lineage.batch_hint') }}</p>
+        <p class="text-xs chrome-text-muted">{{ t('lineage.batch_hint') }}</p>
           <div class="grid grid-cols-2 gap-4">
             <label class="block">
               <span class="block text-xs chrome-text-muted mb-1">{{ t('lineage.datasource') }}</span>
@@ -1529,7 +1528,6 @@ function errorMessage(e: unknown): string {
               </div>
             </div>
           </div>
-        </template>
       </div>
     </div>
   </div>
