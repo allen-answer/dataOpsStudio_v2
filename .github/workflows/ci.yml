@@ -11,6 +11,12 @@ on:
   push:
     branches: [main]
 
+# 同一分支/PR 的新 push 自动取消进行中的旧 run,避免过时 run 空跑占 CI 分钟。
+# main 分支例外:cancel-in-progress=false,合并链的 run 排队跑完不互相取消。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   UV_VERSION: "0.11.16"
 
