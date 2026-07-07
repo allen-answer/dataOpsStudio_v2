@@ -58,9 +58,11 @@ def test_file_ref_requires_file_format() -> None:
 
 
 def test_file_ref_rejects_unknown_format() -> None:
-    # Parquet 归次版,当前只接受 csv|excel。
+    # Parquet 归次版,当前只接受 csv|excel。故意传非法值验证 pydantic 运行时拒绝;
+    # file_format 的 Literal 静态也不含 parquet,mypy(app tests)会报 arg-type,
+    # 这里正是要测这个被拒的值 → 显式 ignore。
     with pytest.raises(ValidationError):
-        CompareDataRef(kind="file", upload_id="up-1", file_format="parquet")
+        CompareDataRef(kind="file", upload_id="up-1", file_format="parquet")  # type: ignore[arg-type]
 
 
 def test_file_ref_rejects_header_row_below_one() -> None:
