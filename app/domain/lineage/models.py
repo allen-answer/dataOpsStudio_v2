@@ -26,6 +26,12 @@ class TableLineageEdge(BaseModel):
     target_table: str
     statement_index: int = 0
     inferred: bool = False
+    # L-3 PR2 补链边元数据(游标/UDF/BULK COLLECT/TRIGGER)。确定性边(sqlglot 直解)
+    # 三者恒为 None;启发式补链边打 edge_type + confidence="medium" + reason,让下游
+    # 区分「确定性 vs 推断补链」。默认 None,envelope 向后兼容(1.x 契约不破)。
+    edge_type: str | None = None
+    confidence: str | None = None
+    reason: str | None = None
 
 
 class InsertMapping(BaseModel):
