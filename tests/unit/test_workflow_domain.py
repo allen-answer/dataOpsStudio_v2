@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from app.domain.job import ALLOWED_WORKFLOW_NODE_KINDS
 from app.domain.workflow import (
     BUILTIN_VARIABLE_NAMES,
+    MAX_VARIABLE_LIST_LENGTH,
     MAX_VARIABLE_VALUE_LENGTH,
     MAX_WORKFLOW_VARIABLES,
     SUPPORTED_WORKFLOW_NODE_KINDS_V1,
@@ -389,3 +390,53 @@ def test_precedence_builtin_lt_spec_lt_trigger() -> None:
     assert merged["env"] == "prod"  # 触发 > spec
     assert merged["region"] == "ap-east-1"  # spec 保留
     assert merged["today"] == builtin["today"]  # builtin 不被覆盖
+
+
+# ---------------------------------------------------------------- C-7 PR3:list 型变量
+
+
+def test_list_variable_accepted_and_roundtrips_on_spec() -> None:
+    spec = WorkflowSpec.model_validate(
+        {
+            "nodes": [make_node("n1")],
+            "edges": [],
+            "variables": {"ids": ["1", "2", "3"], "env": "prod"},
+        }
+    )
+    assert spec.variables == {"ids": ["1", "2", "3"], "env": "prod"}
+    assert WorkflowSpec.model_validate(spec.model_dump()) == spec
+
+
+def test_list_variable_empty_list_accepted() -> None:
+    assert validate_workflow_variables({"ids": []}) == {"ids": []}
+
+
+def test_list_variable_element_failing_charset_rejected_name_only() -> None:
+    # 单个元素含危险字符 → 拒绝;错误只含变量名,绝不含元素值(R5)
+    with pytest.raises(ValueError) as exc_info:
+        validate_workflow_variables({"ids": ["ok", "x'; DROP TABLE t"]})
+    message = str(exc_info.value)
+    assert "unsafe_variable_value" in message
+    assert "ids" in message
+    assert "DROP TABLE" not in message
+
+
+def test_list_variable_non_str_element_rejected_name_only() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        validate_workflow_variables({"ids": ["1", 2]})
+    assert "invalid_variable_value" in str(exc_info.value)
+    assert "ids" in str(exc_info.value)
+
+
+def test_list_variable_over_length_cap_rejected() -> None:
+    ok = {"ids": ["x"] * MAX_VARIABLE_LIST_LENGTH}
+    assert validate_workflow_variables(ok) == ok
+    too_long = {"ids": ["x"] * (MAX_VARIABLE_LIST_LENGTH + 1)}
+    with pytest.raises(ValueError, match="variable_list_too_long"):
+        validate_workflow_variables(too_long)
+
+
+def test_list_variable_element_length_cap_enforced() -> None:
+    long_element = "a" * (MAX_VARIABLE_VALUE_LENGTH + 1)
+    with pytest.raises(ValueError, match="variable_value_too_long"):
+        validate_workflow_variables({"ids": [long_element]})

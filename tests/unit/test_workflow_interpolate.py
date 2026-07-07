@@ -76,11 +76,94 @@ def test_dotted_reference_unsupported() -> None:
     assert "unsupported_param_reference" in str(exc_info.value)
 
 
-def test_filter_unsupported_in_pr1() -> None:
+def test_unknown_filter_rejected() -> None:
+    # sql_in / csv 之外的过滤器仍显式报错(消息带原始表达式,无取值)
     with pytest.raises(ParamInterpolationError) as exc_info:
-        interpolate_payload({"sql": "${today | sql_in}"}, _VARS)
+        interpolate_payload({"sql": "${today | upper}"}, _VARS)
     assert "unsupported_param_filter" in str(exc_info.value)
-    assert "today | sql_in" in str(exc_info.value)
+    assert "today | upper" in str(exc_info.value)
+
+
+# ── C-7 PR3:list 变量 + sql_in / csv 过滤器 ─────────────────────────────────
+
+_LIST_VARS: dict[str, str | list[str]] = {
+    "ids": ["1", "2", "3"],
+    "codes": ["a", "b"],
+    "regions": ["ap-east-1", "us-west-2"],
+    "empty": [],
+    "single": "solo",
+    "today": "2026-07-07",
+}
+
+
+def test_sql_in_numbers_rendered_bare() -> None:
+    result = interpolate_payload({"sql": "WHERE id IN (${ids | sql_in})"}, _LIST_VARS)
+    assert result["sql"] == "WHERE id IN (1, 2, 3)"
+
+
+def test_sql_in_strings_single_quoted() -> None:
+    result = interpolate_payload({"sql": "WHERE code IN (${codes | sql_in})"}, _LIST_VARS)
+    assert result["sql"] == "WHERE code IN ('a', 'b')"
+
+
+def test_sql_in_mixed_and_hyphenated_strings_quoted() -> None:
+    # 含 `-` 的值不是纯数字形态 → 加引号
+    result = interpolate_payload({"sql": "${regions | sql_in}"}, _LIST_VARS)
+    assert result["sql"] == "'ap-east-1', 'us-west-2'"
+
+
+def test_sql_in_empty_list_renders_null_not_empty_parens() -> None:
+    # ★ 空 list → NULL,避免 `IN ()` 语法错
+    result = interpolate_payload({"sql": "WHERE id IN (${empty | sql_in})"}, _LIST_VARS)
+    assert result["sql"] == "WHERE id IN (NULL)"
+
+
+def test_sql_in_single_scalar_treated_as_one_element_list() -> None:
+    # 单标量 str → 单元素 list;非数字形态 → 加引号
+    result = interpolate_payload({"sql": "${single | sql_in}"}, _LIST_VARS)
+    assert result["sql"] == "'solo'"
+    # 内置日期(受控格式,非纯数字)→ 加引号
+    result2 = interpolate_payload({"sql": "d IN (${today | sql_in})"}, _LIST_VARS)
+    assert result2["sql"] == "d IN ('2026-07-07')"
+
+
+def test_sql_in_quote_escaping_is_defense_in_depth() -> None:
+    # 入口 charset 已禁引号,故正常 list 元素不含 `'`;此处直接喂含引号值到纯函数层,
+    # 证明 `'`→`''` 转义作为纵深防御生效(不会逃逸出字符串字面量)
+    variables: dict[str, str | list[str]] = {"names": ["o'brien", "smith"]}
+    result = interpolate_payload({"sql": "${names | sql_in}"}, variables)
+    assert result["sql"] == "'o''brien', 'smith'"
+
+
+def test_csv_joins_without_quotes() -> None:
+    result = interpolate_payload({"sql": "${codes | csv}"}, _LIST_VARS)
+    assert result["sql"] == "a,b"
+    result2 = interpolate_payload({"ids": "${ids | csv}"}, _LIST_VARS)
+    assert result2["ids"] == "1,2,3"
+
+
+def test_bare_list_variable_without_filter_rejected() -> None:
+    # ★ 裸 ${listvar}(无过滤器)→ 报错:list 必须经 sql_in / csv 消费,
+    # 绝不被误 stringify 成 "['1', '2', '3']" 拼进 SQL
+    with pytest.raises(ParamInterpolationError) as exc_info:
+        interpolate_payload({"sql": "${ids}"}, _LIST_VARS)
+    message = str(exc_info.value)
+    assert "list_variable_requires_filter" in message
+    assert "ids" in message
+
+
+def test_filter_on_missing_variable_still_name_only() -> None:
+    # 过滤器分支同样严格缺失,且错误只含变量名(R5)
+    with pytest.raises(ParamInterpolationError) as exc_info:
+        interpolate_payload({"sql": "${nope | sql_in}"}, _LIST_VARS)
+    assert "unresolved_param_variable" in str(exc_info.value)
+    assert "nope" in str(exc_info.value)
+
+
+def test_filter_on_node_reference_rejected() -> None:
+    with pytest.raises(ParamInterpolationError) as exc_info:
+        interpolate_payload({"sql": "${nodes.n1.rows | sql_in}"}, _LIST_VARS)
+    assert "unsupported_param_reference" in str(exc_info.value)
 
 
 def test_custom_variable_resolves_in_compare_table_name() -> None:

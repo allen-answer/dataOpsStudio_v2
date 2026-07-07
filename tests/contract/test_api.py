@@ -3587,6 +3587,44 @@ def test_workflow_run_trigger_rejects_unsafe_variable_value_name_only() -> None:
     assert services.job_backend.enqueued == []
 
 
+def test_workflow_run_trigger_accepts_list_variable_into_snapshot() -> None:
+    # C-7 PR3:list 型触发变量并入快照(供 ${var | sql_in} / csv 展开)
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row()])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows/wf-1/runs",
+        headers=_auth_headers(),
+        json_body={"variables": {"ids": ["1", "2", "3"], "env": "prod"}},
+    )
+
+    assert response.status_code == 201
+    frozen = services.job_backend.enqueued[0].payload["when_variables"]
+    assert frozen["ids"] == ["1", "2", "3"]
+    assert frozen["env"] == "prod"
+
+
+def test_workflow_run_trigger_rejects_unsafe_list_element_name_only() -> None:
+    # list 元素含危险取值 → 400 unsafe_variable_value;不 enqueue;不回显取值(R5)
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row()])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows/wf-1/runs",
+        headers=_auth_headers(),
+        json_body={"variables": {"ids": ["ok", "x'; DROP TABLE t"]}},
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"] == "unsafe_variable_value"
+    assert "ids" in body["message"]
+    assert "DROP TABLE" not in response.body.decode("utf-8")
+    assert services.job_backend.enqueued == []
+
+
 def test_workflow_run_status_contract_returns_run_and_node_states() -> None:
     engine = _FakeEngine(
         [

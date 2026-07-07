@@ -58,6 +58,12 @@ BUILTIN_VARIABLE_NAMES: frozenset[str] = frozenset({"today", "now", "year", "mon
 
 MAX_WORKFLOW_VARIABLES = 32
 MAX_VARIABLE_VALUE_LENGTH = 512
+# list 型变量的元素数上限(C-7 PR3;供 ${var | sql_in} / ${var | csv} 展开)。
+MAX_VARIABLE_LIST_LENGTH = 256
+
+# workflow 变量值:标量 str,或 list[str](list 供过滤器展开成 SQL IN(...) / CSV)。
+# 内置变量恒为 str;spec / 触发变量可为 str 或 list[str]。
+VariableValue = str | list[str]
 
 _VARIABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # ★ 变量值安全字符集(本 PR 注入防御核心):值会被字符串替换进 compare 节点的
@@ -70,33 +76,52 @@ _VARIABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _VARIABLE_VALUE_RE = re.compile(r"^[A-Za-z0-9_.:-]*$")
 
 
-def validate_workflow_variables(variables: Mapping[str, object]) -> dict[str, str]:
+def _validate_scalar_value(name: str, value: str) -> None:
+    """单个标量值(或 list 的一个元素)的长度 + 安全字符集校验。
+
+    ★ R5:错误只含**变量名**,绝不含取值 / 元素值。
+    """
+    if len(value) > MAX_VARIABLE_VALUE_LENGTH:
+        raise ValueError(f"variable_value_too_long: {name}")
+    if not _VARIABLE_VALUE_RE.fullmatch(value) or "--" in value:
+        raise ValueError(f"unsafe_variable_value: {name}")
+
+
+def validate_workflow_variables(variables: Mapping[str, object]) -> dict[str, VariableValue]:
     """校验一组 workflow 变量(spec 默认变量 + 触发时运行时变量的单一实现)。
 
     - 数量 <= ``MAX_WORKFLOW_VARIABLES``;
     - key 匹配 ``^[A-Za-z_][A-Za-z0-9_]*$``,且**禁与内置变量名冲突**;
-    - value 是 ``str``、长度 <= ``MAX_VARIABLE_VALUE_LENGTH``、且只含
-      ``_VARIABLE_VALUE_RE`` 的保守安全字符集(``--`` 另行显式拦截)。
+    - value 是 ``str`` 或 ``list[str]``:
+      - ``str``:长度 <= ``MAX_VARIABLE_VALUE_LENGTH``、只含 ``_VARIABLE_VALUE_RE``
+        的保守安全字符集(``--`` 另行显式拦截);
+      - ``list[str]``(C-7 PR3;供 ``${var | sql_in}`` / ``${var | csv}`` 展开):
+        元素数 <= ``MAX_VARIABLE_LIST_LENGTH``,**每个元素**走与标量同一套校验。
 
-    ★ R5:任何校验错误只含**变量名**,绝不含变量取值。
+    ★ R5:任何校验错误只含**变量名**,绝不含变量取值 / list 元素值。
     抛 :class:`ValueError`(消息形如 ``"<code>: <name>"``);返回浅拷贝 dict。
     """
     if len(variables) > MAX_WORKFLOW_VARIABLES:
         raise ValueError(f"too_many_variables: 变量数量超过上限 {MAX_WORKFLOW_VARIABLES}")
-    validated: dict[str, str] = {}
+    validated: dict[str, VariableValue] = {}
     for name, value in variables.items():
         if not _VARIABLE_NAME_RE.fullmatch(name):
             raise ValueError(f"invalid_variable_name: {name}")
         if name in BUILTIN_VARIABLE_NAMES:
             raise ValueError(f"variable_name_collides_builtin: {name}")
-        if not isinstance(value, str):
+        if isinstance(value, str):
+            _validate_scalar_value(name, value)
+            validated[name] = value
+        elif isinstance(value, list):
+            if len(value) > MAX_VARIABLE_LIST_LENGTH:
+                raise ValueError(f"variable_list_too_long: {name}")
+            for element in value:
+                if not isinstance(element, str):
+                    raise ValueError(f"invalid_variable_value: {name}")
+                _validate_scalar_value(name, element)
+            validated[name] = list(value)
+        else:
             raise ValueError(f"invalid_variable_value: {name}")
-        if len(value) > MAX_VARIABLE_VALUE_LENGTH:
-            raise ValueError(f"variable_value_too_long: {name}")
-        # ★ 只暴露变量名,绝不含取值(R5)
-        if not _VARIABLE_VALUE_RE.fullmatch(value) or "--" in value:
-            raise ValueError(f"unsafe_variable_value: {name}")
-        validated[name] = value
     return validated
 
 
@@ -213,11 +238,12 @@ class WorkflowSpec(BaseModel):
     notifications: list[NotifyTarget] = Field(default_factory=list)
     # workflow 级默认变量(C-7 PR2;存进 dag_jsonb,无需迁移)。触发时并入
     # when_variables 快照,服务 ${var} 插值 + when 求值。值走安全字符集校验。
-    variables: dict[str, str] = Field(default_factory=dict)
+    # str 或 list[str](list 供 ${var | sql_in} / ${var | csv} 展开;C-7 PR3)。
+    variables: dict[str, VariableValue] = Field(default_factory=dict)
 
     @field_validator("variables")
     @classmethod
-    def _validate_variables(cls, value: dict[str, str]) -> dict[str, str]:
+    def _validate_variables(cls, value: dict[str, VariableValue]) -> dict[str, VariableValue]:
         return validate_workflow_variables(value)
 
     @model_validator(mode="after")

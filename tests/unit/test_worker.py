@@ -1555,6 +1555,27 @@ def test_build_workflow_child_job_interpolates_payload_and_keeps_job_kind() -> N
     assert child.kind is JobKind.COMPARE_RUN
 
 
+def test_build_workflow_child_job_expands_list_variable_via_sql_in() -> None:
+    # C-7 PR3:list 型冻结变量经 ${ids | sql_in} 展开进 compare 节点的 sql 字面量位
+    node = WorkflowNode(
+        id="n1",
+        job_kind="compare_run",
+        payload={
+            "source_ref": {"kind": "sql", "sql": "SELECT * FROM t WHERE id IN (${ids | sql_in})"},
+            "target_ref": {"table_name": "t_prev"},
+            "datasource_id": "ds-9",
+        },
+        timeout_seconds=60,
+    )
+    run_job = _workflow_run_job()
+    variables: dict[str, str | list[str]] = {"ids": ["1", "2", "3"], "today": "2026-07-07"}
+
+    child = _build_workflow_child_job(run_job, node, variables)
+
+    assert child.payload["source_ref"]["sql"] == "SELECT * FROM t WHERE id IN (1, 2, 3)"
+    assert child.kind is JobKind.COMPARE_RUN
+
+
 def test_workflow_run_node_interpolation_failure_fails_run_via_on_failure() -> None:
     # 插值失败(未解析变量)= 确定性错误:节点走 when 异常同路径 → FAILED → on_failure
     # (默认 abort)→ run FAILED,而不是把 run job 崩掉 / 卡死重试
