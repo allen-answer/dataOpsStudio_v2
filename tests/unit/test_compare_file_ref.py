@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from app.api.schemas import CompareDataRef
+from app.api.schemas import CompareDataRef, CompareTaskCreateRequest
 
 
 def test_file_ref_csv_minimal_valid() -> None:
@@ -84,3 +84,59 @@ def test_table_ref_ignores_unused_file_fields() -> None:
     ref = CompareDataRef(kind="table", table_name="orders")
     assert ref.upload_id is None
     assert ref.file_format is None
+
+
+# ── CompareTaskCreateRequest:文件侧 datasource 可选校验(C-1 PR3)────────────
+
+
+def _file_ref() -> CompareDataRef:
+    return CompareDataRef(kind="file", upload_id="up-1", file_format="csv")
+
+
+def _table_ref() -> CompareDataRef:
+    return CompareDataRef(kind="table", table_name="orders")
+
+
+def test_task_create_file_source_side_omits_source_id() -> None:
+    body = CompareTaskCreateRequest(
+        project_id="p1",
+        name="file vs db",
+        target_id="ds-target",
+        source_ref=_file_ref(),
+        target_ref=_table_ref(),
+    )
+    assert body.source_id is None
+    assert body.target_id == "ds-target"
+
+
+def test_task_create_both_file_sides_need_no_datasource() -> None:
+    body = CompareTaskCreateRequest(
+        project_id="p1",
+        name="file vs file",
+        source_ref=_file_ref(),
+        target_ref=CompareDataRef(kind="file", upload_id="up-2", file_format="excel"),
+    )
+    assert body.source_id is None
+    assert body.target_id is None
+
+
+def test_task_create_table_side_requires_datasource() -> None:
+    with pytest.raises(ValidationError, match="source ref kind=table requires source_id"):
+        CompareTaskCreateRequest(
+            project_id="p1",
+            name="missing source id",
+            target_id="ds-target",
+            source_ref=_table_ref(),
+            target_ref=_table_ref(),
+        )
+
+
+def test_task_create_sql_target_side_requires_datasource() -> None:
+    with pytest.raises(ValidationError, match="target ref kind=sql requires target_id"):
+        CompareTaskCreateRequest(
+            project_id="p1",
+            name="missing target id",
+            source_id="ds-source",
+            source_ref=_table_ref(),
+            target_ref=CompareDataRef(kind="sql", sql="SELECT 1"),
+        )

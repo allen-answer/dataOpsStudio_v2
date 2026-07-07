@@ -197,16 +197,40 @@ class CompareRunLimitsPayload(BaseModel):
     run_disk_quota_mb: int | None = Field(default=None, gt=0)
 
 
+def _validate_compare_side(*, side: str, kind: str, datasource_id: str | None) -> None:
+    """每侧校验:DB 侧(table/sql)必须给 datasource_id;文件侧(file)不需要。
+
+    C-1 文件源对比:file kind 的一侧 source_id/target_id 可选(照抄 #115
+    数据源可选范式)。DB 侧仍强制绑数据源,否则 worker 无从取数。
+    """
+
+    if kind == "file":
+        return
+    if not datasource_id:
+        raise ValueError(f"{side} ref kind={kind} requires {side}_id")
+
+
 class CompareTaskCreateRequest(BaseModel):
     project_id: str
     name: str = Field(min_length=1, max_length=128)
-    source_id: str
-    target_id: str
+    # 文件侧免 datasource:kind="file" 的一侧无需 *_id(见 _validate_compare_side)。
+    source_id: str | None = None
+    target_id: str | None = None
     source_ref: CompareDataRef
     target_ref: CompareDataRef
     columns: list[Column] = Field(default_factory=list)
     compare_rules: CompareRulesPayload = Field(default_factory=CompareRulesPayload)
     run_limits: CompareRunLimitsPayload = Field(default_factory=CompareRunLimitsPayload)
+
+    @model_validator(mode="after")
+    def _validate_sides(self) -> CompareTaskCreateRequest:
+        _validate_compare_side(
+            side="source", kind=self.source_ref.kind, datasource_id=self.source_id
+        )
+        _validate_compare_side(
+            side="target", kind=self.target_ref.kind, datasource_id=self.target_id
+        )
+        return self
 
 
 class CompareTaskUpdateRequest(BaseModel):
@@ -224,8 +248,8 @@ class CompareTaskResponse(BaseModel):
     id: str
     project_id: str
     name: str
-    source_id: str
-    target_id: str
+    source_id: str | None = None
+    target_id: str | None = None
     source_ref: CompareDataRef
     target_ref: CompareDataRef
     columns: list[Column] = Field(default_factory=list)

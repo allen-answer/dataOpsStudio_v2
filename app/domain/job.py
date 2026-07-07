@@ -53,6 +53,8 @@ class JobErrorCode(StrEnum):
     UNSUPPORTED_DB_TYPE = "unsupported_db_type"
     EXPORT_FAILED = "export_failed"
     EXPORT_LIMIT_EXCEEDED = "export_limit_exceeded"
+    # 文件源对比全量物化超行数硬顶(C-1;不静默截断,任务直接 failed)
+    COMPARE_LIMIT_EXCEEDED = "compare_limit_exceeded"
     INTERNAL = "internal"
 
 

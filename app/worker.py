@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import shutil
 import signal
 import tempfile
 import threading
@@ -81,6 +83,12 @@ from app.domain.lineage import (
     schema_from_metadata_cache_rows,
 )
 from app.domain.plan import PlanNode
+from app.domain.readers import (
+    CsvReader,
+    ExcelReader,
+    MaxRowsExceededError,
+    RowReader,
+)
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Row
@@ -110,6 +118,10 @@ _LINEAGE_BATCH_MAX_FILES = 500
 _LINEAGE_BATCH_MAX_FILE_BYTES = 2 * 1024 * 1024
 _LINEAGE_BATCH_MAX_TOTAL_BYTES = 100 * 1024 * 1024
 _LINEAGE_BATCH_EXTENSIONS = (".sql", ".txt")
+
+# 文件源对比全量物化的行数硬顶(C-1):防大文件把 worker 撑爆内存。
+# 任务 run_limits.max_rows 若给出则以其为准,否则用本默认;超限直接 failed(不截断)。
+_FILE_COMPARE_DEFAULT_MAX_ROWS = 1_000_000
 
 
 class JobCancelled(RuntimeError):
@@ -721,8 +733,8 @@ class WorkerRunner:
     def _execute_compare_run(self, job: Job) -> _ExecutionOutcome:
         payload = job.payload
         run_id = _required_payload_str(payload, "run_id")
-        source_id = _required_payload_str(payload, "source_id")
-        target_id = _required_payload_str(payload, "target_id")
+        source_id = _payload_optional_str(payload, "source_id")
+        target_id = _payload_optional_str(payload, "target_id")
         bucket_spools = _payload_bucket_result_set_ids(payload)
         columns = _payload_compare_columns(payload)
         rules = _payload_compare_rules(payload)
@@ -738,37 +750,28 @@ class WorkerRunner:
             self._result_store.set_spool_columns(result_set_id, compare_result_columns())
         self._write_compare_run_running(run_id, bucket_spools)
 
-        source_ds = self._datasource_loader(source_id)
-        target_ds = self._datasource_loader(target_id)
-        _require_operation_allowed(source_ds.operation_policy, "select")
-        _require_operation_allowed(target_ds.operation_policy, "select")
-
-        source_adapter = self._adapter_factory(
-            source_ds,
-            lambda: self._backend.is_cancel_requested(job.id),
-            lambda columns: None,
-        )
-        target_adapter = self._adapter_factory(
-            target_ds,
-            lambda: self._backend.is_cancel_requested(job.id),
-            lambda columns: None,
-        )
         source_ref = _payload_compare_data_ref(payload, "source_ref")
         target_ref = _payload_compare_data_ref(payload, "target_ref")
-        source_reader = _DatabaseCompareReader(
-            adapter=source_adapter,
-            datasource=source_ds,
+        # 文件侧(C-1)天然走"客户端哈希 + 全量物化",不下推/不分段/不流式:
+        # 任一侧 file 即整体走内存全量 diff(也解决跨类型/无序问题)。
+        file_mode = source_ref.get("kind") == "file" or target_ref.get("kind") == "file"
+        max_rows = limits.max_rows or _FILE_COMPARE_DEFAULT_MAX_ROWS
+
+        source_reader = self._build_compare_reader(
+            job,
             data_ref=source_ref,
+            datasource_id=source_id,
             key_columns=key_columns,
             value_columns=compare_columns,
             select_key_names=[column.name for column in key_columns],
             select_value_names=[column.name for column in compare_columns],
             rules=rules,
+            max_rows=max_rows,
         )
-        target_reader = _DatabaseCompareReader(
-            adapter=target_adapter,
-            datasource=target_ds,
+        target_reader = self._build_compare_reader(
+            job,
             data_ref=target_ref,
+            datasource_id=target_id,
             key_columns=key_columns,
             value_columns=compare_columns,
             select_key_names=[
@@ -778,6 +781,7 @@ class WorkerRunner:
                 rules.column_mappings.get(column.name, column.name) for column in compare_columns
             ],
             rules=rules,
+            max_rows=max_rows,
         )
 
         effective_limits = (
@@ -787,18 +791,27 @@ class WorkerRunner:
         )
         started_at = time.monotonic()
         sample_result: dict[str, object] | None = None
-        if limits.sample_quick_check:
+        if file_mode:
+            # 全量物化对比:两侧 fetch_all 后按归一化 key 对齐(跨类型/大小写等由
+            # CompareRules 规范化吸收),不走 DB 下推的分段/采样路径。
+            result = _diff_materialized_rows(
+                source_reader.fetch_all(),
+                target_reader.fetch_all(),
+                key_columns=key_columns,
+                rules=rules,
+            )
+        elif limits.sample_quick_check:
             result, sample_result = _run_compare_sample_quick_check(
-                source_reader=source_reader,
-                target_reader=target_reader,
+                source_reader=cast(_DatabaseCompareReader, source_reader),
+                target_reader=cast(_DatabaseCompareReader, target_reader),
                 key_columns=key_columns,
                 limits=limits,
                 run_id=run_id,
             )
         else:
             result = _run_compare_hashdiff(
-                source_reader=source_reader,
-                target_reader=target_reader,
+                source_reader=cast(_DatabaseCompareReader, source_reader),
+                target_reader=cast(_DatabaseCompareReader, target_reader),
                 key_columns=key_columns,
                 limits=effective_limits,
             )
@@ -901,6 +914,82 @@ class WorkerRunner:
             ),
             loaded_rows=sum(bucket_counts.values()),
         )
+
+    def _build_compare_reader(
+        self,
+        job: Job,
+        *,
+        data_ref: dict[str, object],
+        datasource_id: str | None,
+        key_columns: list[CompareColumn],
+        value_columns: list[CompareColumn],
+        select_key_names: list[str],
+        select_value_names: list[str],
+        rules: CompareRules,
+        max_rows: int,
+    ) -> _DatabaseCompareReader | _FileCompareReader:
+        """按 ref.kind 装配对比读取器:file → 全量物化内存读;table/sql → DB 读。"""
+
+        if data_ref.get("kind") == "file":
+            rows = self._materialize_file_rows(data_ref, max_rows=max_rows)
+            return _FileCompareReader(
+                rows=rows,
+                value_columns=value_columns,
+                select_key_names=select_key_names,
+                select_value_names=select_value_names,
+                rules=rules,
+            )
+        if datasource_id is None:
+            raise ValueError("compare db side requires a datasource id")
+        datasource = self._datasource_loader(datasource_id)
+        _require_operation_allowed(datasource.operation_policy, "select")
+        adapter = self._adapter_factory(
+            datasource,
+            lambda: self._backend.is_cancel_requested(job.id),
+            lambda columns: None,
+        )
+        return _DatabaseCompareReader(
+            adapter=adapter,
+            datasource=datasource,
+            data_ref=data_ref,
+            key_columns=key_columns,
+            value_columns=value_columns,
+            select_key_names=select_key_names,
+            select_value_names=select_value_names,
+            rules=rules,
+        )
+
+    def _materialize_file_rows(
+        self,
+        data_ref: dict[str, object],
+        *,
+        max_rows: int,
+    ) -> list[dict[str, Any]]:
+        """上传件下载到临时文件 → domain reader 全量物化(超 max_rows 硬顶 raise)。
+
+        临时文件用完即删(finally);行数据不进日志(R5)。openpyxl 靠扩展名判
+        格式,故临时文件保留原始后缀。
+        """
+
+        storage_uri = data_ref.get("storage_uri")
+        if not isinstance(storage_uri, str) or not storage_uri:
+            raise ValueError("file compare ref requires storage_uri")
+        filename = data_ref.get("filename")
+        suffix = os.path.splitext(filename)[1] if isinstance(filename, str) else ""
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            with self._result_store.open_download(
+                ResultRef(backend="local_fs", uri=storage_uri)
+            ) as stream:
+                shutil.copyfileobj(stream, tmp)
+        try:
+            reader = _build_domain_file_reader(data_ref, tmp_path)
+            return reader.fetch_all(max_rows=max_rows)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     def _execute_export_excel(self, job: Job) -> _ExecutionOutcome:
         """export_excel = result_export 固定 format=excel 的薄封装(workflow 节点用)。"""
@@ -2461,6 +2550,127 @@ def _diff_all_rows(source_rows: list[CompareRow], target_rows: list[CompareRow])
     )
 
 
+def _build_domain_file_reader(data_ref: dict[str, object], path: str) -> RowReader:
+    """按 ref.file_format 装配 domain reader(与 file-preview 端点同口径)。"""
+
+    file_format = data_ref.get("file_format")
+    header_row = data_ref.get("header_row")
+    header = int(header_row) if isinstance(header_row, int) else 1
+    if file_format == "excel":
+        sheet = data_ref.get("sheet")
+        return ExcelReader(
+            path,
+            sheet=sheet if isinstance(sheet, str) else None,
+            header_row=header,
+        )
+    if file_format == "csv":
+        encoding = data_ref.get("encoding")
+        delimiter = data_ref.get("delimiter")
+        return CsvReader(
+            path,
+            encoding=encoding if isinstance(encoding, str) and encoding else "utf-8-sig",
+            delimiter=delimiter if isinstance(delimiter, str) and delimiter else ",",
+            header_row=header,
+        )
+    raise ValueError(f"unsupported compare file_format: {file_format!r}")
+
+
+class _FileCompareReader:
+    """文件源对比读取器:把已物化的 dict 行按任务列映射成 CompareRow。
+
+    与 `_DatabaseCompareReader` 同 `fetch_all()` 契约,喂进内存全量 diff。pk 保留
+    原始 key 值(供结果展示),值列走 `normalized_compare_identity` 规范化(跨源
+    类型对齐由 CompareRules 吸收)。零 DB 依赖。
+    """
+
+    def __init__(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+        value_columns: list[CompareColumn],
+        select_key_names: list[str],
+        select_value_names: list[str],
+        rules: CompareRules,
+    ) -> None:
+        self._rows = rows
+        self._value_columns = value_columns
+        self._select_key_names = select_key_names
+        self._select_value_names = select_value_names
+        self._rules = rules
+
+    def fetch_all(self) -> list[CompareRow]:
+        out: list[CompareRow] = []
+        for row in self._rows:
+            key_raw = tuple(row.get(name) for name in self._select_key_names)
+            value_raw = tuple(row.get(name) for name in self._select_value_names)
+            out.append(
+                CompareRow(
+                    pk=key_raw,
+                    values=normalized_compare_identity(self._value_columns, value_raw, self._rules),
+                    raw_values=value_raw,
+                    row_hash64=compare_row_hash64(self._value_columns, value_raw, self._rules),
+                )
+            )
+        return out
+
+
+def _diff_materialized_rows(
+    source_rows: list[CompareRow],
+    target_rows: list[CompareRow],
+    *,
+    key_columns: list[CompareColumn],
+    rules: CompareRules,
+) -> HashdiffResult:
+    """按归一化 key 对齐两侧全量行做 4 桶 diff(文件源路径)。
+
+    与 `_diff_all_rows` 的差别:匹配键用 `normalized_compare_identity(key)` 而非
+    原始 pk —— 让 CSV 的 "1"(str)与 DB 的 1(int)在 INTEGER/UNKNOWN 列下都能对齐。
+    事件 pk 保留原始 key 值供展示。
+    """
+
+    def _match_key(row: CompareRow) -> tuple[tuple[bool, str], ...]:
+        return normalized_compare_identity(key_columns, row.pk, rules)
+
+    source_by_key = {_match_key(row): row for row in source_rows}
+    target_by_key = {_match_key(row): row for row in target_rows}
+    events: list[CompareDiffEvent] = []
+    for key in sorted(source_by_key.keys() | target_by_key.keys()):
+        source = source_by_key.get(key)
+        target = target_by_key.get(key)
+        if source is None and target is not None:
+            events.append(
+                CompareDiffEvent(
+                    bucket=CompareDiffBucket.ONLY_TARGET,
+                    pk=target.pk,
+                    target_values=target.raw_values or target.values,
+                )
+            )
+        elif target is None and source is not None:
+            events.append(
+                CompareDiffEvent(
+                    bucket=CompareDiffBucket.ONLY_SOURCE,
+                    pk=source.pk,
+                    source_values=source.raw_values or source.values,
+                )
+            )
+        elif source is not None and target is not None:
+            bucket = (
+                CompareDiffBucket.SAME if source.values == target.values else CompareDiffBucket.DIFF
+            )
+            events.append(
+                CompareDiffEvent(
+                    bucket=bucket,
+                    pk=source.pk,
+                    source_values=source.raw_values or source.values,
+                    target_values=target.raw_values or target.values,
+                )
+            )
+    return HashdiffResult(
+        events=events,
+        progress=HashdiffProgress(row_mode_segments=1 if events else 0),
+    )
+
+
 def _payload_bucket_result_set_ids(payload: dict[str, object]) -> dict[str, str]:
     raw = payload.get("bucket_result_set_ids")
     if not isinstance(raw, dict):
@@ -2525,8 +2735,8 @@ def _payload_compare_data_ref(payload: dict[str, object], key: str) -> dict[str,
     if not isinstance(raw, dict):
         raise ValueError(f"compare_run payload {key} must be an object")
     kind = raw.get("kind", "table")
-    if kind not in {"table", "sql"}:
-        raise ValueError("compare ref kind must be table or sql")
+    if kind not in {"table", "sql", "file"}:
+        raise ValueError("compare ref kind must be table, sql or file")
     return dict(raw)
 
 
@@ -2651,6 +2861,8 @@ def _public_error_message(exc: Exception, kind: JobKind) -> str:
         return "unsupported_db_type"
     if isinstance(exc, ExportSizeLimitExceeded):
         return "export_limit_exceeded"
+    if isinstance(exc, MaxRowsExceededError):
+        return "compare_limit_exceeded"
     if isinstance(exc, UnsupportedJobKindError):
         return "internal"
     if isinstance(exc, WorkflowRunFailedError):
@@ -2673,6 +2885,8 @@ def _job_error_code(exc: Exception, kind: JobKind) -> JobErrorCode:
         return JobErrorCode.UNSUPPORTED_DB_TYPE
     if isinstance(exc, ExportSizeLimitExceeded):
         return JobErrorCode.EXPORT_LIMIT_EXCEEDED
+    if isinstance(exc, MaxRowsExceededError):
+        return JobErrorCode.COMPARE_LIMIT_EXCEEDED
     if _is_timeout_error(exc):
         return JobErrorCode.TIMEOUT
     if _is_cancel_error(exc):

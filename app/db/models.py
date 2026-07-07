@@ -521,17 +521,18 @@ compare_tasks = Table(
         nullable=False,
     ),
     Column("name", String(128), nullable=False),
+    # 文件源对比(C-1):file kind 的一侧无 datasource,故 source_id/target_id 可空。
     Column(
         "source_id",
         String(36),
         ForeignKey("datasources.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
     ),
     Column(
         "target_id",
         String(36),
         ForeignKey("datasources.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
     ),
     Column("source_ref", JSONB(), nullable=False),
     Column("target_ref", JSONB(), nullable=False),
