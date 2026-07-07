@@ -1370,7 +1370,7 @@ class WorkerRunner:
         # 推进时刻漂移);在途旧 run 无快照时回退为按当前时刻计算
         frozen_variables = when_variables_from_payload(job.payload)
         # when 判定与 payload ${var} 插值共用同一份变量快照(口径不漂移)
-        variables = (
+        variables: Mapping[str, str | list[str]] = (
             frozen_variables if frozen_variables is not None else builtin_when_variables(now)
         )
         plan = plan_workflow_step(
@@ -2192,7 +2192,7 @@ def _workflow_children_snapshots(children: list[Job]) -> dict[str, WorkflowChild
 
 
 def _build_workflow_child_job(
-    run_job: Job, node: WorkflowNode, variables: Mapping[str, str]
+    run_job: Job, node: WorkflowNode, variables: Mapping[str, str | list[str]]
 ) -> Job:
     # 入队时刻渲染 payload 里的 ${var} 占位符(用触发时冻结的变量快照);
     # 未解析变量等确定性错误已在 plan_workflow_step 侧拦成节点 FAILED,故走到这里

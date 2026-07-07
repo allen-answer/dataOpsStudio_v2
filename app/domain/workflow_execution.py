@@ -108,7 +108,7 @@ def plan_workflow_step(
     *,
     now: datetime,
     default_max_retries: int = 0,
-    when_variables: Mapping[str, str] | None = None,
+    when_variables: Mapping[str, str | list[str]] | None = None,
 ) -> WorkflowStepPlan:
     """计算 DAG 的下一步推进计划(纯函数,幂等)。
 

@@ -72,24 +72,39 @@ def builtin_when_variables(now: datetime) -> dict[str, str]:
     }
 
 
-def when_variables_from_payload(payload: Mapping[str, object]) -> dict[str, str] | None:
+def _is_valid_snapshot_value(value: object) -> bool:
+    """快照值形状:``str`` 或 ``list[str]``(C-7 PR3);其余类型无效。"""
+    if isinstance(value, str):
+        return True
+    if isinstance(value, list):
+        return all(isinstance(element, str) for element in value)
+    return False
+
+
+def when_variables_from_payload(
+    payload: Mapping[str, object],
+) -> dict[str, str | list[str]] | None:
     """读取 run payload 里触发时冻结的 when 变量快照。
 
-    触发端点把 ``builtin_when_variables(触发时刻)`` 写进 run payload,
-    执行器每步推进与 API 状态查询都用同一份快照 —— when 决策在 run
-    生命周期内确定不变(跨午夜不翻转),两端口径也不漂移。
-    快照缺失/形状不对(在途旧 run / payload 损坏)返回 None,调用方
-    回退为按当前时刻计算。
+    触发端点把合并变量(内置 + spec + 触发)写进 run payload,执行器每步推进与
+    API 状态查询都用同一份快照 —— when 决策 + ``${var}`` 插值在 run 生命周期内
+    确定不变(跨午夜不翻转),两端口径也不漂移。
+
+    值形状为 ``str`` 或 ``list[str]``(list 供 ``${var | sql_in}`` / ``${var | csv}``
+    展开;C-7 PR3)。快照缺失 / 形状不对(在途旧 run / payload 损坏)返回 None,
+    调用方回退为按当前时刻计算。
     """
     raw = payload.get("when_variables")
     if not isinstance(raw, dict):
         return None
-    if not all(isinstance(key, str) and isinstance(value, str) for key, value in raw.items()):
+    if not all(
+        isinstance(key, str) and _is_valid_snapshot_value(value) for key, value in raw.items()
+    ):
         return None
     return dict(raw)
 
 
-def evaluate_when(expression: str | None, variables: Mapping[str, str]) -> bool:
+def evaluate_when(expression: str | None, variables: Mapping[str, str | list[str]]) -> bool:
     """求值 ``when`` 表达式;空 / 空白 = True(总是执行)。
 
     任何非法构造 / 未知变量 / 类型不可比 → :class:`WhenEvaluationError`。
@@ -123,7 +138,7 @@ def evaluate_when(expression: str | None, variables: Mapping[str, str]) -> bool:
     return bool(_eval_node(tree.body))
 
 
-def _interpolate(expression: str, variables: Mapping[str, str]) -> str:
+def _interpolate(expression: str, variables: Mapping[str, str | list[str]]) -> str:
     def replace(match: re.Match[str]) -> str:
         name = match.group(1).strip()
         if name.startswith("nodes."):
@@ -132,8 +147,15 @@ def _interpolate(expression: str, variables: Mapping[str, str]) -> str:
             )
         if name not in variables:
             raise WhenEvaluationError(f"unknown_when_variable: 未知变量 {name!r}")
-        # 内置变量全是字符串;repr 产出带引号的字符串字面量,交给受限 AST 解析
-        return repr(str(variables[name]))
+        value = variables[name]
+        # list 型变量(为 ${var | sql_in} / csv 而生)在 when 里没有明确布尔语义:
+        # 显式报错(受控、只含变量名,R5),而非把 "['a','b']" 塞进受限 AST 误比较。
+        # ★ 仅当 when 表达式**直接引用**该 list 变量时才触发;list 变量只是存在于
+        # 快照里(未被引用)不进入本函数,不影响其它节点的 when 求值。
+        if isinstance(value, list):
+            raise WhenEvaluationError(f"list_variable_in_when: when 不支持 list 变量 {name!r}")
+        # 标量变量全是字符串;repr 产出带引号的字符串字面量,交给受限 AST 解析
+        return repr(str(value))
 
     return _PLACEHOLDER_RE.sub(replace, expression)
 
