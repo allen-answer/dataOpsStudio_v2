@@ -3746,7 +3746,9 @@ def _validated_workflow_spec(payload: dict[str, Any]) -> WorkflowSpec:
         raise ApiError(400, code, message) from exc
 
 
-def _validated_trigger_variables(variables: Mapping[str, str]) -> dict[str, str]:
+def _validated_trigger_variables(
+    variables: Mapping[str, str | list[str]],
+) -> dict[str, str | list[str]]:
     """触发时运行时变量校验(与 spec.variables 同一套规则,单一实现)。
 
     校验失败 → 结构化 400;错误消息只含变量名(R5),不含取值。

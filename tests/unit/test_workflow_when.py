@@ -132,7 +132,43 @@ def test_when_variables_from_payload_reads_frozen_snapshot() -> None:
 
 
 def test_when_variables_from_payload_rejects_missing_or_malformed() -> None:
-    # 缺失 / 非 dict / 非 str 值:回退 None(调用方按当前时刻计算)
+    # 缺失 / 非 dict / 非 str-或-list 值:回退 None(调用方按当前时刻计算)
     assert when_variables_from_payload({}) is None
     assert when_variables_from_payload({"when_variables": "not-a-dict"}) is None
     assert when_variables_from_payload({"when_variables": {"day": 2}}) is None
+    # list 里含非 str 元素 → 形状不对 → None
+    assert when_variables_from_payload({"when_variables": {"ids": [1, 2]}}) is None
+
+
+def test_when_variables_from_payload_accepts_str_and_list_snapshot() -> None:
+    # C-7 PR3:快照值放宽为 str | list[str](list 供 sql_in / csv 展开)
+    payload: dict[str, object] = {
+        "when_variables": {"day": "99", "ids": ["1", "2", "3"], "empty": []}
+    }
+    assert when_variables_from_payload(payload) == {
+        "day": "99",
+        "ids": ["1", "2", "3"],
+        "empty": [],
+    }
+
+
+def test_when_eval_ignores_unreferenced_list_var_in_snapshot() -> None:
+    # ★ CARE POINT:list 变量只存在于快照(未被 when 引用)→ 不进入插值,
+    # when 只引用 str/内置变量,照常求值,不崩溃
+    variables: dict[str, str | list[str]] = {
+        **builtin_when_variables(_NOW),
+        "env": "prod",
+        "ids": ["1", "2", "3"],  # list 变量存在但下面 when 不引用它
+    }
+    assert evaluate_when("${env} == 'prod' && ${year} == '2026'", variables) is True
+    assert evaluate_when("${env} == 'staging'", variables) is False
+
+
+def test_when_eval_directly_referencing_list_var_is_contained_error() -> None:
+    # when 直接引用 list 变量 → 受控 WhenEvaluationError(非未捕获崩溃),
+    # 消息只含变量名(R5)
+    variables: dict[str, str | list[str]] = {"ids": ["1", "2"]}
+    with pytest.raises(WhenEvaluationError) as exc_info:
+        evaluate_when("${ids} == '1'", variables)
+    assert "list_variable_in_when" in str(exc_info.value)
+    assert "ids" in str(exc_info.value)

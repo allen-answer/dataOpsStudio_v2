@@ -1056,9 +1056,12 @@ class WorkflowRunTriggerRequest(BaseModel):
     并入 when_variables 快照,合并优先级 builtin < spec.variables < 触发时。
     值走与 spec 变量同一套安全字符集校验(路由层 validate_workflow_variables),
     校验错误只含变量名(R5)。无 body / 空 variables 时行为与既往一致(仅内置变量)。
+
+    值为 ``str`` 或 ``list[str]``(C-7 PR3;list 供 ``${var | sql_in}`` / ``${var | csv}``
+    展开)。
     """
 
-    variables: dict[str, str] = Field(default_factory=dict)
+    variables: dict[str, str | list[str]] = Field(default_factory=dict)
 
 
 class WorkflowRunCreateResponse(BaseModel):
