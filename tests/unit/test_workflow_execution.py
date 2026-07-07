@@ -5,11 +5,14 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
+
 from app.domain.job import JobStatus
-from app.domain.workflow import WorkflowSpec
+from app.domain.workflow import WorkflowEdge, WorkflowNode, WorkflowSpec
 from app.domain.workflow_execution import (
     WorkflowChildJob,
     WorkflowNodeExecStatus,
+    _topological_nodes,
     plan_workflow_step,
 )
 
@@ -323,3 +326,24 @@ def test_timeout_child_is_retryable_like_failed() -> None:
     plan = plan_workflow_step(spec, children, now=_NOW)
 
     assert plan.retry_job_ids == ("job-a",)
+
+
+# ── 环检测:防御性校验用 raise 而非 assert(-O 下不被剥离)──────────────────────
+
+
+def test_topological_nodes_raises_on_cycle() -> None:
+    # WorkflowSpec 正常构造会拒环;用 model_construct 绕过校验模拟运行期损坏 spec,
+    # 断言 _topological_nodes 显式 raise ValueError(而非 assert,后者 -O 下消失)。
+    spec = WorkflowSpec.model_construct(
+        nodes=[
+            WorkflowNode(id="a", job_kind="sql_query", timeout_seconds=60),
+            WorkflowNode(id="b", job_kind="sql_query", timeout_seconds=60),
+        ],
+        edges=[
+            WorkflowEdge(source="a", target="b"),
+            WorkflowEdge(source="b", target="a"),
+        ],
+    )
+
+    with pytest.raises(ValueError, match="cycle_detected"):
+        _topological_nodes(spec)
