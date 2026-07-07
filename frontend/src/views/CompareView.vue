@@ -32,10 +32,12 @@ import {
   Sparkles,
   Square,
   Trash2,
+  Upload,
   Wand2,
   X,
 } from 'lucide-vue-next'
 import { listDatasources } from '../api/datasources'
+import { uploadFile } from '../api/uploads'
 import {
   COMPARE_BUCKETS,
   cloneCompareTask,
@@ -51,6 +53,7 @@ import {
   listCompareTaskRuns,
   listCompareTasks,
   previewCompareData,
+  previewCompareFile,
   runCompareTask,
   suggestCompareTasks,
   updateCompareTask,
@@ -58,6 +61,8 @@ import {
   type CompareAiAttributionResponse,
   type CompareBucket,
   type CompareDataRef,
+  type CompareFileFormat,
+  type CompareFilePreviewResponse,
   type CompareInferResponse,
   type ComparePreviewResponse,
   type CompareResultRow,
@@ -144,18 +149,35 @@ const activeTask = computed<CompareTaskResponse | null>(
 )
 
 // ── editor draft (a working copy of the active task) ────────────────
+type RefKind = 'table' | 'sql' | 'file'
+
 interface EditorDraft {
   name: string
   sourceId: string
   targetId: string
-  sourceKind: 'table' | 'sql'
-  targetKind: 'table' | 'sql'
+  sourceKind: RefKind
+  targetKind: RefKind
   sourceSchema: string
   sourceTable: string
   targetSchema: string
   targetTable: string
   sourceSql: string
   targetSql: string
+  // ── 文件源(C-1;kind='file'):config 存进 draft(落 task / 回读),预览态另存 previews。──
+  sourceUploadId: string
+  sourceFilename: string
+  sourceFileFormat: CompareFileFormat
+  sourceSheet: string
+  sourceHeaderRow: number
+  sourceEncoding: string
+  sourceDelimiter: string
+  targetUploadId: string
+  targetFilename: string
+  targetFileFormat: CompareFileFormat
+  targetSheet: string
+  targetHeaderRow: number
+  targetEncoding: string
+  targetDelimiter: string
   /** 单 SQL 便捷模式:同一段 SQL 同时填进 source_ref / target_ref(绑 sourceSql)。 */
   singleSql: boolean
   keyColumns: string[]
@@ -191,6 +213,20 @@ function emptyDraft(): EditorDraft {
     targetTable: '',
     sourceSql: '',
     targetSql: '',
+    sourceUploadId: '',
+    sourceFilename: '',
+    sourceFileFormat: 'csv',
+    sourceSheet: '',
+    sourceHeaderRow: 1,
+    sourceEncoding: '',
+    sourceDelimiter: '',
+    targetUploadId: '',
+    targetFilename: '',
+    targetFileFormat: 'csv',
+    targetSheet: '',
+    targetHeaderRow: 1,
+    targetEncoding: '',
+    targetDelimiter: '',
     singleSql: false,
     keyColumns: [],
     columnMappings: {},
@@ -266,16 +302,20 @@ const historyError = ref<string | null>(null)
 const historyHasMore = ref(false)
 const historyOffset = ref(0)
 
-// ── data preview (C-4) ──────────────────────────────────────────────
+// ── data preview (C-4 / C-1 文件源) ─────────────────────────────────
+// data 兼容 DB 预览(ComparePreviewResponse)与文件预览(CompareFilePreviewResponse):
+// 两者都有 columns/rows/truncated;文件多出 sheets/detected_encoding(经 fileSheets 读取)。
+// uploading = 文件源上传中(与 loading 预览中分开)。
 interface PreviewState {
   open: boolean
   loading: boolean
+  uploading: boolean
   error: string | null
-  data: ComparePreviewResponse | null
+  data: ComparePreviewResponse | CompareFilePreviewResponse | null
 }
 const previews = reactive<Record<RefSide, PreviewState>>({
-  source: { open: false, loading: false, error: null, data: null },
-  target: { open: false, loading: false, error: null, data: null },
+  source: { open: false, loading: false, uploading: false, error: null, data: null },
+  target: { open: false, loading: false, uploading: false, error: null, data: null },
 })
 
 // ── AI attribution ──────────────────────────────────────────────────
@@ -391,9 +431,9 @@ function onToggleShowAllColumns(event: Event): void {
   if (showAllColumns.value) focusColumn.value = null
 }
 
-// ── SQL 引用(C-2)────────────────────────────────────────────────────
+// ── 引用(C-2 SQL / C-1 文件源)──────────────────────────────────────
 /** 单 SQL 模式下两侧都是 sql;否则按各自 kind。 */
-function refKind(side: RefSide): 'table' | 'sql' {
+function refKind(side: RefSide): RefKind {
   if (draft.singleSql) return 'sql'
   return side === 'source' ? draft.sourceKind : draft.targetKind
 }
@@ -403,22 +443,50 @@ function refSql(side: RefSide): string {
   return side === 'source' ? draft.sourceSql : draft.targetSql
 }
 
-/** 该侧引用是否可用:table 要 table_name,sql 要非空 SQL。 */
+/** 该侧文件源的 upload_id / 格式(kind='file' 用)。 */
+function refUploadId(side: RefSide): string {
+  return side === 'source' ? draft.sourceUploadId : draft.targetUploadId
+}
+function refFileFormat(side: RefSide): CompareFileFormat {
+  return side === 'source' ? draft.sourceFileFormat : draft.targetFileFormat
+}
+
+/** 该侧引用是否可用:table 要 table_name,sql 要非空 SQL,file 要 upload_id。 */
 function refReady(side: RefSide): boolean {
-  if (refKind(side) === 'sql') return refSql(side).trim().length > 0
+  const kind = refKind(side)
+  if (kind === 'sql') return refSql(side).trim().length > 0
+  if (kind === 'file') return refUploadId(side).length > 0
   return side === 'source' ? Boolean(draft.sourceTable) : Boolean(draft.targetTable)
 }
 
-/** 按 kind 构造 CompareDataRef(schemas.py:kind=table 要 table_name,kind=sql 要 sql)。 */
+/** 按 kind 构造 CompareDataRef(schemas.py 条件校验:table→table_name,sql→sql,file→upload_id+file_format)。 */
 function buildDataRef(side: RefSide): CompareDataRef {
-  if (refKind(side) === 'sql') return { kind: 'sql', sql: refSql(side).trim() }
+  const kind = refKind(side)
+  if (kind === 'sql') return { kind: 'sql', sql: refSql(side).trim() }
+  if (kind === 'file') {
+    const isSource = side === 'source'
+    const format = isSource ? draft.sourceFileFormat : draft.targetFileFormat
+    const sheet = isSource ? draft.sourceSheet : draft.targetSheet
+    const encoding = isSource ? draft.sourceEncoding : draft.targetEncoding
+    const delimiter = isSource ? draft.sourceDelimiter : draft.targetDelimiter
+    return {
+      kind: 'file',
+      upload_id: isSource ? draft.sourceUploadId : draft.targetUploadId,
+      file_format: format,
+      // excel 才带 sheet;csv 才带 encoding/delimiter(空=后端默认)。
+      sheet: format === 'excel' ? sheet || null : null,
+      header_row: isSource ? draft.sourceHeaderRow : draft.targetHeaderRow,
+      encoding: format === 'csv' ? encoding || null : null,
+      delimiter: format === 'csv' ? delimiter || null : null,
+    }
+  }
   return side === 'source'
     ? { kind: 'table', schema_name: draft.sourceSchema || null, table_name: draft.sourceTable }
     : { kind: 'table', schema_name: draft.targetSchema || null, table_name: draft.targetTable }
 }
 
-// 任一侧 kind=sql 时列推断/表对建议无意义 —— infer 按钮禁用并提示手动配置。
-const sqlMode = computed<boolean>(() => refKind('source') === 'sql' || refKind('target') === 'sql')
+// 任一侧非 table(sql / file)时列推断/表对建议无意义 —— infer 按钮禁用并提示手动配置。
+const sqlMode = computed<boolean>(() => refKind('source') !== 'table' || refKind('target') !== 'table')
 
 function onSingleSqlToggle(): void {
   if (draft.singleSql) {
@@ -504,6 +572,132 @@ function adoptPreviewColumns(side: RefSide): void {
   }
 }
 
+// ── 文件源(C-1)──────────────────────────────────────────────────────
+const FILE_EXT_FORMAT: Record<string, CompareFileFormat> = {
+  csv: 'csv',
+  tsv: 'csv',
+  txt: 'csv',
+  xlsx: 'excel',
+  xlsm: 'excel',
+}
+const FILE_ACCEPT = '.csv,.tsv,.txt,.xlsx,.xlsm'
+
+/** 从已存任务的 file ref 回填 draft 文件字段(非 file kind 不动 emptyDraft 默认)。 */
+function loadFileRefIntoDraft(side: RefSide, ref: CompareDataRef): void {
+  if (ref.kind !== 'file') return
+  const format = ref.file_format ?? 'csv'
+  if (side === 'source') {
+    draft.sourceUploadId = ref.upload_id ?? ''
+    draft.sourceFileFormat = format
+    draft.sourceSheet = ref.sheet ?? ''
+    draft.sourceHeaderRow = ref.header_row ?? 1
+    draft.sourceEncoding = ref.encoding ?? ''
+    draft.sourceDelimiter = ref.delimiter ?? ''
+  } else {
+    draft.targetUploadId = ref.upload_id ?? ''
+    draft.targetFileFormat = format
+    draft.targetSheet = ref.sheet ?? ''
+    draft.targetHeaderRow = ref.header_row ?? 1
+    draft.targetEncoding = ref.encoding ?? ''
+    draft.targetDelimiter = ref.delimiter ?? ''
+  }
+}
+
+/** 该侧文件预览返回的 sheet 名单(仅 excel 非空;供 sheet 下拉)。 */
+function fileSheets(side: RefSide): string[] {
+  const data = previews[side].data
+  return data && 'sheets' in data ? data.sheets : []
+}
+
+function setDraftFile(
+  side: RefSide,
+  patch: { uploadId?: string; filename?: string; format?: CompareFileFormat },
+): void {
+  if (side === 'source') {
+    if (patch.uploadId !== undefined) draft.sourceUploadId = patch.uploadId
+    if (patch.filename !== undefined) draft.sourceFilename = patch.filename
+    if (patch.format !== undefined) draft.sourceFileFormat = patch.format
+  } else {
+    if (patch.uploadId !== undefined) draft.targetUploadId = patch.uploadId
+    if (patch.filename !== undefined) draft.targetFilename = patch.filename
+    if (patch.format !== undefined) draft.targetFileFormat = patch.format
+  }
+}
+
+/** 选文件 → 校验扩展名 → 复用上传基建拿 upload_id(purpose=compare_source)→ 自动预览。 */
+async function onFileSelected(side: RefSide, event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  const ext = file.name.toLowerCase().split('.').pop() ?? ''
+  const format = FILE_EXT_FORMAT[ext]
+  const state = previews[side]
+  if (!format) {
+    state.open = true
+    state.error = t('compare.file_bad_ext')
+    input.value = ''
+    return
+  }
+  state.uploading = true
+  state.error = null
+  state.open = true
+  try {
+    const res = await uploadFile(projectId.value, file, 'compare_source')
+    setDraftFile(side, { uploadId: res.upload_id, filename: res.filename, format })
+    await onFilePreview(side)
+  } catch (e) {
+    state.error = fileUploadErrorMessage(e)
+  } finally {
+    state.uploading = false
+    input.value = '' // 允许重选同名文件
+  }
+}
+
+/** 调 file-preview 端点渲染 sheet / 列 / 前 N 行;csv 回显实际生效编码。 */
+async function onFilePreview(side: RefSide): Promise<void> {
+  if (refKind(side) !== 'file' || !refUploadId(side)) return
+  const state = previews[side]
+  state.open = true
+  state.loading = true
+  state.error = null
+  try {
+    const data = await previewCompareFile(projectId.value, {
+      ref: buildDataRef(side),
+      limit: PREVIEW_LIMIT,
+    })
+    state.data = data
+    // csv:未手填编码时回显后端实际生效编码(GBK 回退可见)。
+    if (refFileFormat(side) === 'csv' && data.detected_encoding) {
+      if (side === 'source' && !draft.sourceEncoding) draft.sourceEncoding = data.detected_encoding
+      if (side === 'target' && !draft.targetEncoding) draft.targetEncoding = data.detected_encoding
+    }
+  } catch (e) {
+    state.data = null
+    state.error = filePreviewErrorMessage(e)
+  } finally {
+    state.loading = false
+  }
+}
+
+/** 上传错误码映射(core.py uploads:413 upload_too_large / 400 empty_upload)。 */
+function fileUploadErrorMessage(e: unknown): string {
+  if (e instanceof ApiError) {
+    if (e.status === 413 || e.code === 'upload_too_large') return t('compare.file_too_large')
+    if (e.code === 'empty_upload') return t('compare.file_empty')
+  }
+  return errorMessage(e)
+}
+
+/** 文件预览错误码映射(core.py file-preview:400 preview_failed / invalid_upload_purpose / 404)。 */
+function filePreviewErrorMessage(e: unknown): string {
+  if (e instanceof ApiError) {
+    if (e.code === 'preview_failed') return t('compare.file_preview_failed')
+    if (e.code === 'invalid_upload_purpose') return t('compare.file_bad_purpose')
+    if (e.status === 404 || e.code === 'not_found') return t('compare.file_not_found')
+  }
+  return errorMessage(e)
+}
+
 // ── lifecycle ───────────────────────────────────────────────────────
 onMounted(() => {
   void loadTasks()
@@ -563,6 +757,8 @@ function loadDraftFromTask(task: CompareTaskResponse): void {
   draft.targetTable = task.target_ref.table_name ?? ''
   draft.sourceSql = task.source_ref.sql ?? ''
   draft.targetSql = task.target_ref.sql ?? ''
+  loadFileRefIntoDraft('source', task.source_ref)
+  loadFileRefIntoDraft('target', task.target_ref)
   draft.singleSql =
     task.source_ref.kind === 'sql' &&
     task.target_ref.kind === 'sql' &&
@@ -1038,12 +1234,18 @@ function resetPreviews(): void {
   for (const side of ['source', 'target'] as const) {
     previews[side].open = false
     previews[side].loading = false
+    previews[side].uploading = false
     previews[side].error = null
     previews[side].data = null
   }
 }
 
 async function onPreview(side: RefSide): Promise<void> {
+  // 文件源走 file-preview(不需 datasource);table/sql 走 DB 预览。
+  if (refKind(side) === 'file') {
+    await onFilePreview(side)
+    return
+  }
   const state = previews[side]
   if (state.loading || !refReady(side)) return
   state.open = true
@@ -1387,18 +1589,61 @@ const missingTarget = computed(
                 >
                   {{ t('compare.ref_kind_sql') }}
                 </button>
+                <button
+                  type="button"
+                  class="chrome-btn-secondary text-xs"
+                  :class="draft.sourceKind === 'file' && 'chrome-accent-light-bg chrome-accent'"
+                  @click="draft.sourceKind = 'file'"
+                >
+                  {{ t('compare.ref_kind_file') }}
+                </button>
               </div>
               <template v-if="!draft.singleSql && draft.sourceKind === 'table'">
                 <input v-model="draft.sourceSchema" class="chrome-input w-full text-sm" :placeholder="t('compare.schema')" />
                 <input v-model="draft.sourceTable" class="chrome-input w-full text-sm" :placeholder="t('compare.table')" />
               </template>
               <textarea
-                v-else-if="!draft.singleSql"
+                v-else-if="!draft.singleSql && draft.sourceKind === 'sql'"
                 v-model="draft.sourceSql"
                 rows="5"
                 class="chrome-input w-full text-xs font-mono"
                 :placeholder="t('compare.sql_placeholder')"
               />
+              <!-- 文件源(源):上传 → 解析参数 -->
+              <div v-else-if="!draft.singleSql && draft.sourceKind === 'file'" class="space-y-2">
+                <label class="chrome-btn-secondary text-xs cursor-pointer w-full justify-center" :class="previews.source.uploading && 'opacity-60 pointer-events-none'">
+                  <Upload class="w-3.5 h-3.5" :class="previews.source.uploading && 'animate-pulse'" />
+                  {{ previews.source.uploading ? t('compare.file_uploading') : (draft.sourceUploadId ? t('compare.file_reupload') : t('compare.file_choose')) }}
+                  <input type="file" class="hidden" :accept="FILE_ACCEPT" @change="onFileSelected('source', $event)" />
+                </label>
+                <div v-if="draft.sourceFilename" class="text-[11px] chrome-text-muted truncate">
+                  {{ draft.sourceFilename }} · {{ t(`compare.file_format_${draft.sourceFileFormat}`) }}
+                </div>
+                <p class="text-[10px] chrome-text-muted">{{ t('compare.file_accept_hint') }}</p>
+                <template v-if="draft.sourceUploadId">
+                  <label v-if="draft.sourceFileFormat === 'excel' && fileSheets('source').length > 0" class="flex items-center justify-between gap-2 text-xs">
+                    <span class="chrome-text-muted shrink-0">{{ t('compare.file_sheet') }}</span>
+                    <select v-model="draft.sourceSheet" class="chrome-input text-xs flex-1" @change="onFilePreview('source')">
+                      <option value="">{{ t('compare.file_sheet_first') }}</option>
+                      <option v-for="sh in fileSheets('source')" :key="sh" :value="sh">{{ sh }}</option>
+                    </select>
+                  </label>
+                  <label class="flex items-center justify-between gap-2 text-xs">
+                    <span class="chrome-text-muted shrink-0">{{ t('compare.file_header_row') }}</span>
+                    <input v-model.number="draft.sourceHeaderRow" type="number" min="1" class="chrome-input w-20 text-xs" @change="onFilePreview('source')" />
+                  </label>
+                  <template v-if="draft.sourceFileFormat === 'csv'">
+                    <label class="flex items-center justify-between gap-2 text-xs">
+                      <span class="chrome-text-muted shrink-0">{{ t('compare.file_delimiter') }}</span>
+                      <input v-model="draft.sourceDelimiter" class="chrome-input w-20 text-xs" placeholder="," @change="onFilePreview('source')" />
+                    </label>
+                    <label class="flex items-center justify-between gap-2 text-xs">
+                      <span class="chrome-text-muted shrink-0">{{ t('compare.file_encoding') }}</span>
+                      <input v-model="draft.sourceEncoding" class="chrome-input w-32 text-xs" placeholder="utf-8-sig" @change="onFilePreview('source')" />
+                    </label>
+                  </template>
+                </template>
+              </div>
               <div>
                 <button
                   type="button"
@@ -1414,13 +1659,14 @@ const missingTarget = computed(
               <div v-if="previews.source.open" class="rounded-card border chrome-border-subtle p-2 space-y-1">
                 <div class="flex items-center justify-between gap-2">
                   <span class="text-[11px] chrome-text-muted">
-                    {{ refKind('source') === 'sql' ? t('compare.preview_sql_note') : t('compare.preview') }}
+                    {{ refKind('source') === 'sql' ? t('compare.preview_sql_note') : refKind('source') === 'file' ? t('compare.file_preview_note') : t('compare.preview') }}
                   </span>
                   <button type="button" class="chrome-btn-ghost" :title="t('compare.preview_close')" @click="previews.source.open = false">
                     <X class="w-3.5 h-3.5" />
                   </button>
                 </div>
-                <div v-if="previews.source.error" class="text-xs text-red-600 dark:text-red-400">{{ previews.source.error }}</div>
+                <div v-if="previews.source.uploading" class="text-xs chrome-text-muted"><LoadingDots /></div>
+                <div v-else-if="previews.source.error" class="text-xs text-red-600 dark:text-red-400">{{ previews.source.error }}</div>
                 <div v-else-if="previews.source.loading" class="text-xs chrome-text-muted"><LoadingDots /></div>
                 <template v-else-if="previews.source.data">
                   <div v-if="previews.source.data.truncated" class="text-[11px] text-amber-700 dark:text-amber-300">
@@ -1483,18 +1729,61 @@ const missingTarget = computed(
                 >
                   {{ t('compare.ref_kind_sql') }}
                 </button>
+                <button
+                  type="button"
+                  class="chrome-btn-secondary text-xs"
+                  :class="draft.targetKind === 'file' && 'chrome-accent-light-bg chrome-accent'"
+                  @click="draft.targetKind = 'file'"
+                >
+                  {{ t('compare.ref_kind_file') }}
+                </button>
               </div>
               <template v-if="!draft.singleSql && draft.targetKind === 'table'">
                 <input v-model="draft.targetSchema" class="chrome-input w-full text-sm" :placeholder="t('compare.schema')" />
                 <input v-model="draft.targetTable" class="chrome-input w-full text-sm" :placeholder="t('compare.table')" />
               </template>
               <textarea
-                v-else-if="!draft.singleSql"
+                v-else-if="!draft.singleSql && draft.targetKind === 'sql'"
                 v-model="draft.targetSql"
                 rows="5"
                 class="chrome-input w-full text-xs font-mono"
                 :placeholder="t('compare.sql_placeholder')"
               />
+              <!-- 文件源(目标):上传 → 解析参数 -->
+              <div v-else-if="!draft.singleSql && draft.targetKind === 'file'" class="space-y-2">
+                <label class="chrome-btn-secondary text-xs cursor-pointer w-full justify-center" :class="previews.target.uploading && 'opacity-60 pointer-events-none'">
+                  <Upload class="w-3.5 h-3.5" :class="previews.target.uploading && 'animate-pulse'" />
+                  {{ previews.target.uploading ? t('compare.file_uploading') : (draft.targetUploadId ? t('compare.file_reupload') : t('compare.file_choose')) }}
+                  <input type="file" class="hidden" :accept="FILE_ACCEPT" @change="onFileSelected('target', $event)" />
+                </label>
+                <div v-if="draft.targetFilename" class="text-[11px] chrome-text-muted truncate">
+                  {{ draft.targetFilename }} · {{ t(`compare.file_format_${draft.targetFileFormat}`) }}
+                </div>
+                <p class="text-[10px] chrome-text-muted">{{ t('compare.file_accept_hint') }}</p>
+                <template v-if="draft.targetUploadId">
+                  <label v-if="draft.targetFileFormat === 'excel' && fileSheets('target').length > 0" class="flex items-center justify-between gap-2 text-xs">
+                    <span class="chrome-text-muted shrink-0">{{ t('compare.file_sheet') }}</span>
+                    <select v-model="draft.targetSheet" class="chrome-input text-xs flex-1" @change="onFilePreview('target')">
+                      <option value="">{{ t('compare.file_sheet_first') }}</option>
+                      <option v-for="sh in fileSheets('target')" :key="sh" :value="sh">{{ sh }}</option>
+                    </select>
+                  </label>
+                  <label class="flex items-center justify-between gap-2 text-xs">
+                    <span class="chrome-text-muted shrink-0">{{ t('compare.file_header_row') }}</span>
+                    <input v-model.number="draft.targetHeaderRow" type="number" min="1" class="chrome-input w-20 text-xs" @change="onFilePreview('target')" />
+                  </label>
+                  <template v-if="draft.targetFileFormat === 'csv'">
+                    <label class="flex items-center justify-between gap-2 text-xs">
+                      <span class="chrome-text-muted shrink-0">{{ t('compare.file_delimiter') }}</span>
+                      <input v-model="draft.targetDelimiter" class="chrome-input w-20 text-xs" placeholder="," @change="onFilePreview('target')" />
+                    </label>
+                    <label class="flex items-center justify-between gap-2 text-xs">
+                      <span class="chrome-text-muted shrink-0">{{ t('compare.file_encoding') }}</span>
+                      <input v-model="draft.targetEncoding" class="chrome-input w-32 text-xs" placeholder="utf-8-sig" @change="onFilePreview('target')" />
+                    </label>
+                  </template>
+                </template>
+              </div>
               <div>
                 <button
                   type="button"
@@ -1510,13 +1799,14 @@ const missingTarget = computed(
               <div v-if="previews.target.open" class="rounded-card border chrome-border-subtle p-2 space-y-1">
                 <div class="flex items-center justify-between gap-2">
                   <span class="text-[11px] chrome-text-muted">
-                    {{ refKind('target') === 'sql' ? t('compare.preview_sql_note') : t('compare.preview') }}
+                    {{ refKind('target') === 'sql' ? t('compare.preview_sql_note') : refKind('target') === 'file' ? t('compare.file_preview_note') : t('compare.preview') }}
                   </span>
                   <button type="button" class="chrome-btn-ghost" :title="t('compare.preview_close')" @click="previews.target.open = false">
                     <X class="w-3.5 h-3.5" />
                   </button>
                 </div>
-                <div v-if="previews.target.error" class="text-xs text-red-600 dark:text-red-400">{{ previews.target.error }}</div>
+                <div v-if="previews.target.uploading" class="text-xs chrome-text-muted"><LoadingDots /></div>
+                <div v-else-if="previews.target.error" class="text-xs text-red-600 dark:text-red-400">{{ previews.target.error }}</div>
                 <div v-else-if="previews.target.loading" class="text-xs chrome-text-muted"><LoadingDots /></div>
                 <template v-else-if="previews.target.data">
                   <div v-if="previews.target.data.truncated" class="text-[11px] text-amber-700 dark:text-amber-300">
