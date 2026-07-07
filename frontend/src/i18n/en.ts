@@ -456,6 +456,7 @@ export default {
     history_sampled: 'sampled',
     history_open_hint: 'Open the results of this run',
     history_not_openable: 'Only successful runs can be opened',
+    history_export_hint: 'Export this run',
     // data preview (C-4)
     preview: 'Preview',
     previewing: 'Previewing…',

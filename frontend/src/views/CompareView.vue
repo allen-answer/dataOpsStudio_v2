@@ -1236,6 +1236,13 @@ function openHistoryRun(item: CompareTaskRunItem): void {
   void Promise.all([loadResults(resultBucket.value), loadProfile()])
 }
 
+/** 历史行"导出":先打开该 run(设为当前 run),再走既有导出流程(#96 review #5)。 */
+async function onExportHistoryRun(item: CompareTaskRunItem): Promise<void> {
+  if (item.status !== 'success' || exportBusy.value) return
+  openHistoryRun(item)
+  await onCreateCompareExport()
+}
+
 // ── data preview (C-4) ──────────────────────────────────────────────
 function resetPreviews(): void {
   for (const side of ['source', 'target'] as const) {
@@ -2415,33 +2422,43 @@ const missingTarget = computed(
           <div v-else-if="historyRuns.length === 0" class="chrome-text-muted text-sm">
             {{ t('compare.history_empty') }}
           </div>
-          <button
-            v-for="item in historyRuns"
-            :key="item.run_id"
-            type="button"
-            class="w-full text-left rounded-card border chrome-border px-3 py-2 flex flex-wrap items-center gap-x-3 gap-y-1 transition-colors"
-            :class="item.status === 'success' ? 'hover:chrome-bg-elevated' : 'opacity-50 cursor-not-allowed'"
-            :disabled="item.status !== 'success'"
-            :title="item.status === 'success' ? t('compare.history_open_hint') : t('compare.history_not_openable')"
-            @click="openHistoryRun(item)"
-          >
-            <span class="text-xs chrome-text-heading tabular-nums w-40 shrink-0">{{ formatDate(item.created_at) }}</span>
-            <JobStatusBadge v-if="isKnownJobStatus(item.status)" :status="asJobStatus(item.status)" />
-            <span v-else class="text-xs chrome-text-muted">{{ item.status }}</span>
-            <span class="flex-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] chrome-text-muted">
-              <span v-for="bucket in COMPARE_BUCKETS" :key="bucket" class="inline-flex items-center gap-1">
-                <span class="w-2 h-2 rounded-full" :class="BUCKET_STYLE[bucket].dot" />
-                {{ t(`compare.bucket_${bucket}`) }}
-                <span class="tabular-nums">{{ item.bucket_counts[bucket] ?? 0 }}</span>
-              </span>
-            </span>
-            <span
-              v-if="item.sampled"
-              class="inline-flex items-center gap-1 text-[10px] text-amber-700 dark:text-amber-300"
+          <div v-for="item in historyRuns" :key="item.run_id" class="flex items-stretch gap-2">
+            <button
+              type="button"
+              class="flex-1 min-w-0 text-left rounded-card border chrome-border px-3 py-2 flex flex-wrap items-center gap-x-3 gap-y-1 transition-colors"
+              :class="item.status === 'success' ? 'hover:chrome-bg-elevated' : 'opacity-50 cursor-not-allowed'"
+              :disabled="item.status !== 'success'"
+              :title="item.status === 'success' ? t('compare.history_open_hint') : t('compare.history_not_openable')"
+              @click="openHistoryRun(item)"
             >
-              <AlertTriangle class="w-3 h-3" /> {{ t('compare.history_sampled') }}
-            </span>
-          </button>
+              <span class="text-xs chrome-text-heading tabular-nums w-40 shrink-0">{{ formatDate(item.created_at) }}</span>
+              <JobStatusBadge v-if="isKnownJobStatus(item.status)" :status="asJobStatus(item.status)" />
+              <span v-else class="text-xs chrome-text-muted">{{ item.status }}</span>
+              <span class="flex-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] chrome-text-muted">
+                <span v-for="bucket in COMPARE_BUCKETS" :key="bucket" class="inline-flex items-center gap-1">
+                  <span class="w-2 h-2 rounded-full" :class="BUCKET_STYLE[bucket].dot" />
+                  {{ t(`compare.bucket_${bucket}`) }}
+                  <span class="tabular-nums">{{ item.bucket_counts[bucket] ?? 0 }}</span>
+                </span>
+              </span>
+              <span
+                v-if="item.sampled"
+                class="inline-flex items-center gap-1 text-[10px] text-amber-700 dark:text-amber-300"
+              >
+                <AlertTriangle class="w-3 h-3" /> {{ t('compare.history_sampled') }}
+              </span>
+            </button>
+            <button
+              v-if="item.status === 'success'"
+              type="button"
+              class="chrome-btn-secondary text-xs shrink-0"
+              :disabled="exportBusy"
+              :title="t('compare.history_export_hint')"
+              @click="onExportHistoryRun(item)"
+            >
+              <Download class="w-3.5 h-3.5" :class="exportBusy && 'animate-pulse'" />
+            </button>
+          </div>
           <button
             v-if="historyHasMore"
             type="button"

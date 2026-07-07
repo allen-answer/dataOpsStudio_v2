@@ -446,6 +446,7 @@ export default {
     history_sampled: '采样',
     history_open_hint: '查看该次运行的结果',
     history_not_openable: '仅成功的运行可查看结果',
+    history_export_hint: '导出该次运行',
     preview: '预览',
     previewing: '预览中…',
     preview_close: '收起预览',

@@ -31,7 +31,7 @@
  * 注:run_id 与 job_id 都能寻址 run(后端 _compare_run_for_current_user 两者皆收);
  * 结果/画像/归因端点用 run_id,本 client 同用 run_id。
  */
-import { apiClient } from './client'
+import { apiClient, downloadTokenizedExport } from './client'
 import type { Column, ExportFormat } from './types'
 
 // ── 4 桶 ────────────────────────────────────────────────────────────
@@ -462,22 +462,9 @@ export function createCompareExport(runId: string): Promise<CompareExportCreateR
   return apiClient.post<CompareExportCreateResponse>(`/compare/runs/${runId}/export`, { format: 'excel' })
 }
 
-export async function downloadCompareExport(
-  token: string,
-  fallbackFilename: string,
-): Promise<void> {
-  const { blob, filename } = await apiClient.downloadBlob(`/exports/${encodeURIComponent(token)}`)
-  const url = URL.createObjectURL(blob)
-  try {
-    const anchor = document.createElement('a')
-    anchor.href = url
-    anchor.download = filename ?? fallbackFilename
-    document.body.appendChild(anchor)
-    anchor.click()
-    anchor.remove()
-  } finally {
-    URL.revokeObjectURL(url)
-  }
+/** 导出下载复用共享 helper(client.ts downloadTokenizedExport,#96 review #4 去重)。 */
+export function downloadCompareExport(token: string, fallbackFilename: string): Promise<void> {
+  return downloadTokenizedExport(token, fallbackFilename)
 }
 
 export function getCompareRunResults(
