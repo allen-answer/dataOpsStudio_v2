@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
+from itertools import islice
 from random import Random
 from typing import Any, BinaryIO, Protocol, cast
 from uuid import uuid4
@@ -124,6 +125,10 @@ _LINEAGE_BATCH_EXTENSIONS = (".sql", ".txt")
 # 文件源对比全量物化的行数硬顶(C-1):防大文件把 worker 撑爆内存。
 # 任务 run_limits.max_rows 若给出则以其为准,否则用本默认;超限直接 failed(不截断)。
 _FILE_COMPARE_DEFAULT_MAX_ROWS = 1_000_000
+
+# Excel 单 sheet 硬上限 1,048,576 行(含表头);数据行上限 = 减去表头 1 行。
+# compare 结果导出每 sheet 必须 cap 到此值,否则运维调高 spool_max_rows 即产出非法 xlsx。
+_EXCEL_MAX_DATA_ROWS_PER_SHEET = 1_048_575
 
 # B 组明细持久化封顶(L-5+ PR2):富明细叠加大批量会撑爆 report JSON,
 # 必须双重封顶——每文件每类明细行上限 + 全局总行预算;超限截断并打 details_truncated
@@ -740,6 +745,9 @@ class WorkerRunner:
         filename = _required_payload_str(payload, "filename")
         bucket_spools = _payload_export_bucket_result_set_ids(payload)
         limit_bytes = self._config.export_limit_mb * 1024 * 1024
+        # 每 sheet 行数上限:cap 到 min(export_max_rows, Excel 单 sheet 硬顶),
+        # 否则 spool_max_rows 调高后单 sheet 会超 1,048,576 → 非法 xlsx。
+        row_cap = _compare_export_row_cap(payload)
         loaded_rows = 0
         sheets: list[tuple[str, list[Column], Iterable[Row]]] = []
         for bucket in COMPARE_BUCKETS:
@@ -750,7 +758,7 @@ class WorkerRunner:
                 (
                     bucket,
                     _columns_from_manifest(manifest),
-                    self._iter_spool_rows(job.id, result_set_id),
+                    islice(self._iter_spool_rows(job.id, result_set_id), row_cap),
                 )
             )
         with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as stream:
@@ -2840,6 +2848,18 @@ def _payload_export_bucket_result_set_ids(payload: dict[str, object]) -> dict[st
     if not isinstance(raw, dict):
         raise ValueError("compare export payload requires bucket_result_set_ids")
     return _required_bucket_result_set_ids(raw, "compare export payload")
+
+
+def _compare_export_row_cap(payload: dict[str, object]) -> int:
+    """每 sheet 导出行上限 = min(export_max_rows, Excel 单 sheet 硬顶)。
+
+    export_max_rows(来自 RunLimits)缺省 / 非正整数时回退到 Excel 硬顶,
+    保证任何配置下单 sheet 都不会超过 1,048,576 行(含表头)产出非法 xlsx。
+    """
+    raw = payload.get("export_max_rows")
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+        return min(raw, _EXCEL_MAX_DATA_ROWS_PER_SHEET)
+    return _EXCEL_MAX_DATA_ROWS_PER_SHEET
 
 
 def _required_bucket_result_set_ids(raw: dict[object, object], label: str) -> dict[str, str]:
