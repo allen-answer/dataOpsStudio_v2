@@ -83,6 +83,15 @@ def test_filter_unsupported_in_pr1() -> None:
     assert "today | sql_in" in str(exc_info.value)
 
 
+def test_custom_variable_resolves_in_compare_table_name() -> None:
+    # C-7 PR2 闭环:触发/spec 自定义变量进快照后,插值把 ${myvar} 解析进 compare 节点
+    # 的 table_name(值已在入口过安全字符集校验,插值层无需再判别)
+    variables = {"myvar": "2026Q3", "today": "2026-07-07"}
+    payload = {"source_ref": {"table_name": "sales_${myvar}"}}
+    result = interpolate_payload(payload, variables)
+    assert result["source_ref"]["table_name"] == "sales_2026Q3"
+
+
 def test_builtin_date_renders_as_controlled_string_in_sql_and_table() -> None:
     # 注入安全(PR1 by construction):内置日期变量格式受控,渲染进 sql/table_name
     # 后仍是无引号/无分号的确定性字符串

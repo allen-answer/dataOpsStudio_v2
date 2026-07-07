@@ -8,19 +8,25 @@ on_failure='branch' 拒绝、cron 基本格式、when 校验、合法 spec 全�
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
 
 from app.domain.job import ALLOWED_WORKFLOW_NODE_KINDS
 from app.domain.workflow import (
+    BUILTIN_VARIABLE_NAMES,
+    MAX_VARIABLE_VALUE_LENGTH,
+    MAX_WORKFLOW_VARIABLES,
     SUPPORTED_WORKFLOW_NODE_KINDS_V1,
     CronSchedule,
     RetryPolicy,
     WorkflowEdge,
     WorkflowNode,
     WorkflowSpec,
+    validate_workflow_variables,
 )
+from app.domain.workflow_when import builtin_when_variables
 
 
 def make_node(node_id: str = "n1", **overrides: object) -> WorkflowNode:
@@ -275,3 +281,111 @@ def test_full_spec_construction_roundtrip() -> None:
     # JSON 往返(API 层将以 JSON 收发 spec)
     restored_json = WorkflowSpec.model_validate_json(spec.model_dump_json())
     assert restored_json == spec
+
+
+# ---------------------------------------------------------------- C-7 PR2 变量来源校验
+
+
+def test_builtin_variable_names_match_when_snapshot_keys_no_drift() -> None:
+    # 防漂移:冲突禁用名集合必须与 builtin_when_variables 实际产出的 key 一致
+    snapshot_keys = set(builtin_when_variables(datetime(2026, 7, 7, tzinfo=UTC)))
+    assert BUILTIN_VARIABLE_NAMES == snapshot_keys
+
+
+def test_valid_variables_accepted_on_spec() -> None:
+    spec = WorkflowSpec.model_validate(
+        {
+            "nodes": [make_node("n1")],
+            "edges": [],
+            "variables": {"biz_date": "2026-07-07", "env": "prod", "region": "ap-east-1"},
+        }
+    )
+    assert spec.variables == {"biz_date": "2026-07-07", "env": "prod", "region": "ap-east-1"}
+
+
+def test_variables_default_empty_and_roundtrip() -> None:
+    spec = WorkflowSpec.model_validate({"nodes": [make_node("n1")], "edges": []})
+    assert spec.variables == {}
+    assert WorkflowSpec.model_validate(spec.model_dump()) == spec
+
+
+def test_variable_key_colliding_with_builtin_rejected() -> None:
+    for builtin in sorted(BUILTIN_VARIABLE_NAMES):
+        with pytest.raises(ValidationError, match="variable_name_collides_builtin"):
+            WorkflowSpec.model_validate(
+                {"nodes": [make_node("n1")], "edges": [], "variables": {builtin: "x"}}
+            )
+
+
+@pytest.mark.parametrize("bad_key", ["1biz", "has-dash", "has.dot", "has space", "", "a b"])
+def test_variable_bad_key_format_rejected(bad_key: str) -> None:
+    with pytest.raises(ValidationError, match="invalid_variable_name"):
+        WorkflowSpec.model_validate(
+            {"nodes": [make_node("n1")], "edges": [], "variables": {bad_key: "x"}}
+        )
+
+
+def test_variable_count_cap_enforced() -> None:
+    ok = {f"v{i}": "x" for i in range(MAX_WORKFLOW_VARIABLES)}
+    assert validate_workflow_variables(ok) == ok
+    too_many = {f"v{i}": "x" for i in range(MAX_WORKFLOW_VARIABLES + 1)}
+    with pytest.raises(ValueError, match="too_many_variables"):
+        validate_workflow_variables(too_many)
+
+
+def test_variable_value_length_cap_enforced() -> None:
+    long_value = "a" * (MAX_VARIABLE_VALUE_LENGTH + 1)
+    with pytest.raises(ValueError, match="variable_value_too_long"):
+        validate_workflow_variables({"v": long_value})
+
+
+@pytest.mark.parametrize(
+    "allowed",
+    ["2026-07-07", "prod", "ap-east-1", "schema_a.table_b", "host:5432", "v1.2.3", ""],
+)
+def test_variable_safe_values_accepted(allowed: str) -> None:
+    assert validate_workflow_variables({"v": allowed}) == {"v": allowed}
+
+
+# ★ 注入核心:每个危险字符 / 序列都必须被拒,且错误只含变量名不含取值(R5)
+@pytest.mark.parametrize(
+    "dangerous",
+    [
+        "a'; DROP TABLE users",  # 单引号 + 分号
+        'a" OR "1"="1',  # 双引号
+        "a`b",  # 反引号
+        "a;b",  # 分号
+        "a--comment",  # SQL 行注释序列
+        "a/*b",  # SQL 块注释起始
+        "a\\b",  # 反斜杠
+        "a\nb",  # 换行
+        "a b",  # 空格(标识符位有风险,一律禁)
+        "1 OR 1=1",  # 经典注入(含空格与 =)
+    ],
+)
+def test_variable_dangerous_value_rejected_name_only_never_value(dangerous: str) -> None:
+    with pytest.raises(ValueError) as exc_info:
+        validate_workflow_variables({"secret_var": dangerous})
+    message = str(exc_info.value)
+    assert "unsafe_variable_value" in message
+    assert "secret_var" in message
+    # ★ R5:错误信息绝不泄露危险取值本身
+    assert dangerous not in message
+
+
+def test_single_hyphen_allowed_double_hyphen_rejected() -> None:
+    # 单 `-`(日期)无害;`--`(SQL 注释)必须拦
+    assert validate_workflow_variables({"d": "2026-07-07"}) == {"d": "2026-07-07"}
+    with pytest.raises(ValueError, match="unsafe_variable_value"):
+        validate_workflow_variables({"d": "a--b"})
+
+
+def test_precedence_builtin_lt_spec_lt_trigger() -> None:
+    # 合并优先级:builtin < spec.variables < 触发时;触发覆盖 spec,builtin 不可被覆盖(禁冲突)
+    builtin = builtin_when_variables(datetime(2026, 7, 7, tzinfo=UTC))
+    spec_vars = validate_workflow_variables({"env": "staging", "region": "ap-east-1"})
+    trigger_vars = validate_workflow_variables({"env": "prod"})
+    merged = {**builtin, **spec_vars, **trigger_vars}
+    assert merged["env"] == "prod"  # 触发 > spec
+    assert merged["region"] == "ap-east-1"  # spec 保留
+    assert merged["today"] == builtin["today"]  # builtin 不被覆盖
