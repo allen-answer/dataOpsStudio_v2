@@ -24,6 +24,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.domain.job import ALLOWED_WORKFLOW_NODE_KINDS
+from app.domain.notify import NotifyTarget
 
 # 首版(2.4.0 PR-1)支持的节点集:R7 白名单的真子集。
 # notify / sleep / branch / scenario_* 在白名单内但首版执行器不实现。
@@ -155,6 +156,8 @@ class WorkflowSpec(BaseModel):
     nodes: list[WorkflowNode] = Field(min_length=1, max_length=MAX_WORKFLOW_NODES)
     edges: list[WorkflowEdge] = Field(default_factory=list)
     schedule: CronSchedule | None = None
+    # run 终态通知目标(C-9;存进 dag_jsonb,无需迁移)。空 = 不通知(默认)。
+    notifications: list[NotifyTarget] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _validate_dag(self) -> WorkflowSpec:
@@ -177,6 +180,12 @@ class WorkflowSpec(BaseModel):
         cycle = _find_cycle(self.nodes, adjacency)
         if cycle is not None:
             raise ValueError(f"cycle_detected: DAG 存在环,环上节点: {' -> '.join(cycle)}")
+
+        notify_ids: set[str] = set()
+        for target in self.notifications:
+            if target.id in notify_ids:
+                raise ValueError(f"duplicate_notify_target_id: 通知目标 id {target.id!r} 重复")
+            notify_ids.add(target.id)
         return self
 
 
