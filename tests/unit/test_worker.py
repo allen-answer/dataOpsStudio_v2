@@ -22,11 +22,13 @@ from app.domain.compare_result import (
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.lineage import LineageReport, schema_from_metadata_cache_rows
+from app.domain.notify import NotifyResult
 from app.domain.plan import PlanNode
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import SecretKind, SecretRef
+from app.services.notify import WorkflowNotifyService
 from app.worker import WorkerRunner, WorkerRunnerConfig
 
 
@@ -1448,6 +1450,220 @@ def test_workflow_run_rejects_spec_with_forbidden_kind_at_execution() -> None:
 
     assert backend.enqueued == []
     assert len(backend.failed) == 1
+
+
+# ── workflow_run 终态通知(C-9 worker 接入)────────────────────────────────────
+
+
+class _RecordingNotifyService:
+    """假通知服务:记录 worker 钩子的 notify 调用(不做 events 过滤——那是真 service 的活)。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, object, str]] = []
+
+    def notify(self, spec: object, payload: object, run_status: str) -> list[NotifyResult]:
+        self.calls.append((spec, payload, run_status))
+        return []
+
+
+class _RaisingNotifyService:
+    """通知服务违约抛异常:验证 worker 外层失败隔离(run 终态仍落定)。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def notify(self, spec: object, payload: object, run_status: str) -> list[NotifyResult]:
+        self.calls += 1
+        raise RuntimeError("notify boom")
+
+
+class _RecordingChannel:
+    """假渠道:调用 reveal 并记录,断言 reveal 注入 + 明文不外泄。"""
+
+    channel = "webhook"
+
+    def __init__(self) -> None:
+        self.sent: list[dict[str, object]] = []
+
+    def send(self, target: object, payload: object, *, reveal: object) -> NotifyResult:
+        ref = SecretRef(ref=target.url_secret_ref, kind=SecretKind.WEBHOOK_SECRET)  # type: ignore[attr-defined]
+        revealed = reveal(ref)  # type: ignore[operator]
+        self.sent.append(
+            {"target_id": target.id, "payload": payload, "revealed": revealed}  # type: ignore[attr-defined]
+        )
+        return NotifyResult(channel=self.channel, target_id=target.id, ok=True)  # type: ignore[attr-defined]
+
+
+def _spec_with_notify(events: list[str], *, channel: str = "webhook") -> dict[str, object]:
+    spec = _workflow_spec_payload()
+    spec["notifications"] = [
+        {"id": "t1", "channel": channel, "url_secret_ref": "ref-1", "events": events}
+    ]
+    return spec
+
+
+def test_workflow_run_notify_on_success() -> None:
+    backend = _FakeBackend([_workflow_run_job(_spec_with_notify(["success"]))])
+    backend.children_by_parent["job-1"] = [_workflow_child("job-1", "n1", JobStatus.SUCCESS)]
+    runner = _workflow_runner(backend)
+    service = _RecordingNotifyService()
+    runner._notify_service = service  # type: ignore[assignment]
+
+    assert runner.run_once() is True
+
+    assert len(backend.completed) == 1
+    assert len(service.calls) == 1
+    _, payload, run_status = service.calls[0]
+    assert run_status == "success"
+    assert payload.workflow_id == "wf-1"  # type: ignore[attr-defined]
+    assert payload.run_job_id == "job-1"  # type: ignore[attr-defined]
+    assert payload.status == "success"  # type: ignore[attr-defined]
+    assert payload.error is None  # type: ignore[attr-defined]
+
+
+def test_workflow_run_notify_on_failure_passes_public_error() -> None:
+    backend = _FakeBackend([_workflow_run_job(_spec_with_notify(["failed"]))])
+    backend.children_by_parent["job-1"] = [
+        _workflow_child("job-1", "n1", JobStatus.FAILED, error="sql_failed")
+    ]
+    runner = _workflow_runner(backend)
+    service = _RecordingNotifyService()
+    runner._notify_service = service  # type: ignore[assignment]
+
+    assert runner.run_once() is True
+
+    assert len(backend.failed) == 1
+    assert len(service.calls) == 1
+    _, payload, run_status = service.calls[0]
+    assert run_status == "failed"
+    assert payload.status == "failed"  # type: ignore[attr-defined]
+    # 失败摘要用 _public_error_message(节点 id + 公开错误串),非敏感
+    assert payload.error is not None and "n1" in payload.error  # type: ignore[attr-defined]
+
+
+def test_workflow_run_notify_on_cancel() -> None:
+    backend = _FakeBackend([_workflow_run_job(_spec_with_notify(["all"]))])
+    backend.children_by_parent["job-1"] = [_workflow_child("job-1", "n1", JobStatus.RUNNING)]
+    backend.cancel_after_checks = 1
+    runner = _workflow_runner(backend)
+    service = _RecordingNotifyService()
+    runner._notify_service = service  # type: ignore[assignment]
+
+    assert runner.run_once() is True
+
+    assert backend.cancelled == [("job-1", "cancel requested")]
+    assert len(service.calls) == 1
+    assert service.calls[0][2] == "cancelled"
+
+
+def test_workflow_run_yield_step_does_not_notify() -> None:
+    # 让位分支(outcome is None)不是终态,不通知
+    backend = _FakeBackend([_workflow_run_job(_spec_with_notify(["all"]))])
+    runner = _workflow_runner(backend)
+    service = _RecordingNotifyService()
+    runner._notify_service = service  # type: ignore[assignment]
+
+    assert runner.run_once() is True
+
+    assert backend.requeued_workflow_runs == ["job-1"]
+    assert backend.completed == []
+    assert service.calls == []
+
+
+def test_workflow_run_notify_events_filter_skips_unsubscribed() -> None:
+    # 真 service 做 events 过滤:target 只订 failed,success run 不发
+    backend = _FakeBackend([_workflow_run_job(_spec_with_notify(["failed"]))])
+    backend.children_by_parent["job-1"] = [_workflow_child("job-1", "n1", JobStatus.SUCCESS)]
+    runner = _workflow_runner(backend)
+    channel = _RecordingChannel()
+    runner._notify_service = WorkflowNotifyService(lambda ref: "unused", {"webhook": channel})
+
+    assert runner.run_once() is True
+
+    assert len(backend.completed) == 1
+    assert channel.sent == []  # failed-only 目标在 success 终态不触发
+
+
+def test_workflow_run_notify_reveal_injected_and_no_plaintext_leak() -> None:
+    # 真 service + 真渠道:reveal 被注入且调用;payload 不含明文 url/token(R2/R5)
+    backend = _FakeBackend([_workflow_run_job(_spec_with_notify(["all"]))])
+    backend.children_by_parent["job-1"] = [
+        _workflow_child("job-1", "n1", JobStatus.FAILED, error="sql_failed")
+    ]
+    runner = _workflow_runner(backend)
+    reveal_calls: list[SecretRef] = []
+    secret_url = "https://example.com/hook?key=SUPERSECRETTOKEN"
+
+    def reveal(ref: SecretRef) -> str:
+        reveal_calls.append(ref)
+        return secret_url
+
+    channel = _RecordingChannel()
+    runner._notify_service = WorkflowNotifyService(reveal, {"webhook": channel})
+
+    assert runner.run_once() is True
+
+    assert len(backend.failed) == 1
+    assert len(reveal_calls) == 1
+    assert reveal_calls[0].ref == "ref-1"
+    assert reveal_calls[0].kind is SecretKind.WEBHOOK_SECRET
+    assert len(channel.sent) == 1
+    payload = channel.sent[0]["payload"]
+    dumped = payload.model_dump_json()  # type: ignore[attr-defined]
+    assert "SUPERSECRETTOKEN" not in dumped
+    assert secret_url not in dumped
+
+
+def test_workflow_run_notify_failure_does_not_break_run_terminal() -> None:
+    # ★ 硬红线:通知服务抛异常时 run 终态仍正确落定,worker 循环不崩
+    backend = _FakeBackend([_workflow_run_job(_spec_with_notify(["all"]))])
+    backend.children_by_parent["job-1"] = [_workflow_child("job-1", "n1", JobStatus.SUCCESS)]
+    runner = _workflow_runner(backend)
+    service = _RaisingNotifyService()
+    runner._notify_service = service  # type: ignore[assignment]
+
+    assert runner.run_once() is True
+
+    assert service.calls == 1  # 通知确实被尝试
+    assert len(backend.completed) == 1  # run 仍正常 complete(通知异常被吞)
+    assert backend.failed == []
+
+
+def test_workflow_run_without_notify_service_completes_normally() -> None:
+    # 默认构造无 notify_reveal → _notify_service is None(no-op),run 照常终态
+    backend = _FakeBackend([_workflow_run_job(_spec_with_notify(["all"]))])
+    backend.children_by_parent["job-1"] = [_workflow_child("job-1", "n1", JobStatus.SUCCESS)]
+    runner = _workflow_runner(backend)
+
+    assert runner._notify_service is None
+    assert runner.run_once() is True
+    assert len(backend.completed) == 1
+
+
+def test_non_workflow_job_failure_does_not_notify() -> None:
+    # _notify_workflow_run_terminal 仅对 WORKFLOW_RUN 生效:sql_query 失败不通知
+    job = _make_job(payload={"sql": "SELECT 1 AS r", "result_set_id": "rs-1"})
+    backend = _FakeBackend([job])
+    # emit_columns_twice 触发 sql_query 失败(复用既有失败范式)
+    adapter = _FakeAdapter(
+        [Row(values=[1])],
+        columns=[Column(name="r", type=ColumnType.UNKNOWN)],
+        emit_columns_twice=True,
+    )
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+    service = _RecordingNotifyService()
+    runner._notify_service = service  # type: ignore[assignment]
+
+    assert runner.run_once() is True
+
+    assert len(backend.failed) == 1
+    assert service.calls == []
 
 
 def test_worker_runs_export_excel_as_result_export_with_forced_excel_format() -> None:
