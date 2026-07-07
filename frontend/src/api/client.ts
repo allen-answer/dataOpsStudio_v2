@@ -191,6 +191,30 @@ async function downloadBlob(
   return { blob, filename: match ? match[1] : null }
 }
 
+/**
+ * downloadTokenizedExport —— 共享的一次性导出下载:GET /exports/{token} 鉴权取 blob
+ * 后触发浏览器下载。compare.ts downloadCompareExport / metadata.ts downloadExport
+ * 复用此实现(#96 review #4:两处逐字重复,提取共享 helper)。
+ * token 一次性:用过/过期后端返 410,调用方据 ApiError.status===410 提示「重新导出」。
+ */
+export async function downloadTokenizedExport(
+  token: string,
+  fallbackFilename: string,
+): Promise<void> {
+  const { blob, filename } = await downloadBlob(`/exports/${encodeURIComponent(token)}`)
+  const url = URL.createObjectURL(blob)
+  try {
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = filename ?? fallbackFilename
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+}
+
 export const apiClient = {
   get: <T>(path: string): Promise<T> => request<T>('GET', path),
   downloadBlob,
