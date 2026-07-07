@@ -3249,6 +3249,128 @@ def test_workflow_update_rejects_forbidden_node_kind_before_any_db_write() -> No
     assert engine.statements == []
 
 
+def _workflow_row_with_variables(**variables: object) -> dict[str, object]:
+    row = _workflow_row()
+    dag = dict(cast(dict[str, Any], row["dag_jsonb"]))
+    dag["variables"] = dict(variables)
+    row["dag_jsonb"] = dag
+    return row
+
+
+def test_workflow_update_omitting_notifications_preserves_existing_targets() -> None:
+    # GET-then-PUT 少带 notifications:既有 notify 目标 + 其 SecretStore ref 必须存活,
+    # 不能被静默清空(避免孤儿化 url_secret_ref)。
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_row_with_notification(),
+            None,
+            _workflow_row_with_notification(),
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={"name": "nightly-report", "spec": _workflow_spec_payload()},
+    )
+
+    assert response.status_code == 200
+    dag = _persisted_workflow_dag(engine)
+    assert len(dag["notifications"]) == 1
+    assert dag["notifications"][0]["id"] == "nt-1"
+    assert dag["notifications"][0]["url_secret_ref"] == "secret-existing"
+
+
+def test_workflow_update_explicit_empty_notifications_clears_targets() -> None:
+    # 显式 notifications: [] 表达"我要清空",按原样处理(尊重显式意图)。
+    engine = _FakeEngine(
+        [{"id": "project-1"}, _workflow_row_with_notification(), None, _workflow_row()]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+    spec = _workflow_spec_payload()
+    spec["notifications"] = []
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={"name": "nightly-report", "spec": spec},
+    )
+
+    assert response.status_code == 200
+    assert _persisted_workflow_dag(engine)["notifications"] == []
+
+
+def test_workflow_update_omitting_variables_preserves_existing() -> None:
+    existing = _workflow_row_with_variables(region="us-east")
+    engine = _FakeEngine([{"id": "project-1"}, existing, None, existing])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={"name": "nightly-report", "spec": _workflow_spec_payload()},
+    )
+
+    assert response.status_code == 200
+    assert _persisted_workflow_dag(engine)["variables"] == {"region": "us-east"}
+
+
+def test_workflow_update_explicit_empty_variables_clears() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_row_with_variables(region="us-east"),
+            None,
+            _workflow_row(),
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+    spec = _workflow_spec_payload()
+    spec["variables"] = {}
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={"name": "nightly-report", "spec": spec},
+    )
+
+    assert response.status_code == 200
+    assert _persisted_workflow_dag(engine)["variables"] == {}
+
+
+def test_workflow_update_still_full_replaces_nodes() -> None:
+    # 控制用例:nodes/edges 仍是全量替换(preserve 只作用于 notifications/variables)。
+    engine = _FakeEngine(
+        [{"id": "project-1"}, _workflow_row_with_notification(), None, _workflow_row()]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+    spec = _workflow_spec_payload()
+    spec["nodes"] = [{"id": "n2", "job_kind": "sql_query", "timeout_seconds": 30}]
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={"name": "nightly-report", "spec": spec},
+    )
+
+    assert response.status_code == 200
+    dag = _persisted_workflow_dag(engine)
+    assert [node["id"] for node in dag["nodes"]] == ["n2"]
+    assert dag["nodes"][0]["timeout_seconds"] == 30
+
+
 def test_workflow_delete_contract_removes_definition() -> None:
     engine = _FakeEngine([{"id": "project-1"}, _workflow_row()])
     services = _Services(engine)
