@@ -16,7 +16,7 @@
  * 契约测试权威来源:tests/contract/test_api.py(test_metadata_* / test_sql_format /
  *    test_sql_expand_star_* / test_create_export_* / test_export_download_token_is_one_time)。
  */
-import { apiClient } from './client'
+import { apiClient, downloadTokenizedExport } from './client'
 import type { ExportFormat } from './types'
 
 // GET /datasources/{id}/metadata/schemas —— MetadataSchemaItem
@@ -131,21 +131,8 @@ export function createExport(
 /**
  * downloadExport —— GET /exports/{token} 鉴权取 blob 后触发浏览器下载。
  * token 一次性:用过/过期后端返 410,调用方据 ApiError.status===410 提示「重新导出」。
+ * 实现复用共享 helper(client.ts downloadTokenizedExport,#96 review #4 去重)。
  */
-export async function downloadExport(
-  token: string,
-  fallbackFilename: string,
-): Promise<void> {
-  const { blob, filename } = await apiClient.downloadBlob(`/exports/${token}`)
-  const url = URL.createObjectURL(blob)
-  try {
-    const anchor = document.createElement('a')
-    anchor.href = url
-    anchor.download = filename ?? fallbackFilename
-    document.body.appendChild(anchor)
-    anchor.click()
-    anchor.remove()
-  } finally {
-    URL.revokeObjectURL(url)
-  }
+export function downloadExport(token: string, fallbackFilename: string): Promise<void> {
+  return downloadTokenizedExport(token, fallbackFilename)
 }
