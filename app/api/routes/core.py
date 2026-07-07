@@ -5,7 +5,7 @@ import os
 import shutil
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from secrets import token_urlsafe
@@ -120,6 +120,7 @@ from app.api.schemas import (
     WorkflowRunCreateResponse,
     WorkflowRunNodeItem,
     WorkflowRunStatusResponse,
+    WorkflowRunTriggerRequest,
     WorkflowUpdateRequest,
 )
 from app.api.security import create_access_token
@@ -189,7 +190,7 @@ from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
 from app.domain.schema import Column, Index, Row, Table
 from app.domain.secret import HashedRef, SecretKind, SecretRef
-from app.domain.workflow import WorkflowSpec
+from app.domain.workflow import WorkflowSpec, validate_workflow_variables
 from app.domain.workflow_execution import (
     TERMINAL_NODE_STATUSES,
     WorkflowChildJob,
@@ -252,6 +253,14 @@ _WORKFLOW_SPEC_ERROR_CODES = frozenset(
         "unknown_edge_node",
         "self_loop",
         "cycle_detected",
+        # C-7 PR2 变量来源校验(spec.variables + 触发时 variables 共用错误码;
+        # unsafe_variable_value 只含变量名不含取值 —— R5)
+        "invalid_variable_name",
+        "variable_name_collides_builtin",
+        "invalid_variable_value",
+        "variable_value_too_long",
+        "unsafe_variable_value",
+        "too_many_variables",
     }
 )
 _PYDANTIC_VALUE_ERROR_PREFIX = "Value error, "
@@ -3737,6 +3746,18 @@ def _validated_workflow_spec(payload: dict[str, Any]) -> WorkflowSpec:
         raise ApiError(400, code, message) from exc
 
 
+def _validated_trigger_variables(variables: Mapping[str, str]) -> dict[str, str]:
+    """触发时运行时变量校验(与 spec.variables 同一套规则,单一实现)。
+
+    校验失败 → 结构化 400;错误消息只含变量名(R5),不含取值。
+    """
+    try:
+        return validate_workflow_variables(variables)
+    except ValueError as exc:
+        code, _, _ = str(exc).partition(":")
+        raise ApiError(400, code or "invalid_variable", str(exc)) from exc
+
+
 def _workflow_spec_error(exc: ValidationError) -> tuple[str, str]:
     # 领域层 ValueError 约定 "code: 说明";pydantic 包装后位于 errors()[i]["msg"]
     # 且带 "Value error, " 前缀。取第一条可识别 code(按节点声明顺序,确定性)。
@@ -3830,13 +3851,18 @@ def trigger_workflow_run(
     project_id: str,
     workflow_id: str,
     request: Request,
+    body: WorkflowRunTriggerRequest | None = None,
 ) -> WorkflowRunCreateResponse:
     """手动触发:enqueue 一个 workflow_run job(WorkflowRun 本身是 job,ADR-0009)。
 
     spec 快照进 payload:执行期不再回读 workflows 表,触发后改定义不影响在途 run。
+
+    可选 body ``{"variables": {...}}``(C-7 PR2):触发时运行时变量,与 spec 默认
+    变量、内置变量合并成 when_variables 快照(优先级 builtin < spec < 触发时)。
     """
     services = services_from(request)
     user = current_user_from(request)
+    trigger_variables = _validated_trigger_variables(body.variables) if body is not None else {}
     with services.engine.begin() as conn:
         _require_project_access(conn, project_id, user.id)
         row = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
@@ -3844,6 +3870,13 @@ def trigger_workflow_run(
             raise ApiError(409, "workflow_disabled", "Workflow is disabled")
         # R7 enqueue 期再校验(ADR-0009 Consequences:创建 + enqueue 双门禁)
         spec = _validated_workflow_spec(dict(row["dag_jsonb"] or {}))
+        # 合并变量源:内置 < spec 默认 < 触发时运行时(禁与内置冲突,优先级无歧义)。
+        # spec.variables 已在 _validated_workflow_spec 过校验;trigger 已过 _validated_trigger。
+        merged_variables = {
+            **builtin_when_variables(datetime.now(UTC)),
+            **spec.variables,
+            **trigger_variables,
+        }
         run_id = new_id()
         timeout_seconds = sum(node.timeout_seconds for node in spec.nodes) + 600
         job = Job(
@@ -3865,9 +3898,10 @@ def trigger_workflow_run(
                 "workflow_name": str(row["name"]),
                 "trigger": "manual",
                 "spec": spec.model_dump(mode="json"),
-                # when 变量在触发时刻冻结:执行器每步推进与状态查询共用这份
-                # 快照,when 决策在 run 生命周期内确定(跨午夜不翻转)
-                "when_variables": builtin_when_variables(datetime.now(UTC)),
+                # 变量在触发时刻冻结:执行器每步推进与状态查询共用这份快照,
+                # when 决策 + ${var} 插值在 run 生命周期内确定(跨午夜不翻转)。
+                # 合并优先级 builtin < spec.variables < 触发时(见上)。
+                "when_variables": merged_variables,
             },
         )
         _enqueue_job_txn(conn, services, job)

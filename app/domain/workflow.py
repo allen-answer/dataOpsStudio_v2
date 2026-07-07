@@ -19,6 +19,7 @@ Cron 只做基本格式校验(5 段 + 字符集受限,不引入 croniter);精确
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -45,6 +46,58 @@ MAX_WHEN_LENGTH = 512
 
 # cron 单字段字符集:数字 + * , - /(基本校验,精确解析属 PR-4)
 _CRON_FIELD_RE = re.compile(r"^[0-9*,\-/]+$")
+
+# ── workflow ${var} 变量来源校验(C-7 PR2)────────────────────────────────────
+# 变量有两个来源(spec 默认变量 + 触发时运行时变量),二者共用这套校验(单一实现)。
+# 合并后的快照写进 run payload 的 when_variables,同时服务 when 求值与 payload 插值。
+
+# 内置确定性变量名(必须与 workflow_when.builtin_when_variables 的 key 集合一致;
+# 单测断言两者不漂移)。spec / 触发变量**禁止**与之冲突 —— 合并优先级
+# builtin < spec.variables < 触发,禁冲突让 builtin 不可被覆盖、优先级无歧义。
+BUILTIN_VARIABLE_NAMES: frozenset[str] = frozenset({"today", "now", "year", "month", "day"})
+
+MAX_WORKFLOW_VARIABLES = 32
+MAX_VARIABLE_VALUE_LENGTH = 512
+
+_VARIABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# ★ 变量值安全字符集(本 PR 注入防御核心):值会被字符串替换进 compare 节点的
+# table_name / schema_name(标识符位)或 sql(字面量位),任何位置都不能逃逸。
+# 只允许 字母 / 数字 / `_` / `-` / `.` / `:` —— 天然排除:
+#   单双引号 ' " 、反引号 ` 、分号 ; 、反斜杠 \ 、注释起始 /* (`/`/`*` 不在集内)、
+#   空格 / 换行 / 控制符。单个 `-` 允许(日期 2026-07-07),但 SQL 行注释 `--`
+#   由下方 `"--" in value` 显式再拦一道(单 `-` 无害、连写才成注释)。
+# 引号型字面量 / list 展开(`WHERE x IN (${ids | sql_in})`)留到 PR3 的过滤器。
+_VARIABLE_VALUE_RE = re.compile(r"^[A-Za-z0-9_.:-]*$")
+
+
+def validate_workflow_variables(variables: Mapping[str, object]) -> dict[str, str]:
+    """校验一组 workflow 变量(spec 默认变量 + 触发时运行时变量的单一实现)。
+
+    - 数量 <= ``MAX_WORKFLOW_VARIABLES``;
+    - key 匹配 ``^[A-Za-z_][A-Za-z0-9_]*$``,且**禁与内置变量名冲突**;
+    - value 是 ``str``、长度 <= ``MAX_VARIABLE_VALUE_LENGTH``、且只含
+      ``_VARIABLE_VALUE_RE`` 的保守安全字符集(``--`` 另行显式拦截)。
+
+    ★ R5:任何校验错误只含**变量名**,绝不含变量取值。
+    抛 :class:`ValueError`(消息形如 ``"<code>: <name>"``);返回浅拷贝 dict。
+    """
+    if len(variables) > MAX_WORKFLOW_VARIABLES:
+        raise ValueError(f"too_many_variables: 变量数量超过上限 {MAX_WORKFLOW_VARIABLES}")
+    validated: dict[str, str] = {}
+    for name, value in variables.items():
+        if not _VARIABLE_NAME_RE.fullmatch(name):
+            raise ValueError(f"invalid_variable_name: {name}")
+        if name in BUILTIN_VARIABLE_NAMES:
+            raise ValueError(f"variable_name_collides_builtin: {name}")
+        if not isinstance(value, str):
+            raise ValueError(f"invalid_variable_value: {name}")
+        if len(value) > MAX_VARIABLE_VALUE_LENGTH:
+            raise ValueError(f"variable_value_too_long: {name}")
+        # ★ 只暴露变量名,绝不含取值(R5)
+        if not _VARIABLE_VALUE_RE.fullmatch(value) or "--" in value:
+            raise ValueError(f"unsafe_variable_value: {name}")
+        validated[name] = value
+    return validated
 
 
 class RetryPolicy(BaseModel):
@@ -158,6 +211,14 @@ class WorkflowSpec(BaseModel):
     schedule: CronSchedule | None = None
     # run 终态通知目标(C-9;存进 dag_jsonb,无需迁移)。空 = 不通知(默认)。
     notifications: list[NotifyTarget] = Field(default_factory=list)
+    # workflow 级默认变量(C-7 PR2;存进 dag_jsonb,无需迁移)。触发时并入
+    # when_variables 快照,服务 ${var} 插值 + when 求值。值走安全字符集校验。
+    variables: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("variables")
+    @classmethod
+    def _validate_variables(cls, value: dict[str, str]) -> dict[str, str]:
+        return validate_workflow_variables(value)
 
     @model_validator(mode="after")
     def _validate_dag(self) -> WorkflowSpec:
