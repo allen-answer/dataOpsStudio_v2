@@ -4325,6 +4325,7 @@ def download_export(token: str, request: Request) -> StreamingResponse:
                     jobs.c.id.label("job_id"),
                     jobs.c.status,
                     jobs.c.result_ref,
+                    jobs.c.finished_at,
                 )
                 .select_from(
                     export_download_tokens.join(
@@ -4342,7 +4343,20 @@ def download_export(token: str, request: Request) -> StreamingResponse:
         if row["consumed_at"] is not None:
             raise ApiError(410, "download_token_consumed", "Download token has been used")
         expires_at = row["expires_at"]
-        if not isinstance(expires_at, datetime) or _as_utc(expires_at) <= now:
+        if not isinstance(expires_at, datetime):
+            raise ApiError(410, "download_token_expired", "Download token has expired")
+        # The download-token TTL clock runs from the export job's completion, not
+        # from token creation. A long-running export could otherwise burn the whole
+        # window before the file is even downloadable (backlog #96 #3). We only ever
+        # extend the stored expiry (never shorten it), so fast exports are unchanged.
+        deadline = _as_utc(expires_at)
+        finished_at = row["finished_at"]
+        if isinstance(finished_at, datetime):
+            completion_deadline = _as_utc(finished_at) + timedelta(
+                seconds=services.download_url_ttl_seconds
+            )
+            deadline = max(deadline, completion_deadline)
+        if deadline <= now:
             raise ApiError(410, "download_token_expired", "Download token has expired")
         status = JobStatus(str(row["status"]))
         if status in {JobStatus.PENDING, JobStatus.RUNNING}:
