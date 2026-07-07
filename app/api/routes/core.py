@@ -3635,7 +3635,10 @@ def trigger_workflow_run(
             owner_user_id=user.id,
             project_id=project_id,
             datasource_ids=[],
-            priority=0,
+            # run job 优先级 -1(低于交互 sql_query 的 0):claim 序 = priority DESC,
+            # 子 job = run+1 = 0(见 _build_workflow_child_job),与交互同档,
+            # 大工作流爆发时不再压制交互查询(backlog Workflow minor #3)
+            priority=-1,
             timeout_seconds=timeout_seconds,
             resource_profile=ResourceProfile(timeout_seconds=timeout_seconds),
             audit_id=new_id(),
