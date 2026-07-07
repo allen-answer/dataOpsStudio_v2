@@ -3539,7 +3539,7 @@ def create_workflow_notification(
     body: NotifyTargetCreateRequest,
     request: Request,
 ) -> NotifyTargetResponse:
-    """新增通知目标:收明文 url → store_secret → 只把 ref 追加进 spec.notifications。"""
+    """新增通知目标:收明文 url / SMTP 密码 → store_secret → 只把 ref 追加进 spec。"""
     services = services_from(request)
     user = current_user_from(request)
     target_id = new_id()
@@ -3547,9 +3547,26 @@ def create_workflow_notification(
         _require_project_access(conn, project_id, user.id)
         row = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
         spec = _validated_workflow_spec(dict(row["dag_jsonb"] or {}))
-        # 先校验通过再 store_secret,避免 404 / 400 时留下孤儿 secret。
-        secret_ref = services.secret_store.store_secret(body.url, SecretKind.WEBHOOK_SECRET)
-        target = _notify_target_from_create(target_id, body, secret_ref.ref)
+        # 先确认 workflow 存在再 store_secret,避免 404 时留下孤儿 secret。
+        url_secret_ref: str | None = None
+        password_secret_ref: str | None = None
+        if body.channel == "email":
+            if body.smtp_password is not None:
+                password_secret_ref = services.secret_store.store_secret(
+                    body.smtp_password, SecretKind.SMTP_PASSWORD
+                ).ref
+        else:
+            if body.url is None:
+                raise ApiError(400, "invalid_url_secret_ref", "webhook/wecom 目标必须提供 url")
+            url_secret_ref = services.secret_store.store_secret(
+                body.url, SecretKind.WEBHOOK_SECRET
+            ).ref
+        target = _notify_target_from_create(
+            target_id,
+            body,
+            url_secret_ref=url_secret_ref,
+            password_secret_ref=password_secret_ref,
+        )
         updated = spec.model_copy(update={"notifications": [*spec.notifications, target]})
         _persist_workflow_notifications(conn, workflow_id, updated)
     _audit_business(
@@ -3577,27 +3594,42 @@ def update_workflow_notification(
     body: NotifyTargetUpdateRequest,
     request: Request,
 ) -> NotifyTargetResponse:
-    """更新通知目标:传新明文 url 则重新 store_secret 换 ref(旧 secret 删除)。"""
+    """更新通知目标:传新明文 url / SMTP 密码则重新 store_secret 换 ref(旧 secret 删除)。"""
     services = services_from(request)
     user = current_user_from(request)
-    old_secret_ref: str | None = None
+    old_url_ref: str | None = None
+    old_password_ref: str | None = None
     with services.engine.begin() as conn:
         _require_project_access(conn, project_id, user.id)
         row = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
         spec = _validated_workflow_spec(dict(row["dag_jsonb"] or {}))
         existing = _require_notify_target(spec, target_id)
         url_secret_ref = existing.url_secret_ref
-        if body.url is not None:
+        password_secret_ref = existing.password_secret_ref
+        if existing.channel == "email":
+            if body.smtp_password is not None:
+                secret_ref = services.secret_store.store_secret(
+                    body.smtp_password, SecretKind.SMTP_PASSWORD
+                )
+                old_password_ref = existing.password_secret_ref
+                password_secret_ref = secret_ref.ref
+        elif body.url is not None:
             secret_ref = services.secret_store.store_secret(body.url, SecretKind.WEBHOOK_SECRET)
-            old_secret_ref = existing.url_secret_ref
+            old_url_ref = existing.url_secret_ref
             url_secret_ref = secret_ref.ref
-        target = _notify_target_from_update(existing, body, url_secret_ref)
+        target = _notify_target_from_update(
+            existing, body, url_secret_ref=url_secret_ref, password_secret_ref=password_secret_ref
+        )
         notifications = [target if item.id == target_id else item for item in spec.notifications]
         updated = spec.model_copy(update={"notifications": notifications})
         _persist_workflow_notifications(conn, workflow_id, updated)
-    if old_secret_ref is not None:
+    if old_url_ref is not None:
         services.secret_store.delete_secret(
-            SecretRef(ref=old_secret_ref, kind=SecretKind.WEBHOOK_SECRET)
+            SecretRef(ref=old_url_ref, kind=SecretKind.WEBHOOK_SECRET)
+        )
+    if old_password_ref is not None:
+        services.secret_store.delete_secret(
+            SecretRef(ref=old_password_ref, kind=SecretKind.SMTP_PASSWORD)
         )
     _audit_business(
         services,
@@ -3626,19 +3658,28 @@ def delete_workflow_notification(
     """删除通知目标:从 spec.notifications 移除,并清理其 SecretStore 条目。"""
     services = services_from(request)
     user = current_user_from(request)
-    removed_secret_ref: str
+    removed_url_ref: str | None = None
+    removed_password_ref: str | None = None
     with services.engine.begin() as conn:
         _require_project_access(conn, project_id, user.id)
         row = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
         spec = _validated_workflow_spec(dict(row["dag_jsonb"] or {}))
         existing = _require_notify_target(spec, target_id)
-        removed_secret_ref = existing.url_secret_ref
+        if existing.channel == "email":
+            removed_password_ref = existing.password_secret_ref
+        else:
+            removed_url_ref = existing.url_secret_ref
         notifications = [item for item in spec.notifications if item.id != target_id]
         updated = spec.model_copy(update={"notifications": notifications})
         _persist_workflow_notifications(conn, workflow_id, updated)
-    services.secret_store.delete_secret(
-        SecretRef(ref=removed_secret_ref, kind=SecretKind.WEBHOOK_SECRET)
-    )
+    if removed_url_ref is not None:
+        services.secret_store.delete_secret(
+            SecretRef(ref=removed_url_ref, kind=SecretKind.WEBHOOK_SECRET)
+        )
+    if removed_password_ref is not None:
+        services.secret_store.delete_secret(
+            SecretRef(ref=removed_password_ref, kind=SecretKind.SMTP_PASSWORD)
+        )
     _audit_business(
         services,
         request,
@@ -3656,7 +3697,9 @@ def delete_workflow_notification(
 def _notify_target_from_create(
     target_id: str,
     body: NotifyTargetCreateRequest,
-    url_secret_ref: str,
+    *,
+    url_secret_ref: str | None,
+    password_secret_ref: str | None,
 ) -> NotifyTarget:
     fields: dict[str, Any] = {
         "id": target_id,
@@ -3665,6 +3708,17 @@ def _notify_target_from_create(
         "enabled": body.enabled,
         "timeout_seconds": body.timeout_seconds,
     }
+    if body.channel == "email":
+        fields.update(
+            {
+                "smtp_host": body.smtp_host,
+                "smtp_port": body.smtp_port,
+                "smtp_from": body.smtp_from,
+                "smtp_to": body.smtp_to,
+                "smtp_user": body.smtp_user,
+                "password_secret_ref": password_secret_ref,
+            }
+        )
     if body.events is not None:
         fields["events"] = body.events
     try:
@@ -3676,10 +3730,24 @@ def _notify_target_from_create(
 def _notify_target_from_update(
     existing: NotifyTarget,
     body: NotifyTargetUpdateRequest,
-    url_secret_ref: str,
+    *,
+    url_secret_ref: str | None,
+    password_secret_ref: str | None,
 ) -> NotifyTarget:
     fields: dict[str, Any] = existing.model_dump()
     fields["url_secret_ref"] = url_secret_ref
+    fields["password_secret_ref"] = password_secret_ref
+    if existing.channel == "email":
+        if body.smtp_host is not None:
+            fields["smtp_host"] = body.smtp_host
+        if body.smtp_port is not None:
+            fields["smtp_port"] = body.smtp_port
+        if body.smtp_from is not None:
+            fields["smtp_from"] = body.smtp_from
+        if body.smtp_to is not None:
+            fields["smtp_to"] = body.smtp_to
+        if body.smtp_user is not None:
+            fields["smtp_user"] = body.smtp_user
     if body.events is not None:
         fields["events"] = body.events
     if body.enabled is not None:
@@ -3723,13 +3791,19 @@ def _persist_workflow_notifications(
 
 
 def _notify_target_response(target: NotifyTarget) -> NotifyTargetResponse:
-    # ★ R5:仅暴露 id / channel / events / enabled / timeout —— 绝不含 url。
+    # ★ R5:绝不含 url / 密码;email 的连接信息(非敏感)回显便于配置查看。
+    is_email = target.channel == "email"
     return NotifyTargetResponse(
         id=target.id,
         channel=target.channel,
         events=list(target.events),
         enabled=target.enabled,
         timeout_seconds=target.timeout_seconds,
+        smtp_host=target.smtp_host if is_email else None,
+        smtp_port=target.smtp_port if is_email else None,
+        smtp_from=target.smtp_from if is_email else None,
+        smtp_to=list(target.smtp_to) if is_email else None,
+        smtp_user=target.smtp_user if is_email else None,
     )
 
 

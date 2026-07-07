@@ -21,6 +21,7 @@ class SecretKind(StrEnum):
     OAUTH_TOKEN = "oauth_token"
     WEBHOOK_SECRET = "webhook_secret"
     SIGNED_URL_SECRET = "signed_url_secret"
+    SMTP_PASSWORD = "smtp_password"
 
 
 class SecretRef(BaseModel):
