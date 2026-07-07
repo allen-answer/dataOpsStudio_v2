@@ -45,12 +45,23 @@ export type PrimaryKeyReason = 'primary_key' | 'unique_index'
 export type TableSuggestionReason = 'exact' | 'normalized'
 export type SchemaPolicy = 'warn' | 'strict'
 
+// ── 文件源格式(C-1;schemas.py CompareFileFormat,Parquet 归次版不含)──
+export type CompareFileFormat = 'csv' | 'excel'
+
 // ── 数据引用 / 规则 / 限制(schemas.py)──────────────────────────────
 export interface CompareDataRef {
-  kind: 'table' | 'sql'
+  kind: 'table' | 'sql' | 'file'
   schema_name?: string | null
   table_name?: string | null
   sql?: string | null
+  // kind="file"(C-1 文件源):指向已上传件(upload_id)+ 格式与解析参数。
+  // 非 file kind 忽略以下字段(schemas.py CompareDataRef 条件校验)。
+  upload_id?: string | null
+  file_format?: CompareFileFormat | null
+  sheet?: string | null // excel:空=第一个 sheet
+  header_row?: number // 1-indexed 表头行(默认 1)
+  encoding?: string | null // csv:空=utf-8-sig(解码失败自动 GBK 回退)
+  delimiter?: string | null // csv 分隔符
 }
 
 export interface CompareRulesPayload {
@@ -223,6 +234,22 @@ export interface ComparePreviewResponse {
   rows: unknown[][]
   row_count: number
   truncated: boolean
+}
+
+// ── 文件源预览(schemas.py CompareFilePreviewRequest / CompareFilePreviewResponse)─
+// ref.kind 必须为 "file";不落任务、不碰 DB,纯 domain reader 读 sheet/列/前 N 行。
+export interface CompareFilePreviewRequest {
+  ref: CompareDataRef
+  limit?: number
+}
+
+export interface CompareFilePreviewResponse {
+  sheets: string[] // excel:工作簿全部 sheet 名;csv 为空
+  columns: string[]
+  rows: unknown[][]
+  row_count: number
+  truncated: boolean
+  detected_encoding: string | null // csv:实际生效编码(GBK 回退回显);excel 为 null
 }
 
 export interface CompareCellDiff {
@@ -413,6 +440,21 @@ export function previewCompareData(
   req: ComparePreviewRequest,
 ): Promise<ComparePreviewResponse> {
   return apiClient.post<ComparePreviewResponse>(`/projects/${projectId}/compare/preview`, req)
+}
+
+/**
+ * POST /projects/{pid}/compare/file-preview —— 文件源上传后预览(C-1)。
+ * upload 必须属本项目且 purpose=compare_source。错误码:
+ * 400 invalid_ref_kind / invalid_upload_purpose / preview_failed、404 not_found。
+ */
+export function previewCompareFile(
+  projectId: string,
+  req: CompareFilePreviewRequest,
+): Promise<CompareFilePreviewResponse> {
+  return apiClient.post<CompareFilePreviewResponse>(
+    `/projects/${projectId}/compare/file-preview`,
+    req,
+  )
 }
 
 export function createCompareExport(runId: string): Promise<CompareExportCreateResponse> {
