@@ -120,6 +120,9 @@ class WorkerConfig(BaseSettings):
     poll_interval_seconds: float = 0.1  # T6:portable 小队列优先降低首个 job 体感延迟
     cancel_check_row_interval: int = 5000  # F3:cancel 查询节流间隔
     result_gc_interval_seconds: float = 600.0  # ResultSet spool TTL 周期清理间隔
+    # RetryPolicy=None 节点继承的全局重试次数。单一配置源:worker 推进器与
+    # API run 状态查询同源读此值(避免三处硬编码漂移);默认 0 = 不重试。
+    workflow_node_default_max_retries: int = 0
 
 
 class ResultStoreConfig(BaseSettings):

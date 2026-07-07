@@ -2008,6 +2008,9 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
             cancel_check_row_interval=actual_settings.worker.cancel_check_row_interval,
             result_gc_interval_seconds=actual_settings.worker.result_gc_interval_seconds,
             export_limit_mb=actual_settings.result_store.export_limit_mb,
+            workflow_node_default_max_retries=(
+                actual_settings.worker.workflow_node_default_max_retries
+            ),
         ),
         PostgresResultSetCatalog(engine),
         PostgresJobErrorCodeWriter(engine),

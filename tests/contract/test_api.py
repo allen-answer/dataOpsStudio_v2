@@ -3361,6 +3361,52 @@ def test_workflow_run_status_contract_returns_run_and_node_states() -> None:
     assert node["attempts"] == 0
 
 
+def test_workflow_run_status_uses_configured_node_default_max_retries() -> None:
+    # RetryPolicy=None 的失败节点:worker 若配 default_max_retries>=1 会重排(retry_wait)。
+    # API 状态查询必须与 worker 同源读该配置,而非硬编码 0(否则展示为终态 failed,漂移)。
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_run_job_row(status="running"),
+            [_workflow_child_job_row("n1", status="failed")],
+        ]
+    )
+    services = _Services(engine, workflow_node_default_max_retries=1)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflow-runs/run-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    node = response.json()["nodes"][0]
+    assert node["node_id"] == "n1"
+    # 配置生效 → 继承重试 → retry_wait;若仍硬编码 0 则会是 failed
+    assert node["status"] == "retry_wait"
+
+
+def test_workflow_run_status_default_max_retries_zero_keeps_failed_terminal() -> None:
+    # 默认口径 0:同一失败节点展示为终态 failed(回归护栏,确认非无条件 retry_wait)。
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_run_job_row(status="running"),
+            [_workflow_child_job_row("n1", status="failed")],
+        ]
+    )
+    services = _Services(engine, workflow_node_default_max_retries=0)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflow-runs/run-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["nodes"][0]["status"] == "failed"
+
+
 def test_workflow_run_status_not_found_returns_404() -> None:
     engine = _FakeEngine([{"id": "project-1"}, None])
     app = create_app(services=cast(ApiServices, _Services(engine)))
@@ -3659,6 +3705,7 @@ class _Services:
         export_per_user_per_hour: int = 10,
         download_url_ttl_seconds: int = 300,
         upload_max_mb: int = 100,
+        workflow_node_default_max_retries: int = 0,
     ) -> None:
         self.engine = engine
         self.rate_limiter = _RateLimiter()
@@ -3669,6 +3716,7 @@ class _Services:
         self.export_per_user_per_hour = export_per_user_per_hour
         self.download_url_ttl_seconds = download_url_ttl_seconds
         self.upload_max_mb = upload_max_mb
+        self.workflow_node_default_max_retries = workflow_node_default_max_retries
         self.audits: list[dict[str, object]] = []
 
     def current_license_mode(self) -> LicenseMode:
