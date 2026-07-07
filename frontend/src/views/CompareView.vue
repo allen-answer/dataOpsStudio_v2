@@ -451,6 +451,12 @@ function refFileFormat(side: RefSide): CompareFileFormat {
   return side === 'source' ? draft.sourceFileFormat : draft.targetFileFormat
 }
 
+/** 提交给后端的该侧 datasource id:file 侧无库(传 null);table/sql 侧传所选库。 */
+function refDatasourceId(side: RefSide): string | null {
+  if (refKind(side) === 'file') return null
+  return side === 'source' ? draft.sourceId : draft.targetId
+}
+
 /** 该侧引用是否可用:table 要 table_name,sql 要非空 SQL,file 要 upload_id。 */
 function refReady(side: RefSide): boolean {
   const kind = refKind(side)
@@ -747,8 +753,9 @@ async function loadTasks(): Promise<void> {
 function loadDraftFromTask(task: CompareTaskResponse): void {
   Object.assign(draft, emptyDraft())
   draft.name = task.name
-  draft.sourceId = task.source_id
-  draft.targetId = task.target_id
+  // file 侧任务 source_id/target_id 为 null;回填空串,库侧下拉默认第一项(隐藏时不影响提交)。
+  draft.sourceId = task.source_id ?? datasources.value[0]?.id ?? ''
+  draft.targetId = task.target_id ?? datasources.value[0]?.id ?? ''
   draft.sourceKind = task.source_ref.kind
   draft.targetKind = task.target_ref.kind
   draft.sourceSchema = task.source_ref.schema_name ?? ''
@@ -897,8 +904,8 @@ async function onSaveTask(): Promise<void> {
       const created = await createCompareTask({
         project_id: projectId.value,
         name: draft.name.trim(),
-        source_id: draft.sourceId,
-        target_id: draft.targetId,
+        source_id: refDatasourceId('source'),
+        target_id: refDatasourceId('target'),
         source_ref: sourceRef,
         target_ref: targetRef,
         columns: draft.columns.filter((c) => c.name.trim()).map((c) => ({ name: c.name, type: c.type as never, driver_type: null, nullable: true, primary_key: draft.keyColumns.includes(c.name) })),
@@ -911,8 +918,8 @@ async function onSaveTask(): Promise<void> {
     } else {
       const updated = await updateCompareTask(activeTask.value.id, {
         name: draft.name.trim(),
-        source_id: draft.sourceId,
-        target_id: draft.targetId,
+        source_id: refDatasourceId('source'),
+        target_id: refDatasourceId('target'),
         source_ref: sourceRef,
         target_ref: targetRef,
         columns: draft.columns.filter((c) => c.name.trim()).map((c) => ({ name: c.name, type: c.type as never, driver_type: null, nullable: true, primary_key: draft.keyColumns.includes(c.name) })),
@@ -1302,6 +1309,14 @@ function datasourceName(id: string): string {
   return datasources.value.find((d) => d.id === id)?.name ?? id.slice(0, 8)
 }
 
+/** 任务卡片某侧标签:file 侧无库,显示「文件」;否则显示 datasource 名。 */
+function taskSideLabel(task: CompareTaskResponse, side: RefSide): string {
+  const ref = side === 'source' ? task.source_ref : task.target_ref
+  if (ref.kind === 'file') return t('compare.ref_kind_file')
+  const id = side === 'source' ? task.source_id : task.target_id
+  return id ? datasourceName(id) : '—'
+}
+
 function fmtCell(value: unknown): string {
   if (value === null || value === undefined) return '∅'
   if (typeof value === 'object') return JSON.stringify(value)
@@ -1388,8 +1403,8 @@ const missingTarget = computed(
             <span class="flex-1 truncate text-sm chrome-text-heading">{{ task.name }}</span>
           </div>
           <div class="mt-1 text-[11px] chrome-text-muted truncate">
-            {{ datasourceName(task.source_id) }} <ArrowRight class="inline w-3 h-3" />
-            {{ datasourceName(task.target_id) }}
+            {{ taskSideLabel(task, 'source') }} <ArrowRight class="inline w-3 h-3" />
+            {{ taskSideLabel(task, 'target') }}
           </div>
           <div class="text-[11px] chrome-text-muted">
             {{ t('compare.last_run') }}: {{ formatDate(task.updated_at) }}
@@ -1569,7 +1584,8 @@ const missingTarget = computed(
 
             <fieldset class="space-y-2 rounded-card border chrome-border p-3">
               <legend class="px-1 text-xs font-medium chrome-text-heading">{{ t('compare.source') }}</legend>
-              <select v-model="draft.sourceId" class="chrome-input w-full text-sm">
+              <!-- file 侧无 datasource(#126 起后端可选):隐藏库下拉。 -->
+              <select v-if="draft.sourceKind !== 'file'" v-model="draft.sourceId" class="chrome-input w-full text-sm">
                 <option v-for="ds in datasources" :key="ds.id" :value="ds.id">{{ ds.name }}</option>
               </select>
               <div v-if="!draft.singleSql" class="flex items-center gap-1">
@@ -1709,7 +1725,8 @@ const missingTarget = computed(
 
             <fieldset class="space-y-2 rounded-card border chrome-border p-3">
               <legend class="px-1 text-xs font-medium chrome-text-heading">{{ t('compare.target') }}</legend>
-              <select v-model="draft.targetId" class="chrome-input w-full text-sm">
+              <!-- file 侧无 datasource(#126 起后端可选):隐藏库下拉。 -->
+              <select v-if="draft.targetKind !== 'file'" v-model="draft.targetId" class="chrome-input w-full text-sm">
                 <option v-for="ds in datasources" :key="ds.id" :value="ds.id">{{ ds.name }}</option>
               </select>
               <div v-if="!draft.singleSql" class="flex items-center gap-1">
