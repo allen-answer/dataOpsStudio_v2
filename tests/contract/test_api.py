@@ -2333,6 +2333,164 @@ def test_lineage_batch_status_returns_report_on_success() -> None:
     assert payload["report"]["file_count"] == 2
 
 
+def test_lineage_batch_export_writes_xlsx_token_and_audit() -> None:
+    from openpyxl import load_workbook
+
+    report_uri = "runs/job-1/artifacts/lineage_batch_report.json"
+    report_json = json.dumps(
+        {
+            "file_count": 2,
+            "parsed": 2,
+            "failed": 0,
+            "skipped": {"non_sql": 0, "too_large": 0, "over_file_limit": 0},
+            "table_edge_total": 1,
+            "column_mapping_total": 0,
+            "files": [
+                {
+                    "source_ref": "etl/a.sql",
+                    "status": "parsed",
+                    "run_id": "run-1",
+                    "table_edge_count": 1,
+                    "column_mapping_count": 0,
+                    "parse_error_count": 0,
+                    "lenient_statement_count": 0,
+                    "tables_read": ["app.src"],
+                    "tables_written": ["app.mid"],
+                }
+            ],
+            "script_edges": [
+                {"producer_file": "etl/a.sql", "consumer_file": "etl/b.sql", "table": "app.mid"}
+            ],
+            "semantic_view": {
+                "targets": [
+                    {
+                        "table": "app.mid",
+                        "primary_role": "target",
+                        "roles": ["target"],
+                        "refresh_mode": "append",
+                        "counts": {"insert": 1},
+                        "source_tables": ["app.src"],
+                        "source_files": ["etl/a.sql"],
+                        "titles": [],
+                    }
+                ],
+                "table_roles": [
+                    {"table": "app.src", "primary_role": "source_fact", "roles": ["source_fact"]}
+                ],
+                "observations": ["app.mid 追加写入"],
+                "risks": [],
+            },
+        }
+    ).encode("utf-8")
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},  # project access
+            {
+                "id": "job-1",
+                "kind": "lineage_batch",
+                "project_id": "project-1",
+                "status": "success",
+                "error": None,
+                "result_ref": {
+                    "backend": "lineage_batch",
+                    "uri": "lineage-batch/job-1",
+                    "metadata": {"report_uri": report_uri},
+                },
+            },
+            0,  # export rate limit count
+        ]
+    )
+    result_store = _ResultStore(downloads={report_uri: report_json})
+    job_backend = _JobBackend()
+    services = _Services(engine, job_backend=job_backend, result_store=result_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/batch/job-1/export",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["format"] == "excel"
+    assert payload["filename"] == f"lineage-batch-{payload['job_id']}.xlsx"
+    assert payload["download_token"]
+    # 同步生成:xlsx artifact 已落 result_store,不入 job 队列
+    assert job_backend.enqueued == []
+    export_id, name, content = result_store.export_artifacts[0]
+    assert export_id == payload["job_id"]
+    assert name == payload["filename"]
+    assert content.startswith(b"PK")  # xlsx = zip
+
+    workbook = load_workbook(io.BytesIO(content), read_only=True)
+    assert workbook.sheetnames == [
+        "流程总览",
+        "脚本清单",
+        "跨脚本依赖",
+        "风险提示",
+        "流程图分组",
+        "表角色",
+        "目标整合",
+    ]
+
+    assert any(statement.startswith("INSERT INTO jobs") for statement in engine.statements)
+    assert any(
+        statement.startswith("INSERT INTO export_download_tokens")
+        for statement in engine.statements
+    )
+    audit = next(item for item in services.audits if item["action"] == "lineage_batch_export")
+    detail = cast(dict[str, object], audit["detail"])
+    assert detail["batch_job_id"] == "job-1"
+    assert detail["file_count"] == 2
+    assert "download_token" not in str(services.audits[-1])
+
+
+def test_lineage_batch_export_missing_job_returns_404() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, None])
+    result_store = _ResultStore()
+    services = _Services(engine, result_store=result_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/batch/missing/export",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "not_found"
+    assert result_store.export_artifacts == []
+    assert not any(statement.startswith("INSERT INTO") for statement in engine.statements)
+
+
+def test_lineage_batch_export_incomplete_job_returns_409() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            {
+                "id": "job-1",
+                "kind": "lineage_batch",
+                "project_id": "project-1",
+                "status": "running",
+                "error": None,
+                "result_ref": None,
+            },
+        ]
+    )
+    result_store = _ResultStore()
+    services = _Services(engine, result_store=result_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/batch/job-1/export",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "batch_not_ready"
+    assert result_store.export_artifacts == []
+    assert not any(statement.startswith("INSERT INTO") for statement in engine.statements)
+
+
 def test_lineage_edge_detail_returns_run_provenance() -> None:
     engine = _FakeEngine(
         [
