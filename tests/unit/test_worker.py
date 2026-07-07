@@ -1654,6 +1654,134 @@ def test_worker_lineage_batch_emits_semantic_view_with_refresh_and_risk() -> Non
     assert any("全量重刷" in obs for obs in semantic["observations"])
 
 
+def test_worker_lineage_batch_persists_projected_details() -> None:
+    # L-5+ PR2:批量 report 保留每文件 B 组明细(details),供完整导出 B 组 7 sheet。
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("a.sql", "insert into kgrp.mid select * from kgrp.src")
+    job = _make_job(
+        kind=JobKind.LINEAGE_BATCH,
+        payload={
+            "upload_id": "up-1",
+            "storage_uri": "uploads/up-1/scripts.zip",
+            "datasource_id": None,
+            "dialect": "oracle",
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    result_store.downloads["uploads/up-1/scripts.zip"] = buffer.getvalue()
+    catalog = _FakeLineageCatalog()
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=catalog,
+    )
+
+    assert runner.run_once() is True
+
+    report = json.loads(result_store.run_artifacts[("job-1", "lineage_batch_report.json")])
+    assert report["details_truncated"] is False
+    file_a = next(item for item in report["files"] if item["source_ref"] == "a.sql")
+    details = file_a["details"]
+    # 全 7 类键存在(空亦守空列表)
+    for kind in (
+        "procedure_segments",
+        "statements",
+        "parse_errors",
+        "dynamic_sql_segments",
+        "warnings",
+        "insert_mappings",
+        "graph_edges",
+    ):
+        assert kind in details
+    # 表级数据流边明细已投影(表级血缘)
+    edge = details["graph_edges"][0]
+    assert edge["source_table"] == "kgrp.src"
+    assert edge["target_table"] == "kgrp.mid"
+    # 语句明细保留 index/type
+    assert details["statements"][0]["index"] == 0
+    # 内存透传键不得泄漏
+    assert "_report" not in file_a
+
+
+def test_project_lineage_batch_details_projects_keys_and_caps_cell() -> None:
+    from app.domain.lineage import LineageReport
+    from app.worker import _project_lineage_batch_details
+
+    report = LineageReport(
+        statements=[{"index": 0, "type": "INSERT", "noise": "drop-me"}],
+        insert_mappings=[
+            {
+                "target_table": "t",
+                "target_column": "c",
+                "source_table": "s",
+                "source_column": "c",
+                "statement_index": 0,
+                "transformation": "DIRECT",
+                "transformation_subtype": "DIRECT",
+                "inferred": False,
+                "extra": "drop-me",
+            }
+        ],
+        procedure_segments=[{"sql": "x" * 5000}],
+    )
+    details, remaining, dropped = _project_lineage_batch_details(report, 50_000)
+
+    assert dropped == []
+    # statements 投影只留 index/type,冗余键被砍
+    assert details["statements"] == [{"index": 0, "type": "INSERT"}]
+    # insert_mappings 投影不含 extra / inferred(不在投影键内)
+    assert "extra" not in details["insert_mappings"][0]
+    assert "inferred" not in details["insert_mappings"][0]
+    # 未知形态 procedure_segments 原样透传,但超长 sql 被单字段封顶截断
+    proc_sql = details["procedure_segments"][0]["sql"]
+    assert len(proc_sql) < 5000
+    assert proc_sql.endswith("…(truncated)")
+    assert remaining == 50_000 - 3  # 消耗 1+1+1 行
+
+
+def test_project_lineage_batch_details_enforces_per_file_row_cap() -> None:
+    from app.domain.lineage import LineageReport
+    from app.worker import _LINEAGE_BATCH_DETAIL_MAX_ROWS_PER_FILE, _project_lineage_batch_details
+
+    over = _LINEAGE_BATCH_DETAIL_MAX_ROWS_PER_FILE + 25
+    report = LineageReport(
+        graph_edges=[
+            {"source_table": f"s{i}", "target_table": "t", "statement_index": 0}
+            for i in range(over)
+        ]
+    )
+    details, _remaining, dropped = _project_lineage_batch_details(report, 50_000)
+
+    assert len(details["graph_edges"]) == _LINEAGE_BATCH_DETAIL_MAX_ROWS_PER_FILE
+    assert details["graph_edges_truncated"] is True
+    assert dropped == [f"graph_edges:{over}->{_LINEAGE_BATCH_DETAIL_MAX_ROWS_PER_FILE}"]
+
+
+def test_project_lineage_batch_details_exhausts_global_budget() -> None:
+    from app.domain.lineage import LineageReport
+    from app.worker import _project_lineage_batch_details
+
+    report = LineageReport(
+        statements=[{"index": i, "type": "SELECT"} for i in range(5)],
+        graph_edges=[{"source_table": "s", "target_table": "t", "statement_index": 0}],
+    )
+    # 全局预算仅 3 行:statements 吃 3 行后截断,后续类(graph_edges)只出 0 行。
+    details, remaining, dropped = _project_lineage_batch_details(report, 3)
+
+    assert remaining == 0
+    assert len(details["statements"]) == 3
+    assert details["statements_truncated"] is True
+    assert details["graph_edges"] == []
+    assert details["graph_edges_truncated"] is True
+    assert "statements:5->3" in dropped
+    assert "graph_edges:1->0" in dropped
+
+
 def test_worker_lineage_analyze_reuses_cached_run() -> None:
     job = _make_job(
         kind=JobKind.LINEAGE_ANALYZE,
