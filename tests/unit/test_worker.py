@@ -28,11 +28,13 @@ from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import SecretKind, SecretRef
+from app.domain.workflow import WorkflowNode
 from app.services.notify import WorkflowNotifyService
 from app.worker import (
     _EXCEL_MAX_DATA_ROWS_PER_SHEET,
     WorkerRunner,
     WorkerRunnerConfig,
+    _build_workflow_child_job,
     _compare_export_row_cap,
 )
 
@@ -1525,6 +1527,61 @@ def test_workflow_run_rejects_spec_with_forbidden_kind_at_execution() -> None:
 
     assert backend.enqueued == []
     assert len(backend.failed) == 1
+
+
+def test_build_workflow_child_job_interpolates_payload_and_keeps_job_kind() -> None:
+    # C-7 PR1:入队时刻用冻结变量快照渲染 payload 里的 ${var};job_kind 不被插值触碰(R7)
+    node = WorkflowNode(
+        id="n1",
+        job_kind="compare_run",
+        payload={
+            "source_ref": {"table_name": "t_${today}", "schema": "public"},
+            "target_ref": {"table_name": "t_prev"},
+            "datasource_id": "ds-9",
+        },
+        timeout_seconds=60,
+    )
+    run_job = _workflow_run_job()
+    variables = {"today": "2026-07-07", "year": "2026", "month": "07", "day": "07", "now": "x"}
+
+    child = _build_workflow_child_job(run_job, node, variables)
+
+    # payload ${today} 渲染成快照值;非占位串原样
+    assert child.payload["source_ref"]["table_name"] == "t_2026-07-07"
+    assert child.payload["source_ref"]["schema"] == "public"
+    assert child.payload["target_ref"]["table_name"] == "t_prev"
+    assert child.payload["workflow_node_id"] == "n1"
+    # R7:job_kind 只按原始 node.job_kind 构造,插值只碰 payload
+    assert child.kind is JobKind.COMPARE_RUN
+
+
+def test_workflow_run_node_interpolation_failure_fails_run_via_on_failure() -> None:
+    # 插值失败(未解析变量)= 确定性错误:节点走 when 异常同路径 → FAILED → on_failure
+    # (默认 abort)→ run FAILED,而不是把 run job 崩掉 / 卡死重试
+    spec = _workflow_spec_payload(
+        nodes=[
+            {
+                "id": "n1",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT '${missing}'", "datasource_id": "ds-9"},
+                "timeout_seconds": 60,
+            }
+        ]
+    )
+    backend = _FakeBackend([_workflow_run_job(spec)])
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    # 没有 enqueue 任何子 job(节点在 plan 阶段即判 FAILED),run 直接 FAILED
+    assert backend.enqueued == []
+    assert len(backend.failed) == 1
+    job_id, error = backend.failed[0]
+    assert job_id == "job-1"
+    assert "n1" in error
+    assert "unresolved_param_variable" in error
+    # ★ R5:失败信息只含变量名,不含任何取值
+    assert "missing" in error
 
 
 # ── workflow_run 终态通知(C-9 worker 接入)────────────────────────────────────

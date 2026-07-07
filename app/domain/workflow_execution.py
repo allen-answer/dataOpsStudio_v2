@@ -29,6 +29,7 @@ from enum import StrEnum
 
 from app.domain.job import JobStatus
 from app.domain.workflow import WorkflowNode, WorkflowSpec
+from app.domain.workflow_interpolate import ParamInterpolationError, interpolate_payload
 from app.domain.workflow_when import WhenEvaluationError, evaluate_when
 
 # RetryPolicy=None 继承全局 max_retries 时的固定退避秒数:
@@ -160,6 +161,18 @@ def plan_workflow_step(
         if not should_run:
             states[node.id] = WorkflowNodeState(
                 node_id=node.id, status=WorkflowNodeExecStatus.SKIPPED
+            )
+            continue
+        # payload ${var} 插值在入队时刻才真正渲染(worker 侧 _build_workflow_child_job),
+        # 但这里先做一次纯校验:未解析变量 / 不支持的引用是确定性错误,与 when 求值
+        # 异常同路径 —— 节点直接 FAILED、不重试、按 on_failure 语义处理,永不把 run 打挂
+        try:
+            interpolate_payload(node.payload, variables)
+        except ParamInterpolationError as exc:
+            states[node.id] = WorkflowNodeState(
+                node_id=node.id,
+                status=WorkflowNodeExecStatus.FAILED,
+                error=f"param interpolation failed: {exc}",
             )
             continue
         states[node.id] = WorkflowNodeState(node_id=node.id, status=WorkflowNodeExecStatus.WAITING)

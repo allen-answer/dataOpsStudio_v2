@@ -101,6 +101,7 @@ from app.domain.workflow_execution import (
     WorkflowChildJob,
     plan_workflow_step,
 )
+from app.domain.workflow_interpolate import interpolate_payload
 from app.domain.workflow_when import builtin_when_variables, when_variables_from_payload
 from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
@@ -1368,18 +1369,20 @@ class WorkerRunner:
         # when 变量优先用触发时冻结的快照(与 API 状态查询同源,决策不随
         # 推进时刻漂移);在途旧 run 无快照时回退为按当前时刻计算
         frozen_variables = when_variables_from_payload(job.payload)
+        # when 判定与 payload ${var} 插值共用同一份变量快照(口径不漂移)
+        variables = (
+            frozen_variables if frozen_variables is not None else builtin_when_variables(now)
+        )
         plan = plan_workflow_step(
             spec,
             children,
             now=now,
             default_max_retries=self._config.workflow_node_default_max_retries,
-            when_variables=(
-                frozen_variables if frozen_variables is not None else builtin_when_variables(now)
-            ),
+            when_variables=variables,
         )
         nodes_by_id = {node.id: node for node in spec.nodes}
         for node_id in plan.enqueue_node_ids:
-            child_job = _build_workflow_child_job(job, nodes_by_id[node_id])
+            child_job = _build_workflow_child_job(job, nodes_by_id[node_id], variables)
             try:
                 self._backend.enqueue(child_job)
             except IntegrityError:
@@ -2188,8 +2191,13 @@ def _workflow_children_snapshots(children: list[Job]) -> dict[str, WorkflowChild
     return snapshots
 
 
-def _build_workflow_child_job(run_job: Job, node: WorkflowNode) -> Job:
-    payload: dict[str, Any] = dict(node.payload)
+def _build_workflow_child_job(
+    run_job: Job, node: WorkflowNode, variables: Mapping[str, str]
+) -> Job:
+    # 入队时刻渲染 payload 里的 ${var} 占位符(用触发时冻结的变量快照);
+    # 未解析变量等确定性错误已在 plan_workflow_step 侧拦成节点 FAILED,故走到这里
+    # 的节点插值必定成功。job_kind 只按原始 node.job_kind 构造,插值只碰 payload(R7)
+    payload: dict[str, Any] = interpolate_payload(node.payload, variables)
     payload["workflow_node_id"] = node.id
     return Job(
         id=str(uuid4()),
