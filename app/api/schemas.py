@@ -12,6 +12,7 @@ from app.domain.compare_infer import (
 )
 from app.domain.datasource import DbType, OperationPolicy
 from app.domain.job import JobErrorCode, JobStatus
+from app.domain.notify import NotifyChannelName, NotifyEvent
 from app.domain.schema import Column
 from app.domain.workflow import WorkflowSpec
 
@@ -1008,6 +1009,42 @@ class WorkflowListItem(BaseModel):
     created_by: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+# ── Workflow run 通知目标配置(C-9 PR4:收明文 url → SecretStore → 只存 ref)──
+#
+#   ★ R2/R5:请求收整条明文 url(webhook / 企微,含 ?key=token),路由层立即
+#   store_secret 换成 SecretRef,配置里只留 url_secret_ref。响应模型 **没有 url
+#   字段**——绝不把明文 url / token 回显给客户端或日志。
+
+
+class NotifyTargetCreateRequest(BaseModel):
+    """新增通知目标:``url`` 是整条明文 webhook / 企微地址(含 token)。"""
+
+    channel: NotifyChannelName
+    url: str = Field(min_length=1)
+    events: list[NotifyEvent] | None = None
+    enabled: bool = True
+    timeout_seconds: int = Field(default=5, ge=1, le=60)
+
+
+class NotifyTargetUpdateRequest(BaseModel):
+    """更新通知目标:仅传要改的字段;传 ``url`` 则重新 store_secret 换 ref。"""
+
+    url: str | None = Field(default=None, min_length=1)
+    events: list[NotifyEvent] | None = None
+    enabled: bool | None = None
+    timeout_seconds: int | None = Field(default=None, ge=1, le=60)
+
+
+class NotifyTargetResponse(BaseModel):
+    """通知目标视图 —— ★ 无 url 字段(R5:绝不回显明文 url / token)。"""
+
+    id: str
+    channel: str
+    events: list[str]
+    enabled: bool
+    timeout_seconds: int
 
 
 # ── Workflow run(2.4.0 PR-4:手动触发 / 状态查询 / 取消;cron tick 属 PR-4b)──

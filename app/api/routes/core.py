@@ -91,6 +91,9 @@ from app.api.schemas import (
     MetadataIndexItem,
     MetadataSchemaItem,
     MetadataTableItem,
+    NotifyTargetCreateRequest,
+    NotifyTargetResponse,
+    NotifyTargetUpdateRequest,
     ProjectResponse,
     RowResponse,
     SqlConsoleCreateRequest,
@@ -174,6 +177,7 @@ from app.domain.lineage.ai_fallback import (
     fallback_statements,
     parse_inferred_edges,
 )
+from app.domain.notify import NotifyTarget
 from app.domain.readers import (
     CsvReader,
     ExcelReader,
@@ -3506,6 +3510,218 @@ def delete_project_workflow(
         result="success",
     )
     return Response(status_code=204)
+
+
+# ── Workflow run 通知目标配置(C-9 PR4)────────────────────────────────────────
+#   通知目标是 workflow 的子资源,持久化进 WorkflowSpec.notifications → dag_jsonb。
+#   ★ R2/R5:客户端提交整条明文 url(webhook / 企微,含 ?key=token),路由层
+#   store_secret 换成 SecretRef,配置里只留 url_secret_ref;明文 url 绝不落 dag_jsonb、
+#   绝不回显、绝不进日志。响应 / 审计只带 target_id / channel(不含 url)。
+
+
+@router.post(
+    "/projects/{project_id}/workflows/{workflow_id}/notifications",
+    response_model=NotifyTargetResponse,
+    status_code=201,
+)
+def create_workflow_notification(
+    project_id: str,
+    workflow_id: str,
+    body: NotifyTargetCreateRequest,
+    request: Request,
+) -> NotifyTargetResponse:
+    """新增通知目标:收明文 url → store_secret → 只把 ref 追加进 spec.notifications。"""
+    services = services_from(request)
+    user = current_user_from(request)
+    target_id = new_id()
+    with services.engine.begin() as conn:
+        _require_project_access(conn, project_id, user.id)
+        row = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+        spec = _validated_workflow_spec(dict(row["dag_jsonb"] or {}))
+        # 先校验通过再 store_secret,避免 404 / 400 时留下孤儿 secret。
+        secret_ref = services.secret_store.store_secret(body.url, SecretKind.WEBHOOK_SECRET)
+        target = _notify_target_from_create(target_id, body, secret_ref.ref)
+        updated = spec.model_copy(update={"notifications": [*spec.notifications, target]})
+        _persist_workflow_notifications(conn, workflow_id, updated)
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="workflow_notify_add",
+        resource_type="workflow",
+        resource_id=workflow_id,
+        result="success",
+        detail={"target_id": target_id, "channel": target.channel},
+    )
+    return _notify_target_response(target)
+
+
+@router.put(
+    "/projects/{project_id}/workflows/{workflow_id}/notifications/{target_id}",
+    response_model=NotifyTargetResponse,
+)
+def update_workflow_notification(
+    project_id: str,
+    workflow_id: str,
+    target_id: str,
+    body: NotifyTargetUpdateRequest,
+    request: Request,
+) -> NotifyTargetResponse:
+    """更新通知目标:传新明文 url 则重新 store_secret 换 ref(旧 secret 删除)。"""
+    services = services_from(request)
+    user = current_user_from(request)
+    old_secret_ref: str | None = None
+    with services.engine.begin() as conn:
+        _require_project_access(conn, project_id, user.id)
+        row = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+        spec = _validated_workflow_spec(dict(row["dag_jsonb"] or {}))
+        existing = _require_notify_target(spec, target_id)
+        url_secret_ref = existing.url_secret_ref
+        if body.url is not None:
+            secret_ref = services.secret_store.store_secret(body.url, SecretKind.WEBHOOK_SECRET)
+            old_secret_ref = existing.url_secret_ref
+            url_secret_ref = secret_ref.ref
+        target = _notify_target_from_update(existing, body, url_secret_ref)
+        notifications = [target if item.id == target_id else item for item in spec.notifications]
+        updated = spec.model_copy(update={"notifications": notifications})
+        _persist_workflow_notifications(conn, workflow_id, updated)
+    if old_secret_ref is not None:
+        services.secret_store.delete_secret(
+            SecretRef(ref=old_secret_ref, kind=SecretKind.WEBHOOK_SECRET)
+        )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="workflow_notify_update",
+        resource_type="workflow",
+        resource_id=workflow_id,
+        result="success",
+        detail={"target_id": target_id, "channel": target.channel},
+    )
+    return _notify_target_response(target)
+
+
+@router.delete(
+    "/projects/{project_id}/workflows/{workflow_id}/notifications/{target_id}",
+    status_code=204,
+)
+def delete_workflow_notification(
+    project_id: str,
+    workflow_id: str,
+    target_id: str,
+    request: Request,
+) -> Response:
+    """删除通知目标:从 spec.notifications 移除,并清理其 SecretStore 条目。"""
+    services = services_from(request)
+    user = current_user_from(request)
+    removed_secret_ref: str
+    with services.engine.begin() as conn:
+        _require_project_access(conn, project_id, user.id)
+        row = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+        spec = _validated_workflow_spec(dict(row["dag_jsonb"] or {}))
+        existing = _require_notify_target(spec, target_id)
+        removed_secret_ref = existing.url_secret_ref
+        notifications = [item for item in spec.notifications if item.id != target_id]
+        updated = spec.model_copy(update={"notifications": notifications})
+        _persist_workflow_notifications(conn, workflow_id, updated)
+    services.secret_store.delete_secret(
+        SecretRef(ref=removed_secret_ref, kind=SecretKind.WEBHOOK_SECRET)
+    )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="workflow_notify_remove",
+        resource_type="workflow",
+        resource_id=workflow_id,
+        result="success",
+        detail={"target_id": target_id},
+    )
+    return Response(status_code=204)
+
+
+def _notify_target_from_create(
+    target_id: str,
+    body: NotifyTargetCreateRequest,
+    url_secret_ref: str,
+) -> NotifyTarget:
+    fields: dict[str, Any] = {
+        "id": target_id,
+        "channel": body.channel,
+        "url_secret_ref": url_secret_ref,
+        "enabled": body.enabled,
+        "timeout_seconds": body.timeout_seconds,
+    }
+    if body.events is not None:
+        fields["events"] = body.events
+    try:
+        return NotifyTarget.model_validate(fields)
+    except ValidationError as exc:
+        raise _notify_target_error(exc) from exc
+
+
+def _notify_target_from_update(
+    existing: NotifyTarget,
+    body: NotifyTargetUpdateRequest,
+    url_secret_ref: str,
+) -> NotifyTarget:
+    fields: dict[str, Any] = existing.model_dump()
+    fields["url_secret_ref"] = url_secret_ref
+    if body.events is not None:
+        fields["events"] = body.events
+    if body.enabled is not None:
+        fields["enabled"] = body.enabled
+    if body.timeout_seconds is not None:
+        fields["timeout_seconds"] = body.timeout_seconds
+    try:
+        return NotifyTarget.model_validate(fields)
+    except ValidationError as exc:
+        raise _notify_target_error(exc) from exc
+
+
+def _notify_target_error(exc: ValidationError) -> ApiError:
+    # 领域层 ValueError 约定 "code: 说明";pydantic 包装后带 "Value error, " 前缀。
+    # ★ 不把 exc 全文塞进 message(可能含请求字段回显);只取领域 code。
+    for error in exc.errors():
+        message = str(error.get("msg", "")).removeprefix(_PYDANTIC_VALUE_ERROR_PREFIX)
+        code, sep, _ = message.partition(":")
+        if sep and code.strip():
+            return ApiError(400, code.strip(), message)
+    return ApiError(400, "invalid_notify_target", "Notify target is invalid")
+
+
+def _require_notify_target(spec: WorkflowSpec, target_id: str) -> NotifyTarget:
+    for target in spec.notifications:
+        if target.id == target_id:
+            return target
+    raise ApiError(404, "not_found", "Notify target not found")
+
+
+def _persist_workflow_notifications(
+    conn: Connection,
+    workflow_id: str,
+    spec: WorkflowSpec,
+) -> None:
+    conn.execute(
+        update(workflows)
+        .where(workflows.c.id == workflow_id)
+        .values(dag_jsonb=spec.model_dump(mode="json"), updated_at=datetime.now(UTC))
+    )
+
+
+def _notify_target_response(target: NotifyTarget) -> NotifyTargetResponse:
+    # ★ R5:仅暴露 id / channel / events / enabled / timeout —— 绝不含 url。
+    return NotifyTargetResponse(
+        id=target.id,
+        channel=target.channel,
+        events=list(target.events),
+        enabled=target.enabled,
+        timeout_seconds=target.timeout_seconds,
+    )
 
 
 def _validated_workflow_spec(payload: dict[str, Any]) -> WorkflowSpec:
