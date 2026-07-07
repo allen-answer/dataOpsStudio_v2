@@ -3456,7 +3456,21 @@ def update_project_workflow(
     spec = _validated_workflow_spec(body.spec)
     with services.engine.begin() as conn:
         _require_project_access(conn, project_id, user.id)
-        _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+        existing = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+        # preserve-on-omit(C-9/C-7 数据丢失防护):body.spec 是原始 dict,PUT 未
+        # 显式带 notifications / variables 时沿用库里既有值,避免 GET-then-PUT
+        # 少带字段就静默清空已配置的 notify 目标(连带孤儿化其 SecretStore
+        # url_secret_ref)/ 变量。显式传 [] / {} 表达"我要清空",按原样处理。
+        preserved: dict[str, Any] = {}
+        stored_dag = dict(existing["dag_jsonb"] or {})
+        if "notifications" not in body.spec:
+            preserved["notifications"] = stored_dag.get("notifications", [])
+        if "variables" not in body.spec:
+            preserved["variables"] = stored_dag.get("variables", {})
+        if preserved:
+            # 合并后再过一遍 _validated_workflow_spec:R7 / notify id 唯一 / 变量
+            # 校验仍作用于最终落库 spec(沿用值本就来自旧的合法 spec)。
+            spec = _validated_workflow_spec({**body.spec, **preserved})
         _require_workflow_name_available(
             conn,
             project_id=project_id,
