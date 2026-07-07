@@ -99,8 +99,8 @@ export interface CompareTaskResponse {
   id: string
   project_id: string
   name: string
-  source_id: string
-  target_id: string
+  source_id: string | null
+  target_id: string | null
   source_ref: CompareDataRef
   target_ref: CompareDataRef
   columns: Column[]
@@ -114,8 +114,9 @@ export interface CompareTaskResponse {
 export interface CompareTaskCreateRequest {
   project_id: string
   name: string
-  source_id: string
-  target_id: string
+  // file 侧无 datasource:传 null(#126 起后端条件校验,仅 table/sql 侧必填)。
+  source_id: string | null
+  target_id: string | null
   source_ref: CompareDataRef
   target_ref: CompareDataRef
   columns?: Column[]
@@ -125,8 +126,8 @@ export interface CompareTaskCreateRequest {
 
 export interface CompareTaskUpdateRequest {
   name?: string
-  source_id?: string
-  target_id?: string
+  source_id?: string | null
+  target_id?: string | null
   source_ref?: CompareDataRef
   target_ref?: CompareDataRef
   columns?: Column[]
