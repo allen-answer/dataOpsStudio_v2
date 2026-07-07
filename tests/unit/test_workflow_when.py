@@ -110,6 +110,22 @@ def test_variable_with_quote_is_escaped_to_plain_string() -> None:
     assert evaluate_when('${day} == "it\'s"', tricky) is True
 
 
+def test_interpolated_value_with_sugar_token_not_rewritten() -> None:
+    # 回归(backlog #92 评论 minor #2):糖替换先于插值,变量值里的 `&&` 不会被
+    # 当语法糖改写。旧顺序(先插值后糖替换)会把值 "x&&y" 里的 `&&` 重写成 " and ",
+    # 错误地等于另一个值 "x and y";新顺序保持值原样,两个不同的值比较得 False。
+    variables = {"a": "x&&y", "b": "x and y"}
+    assert evaluate_when("${a} == ${b}", variables) is False
+
+
+def test_interpolated_value_null_stays_string_not_none() -> None:
+    # 值 "null" 插入后是字符串字面量 'null',不会被糖替换成 Python None;
+    # 而表达式里裸写的 `null` 仍走糖(→ None),两者互不干扰。
+    variables = {"a": "null"}
+    assert evaluate_when("${a} == ${a}", variables) is True  # 'null' == 'null'
+    assert evaluate_when("${a} != null", variables) is True  # 字符串 'null' != None
+
+
 def test_when_variables_from_payload_reads_frozen_snapshot() -> None:
     payload: dict[str, object] = {"when_variables": {"day": "99", "month": "07"}}
     assert when_variables_from_payload(payload) == {"day": "99", "month": "07"}

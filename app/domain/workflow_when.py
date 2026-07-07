@@ -98,12 +98,16 @@ def evaluate_when(expression: str | None, variables: Mapping[str, str]) -> bool:
         return True
     if len(expression) > MAX_WHEN_LENGTH:
         raise WhenEvaluationError(f"when_too_long: when 表达式超过 {MAX_WHEN_LENGTH} 字符")
-    rendered = _interpolate(expression, variables)
-    rendered = rendered.replace("&&", " and ").replace("||", " or ")
-    rendered = _BANG_RE.sub(" not ", rendered)
-    rendered = re.sub(r"\bnull\b", "None", rendered)
-    rendered = re.sub(r"\btrue\b", "True", rendered)
-    rendered = re.sub(r"\bfalse\b", "False", rendered)
+    # 糖替换在插值**之前**做:模板占位符(${var} + 内置变量名)不含 &&/||/!/null
+    # 等 token,先糖化再插值绝对安全;而插值后的变量值(repr 出的字符串字面量)
+    # 若含这些 token,此时已不会被改写 —— 避免变量集合扩大(如开放 ${nodes.*})
+    # 后字符串内容被误当语法糖重写的注入/正确性雷。
+    sugared = expression.replace("&&", " and ").replace("||", " or ")
+    sugared = _BANG_RE.sub(" not ", sugared)
+    sugared = re.sub(r"\bnull\b", "None", sugared)
+    sugared = re.sub(r"\btrue\b", "True", sugared)
+    sugared = re.sub(r"\bfalse\b", "False", sugared)
+    rendered = _interpolate(sugared, variables)
     # 行首 `!` 替换成 ` not ` 会留出前导空格,eval 模式会当缩进错误,strip 掉
     rendered = rendered.strip()
     try:
