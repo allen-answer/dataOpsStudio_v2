@@ -205,6 +205,7 @@ from app.services.ai.default_gateway import (
     build_gateway_from_runtime_config,
 )
 from app.services.ai.errors import AiGatewayError
+from app.services.lineage_batch_export import batch_export_sheets
 
 logger = structlog.get_logger(__name__)
 
@@ -3033,6 +3034,140 @@ def get_lineage_batch(
         status=status,
         error=_optional_str(row["error"]),
         report=report,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/lineage/batch/{job_id}/export",
+    response_model=ExportCreateResponse,
+    status_code=201,
+)
+def create_lineage_batch_export(
+    project_id: str,
+    job_id: str,
+    request: Request,
+) -> ExportCreateResponse:
+    """批量血缘完整导出(L-5+ PR1):把批量作业(L-2)的 report JSON + L-4 语义视图
+    同步导出为一个 xlsx(A 组 7 sheet:流程总览 / 脚本清单 / 跨脚本依赖 / 风险提示 /
+    流程图分组 / 表角色 / 目标整合)。
+
+    与 /lineage/export(焦点子图)是**平行特性、不同数据面**:此端点吃批量作业
+    落的 lineage_batch_report.json,那个吃项目级持久化子图。二者复用同一
+    artifact 存储 + 一次性下载 token + 限额 + GC 通道(不新开下载链路)。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        row = (
+            conn.execute(
+                select(jobs).where(
+                    and_(
+                        jobs.c.id == job_id,
+                        jobs.c.kind == JobKind.LINEAGE_BATCH.value,
+                        jobs.c.project_id == project_id,
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    if row is None:
+        raise ApiError(404, "not_found", "Lineage batch job not found")
+    status = JobStatus(str(row["status"]))
+    if status is not JobStatus.SUCCESS:
+        raise ApiError(409, "batch_not_ready", "Lineage batch job is not complete")
+    result_ref = dict(row["result_ref"] or {})
+    report_uri = str((result_ref.get("metadata") or {}).get("report_uri") or "")
+    if not report_uri:
+        raise ApiError(409, "batch_report_missing", "Lineage batch report is unavailable")
+    with services.result_store.open_download(
+        ResultRef(backend="local_fs", uri=report_uri)
+    ) as stream:
+        report: dict[str, Any] = json.loads(stream.read().decode("utf-8"))
+
+    _enforce_export_rate_limit(services, user.id)
+    export_job_id = new_id()
+    filename = f"lineage-batch-{export_job_id}.xlsx"
+    content_type = export_content_type("excel")
+    try:
+        with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as stream:
+            binary_stream = cast(BinaryIO, stream)
+            exported_bytes = write_xlsx_workbook(
+                stream=binary_stream,
+                sheets=batch_export_sheets(report),
+                limit_bytes=_LINEAGE_EXPORT_LIMIT_BYTES,
+            )
+            binary_stream.seek(0)
+            export_ref = services.result_store.put_export_artifact(
+                export_job_id, filename, binary_stream
+            )
+    except ExportSizeLimitExceeded as exc:
+        raise ApiError(413, "export_limit_exceeded", "Lineage export exceeds size limit") from exc
+    export_ref = export_ref.model_copy(
+        update={"metadata": {"format": "excel", "filename": filename, "bytes": exported_bytes}}
+    )
+
+    download_token = token_urlsafe(32)
+    token_hash = _download_token_hash(download_token)
+    now = datetime.now(UTC)
+    expires_at = now + timedelta(seconds=services.download_url_ttl_seconds)
+    with services.engine.begin() as conn:
+        conn.execute(
+            insert(jobs).values(
+                id=export_job_id,
+                kind=JobKind.RESULT_EXPORT.value,
+                status=JobStatus.SUCCESS.value,
+                owner_user_id=user.id,
+                project_id=project_id,
+                datasource_ids=[],
+                priority=0,
+                timeout_seconds=300,
+                resource_profile={},
+                result_ref=export_ref.model_dump(),
+                audit_id=new_id(),
+                payload={
+                    "lineage_batch_export": True,
+                    "batch_job_id": job_id,
+                    "format": "excel",
+                    "filename": filename,
+                },
+                created_at=now,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        conn.execute(
+            insert(export_download_tokens).values(
+                token_hash=token_hash,
+                job_id=export_job_id,
+                owner_user_id=user.id,
+                format="excel",
+                filename=filename,
+                content_type=content_type,
+                expires_at=expires_at,
+            )
+        )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="lineage_batch_export",
+        resource_type="lineage_batch_export",
+        resource_id=export_job_id,
+        result="success",
+        detail={
+            "batch_job_id": job_id,
+            "file_count": int(report.get("file_count") or 0),
+        },
+    )
+    return ExportCreateResponse(
+        job_id=export_job_id,
+        download_token=download_token,
+        expires_at=expires_at,
+        format="excel",
+        filename=filename,
     )
 
 
