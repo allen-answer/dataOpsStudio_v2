@@ -24,6 +24,11 @@ from app.domain.lineage.models import (
     TransformationSubtype,
 )
 from app.domain.lineage.plsql import split_plsql_statements
+from app.domain.lineage.segments import (
+    extract_dynamic_sql_segments,
+    extract_procedure_segments,
+)
+from app.domain.lineage.variables import all_plsql_local_names, script_variables
 
 LineageSchema = dict[str, dict[str, dict[str, str]]]
 
@@ -61,7 +66,17 @@ class _StatementContext:
 def analyze_sql_lineage(request: LineageParseRequest) -> LineageReport:
     register_lineage_dialects()
     dialect = _normalize_dialect(request.dialect)
-    raw_statements = _parse_or_split_plsql(request.sql_text, dialect)
+    sql_text = request.sql_text
+    # L-3:PL/SQL 深度解析。控制流感知切段 + 动态 SQL 抽取,纯静态(无 DB,R1 满足)。
+    # 变量在任何 normalize 之前抽(``${name}`` 模板名不能丢)。
+    procedure_segments = extract_procedure_segments(sql_text)
+    dynamic_sql_segments = extract_dynamic_sql_segments(sql_text)
+    variables = script_variables(sql_text)
+    local_names = all_plsql_local_names(sql_text)
+
+    raw_statements, segment_titles = _statements_for_analysis(
+        sql_text, dialect, procedure_segments, dynamic_sql_segments
+    )
     report = LineageReport(statement_count=len(raw_statements))
     for index, statement in enumerate(raw_statements):
         context = _StatementContext(
@@ -72,6 +87,22 @@ def analyze_sql_lineage(request: LineageParseRequest) -> LineageReport:
             lenient=request.lenient,
         )
         _analyze_statement(statement, context, report)
+
+    # L-3:业务标题挂到对应 statement;每段单独试解析回填 parse_status;填充预留
+    # envelope 字段;局部变量假表过滤(G6);无法解析的动态 SQL 出 dynamic_sql warning。
+    for entry in report.statements:
+        title = segment_titles.get(entry["index"])
+        if title:
+            entry["title"] = title
+    _mark_segment_parse_status(procedure_segments, dialect)
+    _emit_dynamic_sql_warnings(report, dynamic_sql_segments)
+    if local_names:
+        _drop_local_name_pseudo_tables(report, local_names)
+    report.variables = variables
+    report.dynamic_sql_segments = dynamic_sql_segments
+    report.dynamic_sql_count = len(dynamic_sql_segments)
+    report.procedure_segments = procedure_segments
+
     report.report = _summary(report)
     report.semantic_lineage = {
         "targets": report.target_summary,
@@ -80,6 +111,90 @@ def analyze_sql_lineage(request: LineageParseRequest) -> LineageReport:
         "parse_error_count": len(report.parse_errors),
     }
     return report
+
+
+def _statements_for_analysis(
+    sql_text: str,
+    dialect: str,
+    procedure_segments: list[dict[str, Any]],
+    dynamic_sql_segments: list[dict[str, str]],
+) -> tuple[list[str], dict[int, str]]:
+    """决定送入 ``_analyze_statement`` 的语句列表,并映射 index → 业务标题。
+
+    有 PL/SQL 过程段时,用控制流感知切段的结果(替代裸分号 split)+ 可解析的动态
+    SQL 段;否则退回 :func:`_parse_or_split_plsql`(纯 DML 脚本行为不变,回归安全)。
+    """
+    if not procedure_segments:
+        return _parse_or_split_plsql(sql_text, dialect), {}
+    statements: list[str] = []
+    titles: dict[int, str] = {}
+    for segment in procedure_segments:
+        title = str(segment.get("preceding_comment") or "")
+        if title:
+            titles[len(statements)] = title
+        statements.append(str(segment["sql"]))
+    for dynamic in dynamic_sql_segments:
+        # unresolved 占位段是 `-- ...` 注释,无法解析,不送分析(只作 warning)。
+        if dynamic.get("confidence") == "unresolved":
+            continue
+        statements.append(str(dynamic["sql"]))
+    return statements, titles
+
+
+def _mark_segment_parse_status(procedure_segments: list[dict[str, Any]], dialect: str) -> None:
+    """每段单独试 sqlglot 解析,回填 parse_status='parsed' / 'unsupported'。"""
+    for segment in procedure_segments:
+        try:
+            sqlglot.parse_one(str(segment["sql"]), read=dialect)
+        except ParseError:
+            segment["parse_status"] = "unsupported"
+        else:
+            segment["parse_status"] = "parsed"
+
+
+def _emit_dynamic_sql_warnings(
+    report: LineageReport, dynamic_sql_segments: list[dict[str, str]]
+) -> None:
+    """无法静态解析的动态 SQL(unresolved 变量)诚实告警,而非静默丢失。"""
+    for dynamic in dynamic_sql_segments:
+        if dynamic.get("confidence") != "unresolved":
+            continue
+        report.warnings.append(
+            LineageWarning(
+                code="dynamic_sql",
+                message=(f"dynamic SQL could not be resolved statically: {dynamic['sql']}"),
+            ).model_dump(mode="json")
+        )
+
+
+def _drop_local_name_pseudo_tables(report: LineageReport, local_names: set[str]) -> None:
+    """过滤 PL/SQL 局部变量被误当表的污染(G6)。
+
+    ``SELECT col INTO v_row FROM t`` 被 sqlglot 重写成 ``CREATE TABLE v_row AS
+    SELECT ...``,``v_row`` 会混进 tables / 边。局部变量名恒为无 schema 限定的裸名,
+    真实表(``ods.orders``)有点号,不会误伤。
+    """
+
+    def _is_pseudo(name: str) -> bool:
+        bare = name.strip().strip('"`[]').lower()
+        return "." not in bare and bare in local_names
+
+    report.tables = [t for t in report.tables if not _is_pseudo(str(t.get("name", "")))]
+    report.table_roles = [r for r in report.table_roles if not _is_pseudo(str(r.get("table", "")))]
+    report.columns = [c for c in report.columns if not _is_pseudo(str(c.get("table", "")))]
+    report.graph_edges = [
+        e
+        for e in report.graph_edges
+        if not _is_pseudo(str(e.get("source_table", "")))
+        and not _is_pseudo(str(e.get("target_table", "")))
+    ]
+    report.target_summary = [s for s in report.target_summary if not _is_pseudo(s.table)]
+    report.insert_mappings = [
+        m
+        for m in report.insert_mappings
+        if not _is_pseudo(str(m.get("source_table", "")))
+        and not _is_pseudo(str(m.get("target_table", "")))
+    ]
 
 
 def schema_from_metadata_cache_rows(rows: Iterable[Mapping[str, Any]]) -> LineageSchema:
@@ -1299,9 +1414,18 @@ def _summary(report: LineageReport) -> dict[str, Any]:
     }
 
 
+_RE_LOOKS_LIKE_PLSQL = re.compile(
+    r"\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+\s+)?"
+    r"(?:PROCEDURE|FUNCTION|PACKAGE\s+BODY|TRIGGER)\b"
+    r"|^\s*DECLARE\b",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+
+
 def _looks_like_plsql(sql_text: str) -> bool:
-    upper = sql_text.upper()
-    return "CREATE PROCEDURE" in upper or "CREATE OR REPLACE PROCEDURE" in upper
+    # L-3:覆盖 PROCEDURE / FUNCTION / PACKAGE BODY / TRIGGER / 匿名 DECLARE 块 ——
+    # 这些形态都要走控制流感知切段,不能拿 sqlglot 顶层解析的整块结果。
+    return _RE_LOOKS_LIKE_PLSQL.search(sql_text) is not None
 
 
 def _normalize_dialect(dialect: str) -> str:
