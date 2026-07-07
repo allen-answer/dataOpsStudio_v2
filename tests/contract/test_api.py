@@ -1538,6 +1538,7 @@ def test_export_download_token_is_one_time() -> None:
         "consumed_at": None,
         "job_id": "job-export",
         "status": "success",
+        "finished_at": datetime.now(UTC),
         "result_ref": {
             "backend": "local_fs",
             "uri": "exports/job-export/job-source.csv",
@@ -1556,6 +1557,70 @@ def test_export_download_token_is_one_time() -> None:
     assert first.headers["content-disposition"] == 'attachment; filename="job-source.csv"'
     assert second.status_code == 410
     assert second.json()["error"] == "download_token_consumed"
+
+
+def test_export_download_token_valid_after_slow_job_outlives_creation_ttl() -> None:
+    # The export job took longer than download_url_ttl_seconds (300s) to finish,
+    # so the token's creation-relative expires_at is already in the past. The TTL
+    # clock must run from job completion (finished_at), so the download still works
+    # (backlog #96 #3).
+    now = datetime.now(UTC)
+    token_row = {
+        "token_hash": "not-read-by-fake-engine",
+        "owner_user_id": "user-1",
+        "filename": "job-source.csv",
+        "content_type": "text/csv; charset=utf-8",
+        # created ~10 min ago → creation+300s window already expired
+        "expires_at": now - timedelta(seconds=300),
+        "consumed_at": None,
+        "job_id": "job-export",
+        "status": "success",
+        # job finished just now, i.e. well after the creation-relative window
+        "finished_at": now,
+        "result_ref": {
+            "backend": "local_fs",
+            "uri": "exports/job-export/job-source.csv",
+            "metadata": {},
+        },
+    }
+    engine = _FakeEngine([token_row])
+    result_store = _ResultStore(downloads={"exports/job-export/job-source.csv": b"value\n1\n"})
+    app = create_app(services=cast(ApiServices, _Services(engine, result_store=result_store)))
+
+    response = AsgiClient(app).get("/api/exports/download-token", headers=_auth_headers())
+
+    assert response.status_code == 200
+    assert response.body == b"value\n1\n"
+
+
+def test_export_download_token_expired_after_completion_grace_window() -> None:
+    # Job finished long ago (beyond download_url_ttl_seconds after completion) and
+    # the token was never consumed → the completion-relative window has closed.
+    now = datetime.now(UTC)
+    token_row = {
+        "token_hash": "not-read-by-fake-engine",
+        "owner_user_id": "user-1",
+        "filename": "job-source.csv",
+        "content_type": "text/csv; charset=utf-8",
+        "expires_at": now - timedelta(seconds=1200),
+        "consumed_at": None,
+        "job_id": "job-export",
+        "status": "success",
+        "finished_at": now - timedelta(seconds=600),
+        "result_ref": {
+            "backend": "local_fs",
+            "uri": "exports/job-export/job-source.csv",
+            "metadata": {},
+        },
+    }
+    engine = _FakeEngine([token_row])
+    result_store = _ResultStore(downloads={"exports/job-export/job-source.csv": b"value\n1\n"})
+    app = create_app(services=cast(ApiServices, _Services(engine, result_store=result_store)))
+
+    response = AsgiClient(app).get("/api/exports/download-token", headers=_auth_headers())
+
+    assert response.status_code == 410
+    assert response.json()["error"] == "download_token_expired"
 
 
 def test_lineage_analyze_persists_edges_and_returns_cache_contract() -> None:
