@@ -3265,6 +3265,198 @@ def test_workflow_delete_contract_removes_definition() -> None:
     assert any(audit["action"] == "workflow_delete" for audit in services.audits)
 
 
+# ── Workflow run 通知目标配置(C-9 PR4)────────────────────────────────────────
+# ★ 明文 webhook / 企微 url(含 ?key=token)只能进 SecretStore,配置 / 响应 / 日志
+#   永远只留 SecretRef(R2/R5)。含 token 的固定 url 供各测试断言"明文不外泄"。
+_NOTIFY_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret-token-xyz"
+_NOTIFY_URL_ROTATED = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=rotated-token-abc"
+
+
+def _workflow_row_with_notification(
+    *,
+    target_id: str = "nt-1",
+    url_secret_ref: str = "secret-existing",
+) -> dict[str, object]:
+    row = _workflow_row()
+    dag = dict(cast(dict[str, Any], row["dag_jsonb"]))
+    dag["notifications"] = [
+        {
+            "id": target_id,
+            "channel": "wecom",
+            "url_secret_ref": url_secret_ref,
+            "events": ["failed"],
+            "enabled": True,
+            "timeout_seconds": 5,
+        }
+    ]
+    row["dag_jsonb"] = dag
+    return row
+
+
+def _persisted_workflow_dag(engine: _FakeEngine) -> dict[str, Any]:
+    """从最近一条 UPDATE workflows 语句里 compile 出持久化的 dag_jsonb。"""
+    statement = next(
+        stmt
+        for stmt in reversed(engine.executed)
+        if str(stmt).lstrip().upper().startswith("UPDATE WORKFLOWS")
+    )
+    return dict(statement.compile().params["dag_jsonb"])
+
+
+def test_workflow_notify_create_stores_ref_and_hides_url() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row()])
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows/wf-1/notifications",
+        headers=_auth_headers(),
+        json_body={"channel": "wecom", "url": _NOTIFY_URL, "events": ["failed", "success"]},
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["channel"] == "wecom"
+    assert payload["events"] == ["failed", "success"]
+    assert payload["enabled"] is True
+    assert "url" not in payload  # R5:响应绝不回显 url
+    # R2:明文 url 进了 SecretStore,配置里只留返回的 ref
+    assert secret_store.stored == [_NOTIFY_URL]
+    # R5:明文 url / token 不出现在响应体或任何 SQL 语句文本
+    assert _NOTIFY_URL not in response.body.decode("utf-8")
+    assert "secret-token" not in response.body.decode("utf-8")
+    assert not any(_NOTIFY_URL in statement for statement in engine.statements)
+    # 持久化的 spec.notifications 只带 url_secret_ref,绝无明文 url
+    dag = _persisted_workflow_dag(engine)
+    assert len(dag["notifications"]) == 1
+    target = dag["notifications"][0]
+    assert target["url_secret_ref"] == "secret-new"
+    assert "url" not in target
+    assert _NOTIFY_URL not in json.dumps(dag)
+    assert any(audit["action"] == "workflow_notify_add" for audit in services.audits)
+
+
+def test_workflow_notify_create_unknown_workflow_returns_404_without_orphan_secret() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, None])
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows/wf-missing/notifications",
+        headers=_auth_headers(),
+        json_body={"channel": "webhook", "url": _NOTIFY_URL},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "not_found"
+    # ★ 校验失败先于 store_secret:不留孤儿 secret
+    assert secret_store.stored == []
+
+
+def test_workflow_notify_update_replaces_ref_and_deletes_old() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification()])
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1/notifications/nt-1",
+        headers=_auth_headers(),
+        json_body={"url": _NOTIFY_URL_ROTATED, "enabled": False, "events": ["all"]},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == "nt-1"
+    assert payload["enabled"] is False
+    assert payload["events"] == ["all"]
+    assert "url" not in payload
+    # R2:新明文 url 进 SecretStore;旧 secret 被清理
+    assert secret_store.stored == [_NOTIFY_URL_ROTATED]
+    assert secret_store.deleted == ["secret-existing"]
+    dag = _persisted_workflow_dag(engine)
+    assert dag["notifications"][0]["url_secret_ref"] == "secret-new"
+    assert _NOTIFY_URL_ROTATED not in json.dumps(dag)
+    assert any(audit["action"] == "workflow_notify_update" for audit in services.audits)
+
+
+def test_workflow_notify_update_without_url_keeps_ref_and_stores_nothing() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification()])
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1/notifications/nt-1",
+        headers=_auth_headers(),
+        json_body={"enabled": False},
+    )
+
+    assert response.status_code == 200
+    assert secret_store.stored == []
+    assert secret_store.deleted == []
+    dag = _persisted_workflow_dag(engine)
+    assert dag["notifications"][0]["url_secret_ref"] == "secret-existing"
+    assert dag["notifications"][0]["enabled"] is False
+
+
+def test_workflow_notify_update_unknown_target_returns_404() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification()])
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1/notifications/nt-missing",
+        headers=_auth_headers(),
+        json_body={"enabled": False},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "not_found"
+    assert secret_store.stored == []
+
+
+def test_workflow_notify_delete_removes_target_and_secret() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification()])
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "DELETE",
+        "/api/projects/project-1/workflows/wf-1/notifications/nt-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 204
+    assert secret_store.deleted == ["secret-existing"]
+    assert _persisted_workflow_dag(engine)["notifications"] == []
+    assert any(audit["action"] == "workflow_notify_remove" for audit in services.audits)
+
+
+def test_workflow_notify_delete_unknown_target_returns_404() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification()])
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "DELETE",
+        "/api/projects/project-1/workflows/wf-1/notifications/nt-missing",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "not_found"
+    assert secret_store.deleted == []
+
+
 def test_workflow_run_trigger_contract_enqueues_workflow_run_job() -> None:
     engine = _FakeEngine([{"id": "project-1"}, _workflow_row()])
     services = _Services(engine)
@@ -3746,6 +3938,8 @@ class _FakeEngine:
     def __init__(self, results: list[object]) -> None:
         self.results = list(results)
         self.statements: list[str] = []
+        # 原始 statement 对象(便于测试 compile 出绑定参数,如 UPDATE 的 dag_jsonb)。
+        self.executed: list[Any] = []
 
     def connect(self) -> _FakeConnection:
         return _FakeConnection(self)
@@ -3768,6 +3962,7 @@ class _FakeConnection:
         del parameters
         statement_text = str(statement)
         self._engine.statements.append(statement_text)
+        self._engine.executed.append(statement)
         command = statement_text.lstrip().upper()
         if command.startswith("SELECT") or command.startswith("WITH"):
             return _FakeResult(self._engine.results.pop(0))
