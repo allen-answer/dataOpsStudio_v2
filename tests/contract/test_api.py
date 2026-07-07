@@ -3403,6 +3403,32 @@ def test_workflow_run_cancel_contract_propagates_to_unfinished_children() -> Non
     assert any(audit["action"] == "workflow_run_cancel" for audit in services.audits)
 
 
+def test_workflow_run_cancel_on_terminal_run_returns_409() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_run_job_row(status="success"),
+            [
+                _workflow_child_job_row("n1", status="success", job_id="child-1"),
+            ],
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflow-runs/run-1:cancel",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "workflow_run_terminal"
+    # 已终态 run 不软取消,也不传播到子 job
+    assert services.job_backend.cancel_requested == []
+    assert services.job_backend.cancelled_pending == []
+    assert not any(audit["action"] == "workflow_run_cancel" for audit in services.audits)
+
+
 def _workflow_run_job_row(*, status: str = "running") -> dict[str, object]:
     return {
         "id": "run-1",
