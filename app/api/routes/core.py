@@ -1671,6 +1671,11 @@ def _create_compare_task_record(
             target_id=body.target_id,
             user_id=user_id,
         )
+        _validate_compare_file_uploads(
+            conn,
+            project_id=body.project_id,
+            refs=[body.source_ref, body.target_ref],
+        )
         conn.execute(
             insert(compare_tasks).values(
                 id=task_id,
@@ -2170,6 +2175,9 @@ def update_compare_task(
                 target_id=target_id,
                 user_id=user.id,
             )
+        changed_refs = [ref for ref in (body.source_ref, body.target_ref) if ref is not None]
+        if changed_refs:
+            _validate_compare_file_uploads(conn, project_id=project_id, refs=changed_refs)
         values: dict[str, object] = {}
         if body.name is not None:
             values["name"] = body.name
@@ -2257,17 +2265,29 @@ def run_compare_task(task_id: str, request: Request) -> CompareRunCreateResponse
     if not columns:
         raise ApiError(400, "missing_compare_columns", "Compare task requires columns")
 
+    project_id = str(row["project_id"])
+    source_id = _optional_str(row["source_id"])
+    target_id = _optional_str(row["target_id"])
+    source_ref = dict(row["source_ref"] or {})
+    target_ref = dict(row["target_ref"] or {})
+    # 文件侧:把 upload_id 解析成 storage_uri + filename 注入 ref(worker 回读用),
+    # 与 lineage_batch 同范式(API 侧解析上传件,worker 不直连 uploads 表)。
+    with services.engine.connect() as conn:
+        _resolve_compare_file_ref(conn, project_id=project_id, ref=source_ref)
+        _resolve_compare_file_ref(conn, project_id=project_id, ref=target_ref)
+
     job_id = new_id()
     run_id = new_id()
     bucket_spools = {bucket: new_id() for bucket in COMPARE_BUCKETS}
     timeout_seconds = min(int(limits.get("query_timeout_seconds") or 1800), 3600)
+    datasource_ids = [ds_id for ds_id in (source_id, target_id) if ds_id is not None]
     job = Job(
         id=job_id,
         kind=JobKind.COMPARE_RUN,
         status=JobStatus.PENDING,
         owner_user_id=user.id,
-        project_id=str(row["project_id"]),
-        datasource_ids=[str(row["source_id"]), str(row["target_id"])],
+        project_id=project_id,
+        datasource_ids=datasource_ids,
         priority=0,
         timeout_seconds=timeout_seconds,
         resource_profile=ResourceProfile(timeout_seconds=timeout_seconds),
@@ -2275,10 +2295,10 @@ def run_compare_task(task_id: str, request: Request) -> CompareRunCreateResponse
         payload={
             "task_id": task_id,
             "run_id": run_id,
-            "source_id": str(row["source_id"]),
-            "target_id": str(row["target_id"]),
-            "source_ref": dict(row["source_ref"] or {}),
-            "target_ref": dict(row["target_ref"] or {}),
+            "source_id": source_id,
+            "target_id": target_id,
+            "source_ref": source_ref,
+            "target_ref": target_ref,
             "columns": columns,
             "compare_rules": rules,
             "run_limits": limits,
@@ -4566,8 +4586,8 @@ def _compare_task_response(row: RowMapping) -> CompareTaskResponse:
         id=str(row["id"]),
         project_id=str(row["project_id"]),
         name=str(row["name"]),
-        source_id=str(row["source_id"]),
-        target_id=str(row["target_id"]),
+        source_id=_optional_str(row["source_id"]),
+        target_id=_optional_str(row["target_id"]),
         source_ref=row["source_ref"],
         target_ref=row["target_ref"],
         columns=[Column.model_validate(item) for item in row["columns"] or []],
@@ -4620,23 +4640,98 @@ def _validate_compare_task_datasources(
     conn: Connection,
     *,
     project_id: str,
-    source_id: str,
-    target_id: str,
+    source_id: str | None,
+    target_id: str | None,
     user_id: str,
 ) -> None:
+    # 文件源对比(C-1):file 侧无 datasource(id 为 None),只校验给出的库侧 id。
     _require_project_access(conn, project_id, user_id)
+    ds_ids = [ds_id for ds_id in (source_id, target_id) if ds_id is not None]
+    if not ds_ids:
+        return
     rows = (
         conn.execute(
-            select(datasources.c.id, datasources.c.project_id).where(
-                datasources.c.id.in_([source_id, target_id])
-            )
+            select(datasources.c.id, datasources.c.project_id).where(datasources.c.id.in_(ds_ids))
         )
         .mappings()
         .all()
     )
     by_id = {str(row["id"]): str(row["project_id"]) for row in rows}
-    if by_id.get(source_id) != project_id or by_id.get(target_id) != project_id:
+    if any(by_id.get(ds_id) != project_id for ds_id in ds_ids):
         raise ApiError(404, "not_found", "Compare datasource not found")
+
+
+def _validate_compare_file_uploads(
+    conn: Connection,
+    *,
+    project_id: str,
+    refs: list[CompareDataRef],
+) -> None:
+    """校验 file kind 的 ref 指向的 upload 属本项目且 purpose=compare_source。
+
+    与 file-preview 端点同口径(所有权 + 用途),防止跨项目引用他人上传件。
+    """
+
+    for ref in refs:
+        if ref.kind != "file":
+            continue
+        upload_row = (
+            conn.execute(
+                select(uploads.c.purpose).where(
+                    and_(
+                        uploads.c.id == ref.upload_id,
+                        uploads.c.project_id == project_id,
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if upload_row is None:
+            raise ApiError(404, "not_found", "Compare upload not found")
+        if str(upload_row["purpose"]) != "compare_source":
+            raise ApiError(400, "invalid_upload_purpose", "Upload purpose must be compare_source")
+
+
+def _resolve_compare_file_ref(
+    conn: Connection,
+    *,
+    project_id: str,
+    ref: dict[str, object],
+) -> None:
+    """把 file kind 的 ref(dict 形态)就地补上 storage_uri + filename(worker 回读用)。
+
+    校验 upload 属本项目且 purpose=compare_source(与创建/预览同口径)。非 file
+    kind 直接跳过。task 只存 upload_id,run 时解析,避免存原始路径(规避穿越)。
+    """
+
+    if ref.get("kind") != "file":
+        return
+    upload_id = ref.get("upload_id")
+    if not isinstance(upload_id, str) or not upload_id:
+        raise ApiError(400, "invalid_file_ref", "file ref requires upload_id")
+    upload_row = (
+        conn.execute(
+            select(
+                uploads.c.storage_uri,
+                uploads.c.filename,
+                uploads.c.purpose,
+            ).where(
+                and_(
+                    uploads.c.id == upload_id,
+                    uploads.c.project_id == project_id,
+                )
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if upload_row is None:
+        raise ApiError(404, "not_found", "Compare upload not found")
+    if str(upload_row["purpose"]) != "compare_source":
+        raise ApiError(400, "invalid_upload_purpose", "Upload purpose must be compare_source")
+    ref["storage_uri"] = str(upload_row["storage_uri"])
+    ref["filename"] = str(upload_row["filename"])
 
 
 def _compare_datasource_rows_for_project(
