@@ -3523,6 +3523,70 @@ def test_workflow_run_trigger_missing_workflow_returns_404() -> None:
     assert services.job_backend.enqueued == []
 
 
+def test_workflow_run_trigger_merges_variable_sources_into_snapshot() -> None:
+    # C-7 PR2:合并优先级 builtin < spec.variables < 触发时;触发覆盖 spec,builtin 不被覆盖
+    row = _workflow_row()
+    cast(dict[str, object], row["dag_jsonb"])["variables"] = {
+        "env": "staging",
+        "region": "ap-east-1",
+    }
+    engine = _FakeEngine([{"id": "project-1"}, row])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows/wf-1/runs",
+        headers=_auth_headers(),
+        json_body={"variables": {"env": "prod"}},
+    )
+
+    assert response.status_code == 201
+    job = services.job_backend.enqueued[0]
+    frozen = job.payload["when_variables"]
+    # 内置 5 变量 + spec/触发变量都进同一份快照(服务 when + ${var} 插值)
+    assert {"today", "now", "year", "month", "day"} <= set(frozen)
+    assert frozen["env"] == "prod"  # 触发 > spec
+    assert frozen["region"] == "ap-east-1"  # spec 保留
+    assert all(isinstance(value, str) for value in frozen.values())
+
+
+def test_workflow_run_trigger_without_body_snapshot_is_builtins_only() -> None:
+    # 无 body → 与既往一致:快照只含内置变量
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row()])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows/wf-1/runs",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 201
+    frozen = services.job_backend.enqueued[0].payload["when_variables"]
+    assert set(frozen) == {"today", "now", "year", "month", "day"}
+
+
+def test_workflow_run_trigger_rejects_unsafe_variable_value_name_only() -> None:
+    # 危险取值(引号 + 分号)→ 400 unsafe_variable_value;不 enqueue;错误不回显取值(R5)
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row()])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows/wf-1/runs",
+        headers=_auth_headers(),
+        json_body={"variables": {"inj": "x'; DROP TABLE t"}},
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"] == "unsafe_variable_value"
+    assert "inj" in body["message"]
+    # ★ R5:响应绝不回显危险取值
+    assert "DROP TABLE" not in response.body.decode("utf-8")
+    assert services.job_backend.enqueued == []
+
+
 def test_workflow_run_status_contract_returns_run_and_node_states() -> None:
     engine = _FakeEngine(
         [

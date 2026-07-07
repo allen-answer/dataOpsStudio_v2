@@ -1050,6 +1050,17 @@ class NotifyTargetResponse(BaseModel):
 # ── Workflow run(2.4.0 PR-4:手动触发 / 状态查询 / 取消;cron tick 属 PR-4b)──
 
 
+class WorkflowRunTriggerRequest(BaseModel):
+    """手动触发 run 的可选 body(C-7 PR2):运行时变量。
+
+    并入 when_variables 快照,合并优先级 builtin < spec.variables < 触发时。
+    值走与 spec 变量同一套安全字符集校验(路由层 validate_workflow_variables),
+    校验错误只含变量名(R5)。无 body / 空 variables 时行为与既往一致(仅内置变量)。
+    """
+
+    variables: dict[str, str] = Field(default_factory=dict)
+
+
 class WorkflowRunCreateResponse(BaseModel):
     # WorkflowRun 本身就是 job(ADR-0009):run_id == job_id,双字段便于前端对齐 jobs API
     run_id: str
