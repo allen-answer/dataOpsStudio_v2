@@ -82,6 +82,7 @@ from app.domain.lineage import (
     lineage_sql_hash,
     schema_from_metadata_cache_rows,
 )
+from app.domain.notify import RunNotification
 from app.domain.plan import PlanNode
 from app.domain.readers import (
     CsvReader,
@@ -110,6 +111,7 @@ from app.infrastructure.result_export import (
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
 from app.infrastructure.secretstore.local_file import LocalFileSecretStore
 from app.observability.logging import configure_logging
+from app.services.notify import RevealSecret, WorkflowNotifyService
 
 logger = structlog.get_logger(__name__)
 
@@ -351,6 +353,7 @@ class WorkerRunner:
         job_error_code_writer: JobErrorCodeWriterLike | None = None,
         compare_run_catalog: CompareRunCatalogLike | None = None,
         lineage_catalog: LineageCatalogLike | None = None,
+        notify_reveal: RevealSecret | None = None,
     ) -> None:
         if config.sql_spool_batch_size <= 0:
             raise ValueError("sql_spool_batch_size must be positive")
@@ -375,6 +378,11 @@ class WorkerRunner:
         self._job_error_code_writer = job_error_code_writer
         self._compare_run_catalog = compare_run_catalog
         self._lineage_catalog = lineage_catalog
+        # C-9:run 终态通知服务(注入 SecretStore.reveal_secret 作 RevealSecret DI)。
+        # 未注入 reveal = 不通知(no-op),不影响 run 终态落定。
+        self._notify_service = (
+            WorkflowNotifyService(notify_reveal) if notify_reveal is not None else None
+        )
         self._stop_requested = False
         self._next_result_gc_at = 0.0
 
@@ -442,6 +450,7 @@ class WorkerRunner:
             self._backend.mark_cancelled(job.id, str(exc))
             self._write_result_set_terminal(job, "closed")
             self._write_compare_run_terminal(job, JobStatus.CANCELLED.value)
+            self._notify_workflow_run_terminal(job, JobStatus.CANCELLED.value)
             logger.info(
                 "worker job cancelled",
                 job_id=job.id,
@@ -455,6 +464,7 @@ class WorkerRunner:
             self._write_error_code(job.id, error_code)
             self._write_result_set_terminal(job, "failed")
             self._write_compare_run_terminal(job, JobStatus.FAILED.value)
+            self._notify_workflow_run_terminal(job, JobStatus.FAILED.value, error=public_error)
             logger.exception(
                 "worker job failed",
                 job_id=job.id,
@@ -474,6 +484,7 @@ class WorkerRunner:
                 )
                 return
             self._backend.complete(job.id, outcome.result_ref)
+            self._notify_workflow_run_terminal(job, JobStatus.SUCCESS.value)
             logger.info(
                 "worker job complete",
                 job_id=job.id,
@@ -1514,6 +1525,46 @@ class WorkerRunner:
             return
         self._compare_run_catalog.write_terminal(run_id=run_id, status=status)
 
+    def _notify_workflow_run_terminal(
+        self, job: Job, run_status: str, *, error: str | None = None
+    ) -> None:
+        """C-9:workflow run 到终态时发通知(webhook / 企业微信)。
+
+        ★ 失败隔离(硬红线):run 终态已由 complete/fail/mark_cancelled 在**调用本方法之前**
+        写入;本方法是纯 after-effect。整个方法包在 try/except,任何异常(spec 解析 / 通知
+        构造 / 服务违约抛)都被吞掉并只记不含敏感值的 warning,**绝不回传 worker 循环、
+        绝不改写 run 终态**。service 内部另有 per-target 失败隔离(#128),此处是外层兜底。
+
+        - 仅对 ``JobKind.WORKFLOW_RUN`` 生效;未注入 reveal(``_notify_service is None``)= no-op。
+        - ``error`` 已是 ``_public_error_message`` 的公开串(R5);``RunNotification`` 再截断兜底。
+        - payload 只含非敏感元数据(workflow 名 / run id / 状态 / 公开错误摘要);
+          webhook url/token 只在 service→channel 内经 reveal 取,绝不落 payload / 日志(R2/R5)。
+        """
+        if job.kind is not JobKind.WORKFLOW_RUN or self._notify_service is None:
+            return
+        try:
+            spec = _workflow_spec_from_payload(job.payload)
+            if not spec.notifications:
+                return
+            payload = RunNotification(
+                workflow_id=_payload_optional_str(job.payload, "workflow_id") or job.id,
+                workflow_name=_payload_optional_str(job.payload, "workflow_name"),
+                project=job.project_id,
+                run_job_id=job.id,
+                trigger=_payload_optional_str(job.payload, "trigger"),
+                status=run_status,
+                finished_at=datetime.now(UTC),
+                error=error,
+            )
+            self._notify_service.notify(spec, payload, run_status)
+        except Exception:
+            # 不打 url / error 明文 / stacktrace(R5):只留 job_id + run_status。
+            logger.warning(
+                "workflow run notify skipped",
+                job_id=job.id,
+                run_status=run_status,
+            )
+
     def _delete_result_spool(self, result_set_id: str) -> None:
         started_at = time.monotonic()
         try:
@@ -1928,6 +1979,9 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
         PostgresJobErrorCodeWriter(engine),
         PostgresCompareRunCatalog(engine),
         PostgresLineageCatalog(engine),
+        # C-9:注入 SecretStore.reveal_secret 作 RevealSecret DI(worker 已持 store 实例;
+        # service 不自开 DB 连接,R1)。webhook url/token 只在发送前一刻经此解密。
+        notify_reveal=secret_store.reveal_secret,
     )
 
 
