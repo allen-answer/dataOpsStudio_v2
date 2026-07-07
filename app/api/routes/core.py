@@ -3696,8 +3696,20 @@ def cancel_workflow_run(
     user = current_user_from(request)
     with services.engine.connect() as conn:
         _require_project_access(conn, project_id, user.id)
-        _workflow_run_row_for_project(conn, project_id=project_id, run_id=run_id)
+        run_row = _workflow_run_row_for_project(conn, project_id=project_id, run_id=run_id)
         children = _workflow_run_children(conn, run_id)
+    run_status = JobStatus(str(run_row["status"]))
+    if run_status in {
+        JobStatus.SUCCESS,
+        JobStatus.FAILED,
+        JobStatus.CANCELLED,
+        JobStatus.TIMEOUT,
+    }:
+        raise ApiError(
+            409,
+            "workflow_run_terminal",
+            "Workflow run has already finished and cannot be cancelled",
+        )
     services.job_backend.request_cancel(run_id)
     for child in children:
         child_status = str(child["status"])
