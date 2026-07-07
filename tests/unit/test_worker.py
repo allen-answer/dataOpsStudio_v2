@@ -1319,10 +1319,12 @@ def _workflow_spec_payload(
 
 
 def _workflow_run_job(spec: dict[str, object] | None = None) -> Job:
+    # run job priority = -1(生产 trigger_workflow_run 一致):子 job = run+1 = 0,
+    # 与交互 sql_query(0)同档,不被压制(backlog Workflow minor #3)
     return _make_job(
         kind=JobKind.WORKFLOW_RUN,
         payload={"workflow_id": "wf-1", "spec": spec or _workflow_spec_payload()},
-    )
+    ).model_copy(update={"priority": -1})
 
 
 def _workflow_runner(backend: _FakeBackend) -> WorkerRunner:
@@ -1375,7 +1377,13 @@ def test_workflow_run_first_step_enqueues_root_child_and_yields() -> None:
     child = backend.enqueued[0]
     assert child.kind is JobKind.SQL_QUERY
     assert child.parent_workflow_run_id == "job-1"
-    assert child.priority == 1  # run priority + 1:子 job 先于 run 被 claim,防饿死
+    # 子 job = run(-1) + 1 = 0:仍高于 run 推进器(-1),防子 job 饿死;
+    # 且与交互 sql_query(priority=0)同档 —— claim 序 = priority DESC,
+    # 交互查询不再被排在工作流子 job 之后(backlog Workflow minor #3)
+    interactive_sql_query_priority = 0
+    assert child.priority == 0
+    assert child.priority == interactive_sql_query_priority
+    assert child.priority > _workflow_run_job().priority
     assert child.timeout_seconds == 60
     assert child.payload["workflow_node_id"] == "n1"
     assert child.datasource_ids == ["ds-9"]

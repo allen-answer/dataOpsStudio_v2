@@ -2228,7 +2228,9 @@ def _build_workflow_child_job(run_job: Job, node: WorkflowNode) -> Job:
         project_id=run_job.project_id,
         datasource_ids=_node_datasource_ids(payload),
         # 子 job 优先级高于 run job:单 worker 串行下保证子 job 先被 claim,
-        # run 推进器不会饿死子 job(claim 序 = priority DESC, created_at ASC)
+        # run 推进器不会饿死子 job(claim 序 = priority DESC, created_at ASC)。
+        # run job = -1(见 trigger_workflow_run),故子 job = 0,与交互 sql_query
+        # 同档,大工作流爆发时不压制交互查询(backlog Workflow minor #3)
         priority=run_job.priority + 1,
         timeout_seconds=node.timeout_seconds,
         resource_profile=ResourceProfile(timeout_seconds=node.timeout_seconds),
