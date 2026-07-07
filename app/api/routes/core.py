@@ -3684,7 +3684,11 @@ def get_workflow_run(
         _require_project_access(conn, project_id, user.id)
         run_row = _workflow_run_row_for_project(conn, project_id=project_id, run_id=run_id)
         children = _workflow_run_children(conn, run_id)
-    return _workflow_run_status_response(run_row, children)
+    return _workflow_run_status_response(
+        run_row,
+        children,
+        default_max_retries=services.workflow_node_default_max_retries,
+    )
 
 
 @router.post(
@@ -3781,10 +3785,14 @@ def _workflow_run_children(conn: Connection, run_id: str) -> list[RowMapping]:
 def _workflow_run_status_response(
     run_row: RowMapping,
     children: list[RowMapping],
+    *,
+    default_max_retries: int,
 ) -> WorkflowRunStatusResponse:
     payload = dict(run_row["payload"] or {})
     run_status = JobStatus(str(run_row["status"]))
-    nodes = _workflow_run_node_items(payload, children, run_status)
+    nodes = _workflow_run_node_items(
+        payload, children, run_status, default_max_retries=default_max_retries
+    )
     return WorkflowRunStatusResponse(
         run_id=str(run_row["id"]),
         workflow_id=_optional_str(payload.get("workflow_id")),
@@ -3802,6 +3810,8 @@ def _workflow_run_node_items(
     payload: dict[str, Any],
     children: list[RowMapping],
     run_status: JobStatus,
+    *,
+    default_max_retries: int,
 ) -> list[WorkflowRunNodeItem]:
     raw_spec = payload.get("spec")
     try:
@@ -3829,6 +3839,7 @@ def _workflow_run_node_items(
         spec,
         snapshots,
         now=now,
+        default_max_retries=default_max_retries,
         when_variables=(
             frozen_variables if frozen_variables is not None else builtin_when_variables(now)
         ),
