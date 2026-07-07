@@ -248,8 +248,10 @@ def _topological_nodes(spec: WorkflowSpec) -> list[WorkflowNode]:
             if in_degree[target] == 0:
                 ready.append(target)
         ready.sort(key=lambda node_id: index_by_id[node_id])
-    # WorkflowSpec 构造期已保证无环;此处防御性断言
-    assert len(order) == len(spec.nodes), "workflow spec must be a DAG"
+    # WorkflowSpec 构造期已保证无环;此处防御性校验(assert 在 -O 下会被剥离,
+    # 用显式 raise 保证优化运行也不会让环悄悄漏过)。与 WorkflowSpec 校验同口径。
+    if len(order) != len(spec.nodes):
+        raise ValueError("cycle_detected: workflow spec must be a DAG")
     return order
 
 

@@ -79,6 +79,7 @@ from app.domain.lineage import (
     LineageParseRequest,
     LineageReport,
     analyze_sql_lineage,
+    build_lineage_edge_rows,
     build_semantic_view,
     lineage_sql_hash,
     schema_from_metadata_cache_rows,
@@ -1914,46 +1915,13 @@ class PostgresLineageCatalog:
         now = datetime.now(UTC)
         parse_summary = dict(report.report or {})
         parse_summary["parser_version"] = LINEAGE_PARSER_VERSION
-        table_rows = [
-            {
-                "id": str(uuid4()),
-                "run_id": run_id,
-                "project_id": project_id,
-                "source_table": str(edge["source_table"]),
-                "target_table": str(edge["target_table"]),
-                "edge_kind": "table",
-                "inferred": False,
-                "inference_status": "confirmed",
-                "confidence": 1.0,
-                "sql_hash": sql_hash,
-            }
-            for edge in report.graph_edges
-            if edge.get("source_table") and edge.get("target_table")
-        ]
-        column_rows = [
-            {
-                "id": str(uuid4()),
-                "run_id": run_id,
-                "project_id": project_id,
-                "source_table": str(mapping["source_table"]),
-                "source_column": str(mapping["source_column"]),
-                "target_table": str(mapping["target_table"]),
-                "target_column": str(mapping["target_column"]),
-                "transformation": str(mapping.get("transformation") or "DIRECT"),
-                "transformation_subtype": str(mapping.get("transformation_subtype") or "DIRECT"),
-                "inferred": False,
-                "inference_status": "confirmed",
-                "confidence": 1.0,
-                "sql_hash": sql_hash,
-            }
-            for mapping in report.insert_mappings
-            if (
-                mapping.get("source_table")
-                and mapping.get("source_column")
-                and mapping.get("target_table")
-                and mapping.get("target_column")
-            )
-        ]
+        table_rows, column_rows = build_lineage_edge_rows(
+            run_id=run_id,
+            project_id=project_id,
+            sql_hash=sql_hash,
+            graph_edges=report.graph_edges,
+            insert_mappings=report.insert_mappings,
+        )
         with self._engine.begin() as conn:
             conn.execute(
                 insert(lineage_runs).values(

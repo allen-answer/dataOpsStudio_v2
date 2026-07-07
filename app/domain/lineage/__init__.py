@@ -1,5 +1,6 @@
 from app.domain.lineage.cache import LINEAGE_PARSER_VERSION, lineage_sql_hash
 from app.domain.lineage.dialects import register_lineage_dialects
+from app.domain.lineage.edge_rows import build_lineage_edge_rows
 from app.domain.lineage.models import (
     InsertMapping,
     LineageParseError,
@@ -40,6 +41,7 @@ __all__ = [
     "TransformationKind",
     "TransformationSubtype",
     "analyze_sql_lineage",
+    "build_lineage_edge_rows",
     "build_semantic_view",
     "lineage_sql_hash",
     "register_lineage_dialects",
