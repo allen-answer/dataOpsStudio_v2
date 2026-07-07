@@ -452,8 +452,8 @@ def test_r4_application_secret_kinds_exclude_bootstrap() -> None:
         "license_file",
     }
     assert set(APPLICATION_SECRET_KINDS).isdisjoint(forbidden_bootstrap)
-    # 必须正好 6 种,与 app.domain.secret.SecretKind 对齐
-    assert len(APPLICATION_SECRET_KINDS) == 6
+    # 必须正好 7 种,与 app.domain.secret.SecretKind 对齐
+    assert len(APPLICATION_SECRET_KINDS) == 7
 
 
 def test_secret_refs_check_constraint_exists() -> None:

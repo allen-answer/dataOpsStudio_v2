@@ -7,9 +7,11 @@ monkeypatch urllib(不真发网络):断言 webhook POST body / 企微 markdown �
 from __future__ import annotations
 
 import json
+import smtplib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from email.message import EmailMessage
 
 import pytest
 
@@ -17,6 +19,7 @@ from app.domain.notify import NotifyResult, NotifyTarget, RunNotification
 from app.domain.secret import SecretKind, SecretRef
 from app.domain.workflow import WorkflowSpec
 from app.services.notify.channels import (
+    EmailChannel,
     WebhookChannel,
     WecomChannel,
     _classify_error,
@@ -174,6 +177,158 @@ def test_classify_error_never_leaks_url() -> None:
     assert classified == "http_error status=403"
 
 
+# ------------------------------------------------------------ email(SMTP)渠道
+
+SMTP_PASSWORD = "smtp-secret-pw-456"  # 测试常量,断言绝不外泄(R5)
+
+
+class _RecordingRevealPassword:
+    """stub reveal:记录被调的 SecretRef,返回 SMTP 明文密码。"""
+
+    def __init__(self) -> None:
+        self.calls: list[SecretRef] = []
+
+    def __call__(self, ref: SecretRef) -> str:
+        self.calls.append(ref)
+        return SMTP_PASSWORD
+
+
+@dataclass
+class _SMTPRecorder:
+    host: str | None = None
+    port: int | None = None
+    timeout: int | None = None
+    starttls_called: bool = False
+    has_starttls: bool = True
+    login: tuple[str, str] | None = None
+    sent: list[EmailMessage] = field(default_factory=list)
+    raise_on_send: BaseException | None = None
+
+
+class _FakeSMTP:
+    """充当 smtplib.SMTP:记录连接 / login / send;可配置发送时抛异常。"""
+
+    def __init__(
+        self, rec: _SMTPRecorder, host: str, port: int, timeout: int | None = None
+    ) -> None:
+        self._rec = rec
+        rec.host = host
+        rec.port = port
+        rec.timeout = timeout
+
+    def __enter__(self) -> _FakeSMTP:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def ehlo(self) -> None:
+        return None
+
+    def has_extn(self, name: str) -> bool:
+        return name == "starttls" and self._rec.has_starttls
+
+    def starttls(self) -> None:
+        self._rec.starttls_called = True
+
+    def login(self, user: str, password: str) -> None:
+        self._rec.login = (user, password)
+
+    def send_message(self, message: EmailMessage) -> None:
+        if self._rec.raise_on_send is not None:
+            raise self._rec.raise_on_send
+        self._rec.sent.append(message)
+
+
+@pytest.fixture
+def fake_smtp(monkeypatch: pytest.MonkeyPatch) -> _SMTPRecorder:
+    rec = _SMTPRecorder()
+
+    def factory(host: str, port: int, timeout: int | None = None) -> _FakeSMTP:
+        return _FakeSMTP(rec, host, port, timeout=timeout)
+
+    monkeypatch.setattr(smtplib, "SMTP", factory)
+    return rec
+
+
+def make_email_target(**overrides: object) -> NotifyTarget:
+    payload: dict[str, object] = {
+        "id": "e1",
+        "channel": "email",
+        "smtp_host": "smtp.example.com",
+        "smtp_port": 2525,
+        "smtp_from": "ops@example.com",
+        "smtp_to": ["team@example.com", "lead@example.com"],
+        "smtp_user": "ops",
+        "password_secret_ref": "pw-ref-1",
+    }
+    payload.update(overrides)
+    return NotifyTarget.model_validate(payload)
+
+
+def test_email_sends_message(fake_smtp: _SMTPRecorder) -> None:
+    reveal = _RecordingRevealPassword()
+    result = EmailChannel().send(make_email_target(), make_payload(), reveal=reveal)
+    assert result.ok is True
+    assert result.channel == "email"
+    # 连接到配置的 host/port,超时透传
+    assert fake_smtp.host == "smtp.example.com"
+    assert fake_smtp.port == 2525
+    # user + 明文密码经 login;密码来自 reveal 回调(R2)
+    assert fake_smtp.login == ("ops", SMTP_PASSWORD)
+    assert len(reveal.calls) == 1
+    assert reveal.calls[0] == SecretRef(ref="pw-ref-1", kind=SecretKind.SMTP_PASSWORD)
+    # 邮件头 + 正文含 workflow / status / error
+    assert len(fake_smtp.sent) == 1
+    message = fake_smtp.sent[0]
+    assert message["From"] == "ops@example.com"
+    assert message["To"] == "team@example.com, lead@example.com"
+    assert "failed" in message["Subject"]
+    assert "nightly" in message["Subject"]
+    body = message.get_content()
+    assert "Workflow failed: nightly" in body
+    assert "run: job-9" in body
+    assert "error: boom" in body
+
+
+def test_email_timeout_passed_through(fake_smtp: _SMTPRecorder) -> None:
+    EmailChannel().send(
+        make_email_target(timeout_seconds=9), make_payload(), reveal=_RecordingRevealPassword()
+    )
+    assert fake_smtp.timeout == 9
+
+
+def test_email_no_password_skips_login(fake_smtp: _SMTPRecorder) -> None:
+    reveal = _RecordingRevealPassword()
+    target = make_email_target(smtp_user=None, password_secret_ref=None)
+    result = EmailChannel().send(target, make_payload(), reveal=reveal)
+    assert result.ok is True
+    assert fake_smtp.login is None  # 无 user/密码 → 匿名投递,不 login
+    assert reveal.calls == []  # 无 ref → 不 reveal
+    assert len(fake_smtp.sent) == 1
+
+
+def test_email_failure_swallowed_no_password_leak(fake_smtp: _SMTPRecorder) -> None:
+    # 发送时 SMTP 服务器返回错误码 —— 断言不抛、密码不外泄(R5)
+    fake_smtp.raise_on_send = smtplib.SMTPResponseException(535, "auth failed")
+    reveal = _RecordingRevealPassword()
+    result = EmailChannel().send(make_email_target(), make_payload(), reveal=reveal)
+    assert result.ok is False
+    assert result.error == "smtp_error status=535"
+    # ★ 即使密码已被 reveal,也绝不出现在返回结果的任何字符串里
+    assert SMTP_PASSWORD not in str(result.model_dump())
+    assert SMTP_PASSWORD not in (result.error or "")
+
+
+def test_email_generic_exception_swallowed(fake_smtp: _SMTPRecorder) -> None:
+    fake_smtp.raise_on_send = smtplib.SMTPException("boom")
+    result = EmailChannel().send(
+        make_email_target(), make_payload(), reveal=_RecordingRevealPassword()
+    )
+    assert result.ok is False
+    assert result.error == "smtp_error SMTPException"
+
+
 # ------------------------------------------------------------ WorkflowNotifyService
 
 
@@ -252,4 +407,4 @@ def test_service_unknown_channel_recorded(fake_urlopen: _FakeUrlopen) -> None:
 
 def test_default_channels_registry() -> None:
     channels = default_channels()
-    assert set(channels) == {"webhook", "wecom"}
+    assert set(channels) == {"webhook", "wecom", "email"}

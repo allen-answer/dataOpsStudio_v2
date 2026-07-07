@@ -59,6 +59,7 @@ APPLICATION_SECRET_KINDS: tuple[str, ...] = (
     "oauth_token",
     "webhook_secret",
     "signed_url_secret",
+    "smtp_password",
 )
 
 

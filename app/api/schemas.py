@@ -1019,32 +1019,63 @@ class WorkflowListItem(BaseModel):
 
 
 class NotifyTargetCreateRequest(BaseModel):
-    """新增通知目标:``url`` 是整条明文 webhook / 企微地址(含 token)。"""
+    """新增通知目标。
+
+    webhook / 企微:``url`` 是整条明文地址(含 token)→ store_secret 换 ref。
+    email:``smtp_*`` 连接信息(非敏感)+ 可选 ``smtp_password``(明文,仅 store_secret
+    用,★ 绝不回显 / 绝不入库,R2/R5)。
+    """
 
     channel: NotifyChannelName
-    url: str = Field(min_length=1)
+    # webhook / wecom
+    url: str | None = Field(default=None, min_length=1)
+    # email(SMTP)
+    smtp_host: str | None = None
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_from: str | None = None
+    smtp_to: list[str] = Field(default_factory=list)
+    smtp_user: str | None = None
+    smtp_password: str | None = Field(default=None, min_length=1)
     events: list[NotifyEvent] | None = None
     enabled: bool = True
     timeout_seconds: int = Field(default=5, ge=1, le=60)
 
 
 class NotifyTargetUpdateRequest(BaseModel):
-    """更新通知目标:仅传要改的字段;传 ``url`` 则重新 store_secret 换 ref。"""
+    """更新通知目标:仅传要改的字段。
+
+    传 ``url`` 则重新 store_secret 换 ref;传 ``smtp_password`` 则重新 store_secret
+    换 SMTP 密码 ref(旧 secret 删除)。
+    """
 
     url: str | None = Field(default=None, min_length=1)
+    smtp_host: str | None = None
+    smtp_port: int | None = Field(default=None, ge=1, le=65535)
+    smtp_from: str | None = None
+    smtp_to: list[str] | None = None
+    smtp_user: str | None = None
+    smtp_password: str | None = Field(default=None, min_length=1)
     events: list[NotifyEvent] | None = None
     enabled: bool | None = None
     timeout_seconds: int | None = Field(default=None, ge=1, le=60)
 
 
 class NotifyTargetResponse(BaseModel):
-    """通知目标视图 —— ★ 无 url 字段(R5:绝不回显明文 url / token)。"""
+    """通知目标视图 —— ★ 无 url / 密码字段(R5:绝不回显明文 url / token / 密码)。
+
+    email 的连接信息(host/port/from/to/user)非敏感,回显便于配置查看。
+    """
 
     id: str
     channel: str
     events: list[str]
     enabled: bool
     timeout_seconds: int
+    smtp_host: str | None = None
+    smtp_port: int | None = None
+    smtp_from: str | None = None
+    smtp_to: list[str] | None = None
+    smtp_user: str | None = None
 
 
 # ── Workflow run(2.4.0 PR-4:手动触发 / 状态查询 / 取消;cron tick 属 PR-4b)──

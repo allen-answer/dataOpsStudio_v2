@@ -40,7 +40,7 @@ def test_defaults_events_failed_and_enabled() -> None:
     assert target.timeout_seconds == 5
 
 
-@pytest.mark.parametrize("channel", ["email", "slack", "sms", "", "Webhook"])
+@pytest.mark.parametrize("channel", ["slack", "sms", "", "Webhook"])
 def test_invalid_channel_rejected(channel: str) -> None:
     with pytest.raises(ValidationError):
         make_target(channel=channel)
@@ -49,6 +49,59 @@ def test_invalid_channel_rejected(channel: str) -> None:
 @pytest.mark.parametrize("channel", ["webhook", "wecom"])
 def test_supported_channels_accepted(channel: str) -> None:
     assert make_target(channel=channel).channel == channel
+
+
+# ------------------------------------------------------------ email(SMTP)渠道校验
+
+
+def make_email_target(**overrides: object) -> NotifyTarget:
+    payload: dict[str, object] = {
+        "id": "e1",
+        "channel": "email",
+        "smtp_host": "smtp.example.com",
+        "smtp_from": "ops@example.com",
+        "smtp_to": ["team@example.com"],
+        "password_secret_ref": "pw-ref-1",
+    }
+    payload.update(overrides)
+    return NotifyTarget.model_validate(payload)
+
+
+def test_email_target_accepted_with_required_fields() -> None:
+    target = make_email_target()
+    assert target.channel == "email"
+    assert target.smtp_host == "smtp.example.com"
+    assert target.smtp_port == 587  # 默认提交端口
+    assert target.password_secret_ref == "pw-ref-1"
+    # ★ R2:模型无明文密码字段,只有 password_secret_ref
+    assert "password" not in NotifyTarget.model_fields
+    assert "password_secret_ref" in NotifyTarget.model_fields
+
+
+def test_email_target_does_not_require_url_secret_ref() -> None:
+    # email 目标不需要 url_secret_ref(webhook/wecom 才要)
+    assert make_email_target().url_secret_ref is None
+
+
+@pytest.mark.parametrize("missing", ["smtp_host", "smtp_from", "smtp_to"])
+def test_email_target_missing_required_field_rejected(missing: str) -> None:
+    overrides: dict[str, object] = {missing: [] if missing == "smtp_to" else "  "}
+    with pytest.raises(ValidationError, match="invalid_email_target"):
+        make_email_target(**overrides)
+
+
+def test_email_password_optional_for_anonymous_relay() -> None:
+    # 无密码(匿名 relay)仍是合法 email 目标
+    target = make_email_target(password_secret_ref=None)
+    assert target.password_secret_ref is None
+
+
+def test_webhook_target_unaffected_by_email_fields() -> None:
+    # webhook 目标不需要 email 字段,仍要求 url_secret_ref
+    target = make_target(channel="webhook")
+    assert target.smtp_host is None
+    with pytest.raises(ValidationError, match="invalid_url_secret_ref"):
+        make_target(channel="webhook", url_secret_ref=None)
 
 
 def test_invalid_event_rejected() -> None:

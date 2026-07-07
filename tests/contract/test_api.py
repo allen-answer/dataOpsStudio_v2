@@ -3335,6 +3335,7 @@ def test_workflow_delete_contract_removes_definition() -> None:
 #   永远只留 SecretRef(R2/R5)。含 token 的固定 url 供各测试断言"明文不外泄"。
 _NOTIFY_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret-token-xyz"
 _NOTIFY_URL_ROTATED = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=rotated-token-abc"
+_SMTP_PASSWORD = "smtp-plaintext-pw-789"  # 断言绝不外泄(R2/R5)
 
 
 def _workflow_row_with_notification(
@@ -3418,6 +3419,51 @@ def test_workflow_notify_create_unknown_workflow_returns_404_without_orphan_secr
     assert response.json()["error"] == "not_found"
     # ★ 校验失败先于 store_secret:不留孤儿 secret
     assert secret_store.stored == []
+
+
+def test_workflow_notify_create_email_stores_password_ref_and_hides_it() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row()])
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows/wf-1/notifications",
+        headers=_auth_headers(),
+        json_body={
+            "channel": "email",
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 2525,
+            "smtp_from": "ops@example.com",
+            "smtp_to": ["team@example.com"],
+            "smtp_user": "ops",
+            "smtp_password": _SMTP_PASSWORD,
+            "events": ["failed"],
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["channel"] == "email"
+    assert payload["smtp_host"] == "smtp.example.com"
+    assert payload["smtp_to"] == ["team@example.com"]
+    # ★ R2/R5:响应绝不回显明文密码,也无任何 password 字段
+    assert "smtp_password" not in payload
+    assert "password" not in payload
+    assert _SMTP_PASSWORD not in response.body.decode("utf-8")
+    # R2:明文密码进 SecretStore;配置只留 password_secret_ref
+    assert secret_store.stored == [_SMTP_PASSWORD]
+    dag = _persisted_workflow_dag(engine)
+    target = dag["notifications"][0]
+    assert target["password_secret_ref"] == "secret-new"
+    assert target["url_secret_ref"] is None
+    assert "smtp_password" not in target
+    assert _SMTP_PASSWORD not in json.dumps(dag)
+    assert not any(_SMTP_PASSWORD in statement for statement in engine.statements)
+    # 审计只带 target_id / channel,无密码
+    add_audits = [a for a in services.audits if a["action"] == "workflow_notify_add"]
+    assert add_audits
+    assert _SMTP_PASSWORD not in json.dumps(add_audits, default=str)
 
 
 def test_workflow_notify_update_replaces_ref_and_deletes_old() -> None:
