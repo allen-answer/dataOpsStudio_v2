@@ -2424,6 +2424,7 @@ def test_lineage_batch_export_writes_xlsx_token_and_audit() -> None:
 
     workbook = load_workbook(io.BytesIO(content), read_only=True)
     assert workbook.sheetnames == [
+        # A 组
         "流程总览",
         "脚本清单",
         "跨脚本依赖",
@@ -2431,6 +2432,14 @@ def test_lineage_batch_export_writes_xlsx_token_and_audit() -> None:
         "流程图分组",
         "表角色",
         "目标整合",
+        # B 组(逐文件明细,PR2)
+        "过程段明细",
+        "语句明细",
+        "解析失败明细",
+        "动态SQL明细",
+        "脚本警告",
+        "字段映射明细",
+        "表级数据流",
     ]
 
     assert any(statement.startswith("INSERT INTO jobs") for statement in engine.statements)

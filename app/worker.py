@@ -125,6 +125,41 @@ _LINEAGE_BATCH_EXTENSIONS = (".sql", ".txt")
 # 任务 run_limits.max_rows 若给出则以其为准,否则用本默认;超限直接 failed(不截断)。
 _FILE_COMPARE_DEFAULT_MAX_ROWS = 1_000_000
 
+# B 组明细持久化封顶(L-5+ PR2):富明细叠加大批量会撑爆 report JSON,
+# 必须双重封顶——每文件每类明细行上限 + 全局总行预算;超限截断并打 details_truncated
+# 标记 + 结构化 log 丢弃了什么(不静默膨胀 / 不静默截断)。
+_LINEAGE_BATCH_DETAIL_MAX_ROWS_PER_FILE = 2000
+_LINEAGE_BATCH_DETAIL_MAX_TOTAL_ROWS = 50_000
+# 单明细字段字符上限(过程段 sql / 动态 SQL 片段等可能很长):JSON 侧先截断,
+# 与 exporter _safe_text 的 Excel 单元格截断互补,双保险防 JSON 膨胀。
+_LINEAGE_BATCH_DETAIL_MAX_CELL_CHARS = 4000
+# 每类明细持久化的键投影(只留 B 组 sheet 用得到的列,砍冗余降体积);
+# procedure_segments / dynamic_sql_segments 形态未定(2.0 解析器暂未产出)→ 原样透传。
+_LINEAGE_BATCH_DETAIL_KINDS = (
+    "procedure_segments",
+    "statements",
+    "parse_errors",
+    "dynamic_sql_segments",
+    "warnings",
+    "insert_mappings",
+    "graph_edges",
+)
+_LINEAGE_BATCH_DETAIL_PROJECTIONS: dict[str, tuple[str, ...]] = {
+    "statements": ("index", "type"),
+    "parse_errors": ("statement_index", "error_type", "message", "statement_type", "unsupported"),
+    "warnings": ("code", "message", "statement_index"),
+    "insert_mappings": (
+        "target_table",
+        "target_column",
+        "source_table",
+        "source_column",
+        "transformation",
+        "transformation_subtype",
+        "statement_index",
+    ),
+    "graph_edges": ("source_table", "target_table", "statement_index", "inferred"),
+}
+
 
 class JobCancelled(RuntimeError):
     """Job was cooperatively cancelled."""
@@ -1164,8 +1199,29 @@ class WorkerRunner:
             if isinstance(item.get("_report"), LineageReport)
         ]
         semantic_view = build_semantic_view(semantic_reports)
+        # L-5+ PR2:序列化前把每文件富明细(B 组 sheet 数据源)投影进 files[].details,
+        # 受双重封顶(每文件行上限 + 全局行预算);_report 内存对象在此 pop,不进 JSON。
+        detail_budget = _LINEAGE_BATCH_DETAIL_MAX_TOTAL_ROWS
+        details_dropped: list[dict[str, Any]] = []
         for item in files_report:
-            item.pop("_report", None)
+            report_obj = item.pop("_report", None)
+            if not isinstance(report_obj, LineageReport):
+                continue
+            projected, detail_budget, dropped = _project_lineage_batch_details(
+                report_obj, detail_budget
+            )
+            item["details"] = projected
+            if dropped:
+                details_dropped.append({"file": item.get("source_ref"), "dropped": dropped})
+        if details_dropped:
+            # 明确 log 丢弃了什么(不静默截断):哪些文件哪类明细从多少截到多少。
+            logger.warning(
+                "lineage_batch_details_truncated",
+                job_id=job.id,
+                total_row_budget=_LINEAGE_BATCH_DETAIL_MAX_TOTAL_ROWS,
+                budget_remaining=detail_budget,
+                truncated_files=details_dropped,
+            )
         report_payload = {
             "file_count": len(files_report),
             "parsed": parsed,
@@ -1180,6 +1236,8 @@ class WorkerRunner:
             "files": files_report,
             "script_edges": script_edges,
             "semantic_view": semantic_view.model_dump(mode="json"),
+            # 任一文件任一类明细发生截断即置真,供导出 / 前端提示"明细不完整"。
+            "details_truncated": bool(details_dropped),
         }
         artifact_ref = self._result_store.put_artifact(
             job.id,
@@ -2056,6 +2114,51 @@ def _decode_sql_bytes(raw: bytes) -> str | None:
         except UnicodeDecodeError:
             continue
     return None
+
+
+def _cap_lineage_detail_value(value: Any) -> Any:
+    """单明细字段封顶:超长字符串截断(防 report JSON 被大 SQL 撑爆)。非字符串原样。"""
+    if isinstance(value, str) and len(value) > _LINEAGE_BATCH_DETAIL_MAX_CELL_CHARS:
+        return value[:_LINEAGE_BATCH_DETAIL_MAX_CELL_CHARS] + "…(truncated)"
+    return value
+
+
+def _project_lineage_detail_row(kind: str, row: Any) -> dict[str, Any]:
+    """按 kind 投影一行明细:已知形态只留 B 组 sheet 用到的键;未知形态原样透传。
+
+    两路都过 :func:`_cap_lineage_detail_value` 做单字段字符封顶。
+    """
+    if not isinstance(row, dict):
+        return {}
+    keys = _LINEAGE_BATCH_DETAIL_PROJECTIONS.get(kind)
+    items = ((key, row.get(key)) for key in keys) if keys else row.items()
+    return {key: _cap_lineage_detail_value(value) for key, value in items}
+
+
+def _project_lineage_batch_details(
+    report: LineageReport, budget: int
+) -> tuple[dict[str, Any], int, list[str]]:
+    """把一个文件的富明细投影成受封顶的 details dict(B 组 sheet 数据源)。
+
+    双重封顶:每类明细 ≤ 每文件行上限,且全类合计不超剩余全局行预算。
+    返回 ``(details, 剩余全局预算, 丢弃说明列表)``——details 含被截断类的
+    ``{kind}_truncated: True`` 标记;丢弃说明形如 ``"insert_mappings:5000->2000"``
+    供调用方 log。
+    """
+    details: dict[str, Any] = {}
+    dropped: list[str] = []
+    for kind in _LINEAGE_BATCH_DETAIL_KINDS:
+        source = list(getattr(report, kind, None) or [])
+        total = len(source)
+        # 单类上限 = min(每文件上限, 剩余全局预算);预算耗尽则该类只出 0 行。
+        cap = min(_LINEAGE_BATCH_DETAIL_MAX_ROWS_PER_FILE, max(budget, 0))
+        kept = source[:cap]
+        details[kind] = [_project_lineage_detail_row(kind, row) for row in kept]
+        if len(kept) < total:
+            details[f"{kind}_truncated"] = True
+            dropped.append(f"{kind}:{total}->{len(kept)}")
+        budget -= len(kept)
+    return details, budget, dropped
 
 
 def _lineage_batch_script_edges(files_report: list[dict[str, Any]]) -> list[dict[str, Any]]:
