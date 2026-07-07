@@ -28,6 +28,7 @@ from app.domain.lineage.segments import (
     extract_dynamic_sql_segments,
     extract_procedure_segments,
 )
+from app.domain.lineage.supplemental_edges import build_supplemental_edges
 from app.domain.lineage.variables import all_plsql_local_names, script_variables
 
 LineageSchema = dict[str, dict[str, dict[str, str]]]
@@ -98,6 +99,9 @@ def analyze_sql_lineage(request: LineageParseRequest) -> LineageReport:
     _emit_dynamic_sql_warnings(report, dynamic_sql_segments)
     if local_names:
         _drop_local_name_pseudo_tables(report, local_names)
+    # L-3 PR2:游标 / UDF / BULK COLLECT / TRIGGER 补链边(confidence=medium)。在局部
+    # 变量假表过滤之后追加,与确定性边按 (source, target) 去重,补链不覆盖确定性边。
+    report.graph_edges.extend(build_supplemental_edges(procedure_segments, report.graph_edges))
     report.variables = variables
     report.dynamic_sql_segments = dynamic_sql_segments
     report.dynamic_sql_count = len(dynamic_sql_segments)
