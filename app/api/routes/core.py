@@ -2432,6 +2432,7 @@ def create_compare_run_export(
             "bucket_result_set_ids": bucket_spools,
             "format": body.format,
             "filename": filename,
+            "export_max_rows": _compare_run_export_max_rows(services, run_row),
         },
     )
     services.job_backend.enqueue(job)
@@ -6188,6 +6189,27 @@ def _require_exportable_source(row: RowMapping) -> None:
 def _require_compare_run_exportable(row: RowMapping) -> None:
     if JobStatus(str(row["status"])) is not JobStatus.SUCCESS:
         raise ApiError(409, "compare_run_not_successful", "Compare run must complete before export")
+
+
+def _compare_run_export_max_rows(services: ApiServices, run_row: RowMapping) -> int | None:
+    """读取关联 compare_task 的 run_limits.export_max_rows,供导出 job cap 每 sheet 行数。
+
+    task 已删(task_id SET NULL)或未配置该项时返回 None,worker 侧回退到 Excel 单
+    sheet 硬顶,保证不会产出超过 1,048,576 行的非法 xlsx。
+    """
+    task_id = run_row.get("task_id")
+    if not task_id:
+        return None
+    with services.engine.connect() as conn:
+        limits = conn.execute(
+            select(compare_tasks.c.run_limits).where(compare_tasks.c.id == task_id)
+        ).scalar_one_or_none()
+    if not isinstance(limits, dict):
+        return None
+    value = limits.get("export_max_rows")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
 
 
 def _enforce_export_rate_limit(services: ApiServices, user_id: str) -> None:

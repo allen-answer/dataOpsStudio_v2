@@ -29,7 +29,12 @@ from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import SecretKind, SecretRef
 from app.services.notify import WorkflowNotifyService
-from app.worker import WorkerRunner, WorkerRunnerConfig
+from app.worker import (
+    _EXCEL_MAX_DATA_ROWS_PER_SHEET,
+    WorkerRunner,
+    WorkerRunnerConfig,
+    _compare_export_row_cap,
+)
 
 
 def test_worker_runs_sql_query_to_spool_and_completes() -> None:
@@ -530,6 +535,68 @@ def test_worker_runs_compare_result_export_to_four_sheet_workbook() -> None:
     assert "=cmd" in sheet1_xml
     assert "pk" in sheet4_xml
     assert backend.completed[0][1].metadata["compare_run_id"] == "run-1"
+    assert backend.failed == []
+
+
+def test_compare_export_row_cap_clamps_to_excel_limit_and_honors_smaller() -> None:
+    # export_max_rows 高于 Excel 单 sheet 硬顶 → 被 clamp 到硬顶。
+    assert (
+        _compare_export_row_cap({"export_max_rows": _EXCEL_MAX_DATA_ROWS_PER_SHEET + 5000})
+        == _EXCEL_MAX_DATA_ROWS_PER_SHEET
+    )
+    # export_max_rows 低于硬顶 → 以 export_max_rows 为准。
+    assert _compare_export_row_cap({"export_max_rows": 42}) == 42
+    # 缺省 / 非正 / 非整数 → 回退到 Excel 硬顶。
+    assert _compare_export_row_cap({}) == _EXCEL_MAX_DATA_ROWS_PER_SHEET
+    assert _compare_export_row_cap({"export_max_rows": None}) == _EXCEL_MAX_DATA_ROWS_PER_SHEET
+    assert _compare_export_row_cap({"export_max_rows": 0}) == _EXCEL_MAX_DATA_ROWS_PER_SHEET
+    assert _compare_export_row_cap({"export_max_rows": -3}) == _EXCEL_MAX_DATA_ROWS_PER_SHEET
+    assert _compare_export_row_cap({"export_max_rows": True}) == _EXCEL_MAX_DATA_ROWS_PER_SHEET
+
+
+def test_worker_compare_result_export_caps_rows_per_sheet() -> None:
+    bucket_spools = {
+        "only_source": "rs-only-source",
+        "only_target": "rs-only-target",
+        "diff": "rs-diff",
+        "same": "rs-same",
+    }
+    job = _make_job(
+        kind=JobKind.RESULT_EXPORT,
+        payload={
+            "compare_run_id": "run-1",
+            "bucket_result_set_ids": bucket_spools,
+            "format": "excel",
+            "filename": "run-1.xlsx",
+            "export_max_rows": 2,
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    for result_set_id in bucket_spools.values():
+        result_store.columns_by_result_set[result_set_id] = compare_result_columns()
+    # 5 行落在一个 sheet;export_max_rows=2 应只导出前 2 行(+ 表头共 3 行)。
+    result_store.rows_by_result_set["rs-only-source"] = [
+        encode_compare_result_row(pk={"id": n}, source={"id": n}, target=None, cells=[])
+        for n in range(1, 6)
+    ]
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is True
+
+    artifact = result_store.export_artifacts[("job-1", "run-1.xlsx")]
+    with zipfile.ZipFile(io.BytesIO(artifact)) as workbook:
+        sheet1_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+    # 表头 r="1" + 2 条数据 r="2"/r="3";第 3 条数据 r="4" 被 cap 掉。
+    assert sheet1_xml.count("<row ") == 3
+    assert 'r="3"' in sheet1_xml
+    assert 'r="4"' not in sheet1_xml
     assert backend.failed == []
 
 
