@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from typing import Any, cast
 
 import pytest
@@ -39,7 +40,7 @@ def test_capabilities_enable_execution_and_metadata_not_compare_hash() -> None:
     assert caps.list_tables is True
     assert caps.list_columns is True
     assert caps.list_indexes is True
-    assert caps.server_side_cancel is False
+    assert caps.server_side_cancel is True
     assert caps.get_table_ddl is False
     assert caps.compare_db_hash is False
 
@@ -163,6 +164,65 @@ def test_soft_cancel_raises_on_safe_point_and_closes_connection() -> None:
     with pytest.raises(QueryCancelledError):
         next(iterator)
     assert fake_pg.connections[0].closed is True
+
+
+def test_server_side_cancel_invokes_cancel_safe_during_execute() -> None:
+    # execute() 阻塞窗口内看门狗命中 cancel_check → 调 cancel_safe() 真取消,
+    # execute 抛错收敛为 QueryCancelledError,连接被关闭。
+    conn = _CancelAwareConnection()
+    adapter = PostgresqlAdapter(
+        _conn_info(),
+        cast(SecretStore, _SecretStore("pwd")),
+        psycopg_module=_CancelPsycopg(conn),
+        cancel_check=lambda: True,
+        statement_timeout_seconds=0,
+        cancel_poll_interval_seconds=0.01,
+    )
+
+    with pytest.raises(QueryCancelledError):
+        list(adapter.execute_select("SELECT n FROM t", {}))
+
+    assert conn.cancel_safe_calls == 1
+    assert conn.cancel_calls == 0
+    assert conn.closed is True
+
+
+def test_server_side_cancel_falls_back_to_legacy_cancel() -> None:
+    # cancel_safe 不可用(抛错)时回退 legacy cancel(),仍真取消在飞查询。
+    conn = _CancelAwareConnection(cancel_safe_raises=True)
+    adapter = PostgresqlAdapter(
+        _conn_info(),
+        cast(SecretStore, _SecretStore("pwd")),
+        psycopg_module=_CancelPsycopg(conn),
+        cancel_check=lambda: True,
+        statement_timeout_seconds=0,
+        cancel_poll_interval_seconds=0.01,
+    )
+
+    with pytest.raises(QueryCancelledError):
+        list(adapter.execute_select("SELECT n FROM t", {}))
+
+    assert conn.cancel_safe_calls == 1
+    assert conn.cancel_calls == 1
+    assert conn.closed is True
+
+
+def test_no_cancel_check_skips_watcher_and_streams() -> None:
+    # 无 cancel_check 时不起看门狗、不触发 cancel_safe,正常流式返回。
+    conn = _CancelAwareConnection(blocking=False)
+    adapter = PostgresqlAdapter(
+        _conn_info(),
+        cast(SecretStore, _SecretStore("pwd")),
+        psycopg_module=_CancelPsycopg(conn),
+        statement_timeout_seconds=0,
+    )
+
+    rows = list(adapter.execute_select("SELECT n FROM t", {}))
+
+    assert rows == [Row(values=[7])]
+    assert conn.cancel_safe_calls == 0
+    assert conn.cancel_calls == 0
+    assert conn.closed is True
 
 
 def test_unsupported_operations_raise_not_implemented() -> None:
@@ -418,6 +478,76 @@ class _FakeCursor:
         rows = self._rows[self._offset :]
         self._offset = len(self._rows)
         return rows
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeQueryCanceled(Exception):
+    """模拟 psycopg 在飞查询被服务端取消时抛出的错误(sqlstate 57014)。"""
+
+    sqlstate = "57014"
+
+
+class _CancelPsycopg:
+    def __init__(self, conn: _CancelAwareConnection) -> None:
+        self._conn = conn
+
+    def connect(self, **kwargs: Any) -> _CancelAwareConnection:
+        return self._conn
+
+
+class _BlockingCursor:
+    def __init__(self, cancel_event: threading.Event, *, blocking: bool) -> None:
+        self.closed = False
+        self.executed_sql = ""
+        self.description: tuple[tuple[Any, ...], ...] = (("n", 23),)
+        self._cancel_event = cancel_event
+        self._blocking = blocking
+        self._rows: list[tuple[Any, ...]] = [(7,)]
+        self._offset = 0
+
+    def execute(self, sql: str, params: object = None) -> None:
+        self.executed_sql = sql
+        if self._blocking:
+            # 模拟长查询:阻塞在 execute() 里,直到服务端取消到达
+            triggered = self._cancel_event.wait(timeout=5.0)
+            if triggered:
+                raise _FakeQueryCanceled("canceling statement due to user request")
+
+    def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
+        batch = self._rows[self._offset : self._offset + size]
+        self._offset += len(batch)
+        return batch
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _CancelAwareConnection:
+    def __init__(self, *, cancel_safe_raises: bool = False, blocking: bool = True) -> None:
+        self.closed = False
+        self.cancel_safe_calls = 0
+        self.cancel_calls = 0
+        self.cursors: list[_BlockingCursor] = []
+        self._event = threading.Event()
+        self._cancel_safe_raises = cancel_safe_raises
+        self._blocking = blocking
+
+    def cursor(self) -> _BlockingCursor:
+        cur = _BlockingCursor(self._event, blocking=self._blocking)
+        self.cursors.append(cur)
+        return cur
+
+    def cancel_safe(self) -> None:
+        self.cancel_safe_calls += 1
+        if self._cancel_safe_raises:
+            raise RuntimeError("cancel_safe unavailable")
+        self._event.set()
+
+    def cancel(self) -> None:
+        self.cancel_calls += 1
+        self._event.set()
 
     def close(self) -> None:
         self.closed = True

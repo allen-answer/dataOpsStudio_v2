@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
@@ -56,7 +57,9 @@ class PostgresqlAdapter(DatabaseAdapter):
         execute_select=True,
         explain=True,
         stream_rows=True,
-        server_side_cancel=False,
+        # psycopg3 Connection.cancel_safe() 真取消在飞查询(execute() 阻塞窗口),
+        # 由 _stream_select 的看门狗线程在 cancel_check 命中时触发,不再只靠批间软取消。
+        server_side_cancel=True,
         list_schemas=True,
         list_tables=True,
         list_columns=True,
@@ -75,6 +78,7 @@ class PostgresqlAdapter(DatabaseAdapter):
         statement_timeout_seconds: int = 300,
         fetch_chunk_size: int = 1000,
         connect_timeout_seconds: int = 10,
+        cancel_poll_interval_seconds: float = 0.25,
         psycopg_module: Any | None = None,
         column_sink: Callable[[list[Column]], None] | None = None,
     ) -> None:
@@ -92,6 +96,7 @@ class PostgresqlAdapter(DatabaseAdapter):
         self._statement_timeout_seconds = statement_timeout_seconds
         self._fetch_chunk_size = fetch_chunk_size
         self._connect_timeout_seconds = connect_timeout_seconds
+        self._cancel_poll_interval_seconds = cancel_poll_interval_seconds
         self._psycopg = psycopg_module
         self._column_sink = column_sink
         self._last_server_version: str | None = None
@@ -263,6 +268,9 @@ class PostgresqlAdapter(DatabaseAdapter):
         raise self._unsupported("build_compare_hash_query")
 
     def kill_query(self, connection_id: str) -> bool:
+        # server_side_cancel=True 的真取消走 _stream_select 内的 cancel_safe() 看门狗
+        # (对本 adapter 正在执行的连接生效);按 connection_id 外部 kill 需追踪 backend
+        # PID + 独立管理连接,当前无调用方接线,故此入口恒 False。
         return False
 
     def _stream_select(self, sql: str, params: dict[str, Any]) -> Iterator[Row]:
@@ -276,7 +284,7 @@ class PostgresqlAdapter(DatabaseAdapter):
         try:
             self._apply_statement_timeout(conn)
             cursor = conn.cursor()
-            cursor.execute(sql, params or None)
+            self._execute_with_cancel(conn, cursor, sql, params)
             self._emit_columns(getattr(cursor, "description", None))
             while True:
                 self._check_cancel()
@@ -289,6 +297,50 @@ class PostgresqlAdapter(DatabaseAdapter):
         finally:
             _safe_close(cursor)
             _safe_close(conn)
+
+    def _execute_with_cancel(
+        self, conn: Any, cursor: Any, sql: str, params: dict[str, Any]
+    ) -> None:
+        """执行查询,并在 execute() 阻塞窗口内提供 driver-level 取消。
+
+        psycopg3 客户端游标把整段等待都压在 cursor.execute()(结果一次性拉回),
+        批间 _check_cancel 够不着这里。故起一个看门狗线程轮询 cancel_check,命中即
+        调用 conn.cancel_safe()(3.2+;回退 legacy cancel())真取消服务端在飞查询,
+        execute() 随后抛错 → 收敛为 QueryCancelledError。只有本 adapter 主动取消
+        (cancelled 置位)才映射为 QueryCancelledError,statement_timeout 等其它错
+        原样上抛,不改既有语义。
+        """
+        bound = params or None
+        cancel_check = self._cancel_check
+        if cancel_check is None:
+            cursor.execute(sql, bound)
+            return
+
+        stop = threading.Event()
+        cancelled = threading.Event()
+
+        def _watch() -> None:
+            while not stop.wait(self._cancel_poll_interval_seconds):
+                try:
+                    requested = cancel_check()
+                except Exception:
+                    return
+                if requested:
+                    cancelled.set()
+                    _server_side_cancel(conn)
+                    return
+
+        watcher = threading.Thread(target=_watch, name="pg-cancel-watch", daemon=True)
+        watcher.start()
+        try:
+            cursor.execute(sql, bound)
+        except BaseException as exc:
+            if cancelled.is_set():
+                raise QueryCancelledError("Query cancelled") from exc
+            raise
+        finally:
+            stop.set()
+            watcher.join(timeout=5.0)
 
     def _query_dicts(
         self,
@@ -414,6 +466,23 @@ class PostgresqlAdapter(DatabaseAdapter):
             f"PostgresqlAdapter does not support {operation} in this build. "
             "Check adapter.capabilities before calling."
         )
+
+
+def _server_side_cancel(conn: object) -> bool:
+    """尽力对在飞查询做 driver-level 取消。
+
+    优先 psycopg3.2+ 的 Connection.cancel_safe()(另开一条连接下发 cancel 请求,
+    线程安全);不可用时回退 legacy 阻塞式 cancel()。两者都失败则返回 False。
+    """
+    for method_name in ("cancel_safe", "cancel"):
+        method = getattr(conn, method_name, None)
+        if callable(method):
+            try:
+                method()
+                return True
+            except Exception:
+                continue
+    return False
 
 
 def _validate_identifier(identifier: str) -> None:
