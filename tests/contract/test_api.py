@@ -92,6 +92,7 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("GET", "/api/datasources/{datasource_id}/metadata/columns") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/indexes") in routes
     assert ("POST", "/api/datasources/{datasource_id}/ai/sql-generate") in routes
+    assert ("POST", "/api/datasources/{datasource_id}/ai/slow-sql-diagnose") in routes
     assert ("GET", "/api/jobs") in routes
     assert ("GET", "/api/jobs/{job_id}") in routes
     assert ("GET", "/api/jobs/{job_id}/result") in routes
@@ -1569,7 +1570,7 @@ def test_ai_sql_generate_uses_l2_schema_context_and_audits() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
-    # MockProvider echoes "ok"; no ```sql fence → whole content is the SQL.
+    # MockProvider echoes "ok"; no fenced block -> whole content is the SQL.
     assert payload["sql"] == "ok"
     assert payload["egress_level"] == 2
     assert payload["tables_used"] == ["app.users"]
@@ -1585,7 +1586,7 @@ def test_ai_sql_generate_disabled_returns_structured_409() -> None:
         [
             _datasource_row(),  # datasources select
             {"id": "project-1"},  # _require_project_access
-            None,  # no ai_configs row → AI disabled
+            None,  # no ai_configs row -> AI disabled
         ]
     )
     services = _Services(engine)
@@ -1601,6 +1602,144 @@ def test_ai_sql_generate_disabled_returns_structured_409() -> None:
     assert response.json()["error"] == "ai_disabled"
     assert any(
         audit["action"] == "ai_copilot_run" and audit["result"] == "skipped"
+        for audit in services.audits
+    )
+
+
+def _ai_config_row_l3() -> dict[str, object]:
+    # C4 sends masked SQL (L3); requires admin to allow max_auto_egress_level>=3.
+    row = _ai_config_row()
+    row["max_auto_egress_level"] = 3
+    return row
+
+
+def _slowsql_columns_cache() -> dict[str, object]:
+    return _metadata_cache(
+        [
+            {
+                "name": "id",
+                "type": "integer",
+                "driver_type": "INT",
+                "nullable": False,
+                "primary_key": True,
+                "comment": "pk",
+            },
+            {
+                "name": "amount",
+                "type": "decimal",
+                "driver_type": "DECIMAL(10,2)",
+                "nullable": True,
+                "primary_key": False,
+                "comment": None,
+            },
+        ]
+    )
+
+
+def _slowsql_indexes_cache() -> dict[str, object]:
+    return _metadata_cache(
+        [{"name": "idx_amount", "columns": ["amount"], "is_unique": False, "is_primary": False}]
+    )
+
+
+def test_slow_sql_diagnose_assembles_l3_context_with_baseline_and_audits() -> None:
+    engine = _FakeEngine(
+        [
+            _datasource_row(),  # _datasource_for_current_user: datasources select
+            {"id": "project-1"},  # _require_project_access
+            _ai_config_row_l3(),  # _ai_config_row_or_none (max_auto L3)
+            _slowsql_columns_cache(),  # _metadata_columns_for_table cache read
+            _slowsql_indexes_cache(),  # _metadata_indexes_for_table cache read
+            {  # historical baseline aggregate (same sql_hash)
+                "runs": 3,
+                "avg_seconds": 1.5,
+                "min_seconds": 0.9,
+                "max_seconds": 3.0,
+                "p95_seconds": 2.8,
+            },
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/ai/slow-sql-diagnose",
+        headers=_auth_headers(),
+        json_body={"sql": "SELECT amount FROM orders WHERE name = 'alice' AND amount > 100"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["diagnosis"] == "ok"  # MockProvider echoes "ok"
+    assert payload["egress_level"] == 3
+    assert payload["plan_included"] is False  # no explain_job_id given -> degrade
+    assert payload["tables_analyzed"] == ["app.orders"]
+    assert payload["baseline_available"] is True
+    assert payload["baseline_runs"] == 3
+    assert any(
+        audit["action"] == "ai_assist_call" and audit["result"] == "success"
+        for audit in services.audits
+    )
+    # R5 / egress: masked literals must not appear in the response body.
+    body = response.body.decode("utf-8")
+    assert "alice" not in body
+
+
+def test_slow_sql_diagnose_degrades_gracefully_without_baseline() -> None:
+    engine = _FakeEngine(
+        [
+            _datasource_row(),
+            {"id": "project-1"},
+            _ai_config_row_l3(),
+            _slowsql_columns_cache(),
+            _slowsql_indexes_cache(),
+            {  # no historical runs -> early-delivery graceful degradation
+                "runs": 0,
+                "avg_seconds": None,
+                "min_seconds": None,
+                "max_seconds": None,
+                "p95_seconds": None,
+            },
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/ai/slow-sql-diagnose",
+        headers=_auth_headers(),
+        json_body={"sql": "SELECT amount FROM orders"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["baseline_available"] is False
+    assert payload["baseline_runs"] == 0
+
+
+def test_slow_sql_diagnose_disabled_returns_structured_409() -> None:
+    engine = _FakeEngine(
+        [
+            _datasource_row(),
+            {"id": "project-1"},
+            None,  # no ai_configs row -> AI disabled
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/ai/slow-sql-diagnose",
+        headers=_auth_headers(),
+        json_body={"sql": "SELECT amount FROM orders"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "ai_disabled"
+    assert any(
+        audit["action"] == "ai_assist_call" and audit["result"] == "skipped"
         for audit in services.audits
     )
 

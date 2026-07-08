@@ -102,6 +102,8 @@ from app.api.schemas import (
     NotifyTargetUpdateRequest,
     ProjectResponse,
     RowResponse,
+    SlowSqlDiagnoseRequest,
+    SlowSqlDiagnoseResponse,
     SqlConsoleCreateRequest,
     SqlConsoleResponse,
     SqlConsoleUpdateRequest,
@@ -168,10 +170,20 @@ from app.dbclients.sql_build import limit_clause, quote_identifier
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.ai import AiContext, AiOptions, ContextItem, EgressLevel
 from app.domain.ai_copilot import (
-    MAX_TABLES,
+    MAX_TABLES,  # C1 与 C4 共用同一"送 AI 表数上限"(均为 12,语义一致)
     build_nl2sql_prompt,
     build_schema_context,
     split_sql_and_explanation,
+)
+from app.domain.ai_slowsql import (
+    MAX_PLAN_ROWS,
+    BaselineStats,
+    build_diagnose_prompt,
+    build_plan_payload,
+    build_table_stats,
+    extract_table_refs,
+    mask_sql,
+    summarize_baseline,
 )
 from app.domain.compare_diff_sql import build_diff_row_select
 from app.domain.compare_infer import (
@@ -1020,6 +1032,263 @@ def preflight_sql(body: SqlPreflightRequest, request: Request) -> SqlPreflightRe
             for finding in findings
         ]
     )
+
+
+@router.post(
+    "/datasources/{datasource_id}/ai/slow-sql-diagnose",
+    response_model=SlowSqlDiagnoseResponse,
+)
+def diagnose_slow_sql(
+    datasource_id: str,
+    body: SlowSqlDiagnoseRequest,
+    request: Request,
+) -> SlowSqlDiagnoseResponse:
+    """AI Copilot C4 —— 慢 SQL 根因诊断(设计稿 §2.7.4,egress L3;提前交付)。
+
+    出站上下文(egress 分层见 §2.7.5):
+    - 遮蔽字面量后的 SQL(L3;`mask_sql` 复用 #83 血缘先例,抹掉业务过滤值)
+    - EXPLAIN plan(L1;可选,复用调用方已跑完的 sql_explain job,不阻塞 job 队列)
+    - 表结构 + 索引统计(L2;元数据缓存,取不到的表跳过 → 优雅降级)
+    - 同一 SQL 历史 duration 基线(L1;jobs 聚合,为空则如实告知无基线)
+    → AiGateway.complete → 根因排序 + 建议。未启用 → 409;gateway 失败 → 200 ok:false。
+    详见 docs/design/C4-copilot-slowsql.md。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    row = _datasource_for_current_user(request, datasource_id)
+    project_id = str(row["project_id"])
+    dialect = str(row["db_type"])
+
+    def audit(result: str, detail: dict[str, object]) -> None:
+        _audit_business(
+            services,
+            request,
+            user_id=user.id,
+            project_id=project_id,
+            action="ai_assist_call",
+            resource_type="datasource",
+            resource_id=datasource_id,
+            result=result,
+            detail=detail,
+        )
+
+    try:
+        sql = validate_readonly_sql(body.sql)
+    except SqlGuardError as exc:
+        logger.info(
+            "sql guard rejected slow-sql diagnose statement",
+            request_id=request_id_from(request),
+            reason=str(exc),
+        )
+        raise ApiError(
+            400, "invalid_sql", "Only read-only SELECT/WITH SQL can be diagnosed"
+        ) from exc
+
+    with services.engine.connect() as conn:
+        ai_row = _ai_config_row_or_none(conn)
+    runtime = _ai_runtime_config(services, ai_row)
+    if not runtime.enabled or runtime.provider in {None, "off"}:
+        audit("skipped", {"error": "ai_disabled"})
+        raise ApiError(409, "ai_disabled", "AI copilot is not enabled")
+
+    plan_payload, plan_truncated = _slow_sql_plan_for_ai(request, body.explain_job_id, project_id)
+    stats_payload, tables_used, stats_truncated = _slow_sql_table_stats(services, row, sql, dialect)
+    baseline = _slow_sql_baseline(services, project_id, datasource_id, _sql_hash(sql))
+    baseline_summary = summarize_baseline(baseline)
+    baseline_available = bool(baseline_summary.get("available"))
+    has_plan = plan_payload is not None
+    truncated = plan_truncated or stats_truncated
+
+    # ★ egress:SQL=L3(已遮蔽字面量),结构=L2,plan/基线=L1。Gateway 的
+    # LevelEgressChecker 是最终闸门——L3 需管理员放行 max_auto>=3,否则 EgressBlockedError。
+    items = [
+        ContextItem(content=mask_sql(sql), egress_level=EgressLevel.L3),
+        ContextItem(content=_ai_json({"tables": stats_payload}), egress_level=EgressLevel.L2),
+        ContextItem(content=_ai_json({"baseline": baseline_summary}), egress_level=EgressLevel.L1),
+    ]
+    if plan_payload is not None:
+        items.append(
+            ContextItem(content=_ai_json({"plan": plan_payload}), egress_level=EgressLevel.L1)
+        )
+    context = AiContext(items=items)
+    prompt = build_diagnose_prompt(
+        dialect=dialect,
+        has_plan=has_plan,
+        baseline_available=baseline_available,
+    )
+    try:
+        response = build_gateway_from_runtime_config(runtime).complete(
+            prompt,
+            context,
+            AiOptions(purpose="ai_slow_sql_diagnose", max_tokens=900),
+        )
+    except AiDisabledError:
+        audit("skipped", {"error": "ai_disabled"})
+        raise ApiError(409, "ai_disabled", "AI copilot is not enabled") from None
+    except AiGatewayError as exc:
+        error = type(exc).__name__
+        audit("failed", {"error": error})
+        return SlowSqlDiagnoseResponse(
+            ok=False,
+            error=error,
+            plan_included=has_plan,
+            tables_analyzed=tables_used,
+            baseline_available=baseline_available,
+            baseline_runs=baseline.runs,
+            truncated=truncated,
+        )
+    audit(
+        "success",
+        {
+            "provider": response.provider,
+            "tables": len(tables_used),
+            "plan_included": has_plan,
+            "baseline_runs": baseline.runs,
+            "truncated": truncated,
+        },
+    )
+    return SlowSqlDiagnoseResponse(
+        ok=True,
+        diagnosis=response.content,
+        provider=response.provider,
+        model=response.model,
+        egress_level=int(EgressLevel.L3),
+        plan_included=has_plan,
+        tables_analyzed=tables_used,
+        baseline_available=baseline_available,
+        baseline_runs=baseline.runs,
+        truncated=truncated,
+    )
+
+
+def _ai_json(payload: object) -> str:
+    """出站 context 的紧凑 JSON 序列化(与 Compare 归因 / C1 同一风格)。"""
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+
+
+def _slow_sql_plan_for_ai(
+    request: Request,
+    explain_job_id: str | None,
+    project_id: str,
+) -> tuple[dict[str, object] | None, bool]:
+    """取可选执行计划:复用一个已完成的 sql_explain job 的结果集(L1)。
+
+    不传 job_id / job 非本 project / 非 sql_explain / 未成功 / 无结果集 → 返回
+    (None, False)(优雅降级为无 plan,不阻塞 job 队列同步等 explain,见 PR body 裁决)。
+    404(job 不存在或无访问权)由 `_job_for_current_user` 抛出,视为调用方传错 id。
+    """
+    if not explain_job_id:
+        return None, False
+    job_row = _job_for_current_user(request, explain_job_id)
+    if str(job_row["kind"]) != JobKind.SQL_EXPLAIN.value:
+        return None, False
+    if str(job_row["status"]) != JobStatus.SUCCESS.value:
+        return None, False
+    if str(job_row["project_id"]) != project_id:
+        return None, False
+    result_set_id = _result_set_id_from_payload(job_row)
+    if result_set_id is None:
+        return None, False
+    services = services_from(request)
+    rows = services.result_store.fetch_range(result_set_id, 0, MAX_PLAN_ROWS)
+    manifest = _spool_manifest_or_none(services, result_set_id)
+    columns = [column.name for column in _columns_from_manifest(manifest)]
+    row_values = [list(row.values) for row in rows]
+    return build_plan_payload(columns, row_values)
+
+
+def _slow_sql_table_stats(
+    services: ApiServices,
+    datasource_row: RowMapping,
+    sql: str,
+    dialect: str,
+) -> tuple[list[dict[str, object]], list[str], bool]:
+    """取 SQL 引用表的结构 + 索引统计(L2,元数据缓存;取不到的表跳过)。"""
+    refs = extract_table_refs(sql, dialect=dialect)
+    default_schema = _optional_str(datasource_row["database_name"])
+    collected: list[tuple[str, str, list[Column], list[Index]]] = []
+    for schema_name, table_name in refs[:MAX_TABLES]:
+        schema = schema_name or default_schema or ""
+        try:
+            columns = _metadata_columns_for_table(
+                services,
+                datasource_row,
+                schema_name=schema,
+                table_name=table_name,
+                refresh=False,
+            )
+            indexes = _metadata_indexes_for_table(
+                services,
+                datasource_row,
+                schema_name=schema,
+                table_name=table_name,
+                refresh=False,
+            )
+        except Exception:
+            # 元数据取不到(缓存缺 + 探库失败 / 不支持)→ 跳过该表,诊断降级。
+            continue
+        collected.append((schema, table_name, columns, indexes))
+    payload, tables_used, truncated = build_table_stats(collected)
+    return payload, tables_used, truncated or len(refs) > MAX_TABLES
+
+
+def _slow_sql_baseline(
+    services: ApiServices,
+    project_id: str,
+    datasource_id: str,
+    sql_hash: str,
+) -> BaselineStats:
+    """同一 SQL(sql_hash 相同)近期成功执行的 duration 聚合(L1 统计量)。
+
+    从 jobs 聚合 count/avg/min/max/p95(EXTRACT epoch FROM finished-started)。
+    无匹配 → runs=0,上层据此如实告知"无历史基线"(提前交付的优雅降级)。
+    ★ 不建新表、不落 SQL 原文,只出聚合数字。
+    """
+    duration = func.extract("epoch", jobs.c.finished_at - jobs.c.started_at)
+    stmt = select(
+        func.count().label("runs"),
+        func.avg(duration).label("avg_seconds"),
+        func.min(duration).label("min_seconds"),
+        func.max(duration).label("max_seconds"),
+        func.percentile_cont(0.95).within_group(duration).label("p95_seconds"),
+    ).where(
+        jobs.c.kind == JobKind.SQL_QUERY.value,
+        jobs.c.status == JobStatus.SUCCESS.value,
+        jobs.c.project_id == project_id,
+        jobs.c.datasource_ids.contains([datasource_id]),
+        jobs.c.started_at.is_not(None),
+        jobs.c.finished_at.is_not(None),
+        text("payload->>'sql_hash' = :sql_hash"),
+    )
+    with services.engine.connect() as conn:
+        result = conn.execute(stmt, {"sql_hash": sql_hash}).mappings().one_or_none()
+    if result is None:
+        return BaselineStats(runs=0)
+    runs = int(result["runs"] or 0)
+    if runs <= 0:
+        return BaselineStats(runs=0)
+    return BaselineStats(
+        runs=runs,
+        avg_seconds=_float_or_none(result["avg_seconds"]),
+        min_seconds=_float_or_none(result["min_seconds"]),
+        max_seconds=_float_or_none(result["max_seconds"]),
+        p95_seconds=_float_or_none(result["p95_seconds"]),
+    )
+
+
+def _float_or_none(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 @router.get(

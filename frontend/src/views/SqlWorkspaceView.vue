@@ -88,7 +88,7 @@ import {
   type MetadataTableItem,
 } from '../api/metadata'
 import { explainSql, preflightSql, type SqlPreflightFinding } from '../api/sql'
-import { generateSql } from '../api/ai'
+import { generateSql, diagnoseSlowSql } from '../api/ai'
 import { ApiError, type DatasourceListItem, type ExportFormat, type JobStatus } from '../api/types'
 import { useThemeStore } from '../stores/theme'
 import { useAuthStore } from '../stores/auth'
@@ -255,6 +255,13 @@ const aiBusy = ref(false)
 const aiError = ref<string | null>(null)
 const aiDisabled = ref(false)
 const aiExplanation = ref<string | null>(null)
+
+// ── AI 慢 SQL 根因诊断(C4:EXPLAIN + 结构 + 历史基线 → 根因排序,egress L3)──
+const aiDiagnoseBusy = ref(false)
+const aiDiagnoseError = ref<string | null>(null)
+const aiDiagnoseDisabled = ref(false)
+const aiDiagnosis = ref<string | null>(null)
+const aiDiagnoseBaseline = ref<{ available: boolean; runs: number } | null>(null)
 
 // ── 导出(4 格式 → 一次性 token → 下载)────────────────────────────
 const exportMenuOpen = ref(false)
@@ -1004,6 +1011,8 @@ async function onExplain(): Promise<void> {
   runtime.planResult = null
   runtime.planStatus = 'pending'
   runtime.resultTab = 'plan'
+  // 新计划作废旧 AI 诊断(诊断锚在具体 plan 上)。
+  resetAiDiagnose()
   await flushConsolePatch(consoleRow.id)
   try {
     const response = await explainSql({
@@ -1078,6 +1087,43 @@ async function onPreflight(): Promise<void> {
 function preflightMessage(finding: SqlPreflightFinding): string {
   const key = `sql.preflight_finding.${finding.code}`
   return te(key) ? t(key) : finding.message
+}
+
+function resetAiDiagnose(): void {
+  aiDiagnosis.value = null
+  aiDiagnoseError.value = null
+  aiDiagnoseDisabled.value = false
+  aiDiagnoseBaseline.value = null
+}
+
+async function onDiagnoseSlowSql(): Promise<void> {
+  const runtime = activeRuntime.value
+  if (!runtime || !selectedDsId.value || !editorSql.value.trim()) return
+  resetAiDiagnose()
+  aiDiagnoseBusy.value = true
+  try {
+    // 复用 Plan tab 已跑完的 explain job(有则带上,plan 进 AI 上下文;无则 AI 据结构+基线诊断)。
+    const explainJobId = runtime.planStatus === 'success' ? runtime.planJobId : null
+    const res = await diagnoseSlowSql(selectedDsId.value, {
+      sql: editorSql.value,
+      explain_job_id: explainJobId,
+    })
+    if (!res.ok || !res.diagnosis) {
+      aiDiagnoseError.value = t('sql.ai_diagnose_failed')
+      return
+    }
+    aiDiagnosis.value = res.diagnosis
+    aiDiagnoseBaseline.value = { available: res.baseline_available, runs: res.baseline_runs }
+  } catch (e) {
+    // AI 未启用 → 后端结构化 409 ai_disabled;给友好禁用提示。
+    if (e instanceof ApiError && e.code === 'ai_disabled') {
+      aiDiagnoseDisabled.value = true
+    } else {
+      aiDiagnoseError.value = errorMessage(e)
+    }
+  } finally {
+    aiDiagnoseBusy.value = false
+  }
 }
 
 function startPlanPoll(consoleId: string): void {
@@ -1883,6 +1929,50 @@ function parseVariables(value: string): string[] {
 
           <!-- Plan tab -->
           <div v-show="activeRuntime?.resultTab === 'plan'" class="flex-1 min-h-0 flex flex-col">
+            <!-- AI 慢 SQL 根因诊断入口(C4;与 EXPLAIN 计划展示同区,深诊断) -->
+            <div class="flex items-center gap-2 px-5 py-2 border-b chrome-border-subtle">
+              <button
+                type="button"
+                class="chrome-btn-secondary"
+                :disabled="aiDiagnoseBusy || !selectedDsId || !editorSql.trim()"
+                :title="t('sql.ai_diagnose_hint')"
+                @click="onDiagnoseSlowSql"
+              >
+                <Sparkles class="w-3.5 h-3.5" />
+                {{ aiDiagnoseBusy ? t('sql.ai_diagnosing') : t('sql.ai_diagnose') }}
+              </button>
+              <span class="text-xs chrome-text-muted">{{ t('sql.ai_diagnose_hint') }}</span>
+            </div>
+            <div
+              v-if="aiDiagnoseDisabled"
+              class="flex items-center gap-2 px-5 py-2 border-b chrome-border-subtle text-xs"
+              style="background-color: rgb(180 83 9 / 0.1); color: rgb(180 83 9)"
+            >
+              <AlertTriangle class="w-3.5 h-3.5 shrink-0" />
+              <span>{{ t('sql.ai_disabled') }}</span>
+            </div>
+            <p
+              v-if="aiDiagnoseError"
+              class="px-5 py-2 border-b chrome-border-subtle text-xs text-red-600 dark:text-red-400"
+            >
+              {{ aiDiagnoseError }}
+            </p>
+            <div
+              v-if="aiDiagnosis"
+              class="px-5 py-3 border-b chrome-border-subtle text-sm chrome-bg-elevated"
+            >
+              <div class="flex items-center gap-1.5 mb-1 text-xs chrome-text-muted">
+                <Sparkles class="w-3 h-3 shrink-0" />
+                <span>{{ t('sql.ai_diagnose_generated') }}</span>
+                <span v-if="aiDiagnoseBaseline && !aiDiagnoseBaseline.available">
+                  · {{ t('sql.ai_diagnose_no_baseline') }}
+                </span>
+                <span v-else-if="aiDiagnoseBaseline">
+                  · {{ t('sql.ai_diagnose_baseline_runs', { n: aiDiagnoseBaseline.runs }) }}
+                </span>
+              </div>
+              <p class="whitespace-pre-wrap chrome-text-heading">{{ aiDiagnosis }}</p>
+            </div>
             <div
               v-if="activeRuntime?.planError"
               class="flex items-start gap-2 px-5 py-3 border-b chrome-border-subtle text-sm"
