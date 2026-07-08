@@ -29,6 +29,9 @@ class JobKind(StrEnum):
     SCENARIO_MATERIALIZE = "scenario_materialize"
     SCENARIO_RUN_ALL = "scenario_run_all"
     WORKFLOW_RUN = "workflow_run"
+    # C-10:sensor 数据到达检查(调度线程派发,worker 在 datasource 上跑只读 SQL,
+    # 结果 truthy 则入队 workflow_run)。非 workflow 节点 kind(不在 ALLOWED_ 白名单)。
+    WORKFLOW_SENSOR_CHECK = "workflow_sensor_check"
     AI_ASSIST_CALL = "ai_assist_call"
     AI_COPILOT_RUN = "ai_copilot_run"
     LINEAGE_ANALYZE = "lineage_analyze"

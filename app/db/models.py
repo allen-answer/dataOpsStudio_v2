@@ -797,6 +797,14 @@ workflows = Table(
     # 进程重启不补跑历史错过点(至多补当前触发点一次)。NULL = 从未触发(新调度
     # 首次见到只播种基线不触发,详见 app/services/workflow_scheduler.py)。
     Column("schedule_last_fired_at", DateTime(timezone=True), nullable=True),
+    # ── C-10 SQL sensor 触发(数据到达触发 + 冷却期)──────────────────────────
+    # sensor_enabled 冗余自 dag_jsonb.sensor.enabled,供调度器扫表(权威在 dag_jsonb)。
+    # sensor_last_checked_at:上次派发 sensor 检查 job 的时刻(检查间隔节流锚点)。
+    # sensor_last_triggered_at:上次 sensor 命中触发 workflow_run 的时刻(冷却期锚点;
+    #   worker 侧带守卫的原子推进,冷却期内不重复触发)。均 NULL = 从未发生。
+    Column("sensor_enabled", Boolean(), nullable=False, server_default=text("false")),
+    Column("sensor_last_checked_at", DateTime(timezone=True), nullable=True),
+    Column("sensor_last_triggered_at", DateTime(timezone=True), nullable=True),
     # 总开关:false 时调度器不触发(手动运行语义属 PR-3/PR-4)
     Column("enabled", Boolean(), nullable=False, server_default=text("true")),
     Column(

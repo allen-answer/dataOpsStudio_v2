@@ -1063,6 +1063,7 @@ class WorkflowResponse(BaseModel):
     enabled: bool
     schedule_cron: str | None = None
     schedule_enabled: bool = False
+    sensor_enabled: bool = False
     created_by: str | None = None
     created_at: datetime
     updated_at: datetime
@@ -1076,6 +1077,7 @@ class WorkflowListItem(BaseModel):
     enabled: bool
     schedule_cron: str | None = None
     schedule_enabled: bool = False
+    sensor_enabled: bool = False
     created_by: str | None = None
     created_at: datetime
     updated_at: datetime

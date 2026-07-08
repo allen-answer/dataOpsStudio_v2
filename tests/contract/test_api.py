@@ -4358,6 +4358,7 @@ def _workflow_row() -> dict[str, object]:
         },
         "schedule_cron": "0 2 * * *",
         "schedule_enabled": True,
+        "sensor_enabled": False,
         "enabled": True,
         "created_by": "user-1",
         "created_at": _dt(1),

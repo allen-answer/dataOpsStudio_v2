@@ -440,3 +440,52 @@ def test_list_variable_element_length_cap_enforced() -> None:
     long_element = "a" * (MAX_VARIABLE_VALUE_LENGTH + 1)
     with pytest.raises(ValueError, match="variable_value_too_long"):
         validate_workflow_variables({"ids": [long_element]})
+
+
+# ── C-10 SensorTrigger 构造期校验 ────────────────────────────────────────────
+
+
+def _sensor(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "sql": "SELECT COUNT(*) FROM arrivals",
+        "datasource_id": "ds-1",
+        "check_interval_seconds": 60,
+        "cooldown_seconds": 300,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_sensor_valid_roundtrip() -> None:
+    spec = make_spec(["only"], [], sensor=_sensor())
+    assert spec.sensor is not None
+    assert spec.sensor.datasource_id == "ds-1"
+    assert spec.sensor.enabled is True  # 默认开
+    # 往返序列化保留 sensor
+    assert WorkflowSpec.model_validate(spec.model_dump(mode="json")).sensor == spec.sensor
+
+
+def test_sensor_interval_below_minimum_rejected() -> None:
+    with pytest.raises(ValidationError):
+        make_spec(["only"], [], sensor=_sensor(check_interval_seconds=1))
+
+
+def test_sensor_negative_cooldown_rejected() -> None:
+    with pytest.raises(ValidationError):
+        make_spec(["only"], [], sensor=_sensor(cooldown_seconds=-1))
+
+
+def test_sensor_zero_cooldown_allowed() -> None:
+    spec = make_spec(["only"], [], sensor=_sensor(cooldown_seconds=0))
+    assert spec.sensor is not None
+    assert spec.sensor.cooldown_seconds == 0
+
+
+def test_sensor_blank_datasource_rejected() -> None:
+    with pytest.raises(ValidationError, match="invalid_sensor_datasource"):
+        make_spec(["only"], [], sensor=_sensor(datasource_id="   "))
+
+
+def test_sensor_empty_sql_rejected() -> None:
+    with pytest.raises(ValidationError):
+        make_spec(["only"], [], sensor=_sensor(sql=""))
