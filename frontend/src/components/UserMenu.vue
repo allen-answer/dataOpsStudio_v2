@@ -5,7 +5,7 @@ import { useI18n } from 'vue-i18n'
 import { LogOut, User as UserIcon, Palette, Languages, ChevronDown, ShieldCheck, KeyRound } from 'lucide-vue-next'
 import { useAuthStore } from '../stores/auth'
 import { useThemeStore } from '../stores/theme'
-import { variants } from '../variants'
+import { variants, type VariantId } from '../variants'
 import { setLocale } from '../i18n'
 
 const { t, locale } = useI18n()
@@ -23,10 +23,9 @@ function goAccountSecurity(): void {
   void router.push({ name: 'account-security' })
 }
 
-function cycleVariant(): void {
-  const i = variants.findIndex((v) => v.id === themeStore.variant)
-  const next = variants[(i + 1) % variants.length]
-  themeStore.set(next.id)
+// 四个 variant 直接可选(不再循环切换);菜单保持打开方便对比预览。
+function setVariant(id: VariantId): void {
+  themeStore.set(id)
 }
 
 const open = ref(false)
@@ -88,18 +87,29 @@ onUnmounted(() => document.removeEventListener('mousedown', onClickOutside))
         </div>
       </div>
 
-      <button
-        type="button"
-        @click="cycleVariant"
-        class="w-full text-left px-3 py-2 text-sm hover:chrome-bg-elevated chrome-text-normal flex items-center gap-2 transition-colors"
-        :title="t('common.switch_theme')"
-      >
-        <Palette class="w-4 h-4" />
-        <span class="flex-1">{{ t('common.switch_theme') }}</span>
-        <span class="text-xs chrome-text-muted">
-          {{ variants.find((v) => v.id === themeStore.variant)?.name }}
-        </span>
-      </button>
+      <div class="px-3 py-2 flex items-center gap-2 chrome-text-normal">
+        <Palette class="w-4 h-4 shrink-0" />
+        <span class="flex-1 text-sm">{{ t('common.switch_theme') }}</span>
+        <div class="flex items-center gap-1">
+          <button
+            v-for="v in variants"
+            :key="v.id"
+            type="button"
+            @click="setVariant(v.id)"
+            :title="v.name"
+            :aria-label="v.name"
+            :aria-pressed="themeStore.variant === v.id"
+            class="w-5 h-5 rounded-full grid place-items-center transition-all"
+            :class="
+              themeStore.variant === v.id
+                ? 'ring-2 ring-slate-400 dark:ring-slate-300'
+                : 'opacity-70 hover:opacity-100'
+            "
+          >
+            <span class="w-2.5 h-2.5 rounded-full" :class="v.badge"></span>
+          </button>
+        </div>
+      </div>
 
       <button
         type="button"
