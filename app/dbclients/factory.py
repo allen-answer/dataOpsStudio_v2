@@ -5,6 +5,7 @@ from collections.abc import Callable
 from app.dbclients.db2_adapter import Db2Adapter
 from app.dbclients.dm_adapter import DMAdapter
 from app.dbclients.mysql_adapter import MySQLAdapter
+from app.dbclients.oracle_adapter import OracleAdapter
 from app.dbclients.postgresql_adapter import PostgresqlAdapter
 from app.dbclients.protocol import DatabaseAdapter
 from app.domain.datasource import DatasourceConnInfo, DbType
@@ -28,7 +29,7 @@ def build_database_adapter(
 ) -> DatabaseAdapter:
     """db_type -> DatabaseAdapter dispatch.
 
-    Certified backends: MySQL + DM;Preview: DB2;New: PostgreSQL(待真实例
+    Certified backends: MySQL + DM;Preview: DB2 + Oracle;New: PostgreSQL(待真实例
     验证后升 Certified)。Other datasource types are explicit structured
     unsupported errors instead of best-effort driver guesses.
     """
@@ -55,6 +56,16 @@ def build_database_adapter(
         )
     if conn_info.db_type is DbType.POSTGRESQL:
         return PostgresqlAdapter(
+            conn_info,
+            secret_store,
+            cancel_check=cancel_check,
+            column_sink=column_sink,
+            cursor_max_hold_seconds=cursor_max_hold_seconds,
+            statement_timeout_seconds=statement_timeout_seconds,
+            connect_timeout_seconds=connect_timeout_seconds,
+        )
+    if conn_info.db_type is DbType.ORACLE:
+        return OracleAdapter(
             conn_info,
             secret_store,
             cancel_check=cancel_check,

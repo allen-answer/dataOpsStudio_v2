@@ -1,20 +1,19 @@
 """worker db_type → adapter 分发单测(build_database_adapter)。
 
-Certified:MySQL + DM;DB2 是 Preview(PR-A 起有 adapter,不再抛
-UnsupportedDbTypeError)。其余方言(Oracle / PostgreSQL)仍无 adapter →
-UnsupportedDbTypeError。
+Certified:MySQL + DM;Preview:DB2 + Oracle(有 adapter,不再抛
+UnsupportedDbTypeError);New:PostgreSQL。所有 DbType 现均有 adapter,
+UnsupportedDbTypeError 只在未来新增的、尚未接线的 db_type 上触发(防御分支)。
 """
 
 from __future__ import annotations
 
 from typing import cast
 
-import pytest
-
 from app.dbclients.db2_adapter import Db2Adapter
 from app.dbclients.dm_adapter import DMAdapter
-from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
+from app.dbclients.factory import build_database_adapter
 from app.dbclients.mysql_adapter import MySQLAdapter
+from app.dbclients.oracle_adapter import OracleAdapter
 from app.dbclients.postgresql_adapter import PostgresqlAdapter
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.secret import HashedRef, RotationReport, SecretKind, SecretRef
@@ -54,11 +53,17 @@ def test_dispatch_postgresql_builds_postgresql_adapter_not_unsupported() -> None
     assert adapter.capabilities.list_schemas is True
 
 
-@pytest.mark.parametrize("db_type", [DbType.ORACLE])
-def test_dispatch_uncertified_db_types_still_unsupported(db_type: DbType) -> None:
-    with pytest.raises(UnsupportedDbTypeError) as exc_info:
-        build_database_adapter(_conn_info(db_type), cast(SecretStore, _SecretStore()))
-    assert db_type.value in str(exc_info.value)
+def test_dispatch_oracle_builds_oracle_adapter_not_unsupported() -> None:
+    # Oracle Preview 核心验收:Oracle 数据源不再抛 UnsupportedDbTypeError,
+    # capabilities 按 Preview 范围声明(select/流式/introspection 开,
+    # explain/DDL/compare 关)。
+    adapter = build_database_adapter(_conn_info(DbType.ORACLE), cast(SecretStore, _SecretStore()))
+    assert isinstance(adapter, OracleAdapter)
+    assert adapter.capabilities.execute_select is True
+    assert adapter.capabilities.list_schemas is True
+    assert adapter.capabilities.explain is False
+    assert adapter.capabilities.get_table_ddl is False
+    assert adapter.capabilities.compare_db_hash is False
 
 
 def test_dispatch_passes_cancel_and_column_sink_through() -> None:
