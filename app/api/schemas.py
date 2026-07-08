@@ -172,6 +172,34 @@ class SqlPreflightResponse(BaseModel):
     findings: list[SqlPreflightFinding] = Field(default_factory=list)
 
 
+class SlowSqlDiagnoseRequest(BaseModel):
+    """AI Copilot C4 —— 慢 SQL 根因诊断入参(设计稿 §2.7.4,egress L3)。
+
+    explain_job_id 可选:传一个**已完成的 sql_explain job**,复用其执行计划,
+    避免端点阻塞在 job 队列上同步等 explain(设计裁决,见 PR body)。不传则
+    仅据表结构 + 历史基线诊断(plan_included=False,优雅降级)。
+    """
+
+    sql: str = Field(min_length=1, max_length=20000)
+    explain_job_id: str | None = None
+
+
+class SlowSqlDiagnoseResponse(BaseModel):
+    """C4 诊断结果。ok=True 时 diagnosis 必有;egress_level 恒 L3(SQL 原文遮蔽字面量)。"""
+
+    ok: bool
+    diagnosis: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    error: str | None = None
+    egress_level: int = 3
+    plan_included: bool = False
+    tables_analyzed: list[str] = Field(default_factory=list)
+    baseline_available: bool = False
+    baseline_runs: int = 0
+    truncated: bool = False
+
+
 CompareBucket = Literal["only_source", "only_target", "diff", "same"]
 
 
