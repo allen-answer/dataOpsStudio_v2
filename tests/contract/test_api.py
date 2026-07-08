@@ -79,6 +79,8 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("POST", "/api/projects/{project_id}/lineage/ai-impact") in routes
     assert ("POST", "/api/projects/{project_id}/lineage/export") in routes
     assert ("PATCH", "/api/projects/{project_id}/lineage/edges/{edge_id}") in routes
+    assert ("POST", "/api/projects/{project_id}/lineage/runs/{run_id}/ai-enrich") in routes
+    assert ("GET", "/api/projects/{project_id}/lineage/runs/{run_id}/ai-enrich") in routes
     assert ("GET", "/api/projects/{project_id}/workflows") in routes
     assert ("POST", "/api/projects/{project_id}/workflows") in routes
     assert ("GET", "/api/projects/{project_id}/workflows/{workflow_id}") in routes
@@ -3421,6 +3423,156 @@ def test_lineage_analyze_ai_fallback_disabled_degrades_to_deterministic() -> Non
         audit["action"] == "lineage_ai_fallback" and audit["result"] == "skipped"
         for audit in services.audits
     )
+
+
+def _lineage_run_row_with_sql(
+    sql_text: str = (
+        "INSERT INTO app.tgt (id) SELECT id FROM app.src WHERE app.src.amount > 42999777"
+    ),
+) -> dict[str, object]:
+    row = _lineage_run_row(parse_error_count=0)
+    row["sql_text"] = sql_text
+    return row
+
+
+def _lineage_schema_cache_rows() -> list[dict[str, object]]:
+    return [
+        {
+            "cache_level": "columns",
+            "schema_name": "app",
+            "table_name": "src",
+            "payload": [{"name": "id", "type": "integer"}, {"name": "amount", "type": "integer"}],
+        },
+        {
+            "cache_level": "columns",
+            "schema_name": "app",
+            "table_name": "tgt",
+            "payload": [{"name": "id", "type": "integer"}],
+        },
+    ]
+
+
+def test_lineage_ai_enrich_appends_interpretation_via_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},  # _require_project_access
+            _lineage_run_row_with_sql(),  # lineage_runs
+            _ai_config_row(),  # ai_configs
+            _lineage_schema_cache_rows(),  # metadata_caches (schema context)
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+    captured: dict[str, Any] = {}
+
+    class _Gateway:
+        def complete(self, prompt: str, context: Any, options: Any) -> Any:
+            captured["prompt"] = prompt
+            captured["context"] = context
+            captured["options"] = options
+            return AiResponse(
+                content="全量重刷:app.tgt 采用 TRUNCATE+INSERT,建议核对源表完整性。",
+                provider="mock",
+                model="mock-model",
+            )
+
+    monkeypatch.setattr(
+        core_routes,
+        "build_gateway_from_runtime_config",
+        lambda runtime, **kwargs: _Gateway(),
+    )
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/runs/run-1/ai-enrich",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["interpretation"].startswith("全量重刷")
+    assert payload["provider"] == "mock"
+    assert payload["egress_level"] == 2
+    assert payload["created_at"] is not None
+    # 出站只送 L2 结构画像,行值(字面量)绝不出境。
+    context = captured["context"]
+    assert len(context.items) == 1
+    assert context.items[0].egress_level == 2
+    # 只送结构画像:表名在,行值字面量(WHERE 数字)绝不出境。
+    assert "42999777" not in context.items[0].content
+    assert "app.src" in context.items[0].content
+    assert captured["options"].purpose == "lineage_ai_enrich"
+    # 只增不改:只写新表,绝不回写 lineage_runs / 确定性边表。
+    assert any("INSERT INTO lineage_ai_enrichments" in statement for statement in engine.statements)
+    assert not any("UPDATE lineage_runs" in statement for statement in engine.statements)
+    assert not any("INSERT INTO lineage_edges" in statement for statement in engine.statements)
+    assert any(
+        audit["action"] == "lineage_ai_enrich" and audit["result"] == "success"
+        for audit in services.audits
+    )
+    assert "top-secret-value" not in str(services.audits)
+
+
+def test_lineage_ai_enrich_disabled_returns_structured_409() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _lineage_run_row_with_sql(),
+            None,  # no ai_configs row → ai disabled
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/runs/run-1/ai-enrich",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "ai_disabled"
+    assert not any(
+        "INSERT INTO lineage_ai_enrichments" in statement for statement in engine.statements
+    )
+    assert any(
+        audit["action"] == "lineage_ai_enrich" and audit["result"] == "skipped"
+        for audit in services.audits
+    )
+
+
+def test_lineage_ai_enrich_get_returns_latest_or_none() -> None:
+    stored = {
+        "run_id": "run-1",
+        "interpretation": "AI 解读文本",
+        "provider": "mock",
+        "model": "mock-model",
+        "egress_level": 2,
+        "created_at": datetime(2026, 7, 8, tzinfo=UTC),
+    }
+    engine = _FakeEngine([{"id": "project-1"}, _lineage_run_row(), stored])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/lineage/runs/run-1/ai-enrich",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["interpretation"] == "AI 解读文本"
+
+    empty_engine = _FakeEngine([{"id": "project-1"}, _lineage_run_row(), None])
+    empty_app = create_app(services=cast(ApiServices, _Services(empty_engine)))
+    empty = AsgiClient(empty_app).get(
+        "/api/projects/project-1/lineage/runs/run-1/ai-enrich",
+        headers=_auth_headers(),
+    )
+    assert empty.status_code == 200
+    assert empty.json()["ok"] is False
+    assert empty.json()["error"] == "no_enrichment"
 
 
 def test_lineage_analyze_ai_fallback_invalid_ai_response_degrades() -> None:
