@@ -16,6 +16,10 @@ const mode = computed<'dark' | 'light'>(
   () => variants.find((v) => v.id === variant.value)?.mode ?? 'dark',
 )
 
+// showcase 顶条只在 vite dev server(import.meta.env.DEV)显示,production build 不渲染。
+// 生产环境主题切换走用户菜单里的「切换主题」入口(UserMenu.vue,四 variant 可选)。
+const showShowcaseBar = import.meta.env.DEV
+
 function onUpdate(v: typeof variant.value): void {
   themeStore.set(v)
 }
@@ -26,15 +30,20 @@ function onUpdate(v: typeof variant.value): void {
     data-variant 锁 4 选一(mode 已锁进 variant),不再分离 light/dark toggle。
     body 颜色 / 全局 chrome 都跟着 data-variant 走(见 style.css)。
 
-    VariantSwitcher 是 dev / design review 期间常驻顶条;production 阶段可移到
-    用户设置或通过 env flag 隐藏。当前阶段我们就在 design review,留着方便切。
+    VariantSwitcher 顶条只在 dev / design review(import.meta.env.DEV)常驻;
+    production build 不渲染 —— 生产环境主题切换收进用户菜单「切换主题」(UserMenu.vue)。
+    不引入新 env 变量,直接用 vite 的 DEV 标志。
   -->
   <div
     :data-variant="variant"
     :data-mode="mode"
     class="min-h-screen flex flex-col chrome-bg-main"
   >
-    <VariantSwitcher :model-value="variant" @update:model-value="onUpdate" />
+    <VariantSwitcher
+      v-if="showShowcaseBar"
+      :model-value="variant"
+      @update:model-value="onUpdate"
+    />
     <div class="flex-1 min-h-0 flex">
       <RouterView />
     </div>
