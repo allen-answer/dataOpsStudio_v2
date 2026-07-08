@@ -44,10 +44,12 @@ from app.api.schemas import (
     ComparePreviewResponse,
     CompareResultRow,
     CompareRulesPayload,
+    CompareRunAbortReason,
     CompareRunCreateResponse,
     CompareRunLimitsPayload,
     CompareRunProfileResponse,
     CompareRunResultResponse,
+    CompareRunsDashboardResponse,
     CompareSuggestedTaskCreateRequest,
     CompareTaskCreateRequest,
     CompareTaskResponse,
@@ -112,6 +114,9 @@ from app.api.schemas import (
     SqlGenerateRequest,
     SqlGenerateResponse,
     SqlHistoryItem,
+    SqlPreflightFinding,
+    SqlPreflightRequest,
+    SqlPreflightResponse,
     SqlTemplateCreateRequest,
     SqlTemplateRenderRequest,
     SqlTemplateRenderResponse,
@@ -238,6 +243,7 @@ from app.services.ai.default_gateway import (
 )
 from app.services.ai.errors import AiDisabledError, AiGatewayError
 from app.services.lineage_batch_export import batch_export_sheets
+from app.services.sql_preflight import run_sql_preflight
 from app.services.workflow_scheduler import build_workflow_run_job
 
 logger = structlog.get_logger(__name__)
@@ -993,6 +999,27 @@ def explain_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse
         detail={"datasource_id": body.datasource_id},
     )
     return SqlExecuteResponse(job_id=job_id, result_set_id=result_set_id)
+
+
+@router.post("/sql/preflight", response_model=SqlPreflightResponse)
+def preflight_sql(body: SqlPreflightRequest, request: Request) -> SqlPreflightResponse:
+    """SQL 体检(C-11 advisory):纯文本启发式,只提示不拦截、不连库、不入队。
+
+    行数估算走既有 `/sql/explain` 端点(库内 EXPLAIN,前端并行触发落 Plan tab);
+    本端点只回文本级 finding(全表写 / SELECT * / 缺 LIMIT)。同步返回,轻量。
+    """
+    current_user_from(request)  # 仅要求已登录;体检不触库,无需 datasource 授权
+    findings = run_sql_preflight(body.sql)
+    return SqlPreflightResponse(
+        findings=[
+            SqlPreflightFinding(
+                severity=finding.severity,
+                code=finding.code,
+                message=finding.message,
+            )
+            for finding in findings
+        ]
+    )
 
 
 @router.get(
@@ -2032,6 +2059,77 @@ def list_compare_task_runs(
         offset=offset,
         has_more=has_more,
         runs=items,
+    )
+
+
+@router.get(
+    "/projects/{project_id}/compare/runs-dashboard",
+    response_model=CompareRunsDashboardResponse,
+)
+def compare_runs_dashboard(
+    project_id: str,
+    request: Request,
+    days: int = Query(default=30, ge=1, le=365),
+) -> CompareRunsDashboardResponse:
+    """run_index 仪表盘(C-12):项目维度近 N 天聚合。
+
+    读 run_index 一表得状态分布 / 成功率;中止原因 join jobs.error_code(仅非成功
+    run)。磁盘字节 / 峰值 RSS 当前未落库(run_index 无该列),本期不含 —— 见 PR
+    设计裁决项。SQL 聚合下推,不拉全量 run 进内存。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        status_rows = (
+            conn.execute(
+                select(run_index.c.status, func.count().label("n"))
+                .where(
+                    and_(
+                        run_index.c.project_id == project_id,
+                        run_index.c.created_at >= cutoff,
+                    )
+                )
+                .group_by(run_index.c.status)
+            )
+            .mappings()
+            .all()
+        )
+        # 中止原因:非成功 run join jobs 取 error_code(缺失归 unknown),top 5。
+        reason_expr = func.coalesce(jobs.c.error_code, "unknown")
+        reason_rows = (
+            conn.execute(
+                select(reason_expr.label("reason"), func.count().label("n"))
+                .select_from(run_index.join(jobs, run_index.c.job_id == jobs.c.id))
+                .where(
+                    and_(
+                        run_index.c.project_id == project_id,
+                        run_index.c.created_at >= cutoff,
+                        run_index.c.status.in_(("failed", "timeout", "cancelled")),
+                    )
+                )
+                .group_by(reason_expr)
+                .order_by(func.count().desc())
+                .limit(5)
+            )
+            .mappings()
+            .all()
+        )
+    status_counts = {str(row["status"]): int(row["n"]) for row in status_rows}
+    total_runs = sum(status_counts.values())
+    success = status_counts.get("success", 0)
+    success_rate = round(success / total_runs, 4) if total_runs else 0.0
+    top_abort_reasons = [
+        CompareRunAbortReason(reason=str(row["reason"]), count=int(row["n"])) for row in reason_rows
+    ]
+    return CompareRunsDashboardResponse(
+        project_id=project_id,
+        days=days,
+        total_runs=total_runs,
+        status_counts=status_counts,
+        success_rate=success_rate,
+        top_abort_reasons=top_abort_reasons,
     )
 
 
