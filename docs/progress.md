@@ -11,12 +11,31 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| UX-1 Compare 结果页重构(三层漏斗+四状态卡+差异列开关) | Claude 子代理(Fable 5 复核) | #107 方案 P0-C1/C2 | 进行中 | — |
-| UX-2 批次(懒展开 / 差异行 SQL / 主键预检) | Fable 5 | #107 方案 | 未开工 | — |
-| 真机深走查(Lineage/Workflow/Compare 新面,带登录) | 待人排期(需 admin 凭据) | 下次生产部署 | 未开工 | — |
-| 生产部署(#99–#109 增量:收口件+UX-1,含迁移 0018) | 待排期 | UX-1 合并后 | 未开工 | — |
-| Workflow PR-4b cron tick(定时触发) | 任务书已出,待转 Codex | #92 | 未开工 | — |
-| 2.5.0 两大档拍板(Lineage 深度报告 vs Compare 文件源) | 待人拍板 | 差距矩阵 §三 | 未开工 | — |
+| Compare 导出解码业务列(#96 #2) | Claude 子代理(Fable 5 复核) | — | PR 待审(CI 10/10 绿) | [#153](https://github.com/allen-answer/dataOpsStudio_v2/pull/153) |
+| Oracle adapter(Preview,thin) | Claude 子代理(Fable 5 复核) | — | PR 待审(CI 10/10 绿) | [#154](https://github.com/allen-answer/dataOpsStudio_v2/pull/154) |
+| AI Copilot C1:NL→SQL(设计稿+后端+前端) | Claude 子代理(Fable 5 复核) | AI Gateway / #65 introspection | PR 待审(CI 10/10 绿) | [#155](https://github.com/allen-answer/dataOpsStudio_v2/pull/155) |
+| Workflow 管理前端 v1(+run 历史端点) | Claude 子代理(Fable 5 复核) | #150 设计稿 | PR 待审(CI 10/10 绿) | [#156](https://github.com/allen-answer/dataOpsStudio_v2/pull/156) |
+| UX-2 批次(懒展开 / 差异行 SQL / 主键预检) | Claude 子代理(Fable 5 复核) | #107 方案 | PR 待审(CI 10/10 绿) | [#157](https://github.com/allen-answer/dataOpsStudio_v2/pull/157) |
+| Workflow PR-4b cron tick(定时触发,迁移 0022) | Claude 子代理(Fable 5 复核) | #92 | PR 待审(CI 10/10 绿) | [#158](https://github.com/allen-answer/dataOpsStudio_v2/pull/158) |
+| C-8 trace_compare 逐跳对比 | Claude 子代理(wave-2) | L-8 + C-7(均已合并) | 进行中 | — |
+| C-10 sensor 触发(SQL 条件+冷却期) | Claude 子代理(wave-2) | 栈于 #158 | 进行中 | — |
+| C-11 preflight + C-12 run 仪表盘 | Claude 子代理(wave-2) | — | 进行中 | — |
+| L-1 方言自动识别 | Claude 子代理(wave-2) | — | 进行中 | — |
+| L-7 血缘报告 AI enrichment(只增不改) | Claude 子代理(wave-2) | AI Gateway / L-4 语义层 | 进行中 | — |
+| PG adapter Certified 验证(CI 真 PG 集成测试) | Claude 子代理(wave-2) | #144 cancel_safe | 进行中 | — |
+| Copilot C2/C4/C3(wave-3,提前交付+无历史降级声明) | 待 wave-2 收口后起 | C1 模式 + 各域数据 | 未开工 | — |
+| 真机深走查(Lineage/Workflow/Compare 新面,带登录) | 待人排期(需 admin 凭据) | 生产已在 ac62585 | 未开工 | — |
+
+> **★ 生产部署 ac62585(2026-07-08,Fable 5 按 upgrade-in-place.md 执行)**:
+> 20f18f5 → ac62585(#141–#152 全量:C-7 ${var} 插值三连、C-9 通知全量含 SMTP、
+> compare 导出 token/dedup/历史入口、PG cancel_safe、workflow run 修复包、#150 设计稿、
+> #152 PUT preserve-on-omit)。迁移 0021 干净应用;四进程绿 + healthz 200 +
+> notify-targets 401(非 404)+ 新 dist(index-BgJ9UWxv.js)。
+> 踩坑:fresh 实例所有 launcher 子命令必须带 `DATAOPS_PG_PORT=16432`,
+> 否则打到同机老实例 15432 的 PG(报错伪装成密码错误)。
+>
+> **2.5.0 两大档拍板已被事实超越**:Lineage 深度报告(L-2/L-3/L-4/L-5)与
+> Compare 文件源(C-1)均已全部合并上线,该决策项闭环。
 
 > **★ 差距收口 + UX 优化第一波(2026-07-02/03 全部合并)**:
 > 1.x vs 2.0 差距测绘立项底稿([#100](https://github.com/allen-answer/dataOpsStudio_v2/pull/100),
