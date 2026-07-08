@@ -2828,6 +2828,131 @@ def test_lineage_column_trace_requires_column_focus() -> None:
     assert response.json()["error"] == "column_focus_required"
 
 
+def _trace_compare_walk_rows() -> list[dict[str, object]]:
+    """上游 walk 结果:焦点 app.orders.amount ← app.stg_orders.amt(1 跳)。"""
+    return [
+        {
+            "edge_id": "col-edge-1",
+            "source_table": "app.stg_orders",
+            "target_table": "app.orders",
+            "source_column": "amt",
+            "target_column": "amount",
+            "source": "app.stg_orders.amt",
+            "target": "app.orders.amount",
+            "edge_kind": "column",
+            "transformation": "DIRECT",
+            "transformation_subtype": "DIRECT",
+            "inferred": False,
+            "inference_status": "confirmed",
+            "confidence": 1,
+            "depth": 1,
+            "path": ["app.orders.amount", "app.stg_orders.amt"],
+            "direction": "upstream",
+        }
+    ]
+
+
+def test_trace_compare_creates_workflow_of_compare_nodes() -> None:
+    # project access -> upstream walk -> name available(None)-> INSERT workflows
+    engine = _FakeEngine([{"id": "project-1"}, _trace_compare_walk_rows(), None])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/trace-compare",
+        headers=_auth_headers(),
+        json_body={
+            "focus": "app.orders.amount",
+            "source_id": "ds-prod",
+            "target_id": "ds-test",
+            "key_columns": ["id"],
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["workflow_id"] is not None
+    assert payload["source_id"] == "ds-prod"
+    assert payload["target_id"] == "ds-test"
+    # 焦点表(hop0)+ 上游 1 跳(hop1)= 2 个 compare 节点
+    assert payload["hop_count"] == 2
+    assert [hop["node_id"] for hop in payload["hops"]] == ["hop0", "hop1"]
+    assert payload["hops"][0]["table"] == "app.orders"
+    assert payload["hops"][1]["table"] == "app.stg_orders"
+    assert payload["hops"][1]["column"] == "amt"
+    insert_statement = next(
+        statement
+        for statement in engine.statements
+        if statement.startswith("INSERT INTO workflows")
+    )
+    assert "dag_jsonb" in insert_statement
+    assert any(audit["action"] == "lineage_trace_compare" for audit in services.audits)
+
+
+def test_trace_compare_dry_run_previews_without_persisting() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _trace_compare_walk_rows()])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/trace-compare",
+        headers=_auth_headers(),
+        json_body={
+            "focus": "app.orders.amount",
+            "source_id": "ds-prod",
+            "target_id": "ds-test",
+            "key_columns": ["id"],
+            "dry_run": True,
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["workflow_id"] is None
+    assert payload["hop_count"] == 2
+    assert not any(statement.startswith("INSERT INTO workflows") for statement in engine.statements)
+
+
+def test_trace_compare_no_upstream_returns_400() -> None:
+    # 空 walk → 焦点无上游 → 400 no_upstream_lineage,不落库
+    engine = _FakeEngine([{"id": "project-1"}, []])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/trace-compare",
+        headers=_auth_headers(),
+        json_body={
+            "focus": "app.orders.amount",
+            "source_id": "ds-prod",
+            "target_id": "ds-test",
+            "key_columns": ["id"],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "no_upstream_lineage"
+    assert not any(statement.startswith("INSERT INTO workflows") for statement in engine.statements)
+
+
+def test_trace_compare_requires_column_focus() -> None:
+    engine = _FakeEngine([])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/trace-compare",
+        headers=_auth_headers(),
+        json_body={
+            "focus": "plaintable",
+            "source_id": "ds-prod",
+            "target_id": "ds-test",
+            "key_columns": ["id"],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "column_focus_required"
+    assert engine.statements == []
+
+
 def _lineage_run_row(parse_error_count: int = 2) -> dict[str, object]:
     return {
         "id": "run-1",
