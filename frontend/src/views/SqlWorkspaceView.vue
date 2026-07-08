@@ -36,6 +36,7 @@ import {
   RefreshCw,
   Save,
   Search,
+  Sparkles,
   Square,
   Table2,
   Trash2,
@@ -85,6 +86,7 @@ import {
   type MetadataTableItem,
 } from '../api/metadata'
 import { explainSql } from '../api/sql'
+import { generateSql } from '../api/ai'
 import { ApiError, type DatasourceListItem, type ExportFormat, type JobStatus } from '../api/types'
 import { useThemeStore } from '../stores/theme'
 import { useAuthStore } from '../stores/auth'
@@ -240,6 +242,14 @@ const metadataError = ref<string | null>(null)
 // ── 编辑器工具栏(format / expand-star / explain)─────────────────
 const toolError = ref<string | null>(null)
 const toolBusy = ref<'' | 'format' | 'expand' | 'explain'>('')
+
+// ── AI 生成(C1:自然语言 → 真实 schema 生成只读 SQL)────────────────
+const aiModalOpen = ref(false)
+const aiPrompt = ref('')
+const aiBusy = ref(false)
+const aiError = ref<string | null>(null)
+const aiDisabled = ref(false)
+const aiExplanation = ref<string | null>(null)
 
 // ── 导出(4 格式 → 一次性 token → 下载)────────────────────────────
 const exportMenuOpen = ref(false)
@@ -1002,6 +1012,41 @@ async function onExplain(): Promise<void> {
   }
 }
 
+function openAiModal(): void {
+  aiError.value = null
+  aiDisabled.value = false
+  aiExplanation.value = null
+  aiModalOpen.value = true
+}
+
+async function onGenerateSql(): Promise<void> {
+  if (!aiPrompt.value.trim() || !selectedDsId.value) return
+  aiError.value = null
+  aiDisabled.value = false
+  aiExplanation.value = null
+  aiBusy.value = true
+  try {
+    const res = await generateSql(selectedDsId.value, { natural_language: aiPrompt.value })
+    if (!res.ok || !res.sql) {
+      aiError.value = t('sql.ai_failed')
+      return
+    }
+    // 只插入编辑器,绝不自动执行(执行仍走用户手动 + SqlGuard)。
+    editorSql.value = res.sql
+    aiExplanation.value = res.explanation
+    aiModalOpen.value = false
+  } catch (e) {
+    // AI 未启用 → 后端结构化 409 ai_disabled;给友好禁用提示,不当普通报错。
+    if (e instanceof ApiError && e.code === 'ai_disabled') {
+      aiDisabled.value = true
+    } else {
+      aiError.value = errorMessage(e)
+    }
+  } finally {
+    aiBusy.value = false
+  }
+}
+
 function startPlanPoll(consoleId: string): void {
   void pollPlan(consoleId)
 }
@@ -1628,7 +1673,25 @@ function parseVariables(value: string): string[] {
             <Network class="w-3.5 h-3.5" />
             {{ toolBusy === 'explain' ? t('common.submitting') : t('sql.tool_explain') }}
           </button>
+          <button
+            type="button"
+            class="chrome-btn-secondary"
+            :disabled="!selectedDsId || editorReadOnly"
+            :title="t('sql.ai_generate_hint')"
+            @click="openAiModal"
+          >
+            <Sparkles class="w-3.5 h-3.5" />
+            {{ t('sql.ai_generate') }}
+          </button>
           <div class="flex-1" />
+          <span
+            v-if="aiExplanation"
+            class="text-xs chrome-text-muted truncate max-w-[24rem] flex items-center gap-1"
+            :title="aiExplanation"
+          >
+            <Sparkles class="w-3 h-3 shrink-0" />
+            {{ aiExplanation }}
+          </span>
           <span v-if="toolError" class="text-xs text-red-600 dark:text-red-400 truncate max-w-[24rem]" :title="toolError">
             {{ toolError }}
           </span>
@@ -1830,6 +1893,44 @@ function parseVariables(value: string): string[] {
           <button type="submit" class="chrome-btn-primary" :disabled="templateSaving">
             <Save class="w-3.5 h-3.5" />
             {{ templateSaving ? t('common.submitting') : t('common.save') }}
+          </button>
+        </div>
+      </form>
+    </Modal>
+
+    <Modal :open="aiModalOpen" :title="t('sql.ai_generate_title')" @close="aiModalOpen = false">
+      <form class="space-y-3" @submit.prevent="onGenerateSql">
+        <p class="text-xs chrome-text-muted">{{ t('sql.ai_generate_desc') }}</p>
+        <label class="block">
+          <span class="block text-xs chrome-text-muted mb-1">{{ t('sql.ai_prompt_label') }}</span>
+          <textarea
+            v-model="aiPrompt"
+            class="chrome-input w-full min-h-28"
+            :placeholder="t('sql.ai_prompt_placeholder')"
+            required
+          />
+        </label>
+        <div
+          v-if="aiDisabled"
+          class="flex items-center gap-2 px-3 py-2 text-xs rounded"
+          style="background-color: rgb(180 83 9 / 0.1); color: rgb(180 83 9)"
+        >
+          <AlertTriangle class="w-3.5 h-3.5 shrink-0" />
+          <span>{{ t('sql.ai_disabled') }}</span>
+        </div>
+        <p v-if="aiError" class="text-xs text-red-600 dark:text-red-400">{{ aiError }}</p>
+        <div class="flex justify-end gap-2 pt-2">
+          <button type="button" class="chrome-btn-secondary" @click="aiModalOpen = false">
+            <X class="w-3.5 h-3.5" />
+            {{ t('common.cancel') }}
+          </button>
+          <button
+            type="submit"
+            class="chrome-btn-primary"
+            :disabled="aiBusy || !aiPrompt.trim() || !selectedDsId"
+          >
+            <Sparkles class="w-3.5 h-3.5" />
+            {{ aiBusy ? t('sql.ai_generating') : t('sql.ai_generate') }}
           </button>
         </div>
       </form>
