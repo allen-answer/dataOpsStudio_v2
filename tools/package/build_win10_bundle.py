@@ -1,30 +1,36 @@
-"""Build a fully offline Win10 x64 deployment bundle for DataOpsStudio 2.0.
+"""Build a Win10 x64 deployment bundle for DataOpsStudio 2.0 (offline or online).
 
-The produced ``dataops-studio-<ver>-win10-x64-offline.zip`` is self-contained: an
-air-gapped Windows 10 x64 host unzips it and runs ``start.bat`` — no Python, no
-network, no separate PostgreSQL install required. The bundle carries
+Two modes share one set of PowerShell install/start scripts (``install.ps1`` /
+``start.ps1`` / ``stop.ps1`` + a one-line ``start.cmd`` shim), so there is no
+drift between an air-gapped and a network install:
 
-* a relocatable standalone CPython 3.12 (python-build-standalone, via ``uv``);
-* ``uv.exe`` (drives the launcher's ``uv run`` child processes offline);
-* every runtime wheel (incl. psycopg[binary], pymysql, oracledb thin, ibm_db,
-  dmPython) for cp312 win_amd64 — offline ``pip install --no-index`` installable;
-* PostgreSQL 16 Windows x64 server binaries (bin/lib/share, EDB zip, slimmed —
-  pgAdmin/StackBuilder/doc/include dropped);
-* the built Vue SPA (``frontend/dist``);
-* the application source + ``uv.lock`` (reproducible env) + first-run scripts.
+* ``--mode offline`` (default) — ``dataops-studio-<ver>-win10-x64-offline.zip``
+  is self-contained: an air-gapped host unzips it and runs ``start.cmd``, no
+  Python / network / separate PostgreSQL required. The bundle carries a
+  relocatable standalone CPython 3.12, ``uv.exe``, every runtime wheel (cp312
+  win_amd64, offline ``pip install --no-index`` installable), PostgreSQL 16
+  server binaries (slim bin/lib/share), the built Vue SPA and the app source.
 
-Zero secrets are ever written into the bundle (R8). The bootstrap master key,
+* ``--mode online`` — ``dataops-studio-<ver>-win10-x64-online.zip`` is light: it
+  carries only the app source, ``frontend/dist``, the scripts, the pinned
+  ``requirements-frozen.txt`` (with sha256), and ``download-manifest.json``
+  pinning the Python runtime / ``uv`` / PostgreSQL 16 URLs + sha256. The target
+  downloads + verifies those on first run and installs deps from PyPI
+  (hash-checked). No wheels / python / pg are shipped in the zip.
+
+Zero secrets are ever written into either bundle (R8). The bootstrap master key,
 PG passwords and admin password are generated/entered on the target host at
 first run, never in git and never in this package.
 
-DM (达梦) note: the dmPython *driver wheel* is bundled (it is a locked main
-dependency and ships a cp312 win_amd64 wheel), but the proprietary DM *client*
+DM (达梦) note: the dmPython *driver wheel* is bundled/downloaded (a locked main
+dependency with a cp312 win_amd64 wheel), but the proprietary DM *client*
 (DM_HOME crypto libraries) is NOT — real DM connectivity needs a separate DM
 client install, see docs/deployment/win10-offline-bundle.md.
 
 Usage (build host needs network + uv + Node/npm)::
 
-    uv run python tools/package/build_win10_bundle.py
+    uv run python tools/package/build_win10_bundle.py                  # offline
+    uv run python tools/package/build_win10_bundle.py --mode online    # online
     uv run python tools/package/build_win10_bundle.py --skip-frontend-build
 
 Large artifacts land in ``dist-bundle/`` (git-ignored); the bundle itself never
@@ -35,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -54,6 +61,26 @@ PYTHON_VERSION = "3.12"
 # PG components to keep (server-only slim set). pgAdmin (~670MB), StackBuilder,
 # doc and include are dropped — the launcher only needs initdb/pg_ctl/postgres.
 PG_KEEP_DIRS = ("bin", "lib", "share")
+
+# ── online-mode download pins ────────────────────────────────────────────────
+# The online bundle ships no runtime; install.ps1 downloads these on the target
+# and verifies each sha256. Pins are the *same* python-build-standalone build uv
+# manages on the build host (see download-metadata) and the *same* uv release, so
+# offline and online produce an identical runtime. Bump in lockstep with uv's
+# managed CPython 3.12 patch when refreshing (see PR notes / playbook).
+PYTHON_STANDALONE_TAG = "20260610"
+PYTHON_FULL_VERSION = "3.12.13"
+PYTHON_STANDALONE_URL = (
+    "https://github.com/astral-sh/python-build-standalone/releases/download/"
+    f"{PYTHON_STANDALONE_TAG}/cpython-{PYTHON_FULL_VERSION}%2B{PYTHON_STANDALONE_TAG}"
+    "-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
+)
+PYTHON_STANDALONE_SHA256 = "99dce0b23bf3c3b28d350cdd7bfe3cd3be51cc4f285faae7c0df110d106d1a8d"
+UV_VERSION = "0.11.23"
+UV_URL = (
+    f"https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/uv-x86_64-pc-windows-msvc.zip"
+)
+UV_SHA256 = "02ad29f07e674d68726ba3bb1ff25b335d83515756e2b1a194bb56c3cc30e07c"
 
 # Application source copied into the bundle (everything `python -m app.*` and
 # `alembic upgrade head` need at runtime, cwd = bundle root).
@@ -277,12 +304,13 @@ def extract_pg(zip_path: Path, staging: Path) -> None:
 def assemble(
     staging: Path,
     *,
-    python_dir: Path,
-    uv_dir: Path,
-    wheels: Path,
+    mode: str,
     requirements: Path,
     frontend_dist: Path,
-    pg_zip: Path,
+    python_dir: Path | None = None,
+    uv_dir: Path | None = None,
+    wheels: Path | None = None,
+    pg_zip: Path | None = None,
 ) -> None:
     if staging.exists():
         shutil.rmtree(staging)
@@ -302,20 +330,58 @@ def assemble(
 
     runtime = staging / "runtime"
     runtime.mkdir(parents=True)
-    log("assemble: standalone python")
-    _copytree(python_dir, runtime / "python")
-    log("assemble: uv")
-    _copytree(uv_dir, runtime / "uv")
-    log("assemble: wheels")
-    (runtime / "wheels").mkdir()
-    for wheel in wheels.glob("*.whl"):
-        shutil.copy2(wheel, runtime / "wheels" / wheel.name)
     shutil.copy2(requirements, runtime / "requirements-frozen.txt")
 
-    extract_pg(pg_zip, staging)
+    if mode == "offline":
+        assert python_dir and uv_dir and wheels and pg_zip
+        log("assemble: standalone python")
+        _copytree(python_dir, runtime / "python")
+        log("assemble: uv")
+        _copytree(uv_dir, runtime / "uv")
+        log("assemble: wheels")
+        (runtime / "wheels").mkdir()
+        for wheel in wheels.glob("*.whl"):
+            shutil.copy2(wheel, runtime / "wheels" / wheel.name)
+        extract_pg(pg_zip, staging)
+    else:
+        log("assemble: online download-manifest.json (python/uv/pg pins)")
+        write_download_manifest(staging)
 
     write_scripts(staging)
     write_readme(staging)
+
+
+def download_manifest() -> dict[str, object]:
+    """The URL + sha256 pins install.ps1 uses to provision an online bundle."""
+
+    return {
+        "schema": 1,
+        "mode": "online",
+        "python": {
+            "version": PYTHON_FULL_VERSION,
+            "url": PYTHON_STANDALONE_URL,
+            "sha256": PYTHON_STANDALONE_SHA256,
+        },
+        "uv": {
+            "version": UV_VERSION,
+            "url": UV_URL,
+            "sha256": UV_SHA256,
+        },
+        "postgres": {
+            "version": PG_VERSION,
+            "url": PG_URL,
+            "sha256": PG_SHA256,
+            "keep": list(PG_KEEP_DIRS),
+        },
+    }
+
+
+def write_download_manifest(staging: Path) -> None:
+    runtime = staging / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    (runtime / "download-manifest.json").write_text(
+        json.dumps(download_manifest(), indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def _write_template(name: str, dest: Path, *, encoding: str) -> None:
@@ -323,22 +389,45 @@ def _write_template(name: str, dest: Path, *, encoding: str) -> None:
     dest.write_text(text, encoding=encoding, newline="\r\n")
 
 
+# PowerShell core + one-line .cmd double-click shims (no batch quote nesting).
+SCRIPT_TEMPLATES = (
+    "_common.ps1",
+    "install.ps1",
+    "start.ps1",
+    "stop.ps1",
+    "start.cmd",
+    "stop.cmd",
+)
+
+
 def write_scripts(staging: Path) -> None:
-    log("assemble: start.bat / stop.bat")
-    _write_template("start.bat", staging / "start.bat", encoding="ascii")
-    _write_template("stop.bat", staging / "stop.bat", encoding="ascii")
+    log("assemble: PowerShell scripts + .cmd shims")
+    for name in SCRIPT_TEMPLATES:
+        _write_template(name, staging / name, encoding="ascii")
 
 
 def write_readme(staging: Path) -> None:
     _write_template("README.md", staging / "README.md", encoding="utf-8")
 
 
-def write_manifest(staging_parent: Path, zip_path: Path) -> None:
+def write_manifest(staging_parent: Path, zip_path: Path, mode: str) -> None:
+    if mode == "offline":
+        runtime_lines = [
+            f"postgresql: {PG_VERSION} (EDB windows-x64 binaries, slim bin/lib/share, bundled)",
+            f"python: python-build-standalone {PYTHON_FULL_VERSION} (relocatable, bundled)",
+            "wheels: bundled (offline pip install --no-index)",
+        ]
+    else:
+        runtime_lines = [
+            f"postgresql: {PG_VERSION} (downloaded on first run, sha256 pinned)",
+            f"python: python-build-standalone {PYTHON_FULL_VERSION} (downloaded, sha256 pinned)",
+            f"uv: {UV_VERSION} (downloaded, sha256 pinned)",
+            "wheels: downloaded from PyPI on first run (--require-hashes)",
+        ]
     lines = [
-        "DataOpsStudio Win10 x64 offline bundle",
+        f"DataOpsStudio Win10 x64 {mode} bundle",
         f"bundle_version: {bundle_version()}",
-        f"postgresql: {PG_VERSION} (EDB windows-x64 binaries, slim bin/lib/share)",
-        f"python: python-build-standalone {PYTHON_VERSION} (relocatable, offline)",
+        *runtime_lines,
         f"zip: {zip_path.name}",
         f"zip_sha256: {sha256_file(zip_path)}",
         f"zip_size_mb: {zip_path.stat().st_size / 1024 / 1024:.1f}",
@@ -363,7 +452,13 @@ def make_zip(staging: Path, output_dir: Path, name: str) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Build the Win10 x64 offline bundle.")
+    parser = argparse.ArgumentParser(description="Build the Win10 x64 deployment bundle.")
+    parser.add_argument(
+        "--mode",
+        choices=("offline", "online"),
+        default="offline",
+        help="offline: zip embeds runtime+wheels+PG; online: light zip, download on target",
+    )
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "dist-bundle"))
     parser.add_argument("--cache-dir", default=str(REPO_ROOT / "dist-bundle" / "cache"))
     parser.add_argument("--uv", default="uv", help="uv executable on the build host")
@@ -388,28 +483,37 @@ def main(argv: list[str] | None = None) -> int:
     cache.mkdir(parents=True, exist_ok=True)
 
     version = bundle_version()
-    name = f"dataops-studio-{version}-win10-x64-offline"
+    name = f"dataops-studio-{version}-win10-x64-{args.mode}"
 
     requirements = export_requirements(cache, args.uv)
-    python_dir = prepare_python(cache, args.uv)
-    uv_dir = prepare_uv(cache, args.uv)
-    wheels = download_wheels(cache, python_dir, requirements)
-    pg_zip = download_pg(cache)
     frontend_dist = build_frontend(args.skip_frontend_build)
 
     staging = output_dir / name
-    assemble(
-        staging,
-        python_dir=python_dir,
-        uv_dir=uv_dir,
-        wheels=wheels,
-        requirements=requirements,
-        frontend_dist=frontend_dist,
-        pg_zip=pg_zip,
-    )
+    if args.mode == "offline":
+        python_dir = prepare_python(cache, args.uv)
+        uv_dir = prepare_uv(cache, args.uv)
+        wheels = download_wheels(cache, python_dir, requirements)
+        pg_zip = download_pg(cache)
+        assemble(
+            staging,
+            mode="offline",
+            requirements=requirements,
+            frontend_dist=frontend_dist,
+            python_dir=python_dir,
+            uv_dir=uv_dir,
+            wheels=wheels,
+            pg_zip=pg_zip,
+        )
+    else:
+        assemble(
+            staging,
+            mode="online",
+            requirements=requirements,
+            frontend_dist=frontend_dist,
+        )
 
     zip_path = make_zip(staging, output_dir, name)
-    write_manifest(output_dir, zip_path)
+    write_manifest(output_dir, zip_path, args.mode)
     if not args.keep_staging:
         shutil.rmtree(staging)
     log("done")
