@@ -520,18 +520,34 @@ export default {
     preview_err_select_not_allowed: 'Datasource operation policy denies SELECT.',
     preview_err_unreachable: 'Datasource connection failed.',
     preview_err_failed: 'Preview query failed.',
-    preview_adopt_columns: 'Adopt column names from preview',
-    preview_adopt_hint:
-      'Adopts names only; type defaults to string — adjust manually. Existing columns with the same name are skipped.',
+    preview_adopt_source: 'Adopt as source columns',
+    preview_adopt_source_hint:
+      'Replaces the compare column list with these source column names (type resets to string; keys, ignores and target mappings are cleared). Confirms first if columns already exist.',
+    preview_adopt_target: 'Adopt as target columns',
+    preview_adopt_target_hint:
+      'Fills target column names into the existing compare rows by position (source row i ← target column i). Extra target columns are left out; fewer keeps the remaining rows matched to the source name.',
+    adopt_source_confirm:
+      'Replace the current compare columns with the source preview columns? This clears existing keys, ignores and target mappings.',
+    adopt_target_confirm:
+      'Overwrite target column names on the existing compare rows with the target preview columns (aligned by position)?',
+    adopt_target_needs_source:
+      'Add source columns first (adopt from the source preview), then adopt target column names.',
     // manual column / key editor (C-2)
     columns_empty:
       'No columns yet. Table refs can use auto-infer; for SQL refs add columns manually or preview first and adopt the names.',
     col_name: 'Column',
+    col_name_source: 'Source column',
+    col_name_target: 'Target column',
+    col_target_hint:
+      'Defaults to the source name; enter a different name to map source → target. Leave empty to keep it the same.',
     col_type: 'Type',
     col_ignore: 'Ignore',
     col_pk_hint: 'Checked = use as key column (in check order)',
     col_add: 'Add column',
     col_remove: 'Remove column',
+    columns_clear: 'Clear',
+    columns_clear_hint: 'Remove all compare column configuration (columns, keys, ignores, mappings).',
+    columns_clear_confirm: 'Clear all compare columns, keys, ignores and target mappings?',
     // suggestions
     suggestions: 'Task suggestions',
     suggestions_hint: 'Same-named / normalized table pairs across the two datasources.',

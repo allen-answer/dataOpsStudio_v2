@@ -586,16 +586,63 @@ function toggleKeyColumn(name: string): void {
   }
 }
 
-/** 从预览带入列名:type 默认 string 由用户改,同名列跳过不覆盖(预览不返回类型,不自动填)。 */
+/**
+ * 从预览带入列名(按侧,替换语义):
+ *  - source 侧:整表**替换**比较列(用源预览列名);已有非空列表时先确认。
+ *    type 重置为 string,主键 / 忽略 / 目标映射一并清空(目标列名默认同源)。
+ *  - target 侧:按行序把目标列名填入已有比较行(源第 i 行 ← 目标预览第 i 列);
+ *    与源名不同则写入 column_mappings。目标列多于源行 → 多出的忽略(留待用户加行);
+ *    少于 → 其余源行目标名保持同源。已有自定义映射时先确认。
+ */
 function adoptPreviewColumns(side: RefSide): void {
   const data = previews[side].data
   if (!data) return
-  const existing = new Set(draft.columns.map((c) => c.name))
-  for (const name of data.columns) {
-    if (!name || existing.has(name)) continue
-    existing.add(name)
-    draft.columns.push({ name, type: 'string' })
+  const cols = data.columns.filter((c) => c)
+  if (cols.length === 0) return
+  if (side === 'source') {
+    const hasExisting = draft.columns.some((c) => c.name.trim())
+    if (hasExisting && !confirm(t('compare.adopt_source_confirm'))) return
+    draft.columns = cols.map((name) => ({ name, type: 'string' }))
+    draft.keyColumns = []
+    draft.ignoreColumns = []
+    draft.columnMappings = {}
+  } else {
+    if (draft.columns.length === 0) {
+      editorError.value = t('compare.adopt_target_needs_source')
+      return
+    }
+    if (Object.keys(draft.columnMappings).length > 0 && !confirm(t('compare.adopt_target_confirm'))) return
+    const next: Record<string, string> = {}
+    draft.columns.forEach((col, i) => {
+      const tgt = cols[i]
+      if (tgt && col.name.trim() && tgt !== col.name) next[col.name] = tgt
+    })
+    draft.columnMappings = next
   }
+}
+
+/** 该比较行的目标列名:默认同源,column_mappings 有覆盖时取覆盖值。 */
+function targetColName(sourceName: string): string {
+  return draft.columnMappings[sourceName] ?? sourceName
+}
+
+/** 编辑目标列名:留空或等于源名 = 同步(删除映射);否则写入映射。 */
+function onTargetColInput(index: number, event: Event): void {
+  const src = draft.columns[index]?.name
+  if (!src) return
+  const val = (event.target as HTMLInputElement).value.trim()
+  if (!val || val === src) delete draft.columnMappings[src]
+  else draft.columnMappings[src] = val
+}
+
+/** 清空所有比较列配置(列 / 主键 / 忽略 / 映射),先确认。 */
+function clearColumns(): void {
+  if (draft.columns.length === 0) return
+  if (!confirm(t('compare.columns_clear_confirm'))) return
+  draft.columns = []
+  draft.keyColumns = []
+  draft.ignoreColumns = []
+  draft.columnMappings = {}
 }
 
 // ── 文件源(C-1)──────────────────────────────────────────────────────
@@ -1886,7 +1933,7 @@ const missingTarget = computed(
               {{ t('compare.single_sql') }}
             </label>
 
-            <fieldset class="space-y-2 rounded-card border chrome-border p-3">
+            <fieldset class="space-y-2 rounded-card border chrome-border p-3 min-w-0">
               <legend class="px-1 text-xs font-medium chrome-text-heading">{{ t('compare.source') }}</legend>
               <!-- file 侧无 datasource(#126 起后端可选):隐藏库下拉。 -->
               <select v-if="draft.sourceKind !== 'file'" v-model="draft.sourceId" class="chrome-input w-full text-sm">
@@ -1995,19 +2042,27 @@ const missingTarget = computed(
                   <div v-if="previews.source.data.rows.length === 0" class="text-xs chrome-text-muted">
                     {{ t('compare.preview_empty') }}
                   </div>
-                  <div v-else class="overflow-auto max-h-56">
-                    <table class="text-[11px] border chrome-border rounded-card">
+                  <div v-else class="overflow-x-auto overflow-y-auto max-h-56 rounded-card border chrome-border">
+                    <table class="text-[11px] border-collapse">
                       <thead class="chrome-bg-elevated">
                         <tr class="text-left chrome-text-muted">
-                          <th v-for="col in previews.source.data.columns" :key="col" class="px-2 py-1 font-medium whitespace-nowrap">
-                            {{ col }}
+                          <th
+                            v-for="col in previews.source.data.columns"
+                            :key="col"
+                            class="px-2 py-1 font-medium border-b border-r chrome-border-subtle align-top"
+                          >
+                            <div class="min-w-[4.5rem] max-w-[14rem] truncate" :title="col">{{ col }}</div>
                           </th>
                         </tr>
                       </thead>
                       <tbody>
-                        <tr v-for="(prow, pi) in previews.source.data.rows" :key="pi" class="border-t chrome-border-subtle">
-                          <td v-for="(cell, ci) in prow" :key="ci" class="px-2 py-1 font-mono whitespace-nowrap">
-                            {{ fmtCell(cell) }}
+                        <tr v-for="(prow, pi) in previews.source.data.rows" :key="pi">
+                          <td
+                            v-for="(cell, ci) in prow"
+                            :key="ci"
+                            class="px-2 py-1 font-mono border-b border-r chrome-border-subtle align-top"
+                          >
+                            <div class="min-w-[4.5rem] max-w-[14rem] truncate" :title="fmtCell(cell)">{{ fmtCell(cell) }}</div>
                           </td>
                         </tr>
                       </tbody>
@@ -2018,16 +2073,16 @@ const missingTarget = computed(
                   <button
                     type="button"
                     class="chrome-btn-secondary text-xs"
-                    :title="t('compare.preview_adopt_hint')"
+                    :title="t('compare.preview_adopt_source_hint')"
                     @click="adoptPreviewColumns('source')"
                   >
-                    <ListPlus class="w-3.5 h-3.5" /> {{ t('compare.preview_adopt_columns') }}
+                    <ListPlus class="w-3.5 h-3.5" /> {{ t('compare.preview_adopt_source') }}
                   </button>
                 </div>
               </div>
             </fieldset>
 
-            <fieldset class="space-y-2 rounded-card border chrome-border p-3">
+            <fieldset class="space-y-2 rounded-card border chrome-border p-3 min-w-0">
               <legend class="px-1 text-xs font-medium chrome-text-heading">{{ t('compare.target') }}</legend>
               <!-- file 侧无 datasource(#126 起后端可选):隐藏库下拉。 -->
               <select v-if="draft.targetKind !== 'file'" v-model="draft.targetId" class="chrome-input w-full text-sm">
@@ -2136,19 +2191,27 @@ const missingTarget = computed(
                   <div v-if="previews.target.data.rows.length === 0" class="text-xs chrome-text-muted">
                     {{ t('compare.preview_empty') }}
                   </div>
-                  <div v-else class="overflow-auto max-h-56">
-                    <table class="text-[11px] border chrome-border rounded-card">
+                  <div v-else class="overflow-x-auto overflow-y-auto max-h-56 rounded-card border chrome-border">
+                    <table class="text-[11px] border-collapse">
                       <thead class="chrome-bg-elevated">
                         <tr class="text-left chrome-text-muted">
-                          <th v-for="col in previews.target.data.columns" :key="col" class="px-2 py-1 font-medium whitespace-nowrap">
-                            {{ col }}
+                          <th
+                            v-for="col in previews.target.data.columns"
+                            :key="col"
+                            class="px-2 py-1 font-medium border-b border-r chrome-border-subtle align-top"
+                          >
+                            <div class="min-w-[4.5rem] max-w-[14rem] truncate" :title="col">{{ col }}</div>
                           </th>
                         </tr>
                       </thead>
                       <tbody>
-                        <tr v-for="(prow, pi) in previews.target.data.rows" :key="pi" class="border-t chrome-border-subtle">
-                          <td v-for="(cell, ci) in prow" :key="ci" class="px-2 py-1 font-mono whitespace-nowrap">
-                            {{ fmtCell(cell) }}
+                        <tr v-for="(prow, pi) in previews.target.data.rows" :key="pi">
+                          <td
+                            v-for="(cell, ci) in prow"
+                            :key="ci"
+                            class="px-2 py-1 font-mono border-b border-r chrome-border-subtle align-top"
+                          >
+                            <div class="min-w-[4.5rem] max-w-[14rem] truncate" :title="fmtCell(cell)">{{ fmtCell(cell) }}</div>
                           </td>
                         </tr>
                       </tbody>
@@ -2159,10 +2222,10 @@ const missingTarget = computed(
                   <button
                     type="button"
                     class="chrome-btn-secondary text-xs"
-                    :title="t('compare.preview_adopt_hint')"
+                    :title="t('compare.preview_adopt_target_hint')"
                     @click="adoptPreviewColumns('target')"
                   >
-                    <ListPlus class="w-3.5 h-3.5" /> {{ t('compare.preview_adopt_columns') }}
+                    <ListPlus class="w-3.5 h-3.5" /> {{ t('compare.preview_adopt_target') }}
                   </button>
                 </div>
               </div>
@@ -2369,7 +2432,8 @@ const missingTarget = computed(
               <thead class="chrome-bg-elevated">
                 <tr class="text-left chrome-text-muted">
                   <th class="px-2 py-1.5 font-medium w-12">{{ t('compare.pk_column') }}</th>
-                  <th class="px-2 py-1.5 font-medium">{{ t('compare.col_name') }}</th>
+                  <th class="px-2 py-1.5 font-medium">{{ t('compare.col_name_source') }}</th>
+                  <th class="px-2 py-1.5 font-medium">{{ t('compare.col_name_target') }}</th>
                   <th class="px-2 py-1.5 font-medium w-32">{{ t('compare.col_type') }}</th>
                   <th class="px-2 py-1.5 font-medium w-12">{{ t('compare.col_ignore') }}</th>
                   <th class="px-2 py-1.5 w-10"></th>
@@ -2395,6 +2459,16 @@ const missingTarget = computed(
                     />
                   </td>
                   <td class="px-2 py-1.5">
+                    <input
+                      :value="targetColName(col.name)"
+                      :disabled="!col.name.trim()"
+                      class="chrome-input w-full text-xs font-mono"
+                      :placeholder="col.name || t('compare.col_name')"
+                      :title="t('compare.col_target_hint')"
+                      @input="onTargetColInput(ci, $event)"
+                    />
+                  </td>
+                  <td class="px-2 py-1.5">
                     <select v-model="col.type" class="chrome-input w-full text-xs">
                       <option v-for="ct in COLUMN_TYPE_OPTIONS" :key="ct" :value="ct">{{ ct }}</option>
                     </select>
@@ -2416,9 +2490,20 @@ const missingTarget = computed(
                 </tr>
               </tbody>
             </table>
-            <button type="button" class="chrome-btn-secondary text-xs" @click="addColumn">
-              <Plus class="w-3.5 h-3.5" /> {{ t('compare.col_add') }}
-            </button>
+            <div class="flex items-center gap-2">
+              <button type="button" class="chrome-btn-secondary text-xs" @click="addColumn">
+                <Plus class="w-3.5 h-3.5" /> {{ t('compare.col_add') }}
+              </button>
+              <button
+                v-if="draft.columns.length > 0"
+                type="button"
+                class="chrome-btn-secondary text-xs"
+                :title="t('compare.columns_clear_hint')"
+                @click="clearColumns"
+              >
+                <Trash2 class="w-3.5 h-3.5" /> {{ t('compare.columns_clear') }}
+              </button>
+            </div>
           </div>
 
           <!-- UX-2 C-4:主键健康预检(唯一性 / 空值)—— 跑前先拦主键选错导致的满屏噪声 -->
