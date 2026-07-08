@@ -49,6 +49,7 @@ import {
   explainCompareRun,
   getCompareRunProfile,
   getCompareRunResults,
+  getCompareRunsDashboard,
   inferCompareTask,
   listCompareTaskRuns,
   listCompareTasks,
@@ -68,6 +69,7 @@ import {
   type CompareResultRow,
   type CompareRunProfileResponse,
   type CompareRunResultResponse,
+  type CompareRunsDashboardResponse,
   type CompareTaskResponse,
   type CompareTaskRunItem,
   type PrimaryKeyCandidate,
@@ -141,6 +143,8 @@ const datasources = computed<DatasourceListItem[]>(() => dsQuery.data.value ?? [
 const tasks = ref<CompareTaskResponse[]>([])
 const tasksLoading = ref(false)
 const tasksError = ref<string | null>(null)
+// run 仪表盘(C-12):近 30 天聚合统计卡。加载失败静默(仪表盘非关键路径)。
+const dashboard = ref<CompareRunsDashboardResponse | null>(null)
 const activeTaskId = ref<string | null>(null)
 const rightTab = ref<RightTab>('editor')
 
@@ -707,6 +711,7 @@ function filePreviewErrorMessage(e: unknown): string {
 // ── lifecycle ───────────────────────────────────────────────────────
 onMounted(() => {
   void loadTasks()
+  void loadDashboard()
 })
 onUnmounted(() => {
   if (pollTimer) clearTimeout(pollTimer)
@@ -747,6 +752,16 @@ async function loadTasks(): Promise<void> {
     tasksError.value = errorMessage(e)
   } finally {
     tasksLoading.value = false
+  }
+}
+
+// run 仪表盘(C-12):非关键路径,失败静默(不打断对比主流程)。
+async function loadDashboard(): Promise<void> {
+  if (!projectId.value) return
+  try {
+    dashboard.value = await getCompareRunsDashboard(projectId.value, 30)
+  } catch {
+    dashboard.value = null
   }
 }
 
@@ -1066,6 +1081,7 @@ async function pollRun(): Promise<void> {
       if (job.status === 'success') {
         await Promise.all([loadResults(resultBucket.value), loadProfile()])
       }
+      void loadDashboard() // run 终态 → 刷新仪表盘统计
       return
     }
   } catch (e) {
@@ -1375,6 +1391,38 @@ const missingTarget = computed(
         <div class="text-section font-semibold chrome-text-heading mt-1 flex items-center gap-2">
           <GitCompareArrows class="w-4 h-4" />
           {{ t('compare.workspace') }}
+        </div>
+      </div>
+
+      <!-- run 仪表盘统计卡(C-12):近 N 天 run 数 / 成功率 / 中止 top 原因 -->
+      <div v-if="dashboard && dashboard.total_runs > 0" class="px-3 py-2 border-b chrome-border-subtle">
+        <div class="text-[11px] uppercase tracking-wider chrome-text-muted font-medium mb-1.5">
+          {{ t('compare.dashboard_title', { days: dashboard.days }) }}
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+          <div class="rounded-card border chrome-border-subtle px-2.5 py-1.5">
+            <div class="text-[11px] chrome-text-muted">{{ t('compare.dashboard_runs') }}</div>
+            <div class="text-base font-semibold chrome-text-heading tabular-nums">{{ dashboard.total_runs }}</div>
+          </div>
+          <div class="rounded-card border chrome-border-subtle px-2.5 py-1.5">
+            <div class="text-[11px] chrome-text-muted">{{ t('compare.dashboard_success_rate') }}</div>
+            <div class="text-base font-semibold chrome-text-heading tabular-nums">
+              {{ Math.round(dashboard.success_rate * 100) }}%
+            </div>
+          </div>
+        </div>
+        <div v-if="dashboard.top_abort_reasons.length > 0" class="mt-2">
+          <div class="text-[11px] chrome-text-muted mb-1">{{ t('compare.dashboard_abort_reasons') }}</div>
+          <ul class="space-y-0.5">
+            <li
+              v-for="r in dashboard.top_abort_reasons"
+              :key="r.reason"
+              class="flex items-center justify-between gap-2 text-[11px]"
+            >
+              <span class="truncate chrome-text-normal font-mono" :title="r.reason">{{ r.reason }}</span>
+              <span class="tabular-nums chrome-text-muted shrink-0">{{ r.count }}</span>
+            </li>
+          </ul>
         </div>
       </div>
 

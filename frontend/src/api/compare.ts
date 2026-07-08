@@ -223,6 +223,21 @@ export interface CompareTaskRunsResponse {
   runs: CompareTaskRunItem[]
 }
 
+// ── run 仪表盘(schemas.py CompareRunsDashboardResponse,C-12)─
+export interface CompareRunAbortReason {
+  reason: string
+  count: number
+}
+
+export interface CompareRunsDashboardResponse {
+  project_id: string
+  days: number
+  total_runs: number
+  status_counts: Record<string, number>
+  success_rate: number
+  top_abort_reasons: CompareRunAbortReason[]
+}
+
 // ── 数据预览(schemas.py ComparePreviewRequest / ComparePreviewResponse)─
 export interface ComparePreviewRequest {
   datasource_id: string
@@ -394,6 +409,15 @@ export function inferCompareTask(
   req: CompareInferRequest,
 ): Promise<CompareInferResponse> {
   return apiClient.post<CompareInferResponse>(`/projects/${projectId}/compare/infer`, req)
+}
+
+export function getCompareRunsDashboard(
+  projectId: string,
+  days = 30,
+): Promise<CompareRunsDashboardResponse> {
+  return apiClient.get<CompareRunsDashboardResponse>(
+    `/projects/${encodeURIComponent(projectId)}/compare/runs-dashboard?days=${days}`,
+  )
 }
 
 export function suggestCompareTasks(

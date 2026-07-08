@@ -25,6 +25,7 @@ import {
   FileText,
   Gauge,
   History,
+  Info,
   Key,
   ListTree,
   Network,
@@ -36,6 +37,7 @@ import {
   RefreshCw,
   Save,
   Search,
+  ShieldCheck,
   Sparkles,
   Square,
   Table2,
@@ -85,7 +87,7 @@ import {
   type MetadataSchemaItem,
   type MetadataTableItem,
 } from '../api/metadata'
-import { explainSql } from '../api/sql'
+import { explainSql, preflightSql, type SqlPreflightFinding } from '../api/sql'
 import { generateSql } from '../api/ai'
 import { ApiError, type DatasourceListItem, type ExportFormat, type JobStatus } from '../api/types'
 import { useThemeStore } from '../stores/theme'
@@ -168,7 +170,7 @@ interface TemplateForm {
   project_id: string
 }
 
-const { t } = useI18n()
+const { t, te } = useI18n()
 const route = useRoute()
 const themeStore = useThemeStore()
 const authStore = useAuthStore()
@@ -239,9 +241,12 @@ const metadataSchemas = ref<MetadataSchemaNode[]>([])
 const metadataLoading = ref(false)
 const metadataError = ref<string | null>(null)
 
-// ── 编辑器工具栏(format / expand-star / explain)─────────────────
+// ── 编辑器工具栏(format / expand-star / explain / preflight)──────
 const toolError = ref<string | null>(null)
-const toolBusy = ref<'' | 'format' | 'expand' | 'explain'>('')
+const toolBusy = ref<'' | 'format' | 'expand' | 'explain' | 'preflight'>('')
+
+// SQL 体检(C-11):文本级 advisory finding;卡片展示,可关闭。行数估算复用 EXPLAIN。
+const preflightFindings = ref<SqlPreflightFinding[] | null>(null)
 
 // ── AI 生成(C1:自然语言 → 真实 schema 生成只读 SQL)────────────────
 const aiModalOpen = ref(false)
@@ -392,6 +397,11 @@ watch(editorSql, (value) => {
   if (suppressConsoleSave.value || !activeConsole.value || editorReadOnly.value) return
   patchLocalConsole(activeConsole.value.id, { sql: value })
   scheduleConsolePatch(activeConsole.value.id, { sql: value })
+})
+
+// 切 console → 清体检卡(findings 锚的是上一个 console 的 SQL 文本)。
+watch(activeConsoleId, () => {
+  preflightFindings.value = null
 })
 
 watch(selectedDsId, (value) => {
@@ -1047,6 +1057,29 @@ async function onGenerateSql(): Promise<void> {
   }
 }
 
+// SQL 体检(C-11):文本级 advisory findings 卡;若数据源支持 EXPLAIN,顺带触发一次
+// 库内 EXPLAIN(行数估算落 Plan tab)—— 复用既有端点,不自造行数解析。
+async function onPreflight(): Promise<void> {
+  if (!editorSql.value.trim()) return
+  toolError.value = null
+  toolBusy.value = 'preflight'
+  try {
+    const res = await preflightSql(editorSql.value)
+    preflightFindings.value = res.findings
+    if (explainSupported.value) void onExplain()
+  } catch (e) {
+    toolError.value = errorMessage(e)
+  } finally {
+    toolBusy.value = ''
+  }
+}
+
+// finding 优先按 code 走 i18n(zh/en 双语),缺 key 回退后端英文 message。
+function preflightMessage(finding: SqlPreflightFinding): string {
+  const key = `sql.preflight_finding.${finding.code}`
+  return te(key) ? t(key) : finding.message
+}
+
 function startPlanPoll(consoleId: string): void {
   void pollPlan(consoleId)
 }
@@ -1683,6 +1716,16 @@ function parseVariables(value: string): string[] {
             <Sparkles class="w-3.5 h-3.5" />
             {{ t('sql.ai_generate') }}
           </button>
+          <button
+            type="button"
+            class="chrome-btn-secondary"
+            :disabled="!editorSql.trim() || editorReadOnly || toolBusy !== ''"
+            :title="t('sql.tool_preflight_hint')"
+            @click="onPreflight"
+          >
+            <ShieldCheck class="w-3.5 h-3.5" />
+            {{ toolBusy === 'preflight' ? t('common.submitting') : t('sql.tool_preflight') }}
+          </button>
           <div class="flex-1" />
           <span
             v-if="aiExplanation"
@@ -1695,6 +1738,34 @@ function parseVariables(value: string): string[] {
           <span v-if="toolError" class="text-xs text-red-600 dark:text-red-400 truncate max-w-[24rem]" :title="toolError">
             {{ toolError }}
           </span>
+        </div>
+
+        <!-- SQL 体检结果卡(C-11 advisory:只提示不拦截)-->
+        <div v-if="preflightFindings" class="px-5 py-2 border-b chrome-border-subtle">
+          <div class="rounded-card border chrome-border-subtle chrome-bg-elevated p-3 text-xs space-y-2">
+            <div class="flex items-center gap-2">
+              <ShieldCheck class="w-3.5 h-3.5 chrome-accent shrink-0" />
+              <span class="font-medium chrome-text-heading flex-1">{{ t('sql.preflight_title') }}</span>
+              <button type="button" class="chrome-btn-ghost p-0.5" :title="t('common.close')" @click="preflightFindings = null">
+                <X class="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <p v-if="preflightFindings.length === 0" class="chrome-text-muted flex items-center gap-1.5">
+              <ShieldCheck class="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+              {{ t('sql.preflight_clean') }}
+            </p>
+            <ul v-else class="space-y-1.5">
+              <li v-for="f in preflightFindings" :key="f.code" class="flex items-start gap-2">
+                <AlertTriangle
+                  v-if="f.severity === 'warning'"
+                  class="w-3.5 h-3.5 shrink-0 mt-0.5 text-amber-600 dark:text-amber-400"
+                />
+                <Info v-else class="w-3.5 h-3.5 shrink-0 mt-0.5 chrome-text-muted" />
+                <span class="chrome-text-normal">{{ preflightMessage(f) }}</span>
+              </li>
+            </ul>
+            <p v-if="explainSupported" class="chrome-text-muted pt-0.5">{{ t('sql.preflight_explain_hint') }}</p>
+          </div>
         </div>
 
         <div ref="resultPanel" class="flex-1 min-h-[35vh] flex flex-col">
