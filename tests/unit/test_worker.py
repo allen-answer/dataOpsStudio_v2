@@ -1634,9 +1634,7 @@ def _compare_run_workflow_spec() -> dict[str, object]:
     )
 
 
-def _make_compare_run_child(
-    run_job_id: str, node_id: str, job_id: str, run_id: str
-) -> Job:
+def _make_compare_run_child(run_job_id: str, node_id: str, job_id: str, run_id: str) -> Job:
     return Job(
         id=job_id,
         kind=JobKind.COMPARE_RUN,
