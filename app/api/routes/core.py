@@ -120,7 +120,9 @@ from app.api.schemas import (
     WorkflowListItem,
     WorkflowResponse,
     WorkflowRunCreateResponse,
+    WorkflowRunListItem,
     WorkflowRunNodeItem,
+    WorkflowRunsResponse,
     WorkflowRunStatusResponse,
     WorkflowRunTriggerRequest,
     WorkflowUpdateRequest,
@@ -4233,6 +4235,63 @@ def cancel_workflow_run(
         result="accepted",
     )
     return CancelResponse(cancelled=True)
+
+
+@router.get(
+    "/projects/{project_id}/workflows/{workflow_id}/runs",
+    response_model=WorkflowRunsResponse,
+)
+def list_workflow_runs(
+    project_id: str,
+    workflow_id: str,
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> WorkflowRunsResponse:
+    """列某 workflow 的历史 run(倒序分页;对齐 compare /runs 的 limit+1 has_more 口径)。
+
+    run = kind=workflow_run 的 job,workflow_id 存于 job.payload;节点明细走单 run
+    状态端点(GET workflow-runs/{run_id}),此列表只回 run 级状态 + 时间戳。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        # 先确认 workflow 存在(404 语义与其余 workflow 子资源一致)
+        _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+        rows = (
+            conn.execute(
+                select(jobs)
+                .where(jobs.c.kind == JobKind.WORKFLOW_RUN.value)
+                .where(jobs.c.project_id == project_id)
+                .where(jobs.c.payload["workflow_id"].astext == workflow_id)
+                .order_by(jobs.c.created_at.desc(), jobs.c.id.desc())
+                .limit(limit + 1)
+                .offset(offset)
+            )
+            .mappings()
+            .all()
+        )
+    has_more = len(rows) > limit
+    return WorkflowRunsResponse(
+        workflow_id=workflow_id,
+        limit=limit,
+        offset=offset,
+        has_more=has_more,
+        runs=[_workflow_run_list_item(row) for row in rows[:limit]],
+    )
+
+
+def _workflow_run_list_item(row: RowMapping) -> WorkflowRunListItem:
+    return WorkflowRunListItem(
+        run_id=str(row["id"]),
+        job_id=str(row["id"]),
+        status=JobStatus(str(row["status"])),
+        error=_optional_str(row["error"]),
+        created_at=_row_value_or_none(row, "created_at"),
+        started_at=_row_value_or_none(row, "started_at"),
+        finished_at=_row_value_or_none(row, "finished_at"),
+    )
 
 
 def _enqueue_job_txn(conn: Connection, services: ApiServices, job: Job) -> None:

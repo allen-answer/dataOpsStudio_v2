@@ -10,6 +10,7 @@ const TokensView = () => import('../views/TokensView.vue')
 const SqlWorkspaceView = () => import('../views/SqlWorkspaceView.vue')
 const CompareView = () => import('../views/CompareView.vue')
 const LineageView = () => import('../views/LineageView.vue')
+const WorkflowView = () => import('../views/WorkflowView.vue')
 const JobsView = () => import('../views/JobsView.vue')
 const AccountSecurityView = () => import('../views/AccountSecurityView.vue')
 const AdminLayout = () => import('../views/AdminLayout.vue')
@@ -63,6 +64,11 @@ const routes: RouteRecordRaw[] = [
         path: 'projects/:id/lineage',
         name: 'lineage',
         component: LineageView,
+      },
+      {
+        path: 'projects/:id/workflows',
+        name: 'workflows',
+        component: WorkflowView,
       },
       {
         path: 'projects/:id/jobs',
