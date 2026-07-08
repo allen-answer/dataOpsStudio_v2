@@ -25,6 +25,7 @@ import {
   FileArchive,
   FileSearch,
   FileStack,
+  GitCompareArrows,
   Lightbulb,
   Network,
   Play,
@@ -65,6 +66,7 @@ import { uploadFile } from '../api/uploads'
 import { createStoredZip } from '../utils/zip'
 import { ApiError, type DatasourceListItem } from '../api/types'
 import LoadingDots from '../components/LoadingDots.vue'
+import TraceCompareDialog from '../components/TraceCompareDialog.vue'
 
 type Tab = 'subgraph' | 'impact' | 'analyze' | 'batch'
 
@@ -108,6 +110,9 @@ const includeColumns = ref(false)
 const subgraphLoading = ref(false)
 const subgraphError = ref<string | null>(null)
 const subgraphData = ref<LineageSubgraphResponse | null>(null)
+
+// C-8 逐跳血缘对比弹窗(以当前子图焦点为对比焦点字段)
+const traceCompareOpen = ref(false)
 
 async function runSubgraph(): Promise<void> {
   const focus = subgraphFocus.value.trim()
@@ -924,6 +929,15 @@ function errorMessage(e: unknown): string {
             >
               <Download class="w-3.5 h-3.5" :class="exportBusy && 'animate-pulse'" />
               {{ exportBusy ? t('lineage.exporting') : t('lineage.export_excel') }}
+            </button>
+            <button
+              v-if="subgraphData.edge_count > 0"
+              type="button"
+              class="chrome-btn-secondary text-xs"
+              @click="traceCompareOpen = true"
+            >
+              <GitCompareArrows class="w-3.5 h-3.5" />
+              {{ t('lineage.tc_open') }}
             </button>
           </div>
           <div v-if="exportError" class="text-xs text-red-600 dark:text-red-400">
@@ -1882,6 +1896,16 @@ function errorMessage(e: unknown): string {
       </div>
     </div>
   </div>
+
+  <!-- C-8 逐跳血缘对比:以当前子图焦点为对比焦点字段 -->
+  <TraceCompareDialog
+    v-if="subgraphData"
+    :open="traceCompareOpen"
+    :project-id="projectId"
+    :focus="subgraphData.focus"
+    :datasources="datasources"
+    @close="traceCompareOpen = false"
+  />
 </template>
 
 <style scoped>

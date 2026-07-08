@@ -114,6 +114,9 @@ from app.api.schemas import (
     SqlTemplateResponse,
     SqlTemplateUpdateRequest,
     TokenResponse,
+    TraceCompareHopItem,
+    TraceCompareRequest,
+    TraceCompareResponse,
     UploadPurpose,
     UploadResponse,
     WorkflowCreateRequest,
@@ -188,6 +191,12 @@ from app.domain.lineage.ai_fallback import (
     InferredLineageEdges,
     fallback_statements,
     parse_inferred_edges,
+)
+from app.domain.lineage.trace_compare import (
+    TraceChainNode,
+    TraceCompareBuildError,
+    build_trace_compare_nodes,
+    build_trace_compare_spec,
 )
 from app.domain.notify import NotifyTarget
 from app.domain.readers import (
@@ -3381,6 +3390,157 @@ def get_lineage_column_trace(
             direction=direction,
             max_depth=min(max_depth, 5),
         )
+
+
+def _extract_trace_compare_chain(
+    trace: LineageColumnTraceResponse,
+    *,
+    focus_table: str,
+    focus_column: str,
+) -> list[TraceChainNode]:
+    """从上游 column-trace 结果抽出逐跳对比链:焦点表(depth 0)+ 各上游字段节点。
+
+    按 depth 升序遍历、按节点 id 去重(同字段经多路径重复出现只保留最浅一次),
+    顺序即 workflow 线性 DAG 的对比顺序。
+    """
+    chain: list[TraceChainNode] = [TraceChainNode(depth=0, table=focus_table, column=focus_column)]
+    seen: set[str] = {f"{focus_table}.{focus_column}"}
+    for hop in sorted(trace.hops, key=lambda item: item.depth):
+        for item in hop.items:
+            if item.node in seen:
+                continue
+            seen.add(item.node)
+            chain.append(TraceChainNode(depth=hop.depth, table=item.table, column=item.column))
+    return chain
+
+
+@router.post(
+    "/projects/{project_id}/lineage/trace-compare",
+    response_model=TraceCompareResponse,
+    status_code=201,
+)
+def create_lineage_trace_compare(
+    project_id: str,
+    body: TraceCompareRequest,
+    request: Request,
+) -> TraceCompareResponse:
+    """C-8 逐跳血缘对比:沿焦点字段上游血缘每跳生成一个 compare_run 节点,组装成
+    workflow(**只创建不触发**,返回 ``workflow_id`` 供用户在 workflow 页手动触发)。
+
+    两套环境(``source_id`` / ``target_id``)之间对比链上每张表的被追踪字段,定位
+    "哪一跳把数据搞错"。``dry_run=true`` 只返回预览计划、不落库。链超 ``max_hops``
+    上限 → 400 ``too_many_hops``;焦点无上游血缘 → 400 ``no_upstream_lineage``。
+    """
+    focus_table, focus_column = _lineage_split_column_focus(body.focus)
+    if focus_column is None:
+        raise ApiError(
+            400,
+            "column_focus_required",
+            "focus must be a table.column reference, e.g. app.orders.id",
+        )
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.begin() as conn:
+        _require_project_access(conn, project_id, user.id)
+        trace = _lineage_column_trace_response(
+            conn,
+            project_id=project_id,
+            focus=body.focus,
+            focus_table=focus_table,
+            focus_column=focus_column,
+            direction="upstream",
+            max_depth=min(body.max_depth, 5),
+        )
+        if not trace.hops:
+            # 焦点字段无上游血缘:逐跳对比无跳可比(链只剩焦点自身),显式 400
+            raise ApiError(
+                400,
+                "no_upstream_lineage",
+                "focus column has no upstream lineage to trace-compare",
+            )
+        chain = _extract_trace_compare_chain(
+            trace, focus_table=focus_table, focus_column=focus_column
+        )
+        try:
+            nodes = build_trace_compare_nodes(
+                chain=chain,
+                source_id=body.source_id,
+                target_id=body.target_id,
+                key_columns=body.key_columns,
+                schema_name=body.schema_name,
+                max_hops=body.max_hops,
+            )
+            spec = build_trace_compare_spec(nodes)
+        except TraceCompareBuildError as exc:
+            code, _, detail = str(exc).partition(":")
+            raise ApiError(400, code.strip() or "trace_compare_invalid", detail.strip()) from exc
+        # R7 门禁复核:虽然 build_trace_compare_spec 只生成 compare_run,仍经 WorkflowSpec
+        # 构造期双门禁;此处再走一遍 API 侧结构化错误映射,与手写 spec 同口径。
+        spec = _validated_workflow_spec(spec.model_dump(mode="json"))
+
+        hops = [
+            TraceCompareHopItem(
+                node_id=node.node_id,
+                depth=node.depth,
+                table=node.table,
+                column=node.column,
+                key_columns=node.key_columns,
+            )
+            for node in nodes
+        ]
+        if body.dry_run:
+            return TraceCompareResponse(
+                project_id=project_id,
+                focus=body.focus,
+                source_id=body.source_id,
+                target_id=body.target_id,
+                workflow_id=None,
+                workflow_name=None,
+                hop_count=len(hops),
+                truncated=trace.truncated,
+                hops=hops,
+            )
+
+        workflow_name = body.name or f"trace-compare {body.focus}"[:128]
+        _require_workflow_name_available(conn, project_id=project_id, name=workflow_name)
+        workflow_id = new_id()
+        now = datetime.now(UTC)
+        conn.execute(
+            insert(workflows).values(
+                id=workflow_id,
+                project_id=project_id,
+                name=workflow_name,
+                dag_jsonb=spec.model_dump(mode="json"),
+                schedule_cron=None,
+                schedule_enabled=False,
+                enabled=True,
+                created_by=user.id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="lineage_trace_compare",
+        resource_type="workflow",
+        resource_id=workflow_id,
+        result="success",
+        detail={"focus": body.focus, "node_count": len(hops)},
+    )
+    return TraceCompareResponse(
+        project_id=project_id,
+        focus=body.focus,
+        source_id=body.source_id,
+        target_id=body.target_id,
+        workflow_id=workflow_id,
+        workflow_name=workflow_name,
+        hop_count=len(hops),
+        truncated=trace.truncated,
+        hops=hops,
+    )
 
 
 @router.get(
