@@ -216,6 +216,7 @@ from app.infrastructure.result_export import (
     export_extension,
     write_xlsx_workbook,
 )
+from app.infrastructure.run_index import register_compare_run_index
 from app.services.ai.default_gateway import (
     AI_API_KEY_ENV,
     AiGatewayRuntimeConfig,
@@ -2479,25 +2480,16 @@ def run_compare_task(task_id: str, request: Request) -> CompareRunCreateResponse
             "bucket_result_set_ids": bucket_spools,
         },
     )
-    now = datetime.now(UTC)
     with services.engine.begin() as conn:
         _enqueue_compare_run_job(conn, services, job)
-        conn.execute(
-            insert(run_index).values(
-                run_id=run_id,
-                kind=JobKind.COMPARE_RUN.value,
-                job_id=job_id,
-                owner_user_id=user.id,
-                project_id=str(row["project_id"]),
-                task_id=task_id,
-                status=JobStatus.PENDING.value,
-                result_path=f"compare/{run_id}",
-                bucket_spools=bucket_spools,
-                bucket_counts=empty_bucket_counts(),
-                progress={},
-                created_at=now,
-                updated_at=now,
-            )
+        register_compare_run_index(
+            conn,
+            run_id=run_id,
+            job_id=job_id,
+            owner_user_id=user.id,
+            project_id=str(row["project_id"]),
+            task_id=task_id,
+            bucket_spools=bucket_spools,
         )
     _audit_business(
         services,
