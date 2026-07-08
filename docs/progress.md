@@ -11,8 +11,17 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| 生产部署 5b13659(#153–#169 全量,迁移 0022/0023/0024) | Fable 5(待人 go-ahead) | 三波全部已合并 | 未开工 | — |
-| 真机深走查(Lineage/Workflow/Compare/AI 新面,带登录) | 待人排期(需 admin 凭据) | 上述部署 | 未开工 | — |
+| 真机深走查(Lineage/Workflow/Compare/AI 新面,带登录) | 待人排期(需 admin 凭据) | 生产已在 5b13659 | 未开工 | — |
+
+> **★ 生产部署 5b13659(2026-07-08 晚,Fable 5)**:ac62585 → 5b13659(#153–#169 全量)。
+> 迁移 0022/0023/0024 干净应用;四进程绿 + healthz 200 + ai/sql-generate 401(非 404)+
+> 新 dist(index-Ceqxk999.js)。
+>
+> **★ Win10 全量离线部署包(2026-07-08,[#171](https://github.com/allen-answer/dataOpsStudio_v2/pull/171))**:
+> 打包脚本 + 文档合入;成品 `dataops-studio-2.0.1-win10-x64-offline.zip`(192.5MB,
+> 内嵌 CPython 3.12 + PG 16.14 精简二进制 + 全驱动 wheels(DM 专有客户端除外)+ 前端 dist
+> + start/stop 脚本),本机冷启动冒烟全过(离线装依赖→bootstrap→24 步迁移→登录 200)。
+> 产物在构建机 `dist-bundle/`(git-ignored),sha256 见 PR body。
 
 > **★ 三波并行开发全部合并(2026-07-08,Opus 4.8 子代理开发 / Fable 5 复核,#153–#169 共 17 PR)**:
 > **wave-1**:Compare 导出解码业务列([#153](https://github.com/allen-answer/dataOpsStudio_v2/pull/153))、
