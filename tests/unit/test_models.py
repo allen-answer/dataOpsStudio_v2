@@ -264,6 +264,7 @@ def test_workflow_tables_support_dag_persistence_and_schedule_scan() -> None:
         "dag_jsonb",
         "schedule_cron",
         "schedule_enabled",
+        "schedule_last_fired_at",
         "enabled",
         "created_by",
         "created_at",
@@ -281,6 +282,8 @@ def test_workflow_tables_support_dag_persistence_and_schedule_scan() -> None:
     # 调度器扫表用的冗余列(PR-4):cron 可空、开关非空
     assert workflows.columns["schedule_cron"].nullable is True
     assert workflows.columns["schedule_enabled"].nullable is False
+    # PR-4b:cron tick 幂等防重锚点,可空(NULL = 从未触发)
+    assert workflows.columns["schedule_last_fired_at"].nullable is True
     assert workflows.columns["enabled"].nullable is False
     assert workflows.columns["dag_jsonb"].nullable is False
     assert workflow_templates.columns["dag_jsonb"].nullable is False
