@@ -667,6 +667,49 @@ class LineageImpactResponse(BaseModel):
     impacts: list[LineageImpactItem] = Field(default_factory=list)
 
 
+class LineageAiImpactRequest(BaseModel):
+    """C3 加权影响分析入参(设计稿 §2.7.4)—— 焦点表/列 + 深度 + 频率窗口。"""
+
+    focus: str = Field(min_length=1)
+    max_depth: int = Field(default=3, ge=1, le=5)
+    # 引用频率统计窗口(近 N 天);频率数据稀薄时优雅降级(提前交付说明)。
+    window_days: int = Field(default=90, ge=1, le=365)
+
+
+class LineageImpactSignal(BaseModel):
+    """单个受影响资产的确定性画像(基础影响 + 频率),AI 加权的输入证据。
+
+    频率来自血缘运行历史(引用该表的去重 sql_hash 数,近 window_days 天);
+    无历史时全为 0 —— 前端据此展示证据、后端据此判定 degraded。
+    """
+
+    node: str
+    table: str
+    column: str | None = None
+    depth: int
+    ref_count: int = 0
+    source_ref_count: int = 0
+    last_referenced_days_ago: int | None = None
+
+
+class LineageAiImpactResponse(BaseModel):
+    project_id: str
+    focus: str
+    max_depth: int
+    window_days: int
+    ok: bool
+    error: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    egress_level: int = 2
+    impact_count: int = 0
+    # 频率数据稀薄(所有受影响资产近窗口内引用为 0)→ AI 仅按图深度加权,低置信。
+    degraded: bool = False
+    project_owner: str | None = None
+    assessment: str | None = None
+    signals: list[LineageImpactSignal] = Field(default_factory=list)
+
+
 class LineageExportRequest(BaseModel):
     """血缘报告基础导出请求(L-5)—— 与 subgraph 端点同参,POST body 形态。"""
 
