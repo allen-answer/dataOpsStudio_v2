@@ -342,6 +342,40 @@ export interface CompareRunProfileResponse {
   sample_result: CompareSampleResult | null
 }
 
+// ── UX-2 C-3:差异行定位 SQL(schemas.py CompareDiffSqlResponse / CompareDiffSqlSide)──
+export interface CompareDiffSqlSide {
+  available: boolean
+  sql: string | null
+  reason: string | null
+}
+
+export interface CompareDiffSqlResponse {
+  run_id: string
+  bucket: CompareBucket
+  key_columns: string[]
+  pk_count: number
+  truncated: boolean
+  cap: number
+  source: CompareDiffSqlSide
+  target: CompareDiffSqlSide
+}
+
+// ── UX-2 C-4:主键预检(schemas.py ComparePkPrecheckRequest / ComparePkPrecheckResponse)──
+export interface ComparePkPrecheckRequest {
+  datasource_id: string
+  ref: CompareDataRef
+  key_columns: string[]
+}
+
+export interface ComparePkPrecheckResponse {
+  total_rows: number
+  distinct_pk_rows: number
+  duplicate_pk_rows: number
+  null_pk_rows: number
+  has_duplicates: boolean
+  has_nulls: boolean
+}
+
 export interface CompareAiAttributionResponse {
   run_id: string
   ok: boolean
@@ -479,6 +513,33 @@ export function getCompareRunResults(
 
 export function getCompareRunProfile(runId: string): Promise<CompareRunProfileResponse> {
   return apiClient.get<CompareRunProfileResponse>(`/compare/runs/${runId}/profile`)
+}
+
+/**
+ * GET /compare/runs/{run_id}/diff-sql —— UX-2 C-3:按桶主键生成两侧定位 SQL(仅文本,不执行)。
+ * 文件源那一侧 available=false + reason;超过 cap 个主键时 truncated=true(SQL 只含前 cap 个)。
+ */
+export function getCompareRunDiffSql(
+  runId: string,
+  bucket: CompareBucket,
+): Promise<CompareDiffSqlResponse> {
+  const qs = new URLSearchParams({ bucket })
+  return apiClient.get<CompareDiffSqlResponse>(`/compare/runs/${runId}/diff-sql?${qs.toString()}`)
+}
+
+/**
+ * POST /projects/{pid}/compare/pk-precheck —— UX-2 C-4:建任务前主键唯一性/空值预检(单侧)。
+ * 错误码:400 invalid_sql / invalid_identifier / precheck_unsupported_file / precheck_failed、
+ * 403 select_not_allowed、404 not_found、502 datasource_unreachable。
+ */
+export function precheckComparePk(
+  projectId: string,
+  req: ComparePkPrecheckRequest,
+): Promise<ComparePkPrecheckResponse> {
+  return apiClient.post<ComparePkPrecheckResponse>(
+    `/projects/${projectId}/compare/pk-precheck`,
+    req,
+  )
 }
 
 /** POST /compare/runs/{run_id}/ai-attribution —— AI 关闭/失败返 ok:false + error,画像不受影响。 */

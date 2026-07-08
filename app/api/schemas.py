@@ -373,6 +373,44 @@ class CompareRunProfileResponse(BaseModel):
     sample_result: dict[str, Any] | None = None
 
 
+class CompareDiffSqlSide(BaseModel):
+    """UX-2 C-3:差异行定位 SQL 单侧结果(库源给 SQL,文件源标 available=False)。"""
+
+    available: bool
+    sql: str | None = None
+    reason: str | None = None
+
+
+class CompareDiffSqlResponse(BaseModel):
+    """UX-2 C-3:按桶主键生成 SELECT ... WHERE pk IN (...) 逃生口(仅生成文本,不执行)。"""
+
+    run_id: str
+    bucket: CompareBucket
+    key_columns: list[str]
+    pk_count: int
+    truncated: bool
+    cap: int
+    source: CompareDiffSqlSide
+    target: CompareDiffSqlSide
+
+
+class ComparePkPrecheckRequest(BaseModel):
+    """UX-2 C-4:建任务前主键健康预检(单侧)——唯一性 / 空值。"""
+
+    datasource_id: str = Field(min_length=1)
+    ref: CompareDataRef
+    key_columns: list[str] = Field(min_length=1)
+
+
+class ComparePkPrecheckResponse(BaseModel):
+    total_rows: int
+    distinct_pk_rows: int
+    duplicate_pk_rows: int
+    null_pk_rows: int
+    has_duplicates: bool
+    has_nulls: bool
+
+
 class CompareAiAttributionResponse(BaseModel):
     run_id: str
     ok: bool

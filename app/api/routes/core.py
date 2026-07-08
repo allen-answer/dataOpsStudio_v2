@@ -31,11 +31,15 @@ from app.api.schemas import (
     CompareAiAttributionResponse,
     CompareBucket,
     CompareDataRef,
+    CompareDiffSqlResponse,
+    CompareDiffSqlSide,
     CompareExportCreateRequest,
     CompareFilePreviewRequest,
     CompareFilePreviewResponse,
     CompareInferRequest,
     CompareInferResponse,
+    ComparePkPrecheckRequest,
+    ComparePkPrecheckResponse,
     ComparePreviewRequest,
     ComparePreviewResponse,
     CompareResultRow,
@@ -161,6 +165,7 @@ from app.domain.ai_copilot import (
     build_schema_context,
     split_sql_and_explanation,
 )
+from app.domain.compare_diff_sql import build_diff_row_select
 from app.domain.compare_infer import (
     CompareInferenceDraft,
     infer_compare_draft,
@@ -242,6 +247,8 @@ _EXPORT_FORMATS = frozenset({"csv", "excel", "json", "sql"})
 # 50MB 上限只是防御性护栏,正常子图导出远小于此。
 _LINEAGE_EXPORT_LIMIT_BYTES = 50 * 1024 * 1024
 _COMPARE_BUCKET_QUERY = Query(default="diff")
+# UX-2 C-3:定位 SQL 最多列多少个主键(超过则截断并在响应标 truncated,防生成超长 SQL)。
+_DIFF_SQL_PK_CAP = 500
 _UPLOAD_PURPOSE_QUERY = Query()
 _UPLOAD_FILENAME_QUERY = Query(min_length=1, max_length=255)
 _LINEAGE_FOCUS_QUERY = Query(min_length=1)
@@ -2124,6 +2131,147 @@ def _preview_value(value: object) -> object:
     return str(value)
 
 
+def _precheck_int(value: object) -> int:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(str(value))  # Decimal / driver 特有数值类型走字符串兜底
+    except (TypeError, ValueError):
+        return 0
+
+
+@router.post(
+    "/projects/{project_id}/compare/pk-precheck",
+    response_model=ComparePkPrecheckResponse,
+)
+def precheck_compare_primary_key(
+    project_id: str,
+    body: ComparePkPrecheckRequest,
+    request: Request,
+) -> ComparePkPrecheckResponse:
+    """UX-2 C-4:建任务前主键健康预检——COUNT(*) / DISTINCT / NULL,提前发现噪声源。
+
+    与 preview 同通道(API 直连 adapter,探测级超时,只读)。文件源不支持(前端不该调用)。
+    两条轻量聚合查询:总行数+主键空值 / 主键去重行数;重复 = 总 - 去重(含 null 组的粗略近似,
+    只为给用户一个"主键不唯一"的黄条警告,不追求精确)。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        ds_row = (
+            conn.execute(
+                select(datasources).where(
+                    and_(
+                        datasources.c.id == body.datasource_id,
+                        datasources.c.project_id == project_id,
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    if ds_row is None:
+        raise ApiError(404, "not_found", "Datasource not found")
+    policy = dict(ds_row["operation_policy"] or {})
+    if not bool(policy.get("allow_select", False)):
+        raise ApiError(403, "select_not_allowed", "Datasource operation policy denies SELECT")
+    db_type = DbType(str(ds_row["db_type"]))
+    if body.ref.kind == "file":
+        raise ApiError(
+            400,
+            "precheck_unsupported_file",
+            "Primary key precheck is not available for file sources",
+        )
+    if body.ref.kind == "sql":
+        try:
+            inner_sql = validate_readonly_sql(body.ref.sql or "")
+        except SqlGuardError as exc:
+            raise ApiError(400, "invalid_sql", "Only read-only SELECT/WITH SQL is allowed") from exc
+        source_expr = f"({inner_sql}) DATAOPS_PRECHECK"
+    else:
+        identifier = (
+            f"{body.ref.schema_name}.{body.ref.table_name}"
+            if body.ref.schema_name
+            else str(body.ref.table_name)
+        )
+        try:
+            source_expr = quote_identifier(db_type, identifier)
+        except ValueError as exc:
+            raise ApiError(400, "invalid_identifier", "Invalid schema or table name") from exc
+    try:
+        quoted_keys = [quote_identifier(db_type, key) for key in body.key_columns]
+    except ValueError as exc:
+        raise ApiError(400, "invalid_identifier", "Invalid key column name") from exc
+
+    null_cond = " OR ".join(f"{key} IS NULL" for key in quoted_keys)
+    count_sql = (
+        "SELECT COUNT(*) AS total_rows, "
+        f"COALESCE(SUM(CASE WHEN {null_cond} THEN 1 ELSE 0 END), 0) AS null_pk_rows "
+        f"FROM {source_expr}"
+    )
+    distinct_sql = (
+        "SELECT COUNT(*) AS distinct_pk_rows FROM "
+        f"(SELECT DISTINCT {', '.join(quoted_keys)} FROM {source_expr}) DATAOPS_PK"
+    )
+
+    adapter = build_database_adapter(
+        _datasource_conn_info(ds_row),
+        services.secret_store,
+        connect_timeout_seconds=services.metadata_probe_timeout_seconds,
+        statement_timeout_seconds=services.metadata_probe_timeout_seconds,
+    )
+
+    def _run_scalar_row(sql: str) -> list[object]:
+        for data_row in adapter.execute_select(sql, {}):
+            return list(data_row.values)
+        return []
+
+    try:
+        count_row = _run_scalar_row(count_sql)
+        distinct_row = _run_scalar_row(distinct_sql)
+    except UnsupportedDbTypeError as exc:
+        raise ApiError(400, "unsupported_db_type", "Datasource type is not supported") from exc
+    except AdapterConnectionError as exc:
+        raise ApiError(502, "datasource_unreachable", "Datasource connection failed") from exc
+    except Exception as exc:
+        # R5:driver 原始错误可能含 SQL 片段,不透传,只记类型
+        logger.info(
+            "compare pk precheck query failed",
+            request_id=request_id_from(request),
+            datasource_id=body.datasource_id,
+            error_type=type(exc).__name__,
+        )
+        raise ApiError(400, "precheck_failed", "Primary key precheck query failed") from exc
+
+    total_rows = _precheck_int(count_row[0]) if count_row else 0
+    null_pk_rows = _precheck_int(count_row[1]) if len(count_row) > 1 else 0
+    distinct_pk_rows = _precheck_int(distinct_row[0]) if distinct_row else 0
+    duplicate_pk_rows = max(total_rows - distinct_pk_rows, 0)
+
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="compare_pk_precheck",
+        resource_type="datasource",
+        resource_id=body.datasource_id,
+        result="success",
+        detail={"kind": body.ref.kind, "key_columns": len(body.key_columns)},
+    )
+    return ComparePkPrecheckResponse(
+        total_rows=total_rows,
+        distinct_pk_rows=distinct_pk_rows,
+        duplicate_pk_rows=duplicate_pk_rows,
+        null_pk_rows=null_pk_rows,
+        has_duplicates=duplicate_pk_rows > 0,
+        has_nulls=null_pk_rows > 0,
+    )
+
+
 @router.post(
     "/projects/{project_id}/compare/file-preview",
     response_model=CompareFilePreviewResponse,
@@ -2549,6 +2697,99 @@ def get_compare_run_results(
         diff_profile=_compare_diff_profile(_row_value(run_row, "diff_profile", {})),
         sample_result=_compare_sample_result(_row_value(run_row, "sample_result", None)),
         rows=rows,
+    )
+
+
+def _compare_side_db_type(
+    services: ApiServices, datasource_id: object, ref: dict[str, object]
+) -> DbType | None:
+    """取某侧数据源方言;文件源 / 无 id / 未知类型返回 None(该侧不生成 SQL)。"""
+    if str(ref.get("kind") or "table") == "file":
+        return None
+    ds_id = _optional_str(datasource_id)
+    if not ds_id:
+        return None
+    with services.engine.connect() as conn:
+        row = (
+            conn.execute(select(datasources.c.db_type).where(datasources.c.id == ds_id))
+            .mappings()
+            .one_or_none()
+        )
+    if row is None:
+        return None
+    try:
+        return DbType(str(row["db_type"]))
+    except ValueError:
+        return None
+
+
+def _compare_diff_sql_side(
+    db_type: DbType | None,
+    ref: dict[str, object],
+    columns: list[str],
+    pk_rows: list[list[object]],
+) -> CompareDiffSqlSide:
+    if str(ref.get("kind") or "table") == "file":
+        return CompareDiffSqlSide(available=False, reason="file_source")
+    if db_type is None:
+        return CompareDiffSqlSide(available=False, reason="unknown_datasource")
+    if not pk_rows:
+        return CompareDiffSqlSide(available=False, reason="empty_bucket")
+    sql = build_diff_row_select(db_type, ref=ref, columns=columns, pk_rows=pk_rows)
+    if sql is None:
+        return CompareDiffSqlSide(available=False, reason="unsupported_ref")
+    return CompareDiffSqlSide(available=True, sql=sql)
+
+
+@router.get("/compare/runs/{run_id}/diff-sql", response_model=CompareDiffSqlResponse)
+def get_compare_run_diff_sql(
+    run_id: str,
+    request: Request,
+    bucket: CompareBucket = _COMPARE_BUCKET_QUERY,
+) -> CompareDiffSqlResponse:
+    """UX-2 C-3:按桶主键生成两侧定位 SQL(仅文本,不执行)。
+
+    读该 run 的 bucket spool 主键(封顶 _DIFF_SQL_PK_CAP,超出标 truncated),
+    源侧列名用 key_columns、目标侧过 column_mappings 映射;文件源那一侧标 available=False。
+    """
+    services = services_from(request)
+    run_row = _compare_run_for_current_user(request, run_id)
+    task_row = _compare_task_for_current_user(request, str(run_row["task_id"]))
+    rules = dict(task_row["compare_rules"] or {})
+    key_columns = rules.get("key_columns")
+    if not isinstance(key_columns, list) or not key_columns:
+        raise ApiError(400, "missing_compare_key", "Compare run has no key columns")
+    key_columns = [str(col) for col in key_columns]
+    column_mappings = dict(rules.get("column_mappings") or {})
+    source_ref = dict(task_row["source_ref"] or {})
+    target_ref = dict(task_row["target_ref"] or {})
+    source_db_type = _compare_side_db_type(services, task_row["source_id"], source_ref)
+    target_db_type = _compare_side_db_type(services, task_row["target_id"], target_ref)
+
+    bucket_spools = dict(run_row["bucket_spools"] or {})
+    result_set_id = bucket_spools.get(bucket)
+    pk_dicts: list[dict[str, object]] = []
+    truncated = False
+    if isinstance(result_set_id, str) and services.result_store.spool_exists(result_set_id):
+        raw = services.result_store.fetch_range(result_set_id, 0, _DIFF_SQL_PK_CAP + 1)
+        if len(raw) > _DIFF_SQL_PK_CAP:
+            truncated = True
+            raw = raw[:_DIFF_SQL_PK_CAP]
+        pk_dicts = [decode_compare_result_row(row)["pk"] for row in raw]
+
+    # pk 以 source key 列名存一份;目标侧同值、列名过映射。
+    target_columns = [column_mappings.get(col, col) for col in key_columns]
+    pk_values = [[pk.get(col) for col in key_columns] for pk in pk_dicts]
+
+    return CompareDiffSqlResponse(
+        run_id=str(run_row["run_id"]),
+        bucket=bucket,
+        key_columns=key_columns,
+        pk_count=len(pk_dicts),
+        truncated=truncated,
+        cap=_DIFF_SQL_PK_CAP,
+        source=_compare_diff_sql_side(source_db_type, source_ref, key_columns, pk_values),
+        target=_compare_diff_sql_side(target_db_type, target_ref, target_columns, pk_values),
     )
 
 

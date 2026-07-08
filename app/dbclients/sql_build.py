@@ -42,3 +42,26 @@ def limit_clause(db_type: DbType, limit: int | None) -> str:
     if db_type is DbType.MYSQL:
         return f" LIMIT {limit}"
     return f" FETCH FIRST {limit} ROWS ONLY"
+
+
+def sql_literal(value: object) -> str:
+    """把主键值渲染成可粘贴到 DBA 控制台的 SQL 字面量(非执行路径,仅生成文本)。
+
+    UX-2 差异行定位 SQL 用:结果只交给用户复制到自己的库里跑,不由平台执行。
+    - None -> NULL
+    - bool -> 1 / 0(bool 是 int 子类,须先于 int 判断;跨方言 TRUE/FALSE 不通用)
+    - int / float(非 NaN/Inf) -> 原样数字
+    - 其余(含 spool 里被 default=str 转成字符串的日期等) -> 单引号包裹并转义 '
+    """
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):  # NaN / Inf 无字面量
+            return "NULL"
+        return repr(value)
+    text = str(value).replace("'", "''")
+    return f"'{text}'"
