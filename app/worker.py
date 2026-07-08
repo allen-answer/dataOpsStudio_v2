@@ -88,6 +88,7 @@ from app.domain.lineage import (
     lineage_sql_hash,
     schema_from_metadata_cache_rows,
 )
+from app.domain.lineage.detect import AUTO_DIALECT, resolve_dialect
 from app.domain.notify import RunNotification
 from app.domain.plan import PlanNode
 from app.domain.readers import (
@@ -1166,14 +1167,19 @@ class WorkerRunner:
         datasource_id = _payload_optional_str(payload, "datasource_id")
         storage_uri = _required_payload_str(payload, "storage_uri")
         default_schema = _payload_optional_str(payload, "default_schema")
+        # L-1:dialect 可为 "auto" 哨兵 → 逐文件自动识别(见 _lineage_batch_file);
+        # detect_default 是平票 / 无特征时的回落方言(有库=db_type,无库="oracle")。
         dialect = _payload_optional_str(payload, "dialect")
+        detect_default = "oracle"
         if datasource_id is not None:
+            if dialect is None or dialect.strip().lower() == AUTO_DIALECT:
+                detect_default = self._datasource_loader(datasource_id).db_type.value
             if dialect is None:
-                dialect = self._datasource_loader(datasource_id).db_type.value
+                dialect = detect_default
             schema_context = self._lineage_catalog.schema_context(datasource_id, default_schema)
         else:
-            # 无数据源:dialect 必给(API 已校验),schema 为空 → 全程宽松表级,不持久化
-            dialect = dialect or "oracle"
+            # 无数据源:dialect 由 API 校验必给("auto" 或显式方言),schema 为空 → 宽松表级
+            dialect = dialect or detect_default
             schema_context = {"schema": {}, "default_schema": default_schema}
         dialect = dialect.lower()
 
@@ -1213,6 +1219,7 @@ class WorkerRunner:
                             job=job,
                             datasource_id=datasource_id,
                             dialect=dialect,
+                            detect_default=detect_default,
                             default_schema=default_schema,
                             schema_context=schema_context,
                             source_ref=info.filename,
@@ -1296,6 +1303,7 @@ class WorkerRunner:
         job: Job,
         datasource_id: str | None,
         dialect: str,
+        detect_default: str,
         default_schema: str | None,
         schema_context: dict[str, Any],
         source_ref: str,
@@ -1305,11 +1313,14 @@ class WorkerRunner:
         sql_text = _decode_sql_bytes(raw)
         if sql_text is None or not sql_text.strip():
             return {"source_ref": source_ref, "status": "failed", "error": "undecodable_or_empty"}
+        # L-1:dialect == "auto" 时逐文件识别;显式方言原样透传(不改行为)。
+        detection = resolve_dialect(dialect, sql_text, default=detect_default)
+        file_dialect = detection.dialect
         report = analyze_sql_lineage(
             LineageParseRequest.model_validate(
                 {
                     "sql_text": sql_text,
-                    "dialect": dialect,
+                    "dialect": file_dialect,
                     "schema": schema_context["schema"],
                     "default_schema": default_schema,
                     "lenient": True,
@@ -1321,14 +1332,14 @@ class WorkerRunner:
             # 有数据源:落 lineage_runs/edges(可查询子图),复用 sql_hash 缓存
             sql_hash = lineage_sql_hash(
                 sql_text=sql_text,
-                dialect=dialect,
+                dialect=file_dialect,
                 schema_context=schema_context,
                 parser_version=LINEAGE_PARSER_VERSION,
             )
             cached_run_id = self._lineage_catalog.cached_run_id(
                 project_id=job.project_id,
                 datasource_id=datasource_id,
-                dialect=dialect,
+                dialect=file_dialect,
                 source_ref=source_ref,
                 sql_hash=sql_hash,
             )
@@ -1341,7 +1352,7 @@ class WorkerRunner:
                     run_id=run_id,
                     project_id=job.project_id,
                     datasource_id=datasource_id,
-                    dialect=dialect,
+                    dialect=file_dialect,
                     source_ref=source_ref,
                     sql_hash=sql_hash,
                     sql_text=sql_text,
@@ -1359,6 +1370,9 @@ class WorkerRunner:
             "source_ref": source_ref,
             "status": status,
             "run_id": run_id,
+            # L-1:逐文件识别结果(前端 / 导出可显示 "auto-detected: oracle")。
+            "dialect": file_dialect,
+            "dialect_auto_detected": detection.auto_detected,
             "table_edge_count": len(report.graph_edges),
             "column_mapping_count": len(report.insert_mappings),
             "parse_error_count": len(report.parse_errors),
