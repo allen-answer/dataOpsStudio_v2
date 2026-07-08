@@ -2018,9 +2018,7 @@ def _impact_walk_row() -> dict[str, object]:
     }
 
 
-def _patch_gateway(
-    monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]
-) -> None:
+def _patch_gateway(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) -> None:
     class _Gateway:
         def complete(self, prompt: str, context: Any, options: Any) -> Any:
             captured["prompt"] = prompt

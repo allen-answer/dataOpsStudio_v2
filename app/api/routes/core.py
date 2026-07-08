@@ -6533,10 +6533,7 @@ def _lineage_table_reference_frequency(
         .where(lineage_runs.c.created_at >= window_start)
         .group_by(edge_refs.c.table_name)
     )
-    return {
-        str(row["table_name"]): dict(row)
-        for row in conn.execute(statement).mappings().all()
-    }
+    return {str(row["table_name"]): dict(row) for row in conn.execute(statement).mappings().all()}
 
 
 def _lineage_export_sheets(
