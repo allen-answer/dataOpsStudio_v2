@@ -17,6 +17,7 @@ import pytest
 from app.dbclients.db2_adapter import Db2Adapter
 from app.dbclients.dm_adapter import DMAdapter
 from app.dbclients.mysql_adapter import MySQLAdapter
+from app.dbclients.oracle_adapter import OracleAdapter
 from app.dbclients.protocol import DatabaseAdapter
 from app.domain.compare import CompareColumn, CompareHashRequest, CompareTableRef
 from app.domain.datasource import DatasourceConnInfo, DbType
@@ -27,7 +28,7 @@ from app.infrastructure.secretstore.protocol import SecretStore
 pytestmark = pytest.mark.contract
 
 
-@pytest.fixture(params=["mysql", "dm", "db2"])
+@pytest.fixture(params=["mysql", "dm", "db2", "oracle"])
 def adapter(request: pytest.FixtureRequest) -> DatabaseAdapter:
     secret_store = cast(SecretStore, _SecretStore())
     if request.param == "mysql":
@@ -42,6 +43,12 @@ def adapter(request: pytest.FixtureRequest) -> DatabaseAdapter:
             secret_store,
             ibm_db_dbi_module=_FakeIbmDbDbi(),
             ibm_db_module=_FakeIbmDb(),
+        )
+    if request.param == "oracle":
+        return OracleAdapter(
+            _conn_info(DbType.ORACLE),
+            secret_store,
+            oracledb_module=_FakeOracleDb(),
         )
     return DMAdapter(
         _conn_info(DbType.DM),
@@ -146,7 +153,7 @@ def test_compare_hash_query_builds_without_connecting(adapter: DatabaseAdapter) 
 
 
 def _conn_info(db_type: DbType) -> DatasourceConnInfo:
-    ports = {DbType.MYSQL: 3306, DbType.DM: 5236, DbType.DB2: 50000}
+    ports = {DbType.MYSQL: 3306, DbType.DM: 5236, DbType.DB2: 50000, DbType.ORACLE: 1521}
     port = ports[db_type]
     return DatasourceConnInfo(
         host="127.0.0.1",
@@ -319,6 +326,69 @@ class _FakeDb2Cursor:
             self._rows = [("ID", "BIGINT", "N", 1, None), ("NAME", "VARCHAR", "Y", None, None)]
         else:
             self.description = (("OK",),)
+            self._rows = [(1,)]
+        self._offset = 0
+
+    def fetchone(self) -> tuple[Any, ...] | None:
+        rows = self.fetchmany(1)
+        return rows[0] if rows else None
+
+    def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
+        batch = self._rows[self._offset : self._offset + size]
+        self._offset += len(batch)
+        return batch
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        rows = self._rows[self._offset :]
+        self._offset = len(self._rows)
+        return rows
+
+    def close(self) -> None:
+        return None
+
+
+# ──────────────────── Oracle fake driver ────────────────────
+
+
+class _FakeOracleDb:
+    """fake oracledb 模块:connect(**kwargs) → thin connection。"""
+
+    def connect(self, **kwargs: Any) -> _FakeOracleConnection:
+        return _FakeOracleConnection()
+
+
+class _FakeOracleConnection:
+    def __init__(self) -> None:
+        self.closed = False
+        self.call_timeout: int | None = None
+
+    def cursor(self) -> _FakeOracleCursor:
+        return _FakeOracleCursor()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeOracleCursor:
+    def __init__(self) -> None:
+        self.arraysize = 100
+        self.description: tuple[tuple[Any, ...], ...] = (("ok",),)
+        self._rows: list[tuple[Any, ...]] = []
+        self._offset = 0
+
+    def execute(self, sql: str, params: object = None) -> None:
+        normalized = " ".join(sql.lower().split())
+        if "all_users" in normalized:
+            self.description = (("name",),)
+            self._rows = [("APP",)]
+        elif "all_tab_columns" in normalized:
+            self.description = (("name",), ("data_type",), ("nullable",), ("comment",))
+            self._rows = [("ID", "NUMBER", "N", None), ("NAME", "VARCHAR2", "Y", None)]
+        elif "all_constraints" in normalized:
+            self.description = (("name",),)
+            self._rows = [("ID",)]
+        else:
+            self.description = (("ok",),)
             self._rows = [(1,)]
         self._offset = 0
 

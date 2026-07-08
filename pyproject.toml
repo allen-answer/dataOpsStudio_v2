@@ -44,6 +44,10 @@ dependencies = [
 # 离线/portable 部署是最高失败率项(1.x 同款取舍,1.x 直接注释掉了它)。
 # adapter 延迟 import,缺驱动时报错信息指引安装。import 仅允许在 app/dbclients/(R1)。
 db2 = ["ibm_db>=3.2"]
+# Oracle driver — python-oracledb thin mode(纯 Python,免装 Oracle Instant Client;
+# cp312 wheel 齐全)。刻意作为 optional extra(Preview 档,非默认交付),adapter
+# 延迟 import,缺驱动时报错信息指引安装。import 仅允许在 app/dbclients/(R1)。
+oracle = ["oracledb>=2.0"]
 
 [project.urls]
 Repository = "https://github.com/allen-answer/dataOpsStudio_v2"
