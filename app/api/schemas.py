@@ -506,6 +506,51 @@ class CompareInferResponse(BaseModel):
     columns: list[Column] = Field(default_factory=list)
 
 
+class CompareAiMapSuggestRequest(BaseModel):
+    """AI Copilot C2 —— 残余列映射建议入参(设计稿 §2.7.4,egress L2 + 可选 L4)。
+
+    confirmed_mappings 是规则推断/用户已确认的映射(源列名 → 目标列名);后端据此从
+    两侧全列剔除,只把**残余未映射列**送 AI(C2 不抢规则的活)。include_samples 是
+    L4 样本的**显式 opt-in**,默认关。
+    """
+
+    source_id: str
+    target_id: str
+    source_table: CompareTableRequest
+    target_table: CompareTableRequest
+    confirmed_mappings: dict[str, str] = Field(default_factory=dict)
+    include_samples: bool = False
+
+
+class CompareAiMapSuggestItem(BaseModel):
+    source_column: str
+    target_column: str
+    confidence: float
+    rationale: str | None = None
+
+
+class CompareAiMapSuggestResponse(BaseModel):
+    """C2 建议结果。★ 只是建议,不自动应用;前端逐条采纳。
+
+    egress_level 为本次实际最高出站等级(含样本时 4,否则 2)。history_available
+    为空时前端提示"无历史,优雅降级"。samples_included 反映样本是否真的出站。
+    """
+
+    ok: bool
+    suggestions: list[CompareAiMapSuggestItem] = Field(default_factory=list)
+    provider: str | None = None
+    model: str | None = None
+    error: str | None = None
+    egress_level: int = 2
+    history_available: bool = False
+    history_count: int = 0
+    samples_included: bool = False
+    sample_skip_reason: str | None = None
+    residual_source_columns: list[str] = Field(default_factory=list)
+    residual_target_columns: list[str] = Field(default_factory=list)
+    truncated: bool = False
+
+
 class CompareSuggestedTaskCreateRequest(CompareInferRequest):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     run_limits: CompareRunLimitsPayload = Field(default_factory=CompareRunLimitsPayload)

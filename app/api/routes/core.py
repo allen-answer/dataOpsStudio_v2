@@ -29,6 +29,9 @@ from app.api.routes.account import consume_recovery_code, verify_user_totp
 from app.api.schemas import (
     CancelResponse,
     CompareAiAttributionResponse,
+    CompareAiMapSuggestItem,
+    CompareAiMapSuggestRequest,
+    CompareAiMapSuggestResponse,
     CompareBucket,
     CompareDataRef,
     CompareDiffSqlResponse,
@@ -51,6 +54,7 @@ from app.api.schemas import (
     CompareRunResultResponse,
     CompareRunsDashboardResponse,
     CompareSuggestedTaskCreateRequest,
+    CompareTableRequest,
     CompareTaskCreateRequest,
     CompareTaskResponse,
     CompareTaskRunItem,
@@ -174,6 +178,15 @@ from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.sql_build import limit_clause, quote_identifier
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.ai import AiContext, AiOptions, ContextItem, EgressLevel
+from app.domain.ai_compare_map import (
+    MAX_SAMPLE_ROWS,
+    aggregate_mapping_history,
+    build_map_suggest_prompt,
+    column_schema_payload,
+    parse_map_suggestions,
+    project_sample_rows,
+    split_residual_columns,
+)
 from app.domain.ai_copilot import (
     MAX_TABLES,  # C1 与 C4 共用同一"送 AI 表数上限"(均为 12,语义一致)
     build_nl2sql_prompt,
@@ -260,7 +273,7 @@ from app.services.ai.default_gateway import (
     AiGatewayRuntimeConfig,
     build_gateway_from_runtime_config,
 )
-from app.services.ai.errors import AiDisabledError, AiGatewayError
+from app.services.ai.errors import AiDisabledError, AiGatewayError, EgressBlockedError
 from app.services.lineage_batch_export import batch_export_sheets
 from app.services.sql_preflight import run_sql_preflight
 from app.services.workflow_scheduler import build_workflow_run_job
@@ -2012,6 +2025,231 @@ def infer_project_compare_task(
         project_id=project_id,
         body=body,
         draft=draft,
+    )
+
+
+@router.post(
+    "/projects/{project_id}/compare/ai-map-suggest",
+    response_model=CompareAiMapSuggestResponse,
+)
+def suggest_compare_column_mappings(
+    project_id: str,
+    body: CompareAiMapSuggestRequest,
+    request: Request,
+    refresh: bool = Query(default=False),
+) -> CompareAiMapSuggestResponse:
+    """AI Copilot C2 —— 规则推断后的残余列映射学习(设计稿 §2.7.4,egress L2 + 可选 L4)。
+
+    提前交付(原排 2.7.0):历史为空时优雅降级,如实告知 AI "无历史",不假装有历史。
+    出站三层拼装:两侧残余列 schema(L2)+ 历史映射决策(L2,聚合既有 compare 任务
+    已确认 column_mappings)+ 样本(仅 include_samples 且 gateway 配置允许 L4 时,≤20
+    行、仅残余列、过 gateway 脱敏钩子)。★ 只是建议,不自动应用;审计只记计数/等级,
+    绝不记建议内容 / 样本值 / prompt 原文(R5)。详见 docs/design/C2-copilot-mapping.md。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    source_row, target_row = _compare_datasource_rows_for_project(
+        services,
+        project_id=project_id,
+        source_id=body.source_id,
+        target_id=body.target_id,
+        user_id=user.id,
+    )
+
+    def audit(result: str, detail: dict[str, object]) -> None:
+        _audit_business(
+            services,
+            request,
+            user_id=user.id,
+            project_id=project_id,
+            action="ai_assist_call",
+            resource_type="compare_task",
+            resource_id=None,
+            result=result,
+            detail=detail,
+        )
+
+    with services.engine.connect() as conn:
+        ai_row = _ai_config_row_or_none(conn)
+    runtime = _ai_runtime_config(services, ai_row)
+    if not runtime.enabled or runtime.provider in {None, "off"}:
+        audit("skipped", {"error": "ai_disabled"})
+        raise ApiError(409, "ai_disabled", "AI copilot is not enabled")
+
+    # ★ L4 样本 opt-in 闸门(设计稿 §2.7.5)。include_samples 是用户显式 opt-in;样本
+    # (L4)出站还需 gateway 配置允许——本代码库里 L4 只有在 l4_requires_optin=False
+    # (管理员为本形态授权 L4 出站)时才过 LevelEgressChecker(max_auto 上限仅到 L3)。
+    # 二者缺一即拒发样本 → 403 说明要开什么;portable 默认 True → 永不发样本。
+    if body.include_samples and runtime.l4_requires_optin:
+        audit("skipped", {"error": "l4_optin_required", "include_samples": True})
+        raise ApiError(
+            403,
+            "l4_optin_required",
+            "Sending sample values (L4) requires an administrator to authorize L4 egress "
+            "for this deployment (set l4_requires_optin=false).",
+        )
+
+    source_columns = _metadata_columns_for_table(
+        services,
+        source_row,
+        schema_name=body.source_table.schema_name,
+        table_name=body.source_table.table_name,
+        refresh=refresh,
+    )
+    target_columns = _metadata_columns_for_table(
+        services,
+        target_row,
+        schema_name=body.target_table.schema_name,
+        table_name=body.target_table.table_name,
+        refresh=refresh,
+    )
+    residual_source, residual_target, truncated = split_residual_columns(
+        source_columns, target_columns, body.confirmed_mappings
+    )
+    residual_source_names = [column.name for column in residual_source]
+    residual_target_names = [column.name for column in residual_target]
+
+    if not residual_source or not residual_target:
+        # 无残余列可映射 → 不浪费出站,直接空建议(ok=True,规则已覆盖全部列)。
+        audit(
+            "success",
+            {"suggestion_count": 0, "reason": "no_residual_columns", "egress_level": 2},
+        )
+        return CompareAiMapSuggestResponse(
+            ok=True,
+            egress_level=int(EgressLevel.L2),
+            residual_source_columns=residual_source_names,
+            residual_target_columns=residual_target_names,
+            truncated=truncated,
+        )
+
+    history = _compare_mapping_history(services, project_id=project_id)
+    history_available = bool(history)
+    context_items = [
+        ContextItem(
+            content=json.dumps(
+                {
+                    "source_columns": column_schema_payload(residual_source),
+                    "target_columns": column_schema_payload(residual_target),
+                    "confirmed_mappings": body.confirmed_mappings,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            egress_level=EgressLevel.L2,
+        ),
+        ContextItem(
+            content=json.dumps(
+                {"history": history},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            egress_level=EgressLevel.L2,
+        ),
+    ]
+
+    samples_included = False
+    sample_skip_reason: str | None = None
+    if body.include_samples:
+        # 已过 L4 闸门(l4_requires_optin=False);拉两侧样本,仅残余列、≤20 行。
+        sample_payload, sample_skip_reason = _compare_ai_samples(
+            services,
+            request,
+            source_row=source_row,
+            source_table=body.source_table,
+            residual_source_names=residual_source_names,
+            target_row=target_row,
+            target_table=body.target_table,
+            residual_target_names=residual_target_names,
+        )
+        if sample_payload is not None:
+            context_items.append(
+                ContextItem(
+                    content=json.dumps(
+                        sample_payload, ensure_ascii=False, default=str, separators=(",", ":")
+                    ),
+                    egress_level=EgressLevel.L4,
+                )
+            )
+            samples_included = True
+
+    prompt = build_map_suggest_prompt(
+        source_dialect=str(source_row["db_type"]),
+        target_dialect=str(target_row["db_type"]),
+        has_history=history_available,
+        include_samples=samples_included,
+    )
+    max_level = max(int(item.egress_level) for item in context_items)
+    try:
+        response = build_gateway_from_runtime_config(runtime).complete(
+            prompt,
+            AiContext(items=context_items),
+            AiOptions(purpose="compare_ai_map_suggest", max_tokens=900),
+        )
+    except AiDisabledError:
+        audit("skipped", {"error": "ai_disabled"})
+        raise ApiError(409, "ai_disabled", "AI copilot is not enabled") from None
+    except EgressBlockedError as exc:
+        # L2 schema/history 未获管理员放行(max_auto_egress_level<2)等 → 结构化 403。
+        audit("failed", {"error": "egress_blocked", "level": int(exc.level)})
+        raise ApiError(
+            403,
+            "egress_blocked",
+            "AI egress policy blocked this request; an administrator must raise the allowed "
+            "egress level so schema/sample context can be sent.",
+        ) from None
+    except AiGatewayError as exc:
+        error = type(exc).__name__
+        audit("failed", {"error": error})
+        return CompareAiMapSuggestResponse(
+            ok=False,
+            error=error,
+            history_available=history_available,
+            history_count=len(history),
+            residual_source_columns=residual_source_names,
+            residual_target_columns=residual_target_names,
+            truncated=truncated,
+        )
+
+    suggestions = parse_map_suggestions(
+        response.content,
+        valid_sources=set(residual_source_names),
+        valid_targets=set(residual_target_names),
+    )
+    # ★ R5:审计只记计数 / 等级 / 是否含样本,绝不记建议内容 / 样本值 / prompt 原文。
+    audit(
+        "success",
+        {
+            "provider": response.provider,
+            "suggestion_count": len(suggestions),
+            "egress_level": max_level,
+            "samples_included": samples_included,
+            "history_count": len(history),
+        },
+    )
+    return CompareAiMapSuggestResponse(
+        ok=True,
+        suggestions=[
+            CompareAiMapSuggestItem(
+                source_column=item.source_column,
+                target_column=item.target_column,
+                confidence=item.confidence,
+                rationale=item.rationale,
+            )
+            for item in suggestions
+        ],
+        provider=response.provider,
+        model=response.model,
+        egress_level=max_level,
+        history_available=history_available,
+        history_count=len(history),
+        samples_included=samples_included,
+        sample_skip_reason=sample_skip_reason,
+        residual_source_columns=residual_source_names,
+        residual_target_columns=residual_target_names,
+        truncated=truncated,
     )
 
 
@@ -6645,6 +6883,115 @@ def _compare_infer_response(
         ),
         columns=draft.columns,
     )
+
+
+class _SampleUnavailable(Exception):
+    """样本不可取(策略禁 SELECT / 标识符非法 / 查询失败);触发 L4 优雅降级为 L2。"""
+
+
+def _compare_mapping_history(services: ApiServices, *, project_id: str) -> list[dict[str, Any]]:
+    """聚合本项目既有 compare 任务已确认的 column_mappings(L2 历史映射决策)。
+
+    为空时返回 [] —— route 层据此如实告知 AI "无历史",不假装有历史(提前交付语义)。
+    """
+    with services.engine.connect() as conn:
+        rows = (
+            conn.execute(
+                select(compare_tasks.c.compare_rules).where(
+                    compare_tasks.c.project_id == project_id
+                )
+            )
+            .mappings()
+            .all()
+        )
+    task_mappings: list[dict[str, str]] = []
+    for row in rows:
+        rules = row["compare_rules"]
+        column_mappings = rules.get("column_mappings") if isinstance(rules, dict) else None
+        if isinstance(column_mappings, dict):
+            task_mappings.append(
+                {
+                    str(src): str(tgt)
+                    for src, tgt in column_mappings.items()
+                    if isinstance(src, str) and isinstance(tgt, str)
+                }
+            )
+    return aggregate_mapping_history(task_mappings)
+
+
+def _compare_ai_samples(
+    services: ApiServices,
+    request: Request,
+    *,
+    source_row: RowMapping,
+    source_table: CompareTableRequest,
+    residual_source_names: list[str],
+    target_row: RowMapping,
+    target_table: CompareTableRequest,
+    residual_target_names: list[str],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """拉两侧样本(仅残余列,≤MAX_SAMPLE_ROWS 行)。任一侧不可取 → (None, reason) 降级。"""
+    try:
+        source_columns, source_rows = _compare_fetch_sample_rows(
+            services, request, datasource_row=source_row, table_req=source_table
+        )
+        target_columns, target_rows = _compare_fetch_sample_rows(
+            services, request, datasource_row=target_row, table_req=target_table
+        )
+    except _SampleUnavailable as exc:
+        return None, str(exc)
+    payload = {
+        "source_samples": project_sample_rows(source_columns, source_rows, residual_source_names),
+        "target_samples": project_sample_rows(target_columns, target_rows, residual_target_names),
+    }
+    return payload, None
+
+
+def _compare_fetch_sample_rows(
+    services: ApiServices,
+    request: Request,
+    *,
+    datasource_row: RowMapping,
+    table_req: CompareTableRequest,
+) -> tuple[list[str], list[list[Any]]]:
+    """取一侧 ≤MAX_SAMPLE_ROWS 行样本(照 compare/preview 路径:秒级持有 cursor,不落库)。"""
+    policy = dict(datasource_row["operation_policy"] or {})
+    if not bool(policy.get("allow_select", False)):
+        raise _SampleUnavailable("select_not_allowed")
+    db_type = DbType(str(datasource_row["db_type"]))
+    identifier = (
+        f"{table_req.schema_name}.{table_req.table_name}"
+        if table_req.schema_name
+        else table_req.table_name
+    )
+    try:
+        source_expr = quote_identifier(db_type, identifier)
+    except ValueError as exc:
+        raise _SampleUnavailable("invalid_identifier") from exc
+    sql = f"SELECT * FROM {source_expr}{limit_clause(db_type, MAX_SAMPLE_ROWS)}"
+    columns: list[str] = []
+    adapter = build_database_adapter(
+        _datasource_conn_info(datasource_row),
+        services.secret_store,
+        column_sink=lambda cols: columns.extend(column.name for column in cols),
+        connect_timeout_seconds=services.metadata_probe_timeout_seconds,
+        statement_timeout_seconds=services.metadata_probe_timeout_seconds,
+    )
+    rows: list[list[Any]] = []
+    try:
+        for data_row in adapter.execute_select(sql, {}):
+            rows.append([_preview_value(value) for value in data_row.values])
+            if len(rows) >= MAX_SAMPLE_ROWS:
+                break
+    except Exception as exc:
+        # R5:driver 原始错误可能含 SQL 片段,不透传,只记类型;样本降级为 L2。
+        logger.info(
+            "compare ai sample query failed",
+            request_id=request_id_from(request),
+            error_type=type(exc).__name__,
+        )
+        raise _SampleUnavailable("sample_query_failed") from exc
+    return columns, rows
 
 
 def _compare_tasks_visible_to_user(user_id: str) -> Any:

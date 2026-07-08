@@ -41,6 +41,7 @@ import { listDatasources } from '../api/datasources'
 import { uploadFile } from '../api/uploads'
 import {
   COMPARE_BUCKETS,
+  aiMapSuggestCompare,
   cloneCompareTask,
   createCompareExport,
   createCompareTask,
@@ -63,6 +64,7 @@ import {
   updateCompareTask,
   type ColumnMappingCandidate,
   type CompareAiAttributionResponse,
+  type CompareAiMapSuggestItem,
   type CompareBucket,
   type CompareDataRef,
   type CompareDiffSqlResponse,
@@ -826,6 +828,7 @@ function loadDraftFromTask(task: CompareTaskResponse): void {
   draft.streamCompare = task.run_limits.stream_compare
   draft.persistSame = task.run_limits.persist_same_bucket
   inferResult.value = null
+  resetAiSuggest()
   resetPreviews()
 }
 
@@ -838,6 +841,7 @@ function startNewTask(): void {
   draft.name = ''
   inferResult.value = null
   inferError.value = null
+  resetAiSuggest()
   resetRunState()
   resetHistory()
   resetPreviews()
@@ -974,6 +978,78 @@ function toggleIgnoreColumn(name: string): void {
 
 function applyMapping(mapping: ColumnMappingCandidate): void {
   draft.columnMappings[mapping.source_column] = mapping.target_column
+}
+
+// ── AI Copilot C2:残余列映射建议(设计稿 §2.7.4,egress L2 + 可选 L4 样本)────
+// 只处理规则推断后残余的未映射列;建议只是建议,逐条采纳,不自动应用。
+const aiSuggestBusy = ref(false)
+const aiSuggestError = ref<string | null>(null)
+const aiSuggestDisabled = ref(false)
+const aiSuggestions = ref<CompareAiMapSuggestItem[]>([])
+const aiSuggestNoHistory = ref(false)
+const aiIncludeSamples = ref(false)
+const aiSamplesSkipped = ref<string | null>(null)
+const aiSuggestRan = ref(false)
+
+async function onAiMapSuggest(): Promise<void> {
+  if (sqlMode.value || !draft.sourceTable || !draft.targetTable) {
+    aiSuggestError.value = t('compare.ai_map_needs_tables')
+    return
+  }
+  aiSuggestError.value = null
+  aiSuggestDisabled.value = false
+  aiSamplesSkipped.value = null
+  aiSuggestBusy.value = true
+  try {
+    const res = await aiMapSuggestCompare(projectId.value, {
+      source_id: draft.sourceId,
+      target_id: draft.targetId,
+      source_table: { schema_name: draft.sourceSchema, table_name: draft.sourceTable },
+      target_table: { schema_name: draft.targetSchema, table_name: draft.targetTable },
+      confirmed_mappings: { ...draft.columnMappings },
+      include_samples: aiIncludeSamples.value,
+    })
+    aiSuggestRan.value = true
+    if (!res.ok) {
+      aiSuggestError.value = t('compare.ai_map_failed')
+      return
+    }
+    aiSuggestions.value = res.suggestions
+    aiSuggestNoHistory.value = !res.history_available
+    // 用户勾了样本但后端未能真发(策略禁 SELECT 等)→ 如实提示降级。
+    aiSamplesSkipped.value =
+      aiIncludeSamples.value && !res.samples_included ? res.sample_skip_reason : null
+  } catch (e) {
+    // AI 未启用 → 409 ai_disabled;样本未获授权 → 403 l4_optin_required / egress_blocked。
+    if (e instanceof ApiError && e.code === 'ai_disabled') {
+      aiSuggestDisabled.value = true
+    } else if (e instanceof ApiError && e.code === 'l4_optin_required') {
+      aiSuggestError.value = t('compare.ai_map_l4_blocked')
+    } else if (e instanceof ApiError && e.code === 'egress_blocked') {
+      aiSuggestError.value = t('compare.ai_map_egress_blocked')
+    } else {
+      aiSuggestError.value = errorMessage(e)
+    }
+  } finally {
+    aiSuggestBusy.value = false
+  }
+}
+
+function applyAiSuggestion(item: CompareAiMapSuggestItem): void {
+  // 采纳一条建议 = 写入 draft.columnMappings(与规则建议 applyMapping 同路径),不自动执行。
+  draft.columnMappings[item.source_column] = item.target_column
+  aiSuggestions.value = aiSuggestions.value.filter(
+    (s) => s.source_column !== item.source_column,
+  )
+}
+
+function resetAiSuggest(): void {
+  aiSuggestions.value = []
+  aiSuggestError.value = null
+  aiSuggestDisabled.value = false
+  aiSuggestNoHistory.value = false
+  aiSamplesSkipped.value = null
+  aiSuggestRan.value = false
 }
 
 // ── save ────────────────────────────────────────────────────────────
@@ -2207,6 +2283,79 @@ const missingTarget = computed(
                   </tr>
                 </tbody>
               </table>
+            </div>
+
+            <!-- AI Copilot C2:规则推断后的残余列映射建议(egress L2 + 可选 L4 样本)-->
+            <div class="rounded-card border border-violet-200 dark:border-violet-500/30 bg-violet-50/50 dark:bg-violet-500/5 p-3 space-y-2">
+              <div class="flex items-center gap-2">
+                <Sparkles class="w-3.5 h-3.5 text-violet-600 dark:text-violet-300 shrink-0" />
+                <span class="text-xs font-medium chrome-text-heading">{{ t('compare.ai_map_title') }}</span>
+                <span class="text-[10px] uppercase tracking-wide rounded-input px-1.5 py-0.5 bg-violet-100 text-violet-700 dark:bg-violet-500/15 dark:text-violet-300">
+                  {{ aiIncludeSamples ? 'L4' : 'L2' }}
+                </span>
+              </div>
+              <div class="text-[11px] chrome-text-muted">{{ t('compare.ai_map_desc') }}</div>
+
+              <label class="flex items-start gap-2 text-[11px] chrome-text-muted cursor-pointer">
+                <input type="checkbox" class="mt-0.5" v-model="aiIncludeSamples" />
+                <span>
+                  <span class="font-medium text-amber-700 dark:text-amber-300">{{ t('compare.ai_map_samples_label') }}</span>
+                  {{ t('compare.ai_map_samples_hint') }}
+                </span>
+              </label>
+
+              <div class="flex items-center gap-2">
+                <button
+                  type="button"
+                  class="chrome-btn-secondary"
+                  :disabled="aiSuggestBusy || sqlMode || !draft.sourceTable || !draft.targetTable"
+                  @click="onAiMapSuggest"
+                >
+                  <Sparkles class="w-3.5 h-3.5" :class="aiSuggestBusy && 'animate-pulse'" />
+                  {{ aiSuggestBusy ? t('compare.ai_map_running') : t('compare.ai_map_run') }}
+                </button>
+                <span v-if="aiSuggestNoHistory && aiSuggestRan" class="text-[11px] chrome-text-muted italic">
+                  {{ t('compare.ai_map_no_history') }}
+                </span>
+              </div>
+
+              <div v-if="aiSuggestDisabled" class="text-[11px] text-amber-700 dark:text-amber-300">
+                {{ t('sql.ai_disabled') }}
+              </div>
+              <div v-if="aiSuggestError" class="text-[11px] text-red-600 dark:text-red-400">{{ aiSuggestError }}</div>
+              <div v-if="aiSamplesSkipped" class="text-[11px] text-amber-700 dark:text-amber-300">
+                {{ t('compare.ai_map_samples_skipped', { reason: aiSamplesSkipped }) }}
+              </div>
+
+              <div
+                v-if="aiSuggestRan && aiSuggestions.length === 0 && !aiSuggestError && !aiSuggestDisabled"
+                class="text-[11px] chrome-text-muted"
+              >
+                {{ t('compare.ai_map_empty') }}
+              </div>
+              <div
+                v-for="s in aiSuggestions"
+                :key="s.source_column"
+                class="flex items-center gap-2 rounded-card border chrome-border bg-chrome-panel px-2 py-1.5"
+              >
+                <span class="flex-1 text-xs font-mono chrome-text-heading">
+                  {{ s.source_column }}
+                  <ArrowRight class="inline w-3 h-3 chrome-text-muted" />
+                  {{ s.target_column }}
+                </span>
+                <span v-if="s.rationale" class="text-[10px] chrome-text-muted truncate max-w-[12rem]" :title="s.rationale">
+                  {{ s.rationale }}
+                </span>
+                <span class="text-[10px] chrome-text-muted tabular-nums">{{ Math.round(s.confidence * 100) }}%</span>
+                <button
+                  type="button"
+                  class="chrome-btn-ghost"
+                  :title="t('compare.ai_map_apply')"
+                  @click="applyAiSuggestion(s)"
+                >
+                  <Check class="w-3.5 h-3.5" />
+                </button>
+              </div>
             </div>
           </div>
 

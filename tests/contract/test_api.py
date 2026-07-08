@@ -1528,6 +1528,135 @@ def test_compare_ai_attribution_disabled_degrades_without_profile_loss() -> None
     assert response.json()["ok"] is False
 
 
+def _ai_map_ai_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "enabled": True,
+        "provider": "mock",
+        "model": "mock-model",
+        "base_url": None,
+        "api_key_secret_ref": None,
+        "max_auto_egress_level": 2,
+        "l4_requires_optin": True,
+        "enable_inference": True,
+    }
+    row.update(overrides)
+    return row
+
+
+def _ai_map_columns_cache(names_types: list[tuple[str, str]]) -> dict[str, object]:
+    return _metadata_cache(
+        [
+            {
+                "name": name,
+                "type": ctype,
+                "driver_type": ctype.upper(),
+                "nullable": True,
+                "primary_key": name == "id",
+                "comment": None,
+            }
+            for name, ctype in names_types
+        ]
+    )
+
+
+def _ai_map_datasource_rows() -> tuple[dict[str, object], dict[str, object]]:
+    source_row = _datasource_row()
+    source_row["id"] = "ds-source"
+    target_row = _datasource_row()
+    target_row["id"] = "ds-target"
+    return source_row, target_row
+
+
+def _ai_map_body(*, include_samples: bool) -> dict[str, object]:
+    return {
+        "source_id": "ds-source",
+        "target_id": "ds-target",
+        "source_table": {"schema_name": "app", "table_name": "orders_a"},
+        "target_table": {"schema_name": "app", "table_name": "orders_b"},
+        "confirmed_mappings": {"id": "id", "amount": "amount"},
+        "include_samples": include_samples,
+    }
+
+
+def test_compare_ai_map_suggest_l2_path_with_mock_provider_and_no_history() -> None:
+    source_row, target_row = _ai_map_datasource_rows()
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            [source_row, target_row],
+            _ai_map_ai_row(),
+            _ai_map_columns_cache([("id", "integer"), ("amount", "decimal"), ("note", "string")]),
+            _ai_map_columns_cache([("id", "integer"), ("amount", "decimal"), ("memo", "string")]),
+            [],  # no prior compare tasks → no mapping history
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/ai-map-suggest",
+        headers=_auth_headers(),
+        json_body=_ai_map_body(include_samples=False),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["egress_level"] == 2  # L2 only, no samples
+    assert payload["samples_included"] is False
+    assert payload["history_available"] is False
+    assert payload["residual_source_columns"] == ["note"]
+    assert payload["residual_target_columns"] == ["memo"]
+    # MockProvider 回 "ok" 不可解析为映射 JSON → 空建议但成功(优雅降级)。
+    assert payload["suggestions"] == []
+    audit = next(a for a in services.audits if a["action"] == "ai_assist_call")
+    assert audit["result"] == "success"
+    # ★ R5:审计 detail 只记计数/等级/是否含样本,绝不含建议内容 / 样本值 / prompt 原文。
+    detail = cast(dict[str, object], audit["detail"])
+    assert detail["samples_included"] is False
+    assert detail["egress_level"] == 2
+    assert "suggestions" not in detail
+    assert "prompt" not in detail
+    assert "content" not in detail
+
+
+def test_compare_ai_map_suggest_disabled_returns_409() -> None:
+    source_row, target_row = _ai_map_datasource_rows()
+    engine = _FakeEngine([{"id": "project-1"}, [source_row, target_row], None])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/ai-map-suggest",
+        headers=_auth_headers(),
+        json_body=_ai_map_body(include_samples=False),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "ai_disabled"
+
+
+def test_compare_ai_map_suggest_samples_without_optin_rejected_403() -> None:
+    source_row, target_row = _ai_map_datasource_rows()
+    # l4_requires_optin=True(默认/portable) + include_samples=True → 拒发样本,取数之前即闸门。
+    engine = _FakeEngine(
+        [{"id": "project-1"}, [source_row, target_row], _ai_map_ai_row(l4_requires_optin=True)]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/ai-map-suggest",
+        headers=_auth_headers(),
+        json_body=_ai_map_body(include_samples=True),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "l4_optin_required"
+    audit = next(a for a in services.audits if a["action"] == "ai_assist_call")
+    assert audit["result"] == "skipped"
+
+
 def test_ai_sql_generate_uses_l2_schema_context_and_audits() -> None:
     columns_cache = _metadata_cache(
         [
