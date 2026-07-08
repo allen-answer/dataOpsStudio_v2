@@ -80,6 +80,7 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("PUT", "/api/projects/{project_id}/workflows/{workflow_id}") in routes
     assert ("DELETE", "/api/projects/{project_id}/workflows/{workflow_id}") in routes
     assert ("POST", "/api/projects/{project_id}/workflows/{workflow_id}/runs") in routes
+    assert ("GET", "/api/projects/{project_id}/workflows/{workflow_id}/runs") in routes
     assert ("GET", "/api/projects/{project_id}/workflow-runs/{run_id}") in routes
     assert ("POST", "/api/projects/{project_id}/workflow-runs/{run_id}:cancel") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/schemas") in routes
@@ -3940,6 +3941,77 @@ def test_workflow_run_status_not_found_returns_404() -> None:
 
     response = AsgiClient(app).get(
         "/api/projects/project-1/workflow-runs/run-missing",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "not_found"
+
+
+def test_workflow_runs_list_contract_returns_runs_desc() -> None:
+    # PR0(workflow 前端前置):列某 workflow 的历史 run(倒序 + has_more 分页口径)。
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_row(),  # workflow 存在性检查
+            [
+                _workflow_run_job_row(status="success"),
+                _workflow_run_job_row(status="running"),
+            ],
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflows/wf-1/runs",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["workflow_id"] == "wf-1"
+    assert payload["has_more"] is False
+    assert payload["limit"] == 20
+    assert len(payload["runs"]) == 2
+    first = payload["runs"][0]
+    assert first["run_id"] == "run-1"
+    assert first["job_id"] == first["run_id"]  # run 即 job(ADR-0009)
+    assert first["status"] == "success"
+    # 节点明细不在列表项里(走单 run 状态端点)
+    assert "nodes" not in first
+
+
+def test_workflow_runs_list_has_more_when_over_limit() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_row(),
+            [  # limit=1 → 后端取 limit+1=2 行判 has_more(只回 1 行)
+                _workflow_run_job_row(status="success"),
+                _workflow_run_job_row(status="running"),
+            ],
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflows/wf-1/runs?limit=1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["limit"] == 1
+    assert payload["has_more"] is True
+    assert len(payload["runs"]) == 1
+
+
+def test_workflow_runs_list_missing_workflow_returns_404() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, None])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflows/wf-missing/runs",
         headers=_auth_headers(),
     )
 

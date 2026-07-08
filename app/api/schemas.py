@@ -1122,3 +1122,29 @@ class WorkflowRunStatusResponse(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     nodes: list[WorkflowRunNodeItem]
+
+
+class WorkflowRunListItem(BaseModel):
+    """Workflow run 历史列表项(轻量视图,run 级状态 + 时间戳;不含节点明细)。
+
+    节点明细走单 run 状态端点(GET workflow-runs/{run_id});此列表只喂历史面板。
+    run_id == job_id(WorkflowRun 本身即 job,ADR-0009),双字段便于前端对齐 jobs API。
+    """
+
+    run_id: str
+    job_id: str
+    status: JobStatus
+    error: str | None = None
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class WorkflowRunsResponse(BaseModel):
+    """某 workflow 的历史 run 分页列表(倒序;对齐 compare /runs 的 has_more 口径)。"""
+
+    workflow_id: str
+    limit: int
+    offset: int
+    has_more: bool
+    runs: list[WorkflowRunListItem]
