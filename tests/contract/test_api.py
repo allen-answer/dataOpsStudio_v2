@@ -65,8 +65,10 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("POST", "/api/compare/tasks/{task_id}/run") in routes
     assert ("GET", "/api/compare/runs/{run_id}/results") in routes
     assert ("GET", "/api/compare/runs/{run_id}/profile") in routes
+    assert ("GET", "/api/compare/runs/{run_id}/diff-sql") in routes
     assert ("POST", "/api/compare/runs/{run_id}/ai-attribution") in routes
     assert ("POST", "/api/projects/{project_id}/compare/infer") in routes
+    assert ("POST", "/api/projects/{project_id}/compare/pk-precheck") in routes
     assert ("GET", "/api/projects/{project_id}/compare/suggest-tasks") in routes
     assert ("POST", "/api/projects/{project_id}/compare/draft-task") in routes
     assert ("POST", "/api/projects/{project_id}/lineage/analyze") in routes
@@ -974,6 +976,143 @@ def test_compare_preview_denied_without_allow_select() -> None:
 
     assert response.status_code == 403
     assert response.json()["error"] == "select_not_allowed"
+
+
+def test_compare_pk_precheck_reports_duplicates_and_nulls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_sql: list[str] = []
+
+    class _PrecheckAdapter:
+        def execute_select(self, sql: str, params: dict[str, object]) -> Iterator[Row]:
+            del params
+            captured_sql.append(sql)
+            if "DISTINCT" in sql:
+                yield Row(values=[7])  # distinct_pk_rows
+            else:
+                yield Row(values=[10, 2])  # total_rows, null_pk_rows
+
+    monkeypatch.setattr(
+        core_routes,
+        "build_database_adapter",
+        lambda conn_info, secret_store, **kwargs: _PrecheckAdapter(),
+    )
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _datasource_row(operation_policy=_policy(allow_select=True)),
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/pk-precheck",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "ref": {"kind": "table", "schema_name": "app", "table_name": "orders"},
+            "key_columns": ["id"],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == {
+        "total_rows": 10,
+        "distinct_pk_rows": 7,
+        "duplicate_pk_rows": 3,
+        "null_pk_rows": 2,
+        "has_duplicates": True,
+        "has_nulls": True,
+    }
+    # mysql 反引号 + 两条聚合(总数/空值、去重)
+    assert any("COUNT(*)" in sql and "`id` IS NULL" in sql for sql in captured_sql)
+    assert any("DISTINCT `id`" in sql for sql in captured_sql)
+    assert any(audit["action"] == "compare_pk_precheck" for audit in services.audits)
+
+
+def test_compare_pk_precheck_rejects_file_source() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _datasource_row(operation_policy=_policy(allow_select=True)),
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/pk-precheck",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "ref": {"kind": "file", "upload_id": "up-1", "file_format": "csv"},
+            "key_columns": ["id"],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "precheck_unsupported_file"
+
+
+def test_compare_diff_sql_contract_builds_where_in_for_both_sides() -> None:
+    run_row = {
+        "run_id": "run-1",
+        "job_id": "job-1",
+        "project_id": "project-1",
+        "task_id": "task-1",
+        "bucket_spools": {"diff": "rs-diff"},
+    }
+    result_store = _ResultStore(
+        rows=[
+            encode_compare_result_row(
+                pk={"id": 3},
+                source={"id": 3, "amount": "10.00"},
+                target={"id": 3, "amount": "11.00"},
+                cells=[{"column": "amount", "source": "10.00", "target": "11.00"}],
+            ),
+            encode_compare_result_row(
+                pk={"id": 4},
+                source={"id": 4},
+                target={"id": 4},
+                cells=[],
+            ),
+        ]
+    )
+    engine = _FakeEngine(
+        [
+            run_row,  # _compare_run_for_current_user -> run_index
+            {"id": "project-1"},  # _require_project_access
+            _compare_task_row(),  # _compare_task_for_current_user -> compare_tasks
+            {"id": "project-1"},  # _require_project_access
+            {"db_type": "mysql"},  # source db_type
+            {"db_type": "mysql"},  # target db_type
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine, result_store=result_store)))
+
+    response = AsgiClient(app).get(
+        "/api/compare/runs/run-1/diff-sql",
+        headers=_auth_headers(),
+        params={"bucket": "diff"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["bucket"] == "diff"
+    assert payload["key_columns"] == ["id"]
+    assert payload["pk_count"] == 2
+    assert payload["truncated"] is False
+    assert payload["source"] == {
+        "available": True,
+        "sql": "SELECT * FROM `app`.`orders_a` WHERE `id` IN (3, 4)",
+        "reason": None,
+    }
+    assert payload["target"] == {
+        "available": True,
+        "sql": "SELECT * FROM `app`.`orders_b` WHERE `id` IN (3, 4)",
+        "reason": None,
+    }
 
 
 def test_compare_infer_contract_returns_mapping_confidence_and_pk_draft() -> None:
