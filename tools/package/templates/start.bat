@@ -30,7 +30,6 @@ set "DATAOPS_FORM=portable"
 set "DATAOPS_FRONTEND_DIST=%BUNDLE%\frontend\dist"
 set "PATH=%PGBIN%;%PATH%"
 
-set "LAUNCH=%VENVPY% -m app.launcher --root "%DATAOPS_HOME%" --pg-bin-dir "%PGBIN%" --uv "%UVEXE%""
 
 if not exist "%VENVPY%" (
   echo [start] first run: building offline Python environment ...
@@ -42,23 +41,27 @@ if not exist "%VENVPY%" (
 
 if not exist "%DATAOPS_HOME%\config\.secret_master.key" (
   echo [start] first run: generating bootstrap secrets ...
-  cmd /c %LAUNCH% bootstrap init || goto :fail
+  call :launcher bootstrap init || goto :fail
   echo [start] first run: starting metadata PostgreSQL ...
-  cmd /c %LAUNCH% pg-up || goto :fail
+  call :launcher pg-up || goto :fail
   echo [start] first run: applying database migrations ...
-  cmd /c %LAUNCH% alembic-up || goto :fail
+  call :launcher alembic-up || goto :fail
   echo [start] first run: creating admin user "%DATAOPS_ADMIN_USER%"
   if defined DATAOPS_ADMIN_PASSWORD (
-    cmd /c %LAUNCH% admin create --username "%DATAOPS_ADMIN_USER%" --password "%DATAOPS_ADMIN_PASSWORD%" || goto :fail
+    call :launcher admin create --username "%DATAOPS_ADMIN_USER%" --password "%DATAOPS_ADMIN_PASSWORD%" || goto :fail
   ) else (
-    cmd /c %LAUNCH% admin create --username "%DATAOPS_ADMIN_USER%" || goto :fail
+    call :launcher admin create --username "%DATAOPS_ADMIN_USER%" || goto :fail
   )
 )
 
 echo [start] launching DataOpsStudio on http://127.0.0.1:%DATAOPS_API_PORT%/
 echo [start] press Ctrl+C in this window to stop gracefully.
-cmd /c %LAUNCH% up
+call :launcher up
 goto :eof
+
+:launcher
+"%VENVPY%" -m app.launcher --root "%DATAOPS_HOME%" --pg-bin-dir "%PGBIN%" --uv "%UVEXE%" %*
+exit /b %errorlevel%
 
 :fail
 echo [start] ERROR: startup failed (exit %errorlevel%). See %DATAOPS_HOME%\logs\ for details.
