@@ -76,6 +76,7 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("POST", "/api/projects/{project_id}/lineage/analyze") in routes
     assert ("GET", "/api/projects/{project_id}/lineage/subgraph") in routes
     assert ("GET", "/api/projects/{project_id}/lineage/impact") in routes
+    assert ("POST", "/api/projects/{project_id}/lineage/ai-impact") in routes
     assert ("POST", "/api/projects/{project_id}/lineage/export") in routes
     assert ("PATCH", "/api/projects/{project_id}/lineage/edges/{edge_id}") in routes
     assert ("GET", "/api/projects/{project_id}/workflows") in routes
@@ -2135,6 +2136,165 @@ def test_lineage_impact_contract_returns_downstream_paths() -> None:
         "depth": 1,
         "paths": [["app.src", "app.mid"]],
     }
+
+
+def _impact_walk_row() -> dict[str, object]:
+    return {
+        "edge_id": "edge-1",
+        "source_table": "app.src",
+        "target_table": "app.mid",
+        "source_column": None,
+        "target_column": None,
+        "source": "app.src",
+        "target": "app.mid",
+        "edge_kind": "table",
+        "transformation": None,
+        "transformation_subtype": None,
+        "inferred": False,
+        "inference_status": "confirmed",
+        "confidence": 1,
+        "depth": 1,
+        "path": ["app.src", "app.mid"],
+        "direction": "downstream",
+    }
+
+
+def _patch_gateway(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) -> None:
+    class _Gateway:
+        def complete(self, prompt: str, context: Any, options: Any) -> Any:
+            captured["prompt"] = prompt
+            captured["context"] = context
+            captured["options"] = options
+            return AiResponse(content="ranked", provider="mock", model="mock-model")
+
+    monkeypatch.setattr(
+        core_routes,
+        "build_gateway_from_runtime_config",
+        lambda runtime, **kwargs: _Gateway(),
+    )
+
+
+def test_lineage_ai_impact_weights_frequency_and_owner_via_gateway_l2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},  # project access
+            _ai_config_row(),  # ai config
+            "edge-exists",  # focus_ref table exists
+            [_impact_walk_row()],  # downstream walk
+            {"username": "alice"},  # project owner
+            [
+                {
+                    "table_name": "app.mid",
+                    "ref_count": 4,
+                    "source_ref_count": 2,
+                    "last_referenced_at": datetime.now(UTC),
+                }
+            ],  # frequency
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+    captured: dict[str, Any] = {}
+    _patch_gateway(monkeypatch, captured)
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/ai-impact",
+        headers=_auth_headers(),
+        json_body={"focus": "app.src", "max_depth": 3, "window_days": 90},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["assessment"] == "ranked"
+    assert payload["egress_level"] == 2
+    assert payload["degraded"] is False
+    assert payload["impact_count"] == 1
+    assert payload["project_owner"] == "alice"
+    assert payload["signals"][0]["ref_count"] == 4
+    assert payload["signals"][0]["source_ref_count"] == 2
+    assert payload["signals"][0]["last_referenced_days_ago"] == 0
+    # L2 出站 + 无行值 / 无 SQL 原文:只送名字 + 聚合计数。
+    context = captured["context"]
+    assert len(context.items) == 1
+    assert context.items[0].egress_level == 2
+    content = context.items[0].content
+    assert "app.mid" in content
+    assert "alice" in content
+    assert "SELECT" not in content.upper()
+    assert "INSERT" not in content.upper()
+    assert captured["options"].purpose == "lineage_ai_impact"
+    assert any(
+        audit["action"] == "lineage_ai_impact" and audit["result"] == "success"
+        for audit in services.audits
+    )
+
+
+def test_lineage_ai_impact_degrades_gracefully_without_frequency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _ai_config_row(),
+            "edge-exists",
+            [_impact_walk_row()],
+            {"username": "alice"},
+            [],  # no frequency rows within window → thin data
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+    captured: dict[str, Any] = {}
+    _patch_gateway(monkeypatch, captured)
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/ai-impact",
+        headers=_auth_headers(),
+        json_body={"focus": "app.src"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["degraded"] is True
+    assert payload["signals"][0]["ref_count"] == 0
+    assert payload["signals"][0]["last_referenced_days_ago"] is None
+    # 稀薄频率仍出站,但标注 frequency_available=false 供 AI 降级加权。
+    assert '"frequency_available":false' in captured["context"].items[0].content
+
+
+def test_lineage_ai_impact_disabled_returns_409(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            None,  # no ai_configs row → disabled
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+    called: dict[str, Any] = {}
+    monkeypatch.setattr(
+        core_routes,
+        "build_gateway_from_runtime_config",
+        lambda *a, **k: called.setdefault("built", True),
+    )
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/ai-impact",
+        headers=_auth_headers(),
+        json_body={"focus": "app.src"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "ai_disabled"
+    assert "built" not in called  # gateway never constructed when disabled
+    assert any(
+        audit["action"] == "lineage_ai_impact" and audit["result"] == "skipped"
+        for audit in services.audits
+    )
 
 
 def test_lineage_export_writes_artifact_token_and_audit_synchronously() -> None:

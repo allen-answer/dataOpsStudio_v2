@@ -358,6 +358,54 @@ export function createTraceCompare(
   )
 }
 
+// ── C3 Copilot:加权影响解读(L2,提前交付)──────────────────────────
+// 锚 schemas.py LineageAiImpactRequest / LineageImpactSignal / LineageAiImpactResponse;
+// POST /projects/{pid}/lineage/ai-impact:基础影响 + 引用频率 + 负责人 → AI 加权。
+// AI 关闭 → 409 ai_disabled;gateway 故障 → ok:false + error(signals 仍返回)。
+
+export interface LineageAiImpactRequest {
+  focus: string
+  max_depth?: number
+  window_days?: number
+}
+
+export interface LineageImpactSignal {
+  node: string
+  table: string
+  column: string | null
+  depth: number
+  ref_count: number
+  source_ref_count: number
+  last_referenced_days_ago: number | null
+}
+
+export interface LineageAiImpactResponse {
+  project_id: string
+  focus: string
+  max_depth: number
+  window_days: number
+  ok: boolean
+  error: string | null
+  provider: string | null
+  model: string | null
+  egress_level: number
+  impact_count: number
+  degraded: boolean
+  project_owner: string | null
+  assessment: string | null
+  signals: LineageImpactSignal[]
+}
+
+export function weightedLineageImpact(
+  projectId: string,
+  req: LineageAiImpactRequest,
+): Promise<LineageAiImpactResponse> {
+  return apiClient.post<LineageAiImpactResponse>(
+    `/projects/${projectId}/lineage/ai-impact`,
+    req,
+  )
+}
+
 // ── 批量分析(L-2:ZIP 上传 → job → 报告)────────────────────────────
 // 锚 schemas.py LineageBatchCreateRequest / LineageBatchCreateResponse /
 // LineageBatchStatusResponse;report 形状由 app/worker.py
