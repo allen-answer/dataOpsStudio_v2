@@ -11,7 +11,7 @@ import time
 import zipfile
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from itertools import chain, islice
@@ -20,7 +20,7 @@ from typing import Any, BinaryIO, Protocol, cast
 from uuid import uuid4
 
 import structlog
-from sqlalchemy import URL, and_, create_engine, insert, select, update
+from sqlalchemy import URL, and_, create_engine, insert, or_, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
@@ -34,12 +34,14 @@ from app.db.models import (
     metadata_caches,
     result_sets,
     run_index,
+    workflows,
 )
 from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.protocol import AdapterConnectionError
 from app.dbclients.sql_build import limit_clause as _limit_clause
 from app.dbclients.sql_build import quote_alias as _quote_alias
 from app.dbclients.sql_build import quote_identifier as _quote_identifier
+from app.dbclients.sql_guard import validate_readonly_sql
 from app.domain.compare import (
     CompareColumn,
     CompareDiffBucket,
@@ -121,6 +123,7 @@ from app.infrastructure.run_index import register_compare_run_index
 from app.infrastructure.secretstore.local_file import LocalFileSecretStore
 from app.observability.logging import configure_logging
 from app.services.notify import RevealSecret, WorkflowNotifyService
+from app.services.workflow_scheduler import build_workflow_run_job
 
 logger = structlog.get_logger(__name__)
 
@@ -172,6 +175,10 @@ _LINEAGE_BATCH_DETAIL_PROJECTIONS: dict[str, tuple[str, ...]] = {
     ),
     "graph_edges": ("source_table", "target_table", "statement_index", "inferred"),
 }
+
+
+# C-10 sensor:区分"查询无行"与"第一列为 NULL"(两者都判假,但语义分开更清晰)。
+_NO_SENSOR_ROW = object()
 
 
 class JobCancelled(RuntimeError):
@@ -370,6 +377,23 @@ class LineageCatalogLike(Protocol):
     ) -> None: ...
 
 
+class SensorTriggerCatalogLike(Protocol):
+    """C-10 sensor 命中触发的冷却期原子闸门(worker 执行 sensor 检查用)。
+
+    带守卫地推进 ``sensor_last_triggered_at``(冷却期内不重复触发)并在**同一事务**
+    入队 workflow_run;守卫未命中(冷却期内 / 竞态 / 已禁用)返回 False,不入队。
+    """
+
+    def claim_trigger_and_enqueue(
+        self,
+        *,
+        workflow_id: str,
+        now: datetime,
+        cooldown_seconds: int,
+        run_job: Job,
+    ) -> bool: ...
+
+
 DatasourceLoader = Callable[[str], DatasourceConnInfo]
 AdapterFactory = Callable[
     [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None]],
@@ -413,6 +437,7 @@ class WorkerRunner:
         compare_run_catalog: CompareRunCatalogLike | None = None,
         lineage_catalog: LineageCatalogLike | None = None,
         notify_reveal: RevealSecret | None = None,
+        sensor_trigger_catalog: SensorTriggerCatalogLike | None = None,
     ) -> None:
         if config.sql_spool_batch_size <= 0:
             raise ValueError("sql_spool_batch_size must be positive")
@@ -437,6 +462,7 @@ class WorkerRunner:
         self._job_error_code_writer = job_error_code_writer
         self._compare_run_catalog = compare_run_catalog
         self._lineage_catalog = lineage_catalog
+        self._sensor_trigger_catalog = sensor_trigger_catalog
         # C-9:run 终态通知服务(注入 SecretStore.reveal_secret 作 RevealSecret DI)。
         # 未注入 reveal = 不通知(no-op),不影响 run 终态落定。
         self._notify_service = (
@@ -500,6 +526,8 @@ class WorkerRunner:
                 outcome = self._execute_lineage_batch(job)
             elif job.kind is JobKind.WORKFLOW_RUN:
                 outcome = self._execute_workflow_run(job)
+            elif job.kind is JobKind.WORKFLOW_SENSOR_CHECK:
+                outcome = self._execute_sensor_check(job)
             else:
                 raise UnsupportedJobKindError(f"Unsupported job kind: {job.kind.value}")
         except JobCancelled as exc:
@@ -1511,6 +1539,75 @@ class WorkerRunner:
             )
         )
 
+    def _execute_sensor_check(self, job: Job) -> _ExecutionOutcome:
+        """C-10 sensor 检查:在 datasource 上跑只读 SQL,第一行第一列 truthy → 触发。
+
+        条件真时经 SensorTriggerCatalog 带冷却期守卫地原子入队 workflow_run(冷却期内
+        守卫未命中则不入队)。SQL 执行前再过一道 sql_guard(纵深防御,路由层已校验)。
+        """
+        payload = job.payload
+        workflow_id = _required_payload_str(payload, "workflow_id")
+        datasource_id = _payload_datasource_id(job)
+        sensor_sql = validate_readonly_sql(_required_payload_str(payload, "sensor_sql"))
+        cooldown_seconds = _payload_non_negative_int(payload, "cooldown_seconds")
+        datasource = self._datasource_loader(datasource_id)
+        _require_operation_allowed(datasource.operation_policy, "select")
+        adapter = self._adapter_factory(
+            datasource,
+            lambda: self._backend.is_cancel_requested(job.id),
+            lambda columns: None,
+        )
+        self._check_cancel(job.id)
+        first_cell = _sensor_first_cell(adapter.execute_select(sensor_sql, {}))
+        triggered = _sensor_cell_truthy(first_cell)
+        self._heartbeat(job.id)
+
+        run_id: str | None = None
+        if triggered and self._sensor_trigger_catalog is not None:
+            now = datetime.now(UTC)
+            spec = _workflow_spec_from_payload(payload)
+            run_job = build_workflow_run_job(
+                workflow_id=workflow_id,
+                workflow_name=_payload_optional_str(payload, "workflow_name") or workflow_id,
+                project_id=job.project_id,
+                owner_user_id=job.owner_user_id,
+                spec=spec,
+                trigger="sensor",
+                now=now,
+            )
+            claimed = self._sensor_trigger_catalog.claim_trigger_and_enqueue(
+                workflow_id=workflow_id,
+                now=now,
+                cooldown_seconds=cooldown_seconds,
+                run_job=run_job,
+            )
+            if claimed:
+                run_id = run_job.id
+                logger.info(
+                    "workflow sensor fired",
+                    job_id=job.id,
+                    workflow_id=workflow_id,
+                    run_id=run_id,
+                )
+            else:
+                # 冷却期内 / 竞态 / 期间被禁用:守卫未命中,不触发(不刷屏)。
+                logger.info(
+                    "workflow sensor condition met but in cooldown",
+                    job_id=job.id,
+                    workflow_id=workflow_id,
+                )
+        return _ExecutionOutcome(
+            ResultRef(
+                backend="workflow_sensor",
+                uri=f"sensor/{job.id}",
+                metadata={
+                    "workflow_id": workflow_id,
+                    "triggered": triggered,
+                    "run_id": run_id,
+                },
+            )
+        )
+
     def _cancel_workflow_children(self, run_job_id: str) -> None:
         for child in self._backend.list_jobs_by_parent(run_job_id):
             if child.status in {JobStatus.PENDING, JobStatus.RUNNING}:
@@ -2064,6 +2161,47 @@ class PostgresJobErrorCodeWriter:
             )
 
 
+class PostgresSensorTriggerCatalog:
+    """C-10 sensor 命中触发的冷却期原子闸门(PG 实现)。
+
+    冷却期守卫 + 入队在同一事务:守卫命中(``rowcount==1``)推进
+    ``sensor_last_triggered_at`` 并入队 workflow_run;未命中(冷却期内 / 竞态 / 期间
+    被禁用)不入队,返回 False。与 scheduler 认领锚点同款:PG backend 复用当前连接,
+    保证认领与入队原子(失败一起回滚)。
+    """
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def claim_trigger_and_enqueue(
+        self,
+        *,
+        workflow_id: str,
+        now: datetime,
+        cooldown_seconds: int,
+        run_job: Job,
+    ) -> bool:
+        threshold = now - timedelta(seconds=cooldown_seconds)
+        with self._engine.begin() as conn:
+            claimed = conn.execute(
+                update(workflows)
+                .where(
+                    workflows.c.id == workflow_id,
+                    workflows.c.enabled.is_(True),
+                    workflows.c.sensor_enabled.is_(True),
+                    or_(
+                        workflows.c.sensor_last_triggered_at.is_(None),
+                        workflows.c.sensor_last_triggered_at < threshold,
+                    ),
+                )
+                .values(sensor_last_triggered_at=now)
+            ).rowcount
+            if claimed != 1:
+                return False
+            PostgresJobBackend(conn).enqueue(run_job)
+            return True
+
+
 def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
     actual_settings = settings or load_settings()
     configure_logging(actual_settings.logging.level)
@@ -2124,6 +2262,8 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
         # C-9:注入 SecretStore.reveal_secret 作 RevealSecret DI(worker 已持 store 实例;
         # service 不自开 DB 连接,R1)。webhook url/token 只在发送前一刻经此解密。
         notify_reveal=secret_store.reveal_secret,
+        # C-10:sensor 命中触发的冷却期原子闸门(带守卫推进 + 入队 workflow_run)。
+        sensor_trigger_catalog=PostgresSensorTriggerCatalog(engine),
     )
 
 
@@ -2188,6 +2328,50 @@ def _payload_datasource_id(job: Job) -> str:
 def _payload_optional_str(payload: dict[str, object], key: str) -> str | None:
     value = payload.get(key)
     return value if isinstance(value, str) and value else None
+
+
+def _payload_non_negative_int(payload: dict[str, object], key: str) -> int:
+    value = payload.get(key, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"Job payload requires non-negative int field: {key}")
+    return value
+
+
+def _sensor_first_cell(rows: Iterable[Row]) -> object:
+    """取只读结果第一行第一列(无行返回 ``_NO_SENSOR_ROW``)。
+
+    只拉第一行即停并 close 生成器(释放 cursor,不物化整个结果集);sensor SQL 应是
+    轻量条件查询,但用户 SQL 可能返回多行,故绝不整表读入。
+    """
+    iterator = iter(rows)
+    try:
+        try:
+            first = next(iterator)
+        except StopIteration:
+            return _NO_SENSOR_ROW
+        return first.values[0] if first.values else None
+    finally:
+        closer = getattr(iterator, "close", None)
+        if callable(closer):
+            closer()
+
+
+def _sensor_cell_truthy(value: object) -> bool:
+    """sensor 条件真值判定(第一行第一列)。
+
+    无行(``_NO_SENSOR_ROW``)/ NULL / 数值 0 / 空串 / ``0``/``false``/``f``/``no``/``n``/
+    ``off``(大小写不敏感)→ 假;其余非空值 → 真(典型:``SELECT COUNT(*) ... WHERE
+    arrived_at > :t`` 或 ``SELECT 1 WHERE EXISTS(...)``)。
+    """
+    if value is _NO_SENSOR_ROW or value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float, Decimal)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "f", "no", "n", "off"}
+    return bool(value)
 
 
 def _decode_sql_bytes(raw: bytes) -> str | None:
@@ -3174,7 +3358,12 @@ def _job_error_code(exc: Exception, kind: JobKind) -> JobErrorCode:
         return JobErrorCode.CONNECTION_FAILED
     if isinstance(exc, AdapterConnectionError):
         return JobErrorCode.CONNECTION_FAILED
-    if kind in {JobKind.SQL_QUERY, JobKind.SQL_EXPLAIN, JobKind.COMPARE_RUN}:
+    if kind in {
+        JobKind.SQL_QUERY,
+        JobKind.SQL_EXPLAIN,
+        JobKind.COMPARE_RUN,
+        JobKind.WORKFLOW_SENSOR_CHECK,
+    }:
         return JobErrorCode.SQL_FAILED
     if kind is JobKind.RESULT_EXPORT:
         return JobErrorCode.EXPORT_FAILED

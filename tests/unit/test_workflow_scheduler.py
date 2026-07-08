@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -11,8 +11,11 @@ from pydantic import ValidationError
 from app.domain.workflow import CronSchedule, WorkflowSpec
 from app.services.workflow_scheduler import (
     ScheduleAction,
+    SensorAction,
+    build_sensor_check_job,
     build_workflow_run_job,
     evaluate_schedule,
+    evaluate_sensor,
     most_recent_fire,
 )
 
@@ -191,3 +194,150 @@ def test_cron_schedule_rejects_out_of_range() -> None:
     # 字符集过关但字段越界 → croniter 语义关拦下
     with pytest.raises(ValidationError, match="invalid_cron"):
         CronSchedule(cron="99 * * * *")
+
+
+# ── C-10 evaluate_sensor:检查间隔节流 / 冷却期 / 禁用 ────────────────────────
+
+_SENSOR_NOW = datetime(2026, 7, 8, 10, 0, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("enabled", "sensor_enabled"),
+    [(False, True), (True, False)],
+)
+def test_evaluate_sensor_disabled_never_checks(enabled: bool, sensor_enabled: bool) -> None:
+    d = evaluate_sensor(
+        enabled=enabled,
+        sensor_enabled=sensor_enabled,
+        now=_SENSOR_NOW,
+        last_checked=None,
+        check_interval_seconds=60,
+        last_triggered=None,
+        cooldown_seconds=300,
+    )
+    assert d.action is SensorAction.SKIP
+
+
+def test_evaluate_sensor_first_sight_checks() -> None:
+    d = evaluate_sensor(
+        enabled=True,
+        sensor_enabled=True,
+        now=_SENSOR_NOW,
+        last_checked=None,
+        check_interval_seconds=60,
+        last_triggered=None,
+        cooldown_seconds=300,
+    )
+    assert d.action is SensorAction.CHECK
+
+
+def test_evaluate_sensor_throttles_within_interval() -> None:
+    # 距上次检查 30s < 间隔 60s → 不派
+    d = evaluate_sensor(
+        enabled=True,
+        sensor_enabled=True,
+        now=_SENSOR_NOW,
+        last_checked=_SENSOR_NOW - timedelta(seconds=30),
+        check_interval_seconds=60,
+        last_triggered=None,
+        cooldown_seconds=300,
+    )
+    assert d.action is SensorAction.SKIP
+
+
+def test_evaluate_sensor_checks_after_interval() -> None:
+    d = evaluate_sensor(
+        enabled=True,
+        sensor_enabled=True,
+        now=_SENSOR_NOW,
+        last_checked=_SENSOR_NOW - timedelta(seconds=90),
+        check_interval_seconds=60,
+        last_triggered=None,
+        cooldown_seconds=300,
+    )
+    assert d.action is SensorAction.CHECK
+
+
+def test_evaluate_sensor_skips_within_cooldown() -> None:
+    # 间隔已到,但距上次触发 100s < 冷却 300s → 不派(省无谓 SQL)
+    d = evaluate_sensor(
+        enabled=True,
+        sensor_enabled=True,
+        now=_SENSOR_NOW,
+        last_checked=_SENSOR_NOW - timedelta(seconds=90),
+        check_interval_seconds=60,
+        last_triggered=_SENSOR_NOW - timedelta(seconds=100),
+        cooldown_seconds=300,
+    )
+    assert d.action is SensorAction.SKIP
+
+
+def test_evaluate_sensor_checks_after_cooldown() -> None:
+    d = evaluate_sensor(
+        enabled=True,
+        sensor_enabled=True,
+        now=_SENSOR_NOW,
+        last_checked=_SENSOR_NOW - timedelta(seconds=90),
+        check_interval_seconds=60,
+        last_triggered=_SENSOR_NOW - timedelta(seconds=400),
+        cooldown_seconds=300,
+    )
+    assert d.action is SensorAction.CHECK
+
+
+def test_evaluate_sensor_zero_cooldown_ignores_last_triggered() -> None:
+    # 冷却 0:只要检查间隔到就再派(条件持续为真可重复触发)
+    d = evaluate_sensor(
+        enabled=True,
+        sensor_enabled=True,
+        now=_SENSOR_NOW,
+        last_checked=_SENSOR_NOW - timedelta(seconds=90),
+        check_interval_seconds=60,
+        last_triggered=_SENSOR_NOW - timedelta(seconds=1),
+        cooldown_seconds=0,
+    )
+    assert d.action is SensorAction.CHECK
+
+
+def test_evaluate_sensor_naive_anchors_treated_as_utc() -> None:
+    # DB 取回的 naive datetime 也按 UTC 比较,不炸
+    d = evaluate_sensor(
+        enabled=True,
+        sensor_enabled=True,
+        now=_SENSOR_NOW,
+        last_checked=(_SENSOR_NOW - timedelta(seconds=30)).replace(tzinfo=None),
+        check_interval_seconds=60,
+        last_triggered=None,
+        cooldown_seconds=300,
+    )
+    assert d.action is SensorAction.SKIP
+
+
+def test_build_sensor_check_job_shape() -> None:
+    spec = _spec(
+        sensor={
+            "sql": "SELECT COUNT(*) FROM arrivals WHERE arrived_at > '2026-07-08'",
+            "datasource_id": "ds-1",
+            "check_interval_seconds": 60,
+            "cooldown_seconds": 300,
+        }
+    )
+    job = build_sensor_check_job(
+        workflow_id="wf-1",
+        workflow_name="daily",
+        project_id="proj-1",
+        owner_user_id="user-1",
+        datasource_id="ds-1",
+        sensor_sql="SELECT 1",
+        cooldown_seconds=300,
+        spec=spec,
+        now=_SENSOR_NOW,
+    )
+    assert job.kind.value == "workflow_sensor_check"
+    assert job.priority == -1
+    assert job.owner_user_id == "user-1"
+    assert job.datasource_ids == ["ds-1"]
+    assert job.payload["workflow_id"] == "wf-1"
+    assert job.payload["sensor_sql"] == "SELECT 1"
+    assert job.payload["cooldown_seconds"] == 300
+    assert job.payload["spec"]["sensor"]["datasource_id"] == "ds-1"

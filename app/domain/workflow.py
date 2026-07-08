@@ -47,6 +47,14 @@ MAX_RETRIES_LIMIT = 5
 MAX_BACKOFF_SECONDS = 3600
 MAX_WHEN_LENGTH = 512
 
+# ── C-10 sensor 触发(数据到达触发)边界 ──────────────────────────────────────
+# 检查间隔下限拦住"每 tick 都派检查"(调度 tick 默认 30s,间隔再小也被 tick 粒度吃掉);
+# 上限一天。冷却期 0 = 不冷却(条件持续为真则每次检查都可再触发),上限 7 天。
+MIN_SENSOR_INTERVAL_SECONDS = 10
+MAX_SENSOR_INTERVAL_SECONDS = 86_400
+MAX_SENSOR_COOLDOWN_SECONDS = 604_800
+MAX_SENSOR_SQL_LENGTH = 10_000
+
 # cron 单字段字符集:数字 + * , - /(第一道关;第二道 croniter 语义解析见 CronSchedule)
 _CRON_FIELD_RE = re.compile(r"^[0-9*,\-/]+$")
 
@@ -164,6 +172,36 @@ class CronSchedule(BaseModel):
         return value
 
 
+class SensorTrigger(BaseModel):
+    """SQL sensor 触发(C-10:数据到达触发 + 冷却期)。
+
+    调度线程周期在 ``datasource_id`` 上执行只读 ``sql``(worker 侧连库,不在 API 进程,
+    R1);结果**第一行第一列 truthy 即触发** workflow run。``check_interval_seconds``
+    控制两次检查最小间隔;``cooldown_seconds`` 控制触发后多久内不再触发(冷却期)。
+
+    ★ ``sql`` 只做长度/非空的构造期校验;**只读校验(SELECT/WITH)在路由层用
+    sql_guard 落地**(写语句 → 400),worker 执行前再兜一道(纵深防御)。域层不 import
+    dbclients(层次纯净),故不在此调 sql_guard。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    sql: str = Field(min_length=1, max_length=MAX_SENSOR_SQL_LENGTH)
+    datasource_id: str = Field(min_length=1)
+    check_interval_seconds: int = Field(
+        ge=MIN_SENSOR_INTERVAL_SECONDS, le=MAX_SENSOR_INTERVAL_SECONDS
+    )
+    cooldown_seconds: int = Field(ge=0, le=MAX_SENSOR_COOLDOWN_SECONDS)
+    enabled: bool = True
+
+    @field_validator("datasource_id")
+    @classmethod
+    def _validate_datasource_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("invalid_sensor_datasource: datasource_id 不能为空")
+        return value
+
+
 class WorkflowNode(BaseModel):
     """Workflow DAG 节点(设计稿 §2.8.2)。
 
@@ -241,6 +279,9 @@ class WorkflowSpec(BaseModel):
     nodes: list[WorkflowNode] = Field(min_length=1, max_length=MAX_WORKFLOW_NODES)
     edges: list[WorkflowEdge] = Field(default_factory=list)
     schedule: CronSchedule | None = None
+    # SQL sensor 触发(C-10;存进 dag_jsonb,冗余 sensor_enabled 列供调度器扫表)。
+    # None = 无 sensor(默认)。cron 与 sensor 可并存(两条独立触发路径)。
+    sensor: SensorTrigger | None = None
     # run 终态通知目标(C-9;存进 dag_jsonb,无需迁移)。空 = 不通知(默认)。
     notifications: list[NotifyTarget] = Field(default_factory=list)
     # workflow 级默认变量(C-7 PR2;存进 dag_jsonb,无需迁移)。触发时并入

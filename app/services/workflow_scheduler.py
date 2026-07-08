@@ -29,7 +29,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -159,6 +159,102 @@ def build_workflow_run_job(
     )
 
 
+# ── C-10 SQL sensor 触发(数据到达触发 + 冷却期)──────────────────────────────
+# 调度线程周期扫 sensor_enabled 的 workflow;检查间隔到期即派一个 sensor 检查 job
+# 给 worker(SQL 在 worker 连库执行,不在 API 进程,遵守 R1)。worker 侧 SQL 结果
+# 第一行第一列 truthy → 带冷却期守卫的原子推进 sensor_last_triggered_at + 入队
+# workflow_run(经 build_workflow_run_job,与手动/cron 单一构造点)。
+#
+# 职责切分:调度器管**检查间隔节流**(sensor_last_checked_at 锚点,派发即推进)与
+# **冷却期跳过优化**(冷却期内不派检查,省一次无谓 SQL);worker 侧的带守卫原子
+# 推进是**冷却期的权威闸门**(即便两次检查因 SQL 慢于间隔而并发在途,也只触发一次)。
+
+
+def _as_aware_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+class SensorAction(Enum):
+    SKIP = "skip"  # 未到检查间隔 / 冷却期内 / 被禁用
+    CHECK = "check"  # 检查间隔到期:派 sensor 检查 job(SQL 真值判定在 worker)
+
+
+@dataclass(frozen=True)
+class SensorDecision:
+    action: SensorAction
+
+
+def evaluate_sensor(
+    *,
+    enabled: bool,
+    sensor_enabled: bool,
+    now: datetime,
+    last_checked: datetime | None,
+    check_interval_seconds: int,
+    last_triggered: datetime | None,
+    cooldown_seconds: int,
+) -> SensorDecision:
+    """纯决策(无 IO,单测核心):是否派发一次 sensor 检查 → SKIP / CHECK。
+
+    - 禁用(workflow 总开关关 / sensor 关)→ SKIP。
+    - 冷却期内(距上次触发 < cooldown)→ SKIP:省一次无谓 SQL(worker 侧守卫是权威闸门)。
+    - 距上次检查 < check_interval → SKIP:检查间隔节流(派发即推进锚点)。
+    - 否则 → CHECK。
+    """
+    if not enabled or not sensor_enabled:
+        return SensorDecision(SensorAction.SKIP)
+    triggered = _as_aware_utc(last_triggered)
+    if triggered is not None and now - triggered < timedelta(seconds=cooldown_seconds):
+        return SensorDecision(SensorAction.SKIP)
+    checked = _as_aware_utc(last_checked)
+    if checked is not None and now - checked < timedelta(seconds=check_interval_seconds):
+        return SensorDecision(SensorAction.SKIP)
+    return SensorDecision(SensorAction.CHECK)
+
+
+def build_sensor_check_job(
+    *,
+    workflow_id: str,
+    workflow_name: str,
+    project_id: str,
+    owner_user_id: str,
+    datasource_id: str,
+    sensor_sql: str,
+    cooldown_seconds: int,
+    spec: WorkflowSpec,
+    now: datetime,
+) -> Job:
+    """构造一个 sensor 检查 job(单一构造点)。
+
+    payload 冻结 spec 快照:worker 侧条件为真时用它经 build_workflow_run_job 入队
+    workflow_run(run 反映派检查时刻的定义,不回读 workflows 表)。job 优先级 -1
+    (与 workflow_run / 手动触发同档,低于交互 sql_query,不压制交互查询)。
+    """
+    timeout_seconds = 300  # sensor SQL 应是轻量条件查询;超时按 300s 兜底
+    return Job(
+        id=_new_id(),
+        kind=JobKind.WORKFLOW_SENSOR_CHECK,
+        status=JobStatus.PENDING,
+        owner_user_id=owner_user_id,
+        project_id=project_id,
+        datasource_ids=[datasource_id],
+        priority=-1,
+        timeout_seconds=timeout_seconds,
+        resource_profile=ResourceProfile(timeout_seconds=timeout_seconds),
+        audit_id=_new_id(),
+        payload={
+            "workflow_id": workflow_id,
+            "workflow_name": workflow_name,
+            "datasource_id": datasource_id,
+            "sensor_sql": sensor_sql,
+            "cooldown_seconds": cooldown_seconds,
+            "spec": spec.model_dump(mode="json"),
+        },
+    )
+
+
 def _enqueue_in_txn(conn: Connection, job: Job) -> None:
     """事务内 enqueue(与 core._enqueue_job_txn 同款:PG backend 复用当前连接,
     保证认领锚点与入队 job 同一事务,失败一起回滚)。API 进程恒用 PostgresJobBackend。"""
@@ -206,7 +302,11 @@ class WorkflowScheduler:
                 )
 
     def tick(self, now: datetime) -> None:
-        """扫一遍到期调度并触发(公开供确定性单测注入 ``now``)。"""
+        """扫一遍到期调度并触发(公开供确定性单测注入 ``now``)。
+
+        两条独立触发路径:cron(schedule)与 SQL sensor;逐行隔离,单行/单路径失败
+        不影响其他 workflow。
+        """
         for row in self._candidate_rows():
             workflow_id = str(row["id"])
             try:
@@ -214,6 +314,16 @@ class WorkflowScheduler:
             except Exception as exc:  # 单行失败不影响其他 workflow
                 logger.warning(
                     "workflow schedule tick row failed",
+                    workflow_id=workflow_id,
+                    error_type=type(exc).__name__,
+                )
+        for row in self._sensor_candidate_rows():
+            workflow_id = str(row["id"])
+            try:
+                self._process_sensor_row(row, now)
+            except Exception as exc:  # 单行失败不影响其他 workflow
+                logger.warning(
+                    "workflow sensor tick row failed",
                     workflow_id=workflow_id,
                     error_type=type(exc).__name__,
                 )
@@ -321,4 +431,89 @@ class WorkflowScheduler:
             workflow_id=workflow_id,
             run_id=run_id,
             fire_at=fire_at.isoformat(),
+        )
+
+    # ── C-10 sensor 检查派发 ────────────────────────────────────────────────
+
+    def _sensor_candidate_rows(self) -> list[dict[str, object]]:
+        stmt = select(
+            workflows.c.id,
+            workflows.c.project_id,
+            workflows.c.name,
+            workflows.c.enabled,
+            workflows.c.created_by,
+            workflows.c.dag_jsonb,
+            workflows.c.sensor_enabled,
+            workflows.c.sensor_last_checked_at,
+            workflows.c.sensor_last_triggered_at,
+        ).where(
+            workflows.c.enabled.is_(True),
+            workflows.c.sensor_enabled.is_(True),
+        )
+        with self._services.engine.connect() as conn:
+            return [dict(m) for m in conn.execute(stmt).mappings().all()]
+
+    def _process_sensor_row(self, row: dict[str, object], now: datetime) -> None:
+        workflow_id = str(row["id"])
+        spec = WorkflowSpec.model_validate(row["dag_jsonb"] or {})
+        sensor = spec.sensor
+        if sensor is None or not sensor.enabled:
+            # 冗余列说 sensor 开,但 dag_jsonb 无 sensor / 已禁用(列一时未同步):不派。
+            return
+        last_checked = row["sensor_last_checked_at"]
+        last_triggered = row["sensor_last_triggered_at"]
+        decision = evaluate_sensor(
+            enabled=bool(row["enabled"]),
+            sensor_enabled=bool(row["sensor_enabled"]),
+            now=now,
+            last_checked=last_checked if isinstance(last_checked, datetime) else None,
+            check_interval_seconds=sensor.check_interval_seconds,
+            last_triggered=last_triggered if isinstance(last_triggered, datetime) else None,
+            cooldown_seconds=sensor.cooldown_seconds,
+        )
+        if decision.action is SensorAction.SKIP:
+            return
+
+        created_by = row["created_by"]
+        prev_checked = last_checked if isinstance(last_checked, datetime) else None
+        # 原子认领 sensor_last_checked_at(compare-and-swap 读到的旧值):单 API 实例本
+        # 无竞争,此守卫顺带兜住 HA 多实例误重复(HA 去重仍属后置,ADR-0009 Non-Goals)。
+        with self._services.engine.begin() as conn:
+            claim = update(workflows).where(
+                workflows.c.id == workflow_id,
+                workflows.c.enabled.is_(True),
+                workflows.c.sensor_enabled.is_(True),
+                (
+                    workflows.c.sensor_last_checked_at.is_(None)
+                    if prev_checked is None
+                    else workflows.c.sensor_last_checked_at == prev_checked
+                ),
+            )
+            claimed = conn.execute(claim.values(sensor_last_checked_at=now)).rowcount
+            if claimed != 1:
+                return
+            if not isinstance(created_by, str) or not created_by:
+                # 创建者被删(created_by SET NULL):无法归属 owner(jobs.owner NOT NULL)。
+                # 锚点已推进 → 只告警一次(不逐 tick 刷屏),sensor 暂停至有人重存该 workflow。
+                logger.warning(
+                    "workflow sensor check skipped: no owner",
+                    workflow_id=workflow_id,
+                )
+                return
+            job = build_sensor_check_job(
+                workflow_id=workflow_id,
+                workflow_name=str(row["name"]),
+                project_id=str(row["project_id"]),
+                owner_user_id=created_by,
+                datasource_id=sensor.datasource_id,
+                sensor_sql=sensor.sql,
+                cooldown_seconds=sensor.cooldown_seconds,
+                spec=spec,
+                now=now,
+            )
+            _enqueue_in_txn(conn, job)
+        logger.info(
+            "workflow sensor check dispatched",
+            workflow_id=workflow_id,
+            check_job_id=job.id,
         )
