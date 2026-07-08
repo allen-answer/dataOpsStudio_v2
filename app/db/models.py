@@ -792,6 +792,11 @@ workflows = Table(
     # ★ 冗余列(权威数据在 dag_jsonb.schedule):调度器扫表专用,写入时同步
     Column("schedule_cron", String(64), nullable=True),
     Column("schedule_enabled", Boolean(), nullable=False, server_default=text("false")),
+    # 幂等防重锚点(PR-4b):最近一次已触发的 cron 时刻。tick 只在
+    # most_recent_fire(cron, now) > 此值时入队并推进该锚点 —— 同一触发点不重复,
+    # 进程重启不补跑历史错过点(至多补当前触发点一次)。NULL = 从未触发(新调度
+    # 首次见到只播种基线不触发,详见 app/services/workflow_scheduler.py)。
+    Column("schedule_last_fired_at", DateTime(timezone=True), nullable=True),
     # 总开关:false 时调度器不触发(手动运行语义属 PR-3/PR-4)
     Column("enabled", Boolean(), nullable=False, server_default=text("true")),
     Column(

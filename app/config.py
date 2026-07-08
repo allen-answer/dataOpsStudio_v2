@@ -125,6 +125,20 @@ class WorkerConfig(BaseSettings):
     workflow_node_default_max_retries: int = 0
 
 
+class SchedulerConfig(BaseSettings):
+    """Workflow cron 调度 tick 配置(PR-4b / ADR-0009 §1)。
+
+    进程内后台线程在 API 进程里周期扫 workflows.schedule_cron,到期即入队
+    workflow_run job(执行仍在 worker)。无独立调度进程、无 APScheduler。
+    单 API 实例是受支持拓扑;HA 多实例去重后置(ADR-0009 Non-Goals)。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="DATAOPS_SCHEDULER_", extra="ignore")
+
+    enabled: bool = True
+    tick_interval_seconds: float = Field(default=30.0, ge=1.0, le=3600.0)
+
+
 class ResultStoreConfig(BaseSettings):
     """ResultStore + ResultSet spool 配置(设计稿 §2.6.4)。
 
@@ -190,6 +204,7 @@ class Settings(BaseSettings):
     db: MetadataDbConfig = Field(default_factory=MetadataDbConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     result_store: ResultStoreConfig = Field(default_factory=ResultStoreConfig)
     ai: AiGatewayConfig = Field(default_factory=AiGatewayConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)

@@ -37,6 +37,10 @@ dependencies = [
     "dmPython>=2.5",
     "pyjwt>=2.13.0",
     "pyotp>=2.9.0",
+    # Cron 表达式解析 — Workflow schedule tick(PR-4b / ADR-0009 §1)。
+    # 纯 Python parser(非调度框架/进程),只解析 cron 求上/下一触发点;
+    # ADR-0009 §1 拒绝的是 APScheduler(独立调度进程),进程内 tick 仍自写。
+    "croniter>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -138,6 +142,11 @@ python_version = "3.12"
 strict = true
 warn_unreachable = true
 exclude = ["app/db/migrations/versions/"]
+
+# croniter 未随包发 py.typed(无 stub),strict 下 import 会报 import-untyped。
+[[tool.mypy.overrides]]
+module = ["croniter", "croniter.*"]
+ignore_missing_imports = true
 
 # openpyxl 不发布 type stubs(无 py.typed);domain readers 需 import 它。
 [[tool.mypy.overrides]]
