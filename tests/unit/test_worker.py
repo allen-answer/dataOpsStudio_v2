@@ -1269,9 +1269,31 @@ class _FakeResultSetCatalog:
 
 class _FakeCompareRunCatalog:
     def __init__(self) -> None:
+        self.registered: list[dict[str, object]] = []
         self.running: list[dict[str, object]] = []
         self.completed: list[dict[str, object]] = []
         self.terminal: list[dict[str, object]] = []
+
+    def register(
+        self,
+        *,
+        run_id: str,
+        job_id: str,
+        owner_user_id: str,
+        project_id: str,
+        task_id: str | None,
+        bucket_spools: dict[str, str],
+    ) -> None:
+        self.registered.append(
+            {
+                "run_id": run_id,
+                "job_id": job_id,
+                "owner_user_id": owner_user_id,
+                "project_id": project_id,
+                "task_id": task_id,
+                "bucket_spools": dict(bucket_spools),
+            }
+        )
 
     def write_running(self, *, run_id: str, bucket_spools: dict[str, str]) -> None:
         self.running.append({"run_id": run_id, "bucket_spools": dict(bucket_spools)})
@@ -1329,13 +1351,17 @@ def _workflow_run_job(spec: dict[str, object] | None = None) -> Job:
     ).model_copy(update={"priority": -1})
 
 
-def _workflow_runner(backend: _FakeBackend) -> WorkerRunner:
+def _workflow_runner(
+    backend: _FakeBackend,
+    compare_run_catalog: _FakeCompareRunCatalog | None = None,
+) -> WorkerRunner:
     return WorkerRunner(
         backend,
         _FakeResultStore(),
         lambda datasource_id: _conn_info(datasource_id),
         _adapter_factory(_FakeAdapter([])),
         WorkerRunnerConfig(worker_id="worker-1", workflow_advance_interval_seconds=0.01),
+        compare_run_catalog=compare_run_catalog,
     )
 
 
@@ -1574,6 +1600,194 @@ def test_build_workflow_child_job_expands_list_variable_via_sql_in() -> None:
 
     assert child.payload["source_ref"]["sql"] == "SELECT * FROM t WHERE id IN (1, 2, 3)"
     assert child.kind is JobKind.COMPARE_RUN
+
+
+def _compare_run_node_payload() -> dict[str, object]:
+    # compare_run 节点 = 内联配置(以 _execute_compare_run 实际消费字段为准:
+    # source_id/target_id + source_ref/target_ref + columns + compare_rules + run_limits;
+    # 不含 run_id / bucket_result_set_ids —— 那是入队时按执行铸造的一次性身份)。
+    return {
+        "task_id": "task-1",
+        "source_id": "ds-source",
+        "target_id": "ds-target",
+        "source_ref": {"kind": "table", "schema_name": "app", "table_name": "src"},
+        "target_ref": {"kind": "table", "schema_name": "app", "table_name": "tgt"},
+        "columns": [
+            {"name": "id", "type": "integer"},
+            {"name": "name", "type": "string"},
+        ],
+        "compare_rules": {"key_columns": ["id"]},
+        "run_limits": {"recursive_checksum": False, "persist_same_bucket": False},
+    }
+
+
+def _compare_run_workflow_spec() -> dict[str, object]:
+    return _workflow_spec_payload(
+        nodes=[
+            {
+                "id": "n1",
+                "job_kind": "compare_run",
+                "payload": _compare_run_node_payload(),
+                "timeout_seconds": 60,
+            }
+        ]
+    )
+
+
+def _make_compare_run_child(
+    run_job_id: str, node_id: str, job_id: str, run_id: str
+) -> Job:
+    return Job(
+        id=job_id,
+        kind=JobKind.COMPARE_RUN,
+        status=JobStatus.PENDING,
+        owner_user_id="u_1",
+        project_id="p_1",
+        datasource_ids=["ds-source", "ds-target"],
+        priority=0,
+        timeout_seconds=60,
+        resource_profile=ResourceProfile(),
+        audit_id="audit-" + node_id,
+        payload={
+            "workflow_node_id": node_id,
+            "run_id": run_id,
+            "bucket_result_set_ids": {
+                "only_source": "rs-os",
+                "only_target": "rs-ot",
+                "diff": "rs-diff",
+                "same": "rs-same",
+            },
+        },
+        parent_workflow_run_id=run_job_id,
+    )
+
+
+def test_workflow_compare_run_child_mints_run_id_and_registers() -> None:
+    # 核心缺口:workflow 的 compare_run 子 job 入队时必须铸造一次性 run 身份 +
+    # bucket result set 占位 + 登记 run_index,否则执行期缺 run_id/bucket_result_set_ids
+    # 直接炸(C-7 参数化 compare / C-8 trace_compare 全跑不通)。
+    backend = _FakeBackend([_workflow_run_job(_compare_run_workflow_spec())])
+    catalog = _FakeCompareRunCatalog()
+    runner = _workflow_runner(backend, compare_run_catalog=catalog)
+
+    assert runner.run_once() is True
+
+    assert len(backend.enqueued) == 1
+    child = backend.enqueued[0]
+    assert child.kind is JobKind.COMPARE_RUN
+    run_id = child.payload["run_id"]
+    assert isinstance(run_id, str) and run_id
+    bucket_spools = child.payload["bucket_result_set_ids"]
+    assert isinstance(bucket_spools, dict)
+    assert set(bucket_spools) == {"only_source", "only_target", "diff", "same"}
+    assert len(set(bucket_spools.values())) == 4  # 四个占位互不相同
+
+    assert len(catalog.registered) == 1
+    registered = catalog.registered[0]
+    assert registered["run_id"] == run_id
+    assert registered["job_id"] == child.id
+    assert registered["bucket_spools"] == bucket_spools
+    assert registered["task_id"] == "task-1"
+    assert registered["owner_user_id"] == "u_1"
+    assert registered["project_id"] == "p_1"
+    assert backend.failed == []
+    assert backend.requeued_workflow_runs == ["job-1"]
+
+
+def test_workflow_compare_run_child_payload_executes_end_to_end() -> None:
+    # workflow 铸出的 compare_run 子 job payload 必须真能被 _execute_compare_run 消费:
+    # 修复前缺 run_id / bucket_result_set_ids 必炸。这里取 workflow 铸出的子 job 直接执行。
+    plan_backend = _FakeBackend([_workflow_run_job(_compare_run_workflow_spec())])
+    _workflow_runner(plan_backend, compare_run_catalog=_FakeCompareRunCatalog()).run_once()
+    child = plan_backend.enqueued[0]
+
+    exec_backend = _FakeBackend([child])
+    exec_catalog = _FakeCompareRunCatalog()
+    result_store = _FakeResultStore()
+    adapters = [
+        _FakeAdapter(
+            [Row(values=[1, 1, "same"]), Row(values=[2, 2, "left"]), Row(values=[3, 3, "old"])],
+            bounds=(1, 3),
+        ),
+        _FakeAdapter(
+            [Row(values=[1, 1, "same"]), Row(values=[3, 3, "new"]), Row(values=[4, 4, "right"])],
+            bounds=(1, 4),
+        ),
+    ]
+
+    def adapter_factory(
+        conn_info: DatasourceConnInfo,
+        cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
+    ) -> _ColumnSinkAdapter:
+        del conn_info, cancel_check, column_sink
+        return adapters.pop(0)
+
+    runner = WorkerRunner(
+        exec_backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        adapter_factory,
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=exec_catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert exec_backend.failed == []
+    run_id = child.payload["run_id"]
+    assert [entry["run_id"] for entry in exec_catalog.running] == [run_id]
+    assert [entry["run_id"] for entry in exec_catalog.completed] == [run_id]
+    assert exec_backend.completed[0][0] == child.id
+
+
+def test_workflow_abort_writes_compare_run_terminal_for_pending_child() -> None:
+    # 失败路径:workflow abort 取消 pending 的 compare_run 子 job 时,补写 run_index 终态
+    # (该子 job 不进执行循环 except 分支,否则 run_index 永远停在 pending)。
+    spec = _workflow_spec_payload(
+        nodes=[
+            {
+                "id": "n1",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 1", "datasource_id": "ds-9"},
+                "timeout_seconds": 60,
+            },
+            {
+                "id": "n2",
+                "job_kind": "compare_run",
+                "payload": _compare_run_node_payload(),
+                "timeout_seconds": 60,
+            },
+        ]
+    )
+    backend = _FakeBackend([_workflow_run_job(spec)])
+    backend.children_by_parent["job-1"] = [
+        _workflow_child("job-1", "n1", JobStatus.FAILED, error="boom"),
+        _make_compare_run_child("job-1", "n2", "child-n2", "run-n2"),
+    ]
+    catalog = _FakeCompareRunCatalog()
+    runner = _workflow_runner(backend, compare_run_catalog=catalog)
+
+    assert runner.run_once() is True
+
+    assert len(backend.failed) == 1  # n1 abort → run FAILED
+    assert ("child-n2", "workflow aborted") in backend.cancelled_pending
+    assert catalog.terminal == [{"run_id": "run-n2", "status": "cancelled"}]
+
+
+def test_workflow_non_compare_child_gets_no_compare_bookkeeping() -> None:
+    # 非 compare_run 节点行为不变:不铸 run_id、不登记 run_index。
+    backend = _FakeBackend([_workflow_run_job()])  # 默认 sql_query 节点
+    catalog = _FakeCompareRunCatalog()
+    runner = _workflow_runner(backend, compare_run_catalog=catalog)
+
+    assert runner.run_once() is True
+
+    child = backend.enqueued[0]
+    assert child.kind is JobKind.SQL_QUERY
+    assert "run_id" not in child.payload
+    assert "bucket_result_set_ids" not in child.payload
+    assert catalog.registered == []
 
 
 def test_workflow_run_node_interpolation_failure_fails_run_via_on_failure() -> None:

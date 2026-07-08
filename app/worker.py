@@ -112,6 +112,7 @@ from app.infrastructure.result_export import (
     write_xlsx_workbook,
 )
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
+from app.infrastructure.run_index import register_compare_run_index
 from app.infrastructure.secretstore.local_file import LocalFileSecretStore
 from app.observability.logging import configure_logging
 from app.services.notify import RevealSecret, WorkflowNotifyService
@@ -291,6 +292,17 @@ class ResultSetCatalogLike(Protocol):
 
 
 class CompareRunCatalogLike(Protocol):
+    def register(
+        self,
+        *,
+        run_id: str,
+        job_id: str,
+        owner_user_id: str,
+        project_id: str,
+        task_id: str | None,
+        bucket_spools: dict[str, str],
+    ) -> None: ...
+
     def write_running(
         self,
         *,
@@ -1394,6 +1406,10 @@ class WorkerRunner:
                     node_id=node_id,
                 )
                 continue
+            # compare_run 子 job:jobs 行已落库后补登记 run_index 占位行,否则
+            # 执行期 _write_compare_run_running/_complete 的 UPDATE 落空、结果不可查
+            # (对齐 API 直连路径的 bookkeeping)。非 compare_run 节点 no-op。
+            self._register_compare_run_child(child_job)
             logger.info(
                 "workflow node enqueued",
                 job_id=job.id,
@@ -1408,9 +1424,17 @@ class WorkerRunner:
                 job_id=job.id,
                 child_job_id=child_job_id,
             )
+        children_by_id = {child.id: child for child in children_jobs}
         for child_job_id in plan.cancel_job_ids:
             self._backend.request_cancel(child_job_id)
             self._backend.cancel_pending_job(child_job_id, "workflow aborted")
+            # pending 的 compare_run 子 job 被 abort 时不进执行循环的 except 分支,
+            # run_index 会永远停在 pending;此处补写终态,对齐 _write_compare_run_terminal
+            # 语义(非 compare_run / 无 run_id 时该方法自身 no-op)。仅限 PENDING:
+            # RUNNING 子 job 收到软取消后由其自身执行循环写终态,避免覆盖其已落定的终态。
+            cancelled_child = children_by_id.get(child_job_id)
+            if cancelled_child is not None and cancelled_child.status is JobStatus.PENDING:
+                self._write_compare_run_terminal(cancelled_child, JobStatus.CANCELLED.value)
 
         if plan.run_status is None:
             made_progress = bool(plan.enqueue_node_ids or plan.retry_job_ids)
@@ -1562,6 +1586,25 @@ class WorkerRunner:
             )
         if state == "closed":
             self._delete_result_spool(result_set_id)
+
+    def _register_compare_run_child(self, child_job: Job) -> None:
+        """compare_run 子 job 入队后登记 run_index 占位行(对齐 API 直连路径)。
+
+        非 compare_run 节点 / 未注入 catalog(纯 fake 测试)时 no-op。run_id 与
+        bucket_result_set_ids 已在 _build_workflow_child_job 铸入 payload;task_id
+        为可空归属(workflow 内联配置节点无 task 时为 None)。
+        """
+        if child_job.kind is not JobKind.COMPARE_RUN or self._compare_run_catalog is None:
+            return
+        payload = child_job.payload
+        self._compare_run_catalog.register(
+            run_id=_required_payload_str(payload, "run_id"),
+            job_id=child_job.id,
+            owner_user_id=child_job.owner_user_id,
+            project_id=child_job.project_id,
+            task_id=_payload_optional_str(payload, "task_id"),
+            bucket_spools=_payload_bucket_result_set_ids(payload),
+        )
 
     def _write_compare_run_running(self, run_id: str, bucket_spools: dict[str, str]) -> None:
         if self._compare_run_catalog is None:
@@ -1793,6 +1836,30 @@ class PostgresResultSetCatalog:
 class PostgresCompareRunCatalog:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
+
+    def register(
+        self,
+        *,
+        run_id: str,
+        job_id: str,
+        owner_user_id: str,
+        project_id: str,
+        task_id: str | None,
+        bucket_spools: dict[str, str],
+    ) -> None:
+        # workflow compare_run 子 job 入队后补登记 run_index 占位行(与 API 直连
+        # core.run_compare_task 同一 bookkeeping);jobs 行已由前一步 enqueue 落库,
+        # 满足 run_index.job_id 外键。自开事务,对齐 catalog 内其余写入的单事务语义。
+        with self._engine.begin() as conn:
+            register_compare_run_index(
+                conn,
+                run_id=run_id,
+                job_id=job_id,
+                owner_user_id=owner_user_id,
+                project_id=project_id,
+                task_id=task_id,
+                bucket_spools=bucket_spools,
+            )
 
     def write_running(self, *, run_id: str, bucket_spools: dict[str, str]) -> None:
         with self._engine.begin() as conn:
@@ -2199,6 +2266,14 @@ def _build_workflow_child_job(
     # 的节点插值必定成功。job_kind 只按原始 node.job_kind 构造,插值只碰 payload(R7)
     payload: dict[str, Any] = interpolate_payload(node.payload, variables)
     payload["workflow_node_id"] = node.id
+    if node.job_kind == JobKind.COMPARE_RUN.value:
+        # compare_run 每次执行都要一次性 run 身份 + bucket result set 占位:
+        # API 直连路径在 core.run_compare_task 铸造,workflow 路径此处铸造。
+        # 必须每次新铸(不复用节点作者 payload 里的旧值,否则跨执行 run_id 撞
+        # run_index 主键)。子 job 单节点单次入队(uq_jobs_workflow_node_per_run;
+        # 重试走 retry_workflow_node 不重建),故此处铸造恰好一次。
+        payload["run_id"] = str(uuid4())
+        payload["bucket_result_set_ids"] = {bucket: str(uuid4()) for bucket in COMPARE_BUCKETS}
     return Job(
         id=str(uuid4()),
         kind=JobKind(node.job_kind),
