@@ -9,12 +9,12 @@ import tempfile
 import threading
 import time
 import zipfile
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
-from itertools import islice
+from itertools import chain, islice
 from random import Random
 from typing import Any, BinaryIO, Protocol, cast
 from uuid import uuid4
@@ -68,7 +68,11 @@ from app.domain.compare_profile import (
 )
 from app.domain.compare_result import (
     COMPARE_BUCKETS,
+    compare_export_columns,
+    compare_export_row,
+    compare_export_schema,
     compare_result_columns,
+    decode_compare_result_row,
     empty_bucket_counts,
     encode_compare_result_row,
 )
@@ -751,16 +755,33 @@ class WorkerRunner:
         # 否则 spool_max_rows 调高后单 sheet 会超 1,048,576 → 非法 xlsx。
         row_cap = _compare_export_row_cap(payload)
         loaded_rows = 0
-        sheets: list[tuple[str, list[Column], Iterable[Row]]] = []
+        # 导出解码后的业务列(pk + source/target 值),而非 spool 原始 4 列 JSON blob。
+        # 先探每桶首行推断 key/值列 schema(整个 run 四桶共享),空桶据此仍产出正确表头。
+        peeked_buckets: list[tuple[str, dict[str, Any] | None, Iterator[dict[str, Any]]]] = []
+        key_columns: list[str] = []
+        value_columns: list[str] = []
+        schema_found = False
         for bucket in COMPARE_BUCKETS:
             result_set_id = bucket_spools[bucket]
             manifest = self._result_store.get_spool_manifest(result_set_id)
             loaded_rows += _manifest_int(manifest, "loaded_rows")
+            decoded_iter: Iterator[dict[str, Any]] = (
+                decode_compare_result_row(row)
+                for row in islice(self._iter_spool_rows(job.id, result_set_id), row_cap)
+            )
+            first = next(decoded_iter, None)
+            if first is not None and not schema_found:
+                key_columns, value_columns = compare_export_schema(first)
+                schema_found = True
+            peeked_buckets.append((bucket, first, decoded_iter))
+        sheets: list[tuple[str, list[Column], Iterable[Row]]] = []
+        for bucket, first, decoded_iter in peeked_buckets:
+            rows_source = decoded_iter if first is None else chain([first], decoded_iter)
             sheets.append(
                 (
                     bucket,
-                    _columns_from_manifest(manifest),
-                    islice(self._iter_spool_rows(job.id, result_set_id), row_cap),
+                    compare_export_columns(bucket, key_columns, value_columns),
+                    _iter_compare_export_rows(bucket, rows_source, key_columns, value_columns),
                 )
             )
         with tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as stream:
@@ -2829,6 +2850,17 @@ def _payload_export_bucket_result_set_ids(payload: dict[str, object]) -> dict[st
     if not isinstance(raw, dict):
         raise ValueError("compare export payload requires bucket_result_set_ids")
     return _required_bucket_result_set_ids(raw, "compare export payload")
+
+
+def _iter_compare_export_rows(
+    bucket: str,
+    decoded_rows: Iterable[dict[str, Any]],
+    key_columns: list[str],
+    value_columns: list[str],
+) -> Iterator[Row]:
+    """把某桶的解码行流式摊平成导出 Row(独立函数以按 bucket 绑定,避免闭包晚绑定)。"""
+    for decoded in decoded_rows:
+        yield compare_export_row(bucket, decoded, key_columns, value_columns)
 
 
 def _compare_export_row_cap(payload: dict[str, object]) -> int:

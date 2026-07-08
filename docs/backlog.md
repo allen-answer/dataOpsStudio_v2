@@ -11,8 +11,9 @@
 1. **每 sheet 无行数上限**:当前安全仅因 `spool_max_rows` 默认 1M < Excel 单 sheet
    上限 1,048,576;运维调高即产出非法 xlsx。`RunLimits.export_max_rows` 至今无人消费,
    修法 = cap 到 `min(export_max_rows, 1_048_575)`。
-2. 导出内容是 spool 原始 4 列 JSON blob(pk/source/target/cells)非解码业务列 ——
-   **需人确认是否有意的 v1 形态**;若否,follow-up 用 `decode_compare_result_row` 展开。
+2. ~~导出内容是 spool 原始 4 列 JSON blob(pk/source/target/cells)非解码业务列。~~
+   **已修**:导出改为解码业务列(主键列 + 值列;diff 桶 `<col> (source)`/`<col> (target)`
+   并排,与前端 4 桶口径一致),注入防御 / `export_max_rows` cap 不变。
 3. token TTL(300s)从创建时刻起算,与导出 job 时长竞争;建议 job 完成时再签发。
 4. `downloadCompareExport` 与 metadata.ts `downloadExport` 逐行重复,可抽共享。
 5. 历史成功 run 后端支持导出但前端无入口。
