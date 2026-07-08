@@ -548,6 +548,19 @@ export default {
     columns_clear: 'Clear',
     columns_clear_hint: 'Remove all compare column configuration (columns, keys, ignores, mappings).',
     columns_clear_confirm: 'Clear all compare columns, keys, ignores and target mappings?',
+    pair_by_position: 'Pair by position',
+    pair_by_position_hint:
+      'Pairs source preview column i with target preview column i (rows = the shorter side). Replaces the current columns.',
+    pair_by_name: 'Pair by name',
+    pair_by_name_hint:
+      'Pairs columns whose names match after lower-casing and dropping underscores (a minimal front-end version of auto-infer). Replaces the current columns.',
+    pair_needs_both_previews: 'Preview both the source and the target file first, then pair their columns.',
+    pair_replace_confirm:
+      'Replace the current compare columns with the paired result? This clears existing keys, ignores and target mappings.',
+    pair_extra_target: '{n} extra target column(s) left unpaired.',
+    pair_extra_source: '{n} extra source column(s) left unpaired.',
+    pair_name_no_match: 'No columns matched by name between the two previews.',
+    pair_name_unmatched: '{n} source column(s) had no name match and were skipped.',
     // suggestions
     suggestions: 'Task suggestions',
     suggestions_hint: 'Same-named / normalized table pairs across the two datasources.',

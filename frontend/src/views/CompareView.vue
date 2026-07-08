@@ -86,6 +86,7 @@ import { getJob, cancelJob, type JobResponse } from '../api/jobs'
 import { ApiError, type ColumnType, type DatasourceListItem, type JobStatus } from '../api/types'
 import LoadingDots from '../components/LoadingDots.vue'
 import JobStatusBadge from '../components/JobStatusBadge.vue'
+import { useToast } from '../composables/useToast'
 
 const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>([
   'success',
@@ -135,6 +136,7 @@ const BUCKET_STYLE: Record<CompareBucket, BucketStyle> = {
 }
 
 const { t } = useI18n()
+const toast = useToast()
 const route = useRoute()
 const projectId = computed(() => (typeof route.params.id === 'string' ? route.params.id : ''))
 
@@ -644,6 +646,71 @@ function clearColumns(): void {
   draft.ignoreColumns = []
   draft.columnMappings = {}
 }
+
+/** 两侧预览的非空列名(供配对入口用)。 */
+function previewCols(side: RefSide): string[] {
+  return previews[side].data?.columns.filter((c) => c) ?? []
+}
+
+/** 用配对结果整表替换比较列:src[i] 为源名,tgt[i] 为目标名(异名写映射)。替换语义(先确认)。 */
+function applyPairedColumns(pairs: { source: string; target: string }[]): boolean {
+  if (draft.columns.some((c) => c.name.trim()) && !confirm(t('compare.pair_replace_confirm'))) return false
+  draft.columns = pairs.map((p) => ({ name: p.source, type: 'string' }))
+  draft.keyColumns = []
+  draft.ignoreColumns = []
+  const mappings: Record<string, string> = {}
+  for (const p of pairs) if (p.target && p.target !== p.source) mappings[p.source] = p.target
+  draft.columnMappings = mappings
+  return true
+}
+
+/** 按位置配对(V1 _rules_with_positional_mappings 的前端版):源第 i 列 ↔ 目标第 i 列,行数取较短。 */
+function pairColumnsByPosition(): void {
+  const src = previewCols('source')
+  const tgt = previewCols('target')
+  if (src.length === 0 || tgt.length === 0) {
+    editorError.value = t('compare.pair_needs_both_previews')
+    return
+  }
+  const n = Math.min(src.length, tgt.length)
+  const pairs = Array.from({ length: n }, (_, i) => ({ source: src[i], target: tgt[i] }))
+  if (!applyPairedColumns(pairs)) return
+  editorError.value = null
+  if (tgt.length > n) toast.info(t('compare.pair_extra_target', { n: tgt.length - n }))
+  else if (src.length > n) toast.info(t('compare.pair_extra_source', { n: src.length - n }))
+}
+
+/** 按名配对(#72 推断的极简前端版):列名小写 + 去下划线归一化后求交集,配不上的计数提示。 */
+function pairColumnsByName(): void {
+  const src = previewCols('source')
+  const tgt = previewCols('target')
+  if (src.length === 0 || tgt.length === 0) {
+    editorError.value = t('compare.pair_needs_both_previews')
+    return
+  }
+  const norm = (s: string): string => s.toLowerCase().replace(/_/g, '')
+  const tgtByNorm = new Map<string, string>()
+  for (const tc of tgt) if (!tgtByNorm.has(norm(tc))) tgtByNorm.set(norm(tc), tc)
+  const pairs: { source: string; target: string }[] = []
+  let unmatched = 0
+  for (const sc of src) {
+    const tc = tgtByNorm.get(norm(sc))
+    if (tc === undefined) unmatched++
+    else pairs.push({ source: sc, target: tc })
+  }
+  if (pairs.length === 0) {
+    editorError.value = t('compare.pair_name_no_match')
+    return
+  }
+  if (!applyPairedColumns(pairs)) return
+  editorError.value = null
+  if (unmatched > 0) toast.info(t('compare.pair_name_unmatched', { n: unmatched }))
+}
+
+/** 两侧预览都有列时才可用配对入口。 */
+const canPairPreviews = computed<boolean>(
+  () => previewCols('source').length > 0 && previewCols('target').length > 0,
+)
 
 // ── 文件源(C-1)──────────────────────────────────────────────────────
 const FILE_EXT_FORMAT: Record<string, CompareFileFormat> = {
@@ -2490,9 +2557,27 @@ const missingTarget = computed(
                 </tr>
               </tbody>
             </table>
-            <div class="flex items-center gap-2">
+            <div class="flex items-center flex-wrap gap-2">
               <button type="button" class="chrome-btn-secondary text-xs" @click="addColumn">
                 <Plus class="w-3.5 h-3.5" /> {{ t('compare.col_add') }}
+              </button>
+              <button
+                type="button"
+                class="chrome-btn-secondary text-xs"
+                :disabled="!canPairPreviews"
+                :title="canPairPreviews ? t('compare.pair_by_position_hint') : t('compare.pair_needs_both_previews')"
+                @click="pairColumnsByPosition"
+              >
+                <GitCompareArrows class="w-3.5 h-3.5" /> {{ t('compare.pair_by_position') }}
+              </button>
+              <button
+                type="button"
+                class="chrome-btn-secondary text-xs"
+                :disabled="!canPairPreviews"
+                :title="canPairPreviews ? t('compare.pair_by_name_hint') : t('compare.pair_needs_both_previews')"
+                @click="pairColumnsByName"
+              >
+                <Wand2 class="w-3.5 h-3.5" /> {{ t('compare.pair_by_name') }}
               </button>
               <button
                 v-if="draft.columns.length > 0"
