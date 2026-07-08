@@ -260,6 +260,104 @@ export function getLineageImpact(
   )
 }
 
+// ── L-8 字段多跳追溯 + C-8 逐跳血缘对比 ────────────────────────────────
+// 锚 schemas.py LineageColumnTraceItem/Hop/Response、TraceCompareRequest/
+// TraceCompareHopItem/TraceCompareResponse;端点见 core.py
+//   GET  /projects/{pid}/lineage/column-trace?focus=&direction=&max_depth=
+//   POST /projects/{pid}/lineage/trace-compare (201;dry_run=true 只预览不落库)
+
+/** 链上一跳字段(node 为本跳字段,from_node 为它经由的上一跳字段)。 */
+export interface LineageColumnTraceItem {
+  node: string
+  table: string
+  column: string
+  from_node: string
+  direction: 'upstream' | 'downstream'
+  edge_id: string
+  transformation: string | null
+  transformation_subtype: string | null
+  inferred: boolean
+  inference_status: string
+  confidence: number
+}
+
+export interface LineageColumnTraceHop {
+  depth: number
+  items: LineageColumnTraceItem[]
+}
+
+export interface LineageColumnTraceResponse {
+  project_id: string
+  focus: string
+  direction: 'upstream' | 'downstream' | 'both'
+  max_depth: number
+  truncated: boolean
+  hop_count: number
+  hops: LineageColumnTraceHop[]
+}
+
+/** GET /projects/{pid}/lineage/column-trace —— focus 必须是 table.column(否则 400)。 */
+export function getLineageColumnTrace(
+  projectId: string,
+  focus: string,
+  direction: LineageDirection = 'upstream',
+  maxDepth = 5,
+): Promise<LineageColumnTraceResponse> {
+  const qs = new URLSearchParams({ focus, direction, max_depth: String(maxDepth) })
+  return apiClient.get<LineageColumnTraceResponse>(
+    `/projects/${projectId}/lineage/column-trace?${qs.toString()}`,
+  )
+}
+
+export interface TraceCompareRequest {
+  focus: string
+  source_id: string
+  target_id: string
+  key_columns: string[]
+  schema_name?: string | null
+  max_hops?: number
+  max_depth?: number
+  name?: string | null
+  dry_run?: boolean
+}
+
+export interface TraceCompareHopItem {
+  node_id: string
+  depth: number
+  table: string
+  column: string
+  key_columns: string[]
+}
+
+export interface TraceCompareResponse {
+  project_id: string
+  focus: string
+  source_id: string
+  target_id: string
+  /** dry_run=true 时为 null(只预览未落库)。 */
+  workflow_id: string | null
+  workflow_name: string | null
+  hop_count: number
+  truncated: boolean
+  hops: TraceCompareHopItem[]
+}
+
+/**
+ * POST /projects/{pid}/lineage/trace-compare —— 沿焦点字段上游血缘每跳生成 compare
+ * 节点组装 workflow(只创建不触发)。dry_run=true 只返回预览计划。
+ * focus 非列引用 → 400 column_focus_required;无上游 → 400 no_upstream_lineage;
+ * 链超上限 → 400 too_many_hops。
+ */
+export function createTraceCompare(
+  projectId: string,
+  req: TraceCompareRequest,
+): Promise<TraceCompareResponse> {
+  return apiClient.post<TraceCompareResponse>(
+    `/projects/${projectId}/lineage/trace-compare`,
+    req,
+  )
+}
+
 // ── 批量分析(L-2:ZIP 上传 → job → 报告)────────────────────────────
 // 锚 schemas.py LineageBatchCreateRequest / LineageBatchCreateResponse /
 // LineageBatchStatusResponse;report 形状由 app/worker.py

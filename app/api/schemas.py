@@ -612,6 +612,51 @@ class LineageColumnTraceResponse(BaseModel):
     hops: list[LineageColumnTraceHop] = Field(default_factory=list)
 
 
+class TraceCompareRequest(BaseModel):
+    """C-8 逐跳血缘对比:给定焦点字段 + 两套环境数据源 + 共享主键,沿上游血缘每跳生成
+    一个 compare_run 节点,组装成 workflow(只创建不触发)。
+
+    - ``focus``:``table.column`` 焦点字段(必须是列引用,否则 400);
+    - ``source_id`` / ``target_id``:两个待对比数据源(两套环境),链上每张表在二者间对比;
+    - ``key_columns``:行级对比 join 主键(链上稳定,>=1);
+    - ``max_hops``:生成 compare 节点数上限(1..20;链更长时 400 too_many_hops);
+    - ``dry_run=true``:只返回预览计划,不落库 workflow(``workflow_id`` 为 null)。
+    """
+
+    focus: str = Field(min_length=1)
+    source_id: str = Field(min_length=1)
+    target_id: str = Field(min_length=1)
+    key_columns: list[str] = Field(min_length=1)
+    schema_name: str | None = None
+    max_hops: int = Field(default=10, ge=1, le=20)
+    max_depth: int = Field(default=5, ge=1, le=5)
+    name: str | None = Field(default=None, max_length=128)
+    dry_run: bool = False
+
+
+class TraceCompareHopItem(BaseModel):
+    """预览:链上一跳对比。node_id 为生成的 workflow 节点 id。"""
+
+    node_id: str
+    depth: int
+    table: str
+    column: str
+    key_columns: list[str] = Field(default_factory=list)
+
+
+class TraceCompareResponse(BaseModel):
+    project_id: str
+    focus: str
+    source_id: str
+    target_id: str
+    # dry_run=true 时为 null(只预览未落库);否则为新建 workflow id。
+    workflow_id: str | None = None
+    workflow_name: str | None = None
+    hop_count: int
+    truncated: bool
+    hops: list[TraceCompareHopItem] = Field(default_factory=list)
+
+
 class JobResponse(BaseModel):
     id: str
     kind: str
