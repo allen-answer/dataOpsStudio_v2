@@ -42,6 +42,7 @@ import { downloadExport } from '../api/metadata'
 import {
   analyzeLineage,
   createLineageBatch,
+  enrichLineageRun,
   exportLineage,
   getLineageBatch,
   getLineageEdgeDetail,
@@ -50,6 +51,7 @@ import {
   updateLineageEdge,
   weightedLineageImpact,
   type LineageAiImpactResponse,
+  type LineageAiEnrichmentResponse,
   type LineageBatchFileEntry,
   type LineageBatchJobStatus,
   type LineageBatchReport,
@@ -559,6 +561,33 @@ const dialectUnsupported = computed(
   () => Boolean(analyzeDialect.value) && !LINEAGE_DIALECTS.has(analyzeDialect.value),
 )
 
+// ── L-7:整份报告 AI 解读(叠加层,不影响确定性结果)──────────────────
+const aiEnrichBusy = ref(false)
+const aiEnrichResult = ref<LineageAiEnrichmentResponse | null>(null)
+
+async function onAiEnrich(): Promise<void> {
+  const runId = analyzeResult.value?.run_id
+  if (!runId || aiEnrichBusy.value) return
+  aiEnrichBusy.value = true
+  try {
+    aiEnrichResult.value = await enrichLineageRun(projectId.value, runId)
+  } catch (e) {
+    // AI 关闭 / 旧 run 无 SQL / provider 故障 → 后端 4xx-5xx;降级为 ok:false 提示。
+    aiEnrichResult.value = {
+      run_id: runId,
+      ok: false,
+      interpretation: null,
+      provider: null,
+      model: null,
+      egress_level: 2,
+      created_at: null,
+      error: e instanceof ApiError ? e.code : errorMessage(e),
+    }
+  } finally {
+    aiEnrichBusy.value = false
+  }
+}
+
 async function onAnalyze(): Promise<void> {
   if (!analyzeDsId.value || !analyzeSourceRef.value.trim() || !analyzeSql.value.trim()) {
     analyzeError.value = t('lineage.analyze_required')
@@ -566,6 +595,7 @@ async function onAnalyze(): Promise<void> {
   }
   analyzing.value = true
   analyzeError.value = null
+  aiEnrichResult.value = null // 新解析:清掉上一次 AI 解读
   try {
     analyzeResult.value = await analyzeLineage(
       projectId.value,
@@ -1589,6 +1619,40 @@ function errorMessage(e: unknown): string {
                   {{ t('lineage.parse_error_detail_unavailable') }}
                 </div>
               </template>
+            </div>
+
+            <!-- L-7:整份报告 AI 解读(叠加层,标注 AI 生成;未启用 AI 显示禁用提示)-->
+            <div class="border-t chrome-border-subtle pt-3">
+              <button
+                type="button"
+                class="chrome-btn-secondary text-xs"
+                :disabled="aiEnrichBusy"
+                @click="onAiEnrich"
+              >
+                <Sparkles class="w-3.5 h-3.5" :class="aiEnrichBusy && 'animate-pulse'" />
+                {{ aiEnrichBusy ? t('lineage.ai_enriching') : t('lineage.ai_enrich') }}
+              </button>
+              <div v-if="aiEnrichResult" class="mt-3">
+                <div
+                  v-if="aiEnrichResult.ok"
+                  class="rounded-card border chrome-border p-3 text-sm chrome-text-normal whitespace-pre-wrap"
+                >
+                  <div class="text-xs chrome-text-muted mb-1">
+                    {{ t('lineage.ai_result') }}
+                    <span v-if="aiEnrichResult.provider">
+                      · {{ aiEnrichResult.provider }}/{{ aiEnrichResult.model }}</span
+                    >
+                    · {{ t('lineage.ai_egress', { level: aiEnrichResult.egress_level }) }}
+                  </div>
+                  {{ aiEnrichResult.interpretation }}
+                </div>
+                <div v-else class="flex items-center gap-2 text-xs chrome-text-muted">
+                  <X class="w-4 h-4" /> {{ t('lineage.ai_disabled') }}
+                  <span v-if="aiEnrichResult.error" class="font-mono"
+                    >({{ aiEnrichResult.error }})</span
+                  >
+                </div>
+              </div>
             </div>
 
             <div class="flex items-center gap-2 text-xs chrome-text-muted">

@@ -771,6 +771,33 @@ lineage_column_edges = Table(
 )
 
 
+# L-7:整份血缘报告的 AI 解读(风险点 / 刷新模式解释 / 建议)。**纯追加** —— 每次
+# ai-enrich 落一行,绝不回写 lineage_runs.parse_summary 的确定性字段。
+lineage_ai_enrichments = Table(
+    "lineage_ai_enrichments",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column(
+        "run_id",
+        String(36),
+        ForeignKey("lineage_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "project_id",
+        String(36),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("interpretation", Text(), nullable=False),
+    Column("provider", String(64), nullable=False),
+    Column("model", String(128), nullable=False),
+    Column("egress_level", Integer(), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Index("ix_lineage_ai_enrichments_run_created", "run_id", "created_at"),
+)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # workflows / workflow_templates —— Workflow 2.4 定义持久化(ADR-0009)
 #   dag_jsonb = WorkflowSpec.model_dump(mode="json")(app/domain/workflow.py)
@@ -934,6 +961,7 @@ __all__ = [
     "job_events",
     "jobs",
     "license_state",
+    "lineage_ai_enrichments",
     "lineage_column_edges",
     "lineage_edges",
     "lineage_runs",

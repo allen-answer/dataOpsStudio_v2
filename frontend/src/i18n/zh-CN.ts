@@ -736,6 +736,11 @@ export default {
     parse_error_stage: '阶段',
     parse_error_statement: '语句 #{index}',
     parse_error_detail_unavailable: '后端当前只返回错误计数,不含逐条明细。',
+    ai_enrich: 'AI 解读',
+    ai_enriching: 'AI 解读中…',
+    ai_result: 'AI 生成解读',
+    ai_egress: '出站等级 L{level}',
+    ai_disabled: 'AI 未启用或不可用 —— 上方确定性解析结果不受影响。',
     view_subgraph_hint: '边已入库 —— 到「子图查询」输入目标表查看血缘。',
     // C-8 逐跳血缘对比(两域联动:沿上游血缘每跳生成 compare 节点,组装 workflow)
     tc_open: '逐跳对比',

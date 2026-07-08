@@ -221,6 +221,49 @@ export function getLineageEdgeDetail(
   )
 }
 
+/**
+ * 锚 schemas.py LineageAiEnrichmentResponse —— L-7 整份血缘报告的 AI 解读。
+ * ok=false 时 error 说明原因(no_enrichment / 后端 4xx 由 apiClient 抛异常)。
+ */
+export interface LineageAiEnrichmentResponse {
+  run_id: string
+  ok: boolean
+  interpretation: string | null
+  provider: string | null
+  model: string | null
+  egress_level: number
+  created_at: string | null
+  error: string | null
+}
+
+/**
+ * POST /projects/{pid}/lineage/runs/{run_id}/ai-enrich —— 生成整份报告的 AI 解读并
+ * 追加落库(只增不改)。AI 关闭 → 409 ai_disabled;旧 run 无存档 SQL → 409
+ * lineage_run_not_enrichable;provider 故障 → 502 ai_provider_error(均由 apiClient 抛)。
+ */
+export function enrichLineageRun(
+  projectId: string,
+  runId: string,
+): Promise<LineageAiEnrichmentResponse> {
+  return apiClient.post<LineageAiEnrichmentResponse>(
+    `/projects/${projectId}/lineage/runs/${runId}/ai-enrich`,
+    {},
+  )
+}
+
+/**
+ * GET /projects/{pid}/lineage/runs/{run_id}/ai-enrich —— 读该 run 最近一次 AI 解读;
+ * 无则 200 { ok:false, error:'no_enrichment' }(不是 404)。
+ */
+export function getLineageRunEnrichment(
+  projectId: string,
+  runId: string,
+): Promise<LineageAiEnrichmentResponse> {
+  return apiClient.get<LineageAiEnrichmentResponse>(
+    `/projects/${projectId}/lineage/runs/${runId}/ai-enrich`,
+  )
+}
+
 /** 锚 schemas.py LineageExportRequest —— 与 subgraph 端点同参(POST body 形态)。 */
 export interface LineageExportRequest {
   focus: string

@@ -529,6 +529,19 @@ class LineageAnalyzeResponse(BaseModel):
     ai_fallback: LineageAiFallbackResult | None = None
 
 
+class LineageAiEnrichmentResponse(BaseModel):
+    """L-7 整份血缘报告的 AI 解读结果(纯追加;标注 AI 生成)。"""
+
+    run_id: str
+    ok: bool
+    interpretation: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    egress_level: int = 2
+    created_at: datetime | None = None
+    error: str | None = None
+
+
 class LineageSubgraphNode(BaseModel):
     id: str
     label: str

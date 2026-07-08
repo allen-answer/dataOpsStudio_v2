@@ -82,7 +82,7 @@ def test_all_alembic_revision_ids_under_32_chars() -> None:
     assert not violations, f"revision ID 超 32 字符: {violations}"
 
 
-def test_metadata_has_25_tables() -> None:
+def test_metadata_has_26_tables() -> None:
     expected = {
         "ai_configs",
         "compare_tasks",
@@ -103,6 +103,7 @@ def test_metadata_has_25_tables() -> None:
         "sql_templates",
         "metadata_caches",
         "license_state",
+        "lineage_ai_enrichments",  # 0022:L-7 整份报告 AI 解读(纯追加)
         "lineage_column_edges",
         "lineage_edges",
         "lineage_runs",
