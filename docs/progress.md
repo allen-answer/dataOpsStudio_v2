@@ -11,20 +11,41 @@
 
 | 任务 | 负责 | 依赖 | 状态 | PR |
 |---|---|---|---|---|
-| Compare 导出解码业务列(#96 #2) | Claude 子代理(Fable 5 复核) | — | PR 待审(CI 10/10 绿) | [#153](https://github.com/allen-answer/dataOpsStudio_v2/pull/153) |
-| Oracle adapter(Preview,thin) | Claude 子代理(Fable 5 复核) | — | PR 待审(CI 10/10 绿) | [#154](https://github.com/allen-answer/dataOpsStudio_v2/pull/154) |
-| AI Copilot C1:NL→SQL(设计稿+后端+前端) | Claude 子代理(Fable 5 复核) | AI Gateway / #65 introspection | PR 待审(CI 10/10 绿) | [#155](https://github.com/allen-answer/dataOpsStudio_v2/pull/155) |
-| Workflow 管理前端 v1(+run 历史端点) | Claude 子代理(Fable 5 复核) | #150 设计稿 | PR 待审(CI 10/10 绿) | [#156](https://github.com/allen-answer/dataOpsStudio_v2/pull/156) |
-| UX-2 批次(懒展开 / 差异行 SQL / 主键预检) | Claude 子代理(Fable 5 复核) | #107 方案 | PR 待审(CI 10/10 绿) | [#157](https://github.com/allen-answer/dataOpsStudio_v2/pull/157) |
-| Workflow PR-4b cron tick(定时触发,迁移 0022) | Claude 子代理(Fable 5 复核) | #92 | PR 待审(CI 10/10 绿) | [#158](https://github.com/allen-answer/dataOpsStudio_v2/pull/158) |
-| C-8 trace_compare 逐跳对比 | Claude 子代理(wave-2) | L-8 + C-7(均已合并) | 进行中 | — |
-| C-10 sensor 触发(SQL 条件+冷却期) | Claude 子代理(wave-2) | 栈于 #158 | 进行中 | — |
-| C-11 preflight + C-12 run 仪表盘 | Claude 子代理(wave-2) | — | 进行中 | — |
-| L-1 方言自动识别 | Claude 子代理(wave-2) | — | 进行中 | — |
-| L-7 血缘报告 AI enrichment(只增不改) | Claude 子代理(wave-2) | AI Gateway / L-4 语义层 | 进行中 | — |
-| PG adapter Certified 验证(CI 真 PG 集成测试) | Claude 子代理(wave-2) | #144 cancel_safe | 进行中 | — |
-| Copilot C2/C4/C3(wave-3,提前交付+无历史降级声明) | 待 wave-2 收口后起 | C1 模式 + 各域数据 | 未开工 | — |
-| 真机深走查(Lineage/Workflow/Compare 新面,带登录) | 待人排期(需 admin 凭据) | 生产已在 ac62585 | 未开工 | — |
+| 真机深走查(Lineage/Workflow/Compare/AI 新面,带登录) | 待人排期(需 admin 凭据) | 生产已在 5b13659 | 未开工 | — |
+
+> **★ 生产部署 5b13659(2026-07-08 晚,Fable 5)**:ac62585 → 5b13659(#153–#169 全量)。
+> 迁移 0022/0023/0024 干净应用;四进程绿 + healthz 200 + ai/sql-generate 401(非 404)+
+> 新 dist(index-Ceqxk999.js)。
+>
+> **★ Win10 全量离线部署包(2026-07-08,[#171](https://github.com/allen-answer/dataOpsStudio_v2/pull/171))**:
+> 打包脚本 + 文档合入;成品 `dataops-studio-2.0.1-win10-x64-offline.zip`(192.5MB,
+> 内嵌 CPython 3.12 + PG 16.14 精简二进制 + 全驱动 wheels(DM 专有客户端除外)+ 前端 dist
+> + start/stop 脚本),本机冷启动冒烟全过(离线装依赖→bootstrap→24 步迁移→登录 200)。
+> 产物在构建机 `dist-bundle/`(git-ignored),sha256 见 PR body。
+
+> **★ 三波并行开发全部合并(2026-07-08,Opus 4.8 子代理开发 / Fable 5 复核,#153–#169 共 17 PR)**:
+> **wave-1**:Compare 导出解码业务列([#153](https://github.com/allen-answer/dataOpsStudio_v2/pull/153))、
+> Oracle adapter Preview([#154](https://github.com/allen-answer/dataOpsStudio_v2/pull/154),thin 免客户端,PR 附 Certified 前置清单)、
+> **AI Copilot C1 NL→SQL**([#155](https://github.com/allen-answer/dataOpsStudio_v2/pull/155),L2)、
+> Workflow 管理前端 v1 + run 历史端点([#156](https://github.com/allen-answer/dataOpsStudio_v2/pull/156))、
+> UX-2 批次懒展开/差异行 SQL/主键预检([#157](https://github.com/allen-answer/dataOpsStudio_v2/pull/157))、
+> Workflow cron tick PR-4b([#158](https://github.com/allen-answer/dataOpsStudio_v2/pull/158),迁移 0022)。
+> **wave-2**:PG adapter Certified CI 真 PG 验证([#160](https://github.com/allen-answer/dataOpsStudio_v2/pull/160),
+> statement_timeout/jsonb/注入面/cancel_safe 七测全过,`docs/acceptance-pg-certified.md`)、
+> L-1 方言自动识别([#161](https://github.com/allen-answer/dataOpsStudio_v2/pull/161))、
+> C-11 preflight + C-12 run 仪表盘([#162](https://github.com/allen-answer/dataOpsStudio_v2/pull/162))、
+> C-10 sensor 触发([#163](https://github.com/allen-answer/dataOpsStudio_v2/pull/163),迁移 0023)、
+> C-8 trace_compare 逐跳对比([#164](https://github.com/allen-answer/dataOpsStudio_v2/pull/164))、
+> L-7 血缘报告 AI enrichment([#165](https://github.com/allen-answer/dataOpsStudio_v2/pull/165),迁移 0024,append-only)。
+> **wave-3(Copilot 提前交付,无历史优雅降级)**:C4 慢 SQL 根因诊断([#168](https://github.com/allen-answer/dataOpsStudio_v2/pull/168),L3)、
+> C3 加权影响([#167](https://github.com/allen-answer/dataOpsStudio_v2/pull/167),L2)、
+> C2 映射学习([#169](https://github.com/allen-answer/dataOpsStudio_v2/pull/169),L4 双重 opt-in)。
+> **修复件**:workflow compare_run 子 job 登记接线([#166](https://github.com/allen-answer/dataOpsStudio_v2/pull/166),
+> 解锁 C-7 模板与 C-8 生成的 workflow 真正可跑)。
+> 至此 **AI Copilot 五场景除 C5(依赖 Scenario Lab,2.6.0)外全部落地**;差距矩阵除
+> L-10(OpenLineage,等外部 collector 需求)/ L-12(资产域未立项)/ 徽章类外全部收口。
+> 过程要点:#158/#165 迁移 0022 撞号(重编号 0024 解决);squash 合并触发多轮 rebase
+> 由子代理逐一处理;全部 PR 合并前 CI 10/10 绿。
 
 > **★ 生产部署 ac62585(2026-07-08,Fable 5 按 upgrade-in-place.md 执行)**:
 > 20f18f5 → ac62585(#141–#152 全量:C-7 ${var} 插值三连、C-9 通知全量含 SMTP、
