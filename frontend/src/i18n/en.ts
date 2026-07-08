@@ -757,6 +757,11 @@ export default {
     parse_error_stage: 'Stage',
     parse_error_statement: 'Statement #{index}',
     parse_error_detail_unavailable: 'The backend currently returns only the error count, not per-error details.',
+    ai_enrich: 'AI interpretation',
+    ai_enriching: 'Interpreting…',
+    ai_result: 'AI-generated interpretation',
+    ai_egress: 'Egress level L{level}',
+    ai_disabled: 'AI is disabled or unavailable — the deterministic parse result above is unaffected.',
     view_subgraph_hint: 'Edges persisted — open "Subgraph" and enter a target table to explore lineage.',
     // C-8 hop-by-hop lineage compare (lineage x compare: one compare node per upstream hop, packed into a workflow)
     tc_open: 'Hop-by-hop compare',

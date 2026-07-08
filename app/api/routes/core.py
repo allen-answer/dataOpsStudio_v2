@@ -72,6 +72,7 @@ from app.api.schemas import (
     JobResponse,
     JobResultResponse,
     LicenseStatusResponse,
+    LineageAiEnrichmentResponse,
     LineageAiFallbackResult,
     LineageAiImpactRequest,
     LineageAiImpactResponse,
@@ -151,6 +152,7 @@ from app.db.models import (
     export_download_tokens,
     jobs,
     license_state,
+    lineage_ai_enrichments,
     lineage_column_edges,
     lineage_edges,
     lineage_runs,
@@ -196,10 +198,12 @@ from app.domain.lineage import (
     LineageReport,
     analyze_sql_lineage,
     build_lineage_edge_rows,
+    build_semantic_view,
     lineage_sql_hash,
     resolve_dialect,
     schema_from_metadata_cache_rows,
 )
+from app.domain.lineage.ai_enrichment import build_enrichment_profile
 from app.domain.lineage.ai_fallback import (
     InferredLineageEdges,
     fallback_statements,
@@ -3252,6 +3256,178 @@ def analyze_project_lineage(
     return response
 
 
+_LINEAGE_AI_ENRICH_PROMPT = (
+    "You are a senior data engineer reviewing a SQL data-lineage report. You are "
+    "given a STRUCTURED JSON profile of one lineage run: aggregate statistics, "
+    "target tables with their roles and refresh modes, table roles, table-level "
+    "edges, deterministic observations and risks. Only table/column names, roles "
+    "and counts are provided — there are no row values and no raw SQL. Write a "
+    "concise interpretation of the whole report for a human operator: (1) explain "
+    "the refresh pattern of the key target tables, (2) call out the most important "
+    "risks and why they matter, (3) give actionable recommendations and checks. "
+    "Use only the provided profile; never invent tables, columns or row values. "
+    "Answer in the same language as the observations."
+)
+
+
+@router.get(
+    "/projects/{project_id}/lineage/runs/{run_id}/ai-enrich",
+    response_model=LineageAiEnrichmentResponse,
+)
+def get_lineage_run_ai_enrichment(
+    project_id: str,
+    run_id: str,
+    request: Request,
+) -> LineageAiEnrichmentResponse:
+    """读取该 run 最近一次 AI 解读(纯追加存储;无则 ok=False)。"""
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _lineage_run_for_project(conn, project_id=project_id, run_id=run_id, user_id=user.id)
+        row = (
+            conn.execute(
+                select(lineage_ai_enrichments)
+                .where(lineage_ai_enrichments.c.run_id == run_id)
+                .order_by(lineage_ai_enrichments.c.created_at.desc())
+                .limit(1)
+            )
+            .mappings()
+            .one_or_none()
+        )
+    if row is None:
+        return LineageAiEnrichmentResponse(run_id=run_id, ok=False, error="no_enrichment")
+    return LineageAiEnrichmentResponse(
+        run_id=run_id,
+        ok=True,
+        interpretation=str(row["interpretation"]),
+        provider=str(row["provider"]),
+        model=str(row["model"]),
+        egress_level=int(row["egress_level"]),
+        created_at=row["created_at"],
+    )
+
+
+@router.post(
+    "/projects/{project_id}/lineage/runs/{run_id}/ai-enrich",
+    response_model=LineageAiEnrichmentResponse,
+    status_code=201,
+)
+def enrich_lineage_run_with_ai(
+    project_id: str,
+    run_id: str,
+    request: Request,
+) -> LineageAiEnrichmentResponse:
+    """L-7:对整份血缘报告做 AI 解读并**追加**落库(绝不回写确定性 parse_summary)。
+
+    出站只送 L2 结构画像(表 / 边 / 角色 / 刷新方式 / 计数 / 观察 / 风险),无行值、
+    无 SQL 原文全文。AI 关闭 → 结构化 4xx;每步失败都审计。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+
+    def audit(result: str, detail: dict[str, object]) -> None:
+        _audit_business(
+            services,
+            request,
+            user_id=user.id,
+            project_id=project_id,
+            action="lineage_ai_enrich",
+            resource_type="lineage_run",
+            resource_id=run_id,
+            result=result,
+            detail=detail,
+        )
+
+    with services.engine.connect() as conn:
+        run_row = _lineage_run_for_project(
+            conn, project_id=project_id, run_id=run_id, user_id=user.id
+        )
+        ai_row = _ai_config_row_or_none(conn)
+    runtime = _ai_runtime_config(services, ai_row)
+    if not runtime.enabled or runtime.provider in {None, "off"}:
+        audit("skipped", {"reason": "ai_disabled"})
+        raise ApiError(409, "ai_disabled", "AI enrichment is disabled")
+
+    sql_text = _optional_str(run_row["sql_text"])
+    if sql_text is None:
+        # 0018 之前的旧 run 未存档 SQL —— 无法重建结构化报告。
+        audit("skipped", {"reason": "no_sql_text"})
+        raise ApiError(409, "lineage_run_not_enrichable", "Lineage run has no archived SQL")
+
+    with services.engine.connect() as conn:
+        schema_context = _lineage_schema_context(conn, str(run_row["datasource_id"]), None)
+    # 重跑确定性解析(纯函数)得到完整报告 + L-4 语义视图,再投影成 L2 画像。
+    # 确定性结果只读不写,parse_summary / 边表原样不动(只增不改)。
+    try:
+        report = analyze_sql_lineage(
+            LineageParseRequest(
+                sql_text=sql_text,
+                dialect=str(run_row["dialect"]),
+                schema=schema_context["schema"],
+                default_schema=None,
+            )
+        )
+    except ValueError as exc:
+        audit("failed", {"reason": "lineage_parse_failed"})
+        raise ApiError(400, "lineage_parse_failed", "Lineage SQL parse failed") from exc
+    view = build_semantic_view([(str(run_row["source_ref"]), report)])
+    profile = build_enrichment_profile(view, report)
+
+    # ★ 姿态同 Compare `profile_for_ai` / Lineage 兜底:只送结构与统计,按 L2 出站。
+    context = AiContext(
+        items=[
+            ContextItem(
+                content=json.dumps(
+                    profile,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                egress_level=EgressLevel.L2,
+            )
+        ]
+    )
+    try:
+        ai_response = build_gateway_from_runtime_config(runtime).complete(
+            _LINEAGE_AI_ENRICH_PROMPT,
+            context,
+            AiOptions(purpose="lineage_ai_enrich", max_tokens=900),
+        )
+    except AiGatewayError as exc:
+        error = type(exc).__name__
+        audit("failed", {"error": error})
+        raise ApiError(
+            502, "ai_provider_error", "AI enrichment call failed", internal_detail=error
+        ) from exc
+
+    enrich_id = new_id()
+    now = datetime.now(UTC)
+    egress = int(EgressLevel.L2)
+    with services.engine.begin() as conn:
+        conn.execute(
+            insert(lineage_ai_enrichments).values(
+                id=enrich_id,
+                run_id=run_id,
+                project_id=project_id,
+                interpretation=ai_response.content,
+                provider=ai_response.provider,
+                model=ai_response.model,
+                egress_level=egress,
+                created_at=now,
+            )
+        )
+    audit("success", {"provider": ai_response.provider})
+    return LineageAiEnrichmentResponse(
+        run_id=run_id,
+        ok=True,
+        interpretation=ai_response.content,
+        provider=ai_response.provider,
+        model=ai_response.model,
+        egress_level=egress,
+        created_at=now,
+    )
+
+
 @router.get(
     "/projects/{project_id}/lineage/subgraph",
     response_model=LineageSubgraphResponse,
@@ -6271,6 +6447,25 @@ def _lineage_datasource_for_project(
     )
     if row is None or str(row["project_id"]) != project_id:
         raise ApiError(404, "not_found", "Lineage datasource not found")
+    return row
+
+
+def _lineage_run_for_project(
+    conn: Connection,
+    *,
+    project_id: str,
+    run_id: str,
+    user_id: str,
+) -> RowMapping:
+    """定位 run 并校验项目归属;越权 / 不存在一律 404(不泄露存在性)。"""
+    _require_project_access(conn, project_id, user_id)
+    row = (
+        conn.execute(select(lineage_runs).where(lineage_runs.c.id == run_id))
+        .mappings()
+        .one_or_none()
+    )
+    if row is None or str(row["project_id"]) != project_id:
+        raise ApiError(404, "not_found", "Lineage run not found")
     return row
 
 
