@@ -48,10 +48,7 @@ TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 # Pinned downstream artifacts. Recorded (not silently trusted): the script
 # prints the sha256 it actually saw so a reviewer can compare across rebuilds.
 PG_VERSION = "16.14-1"
-PG_URL = (
-    "https://get.enterprisedb.com/postgresql/"
-    f"postgresql-{PG_VERSION}-windows-x64-binaries.zip"
-)
+PG_URL = f"https://get.enterprisedb.com/postgresql/postgresql-{PG_VERSION}-windows-x64-binaries.zip"
 PG_SHA256 = "98af1417ba6a8dc30543e560e5407833a3b9e7cc7ed20e73b2006f3aa2f04663"
 PYTHON_VERSION = "3.12"
 # PG components to keep (server-only slim set). pgAdmin (~670MB), StackBuilder,
@@ -270,9 +267,10 @@ def extract_pg(zip_path: Path, staging: Path) -> None:
         # Keep the server license for compliance.
         if "pgsql/server_license.txt" in names:
             target.mkdir(parents=True, exist_ok=True)
-            with archive.open("pgsql/server_license.txt") as src, (
-                target / "server_license.txt"
-            ).open("wb") as dst:
+            with (
+                archive.open("pgsql/server_license.txt") as src,
+                (target / "server_license.txt").open("wb") as dst,
+            ):
                 shutil.copyfileobj(src, dst)
 
 
