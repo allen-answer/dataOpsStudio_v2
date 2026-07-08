@@ -56,6 +56,80 @@ def decode_compare_result_row(row: Row) -> dict[str, Any]:
     }
 
 
+def compare_export_schema(decoded: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """从一条解码后的 compare 结果行推断导出列 schema。
+
+    整个 run 的 key 列 / 值列在四桶间一致(compare_run 固定 key/value 列),
+    故任意非空桶首行即可得到全 run 的 schema(空桶据此仍能产出正确表头)。
+    """
+    pk = decoded.get("pk") or {}
+    source = decoded.get("source") or {}
+    target = decoded.get("target") or {}
+    key_columns = list(pk.keys())
+    # 并集(保序):只出现在某一侧的列也不漏;diff/same 两侧同集时等价。
+    value_columns = list(dict.fromkeys([*source.keys(), *target.keys()]))
+    return key_columns, value_columns
+
+
+def compare_export_columns(
+    bucket: str,
+    key_columns: list[str],
+    value_columns: list[str],
+) -> list[Column]:
+    """构造某桶导出 sheet 的表头(解码业务列,非原始 4 列 JSON blob)。
+
+    diff 桶:每个值列拆成 `<col> (source)` / `<col> (target)` 并排,与前端"上下分裂"
+    展示同口径(两侧值都可见);其余桶单列。
+    """
+    columns = [Column(name=name) for name in key_columns]
+    if bucket == CompareDiffBucket.DIFF.value:
+        for name in value_columns:
+            columns.append(Column(name=f"{name} (source)"))
+            columns.append(Column(name=f"{name} (target)"))
+    else:
+        columns.extend(Column(name=name) for name in value_columns)
+    return columns
+
+
+def compare_export_row(
+    bucket: str,
+    decoded: dict[str, Any],
+    key_columns: list[str],
+    value_columns: list[str],
+) -> Row:
+    """把一条解码行摊平成导出行值,列序与 `compare_export_columns` 对齐。
+
+    - only_source / same:取 source 侧值(same 两侧相等)
+    - only_target:取 target 侧值
+    - diff:每列输出 source、target 两格并排
+    """
+    pk = decoded.get("pk") or {}
+    source = decoded.get("source") or {}
+    target = decoded.get("target") or {}
+    values: list[object] = [_export_scalar(pk.get(name)) for name in key_columns]
+    if bucket == CompareDiffBucket.DIFF.value:
+        for name in value_columns:
+            values.append(_export_scalar(source.get(name)))
+            values.append(_export_scalar(target.get(name)))
+    elif bucket == CompareDiffBucket.ONLY_TARGET.value:
+        values.extend(_export_scalar(target.get(name)) for name in value_columns)
+    else:  # only_source / same:优先 source,空则回退 target
+        side = source if source else target
+        values.extend(_export_scalar(side.get(name)) for name in value_columns)
+    return Row(values=values)
+
+
+def _export_scalar(value: Any) -> object:
+    """保留标量(数值列在 xlsx 里仍是数值),复杂值(嵌套 dict/list)压成紧凑 JSON 串。
+
+    公式注入防御由导出写入层(`_xlsx_cell_xml` → `sanitize_formula_text`)统一兜底,
+    此处不重复转义。
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return _json_dumps(value)
+
+
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
@@ -70,6 +144,9 @@ def _json_loads(value: object) -> Any:
 
 __all__ = [
     "COMPARE_BUCKETS",
+    "compare_export_columns",
+    "compare_export_row",
+    "compare_export_schema",
     "compare_result_columns",
     "decode_compare_result_row",
     "empty_bucket_counts",

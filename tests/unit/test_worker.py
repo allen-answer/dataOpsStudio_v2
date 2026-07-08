@@ -512,7 +512,7 @@ def test_worker_runs_compare_result_export_to_four_sheet_workbook() -> None:
     result_store.rows_by_result_set["rs-only-source"] = [
         encode_compare_result_row(
             pk={"id": 1},
-            source={"id": 1, "name": "=cmd"},
+            source={"name": "=cmd"},
             target=None,
             cells=[],
         )
@@ -534,8 +534,15 @@ def test_worker_runs_compare_result_export_to_four_sheet_workbook() -> None:
         sheet4_xml = workbook.read("xl/worksheets/sheet4.xml").decode("utf-8")
     assert 'name="only_source"' in workbook_xml
     assert 'name="same"' in workbook_xml
-    assert "=cmd" in sheet1_xml
-    assert "pk" in sheet4_xml
+    # 解码业务列表头(pk 键 id + 值列 name),非原始 4 列 JSON blob(pk/source/target/cells)。
+    assert "<t>id</t>" in sheet1_xml
+    assert "<t>name</t>" in sheet1_xml
+    assert "pk/source/target/cells" not in sheet1_xml
+    # 公式注入防御:导出值仍走 sanitize,危险前缀被加撇号转义为文本。
+    assert "'=cmd" in sheet1_xml
+    # 空桶 sheet(same)据全 run schema 仍产出正确业务列表头。
+    assert "<t>id</t>" in sheet4_xml
+    assert "<t>name</t>" in sheet4_xml
     assert backend.completed[0][1].metadata["compare_run_id"] == "run-1"
     assert backend.failed == []
 
