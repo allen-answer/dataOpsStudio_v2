@@ -222,6 +222,7 @@ from app.services.ai.default_gateway import (
 )
 from app.services.ai.errors import AiDisabledError, AiGatewayError
 from app.services.lineage_batch_export import batch_export_sheets
+from app.services.workflow_scheduler import build_workflow_run_job
 
 logger = structlog.get_logger(__name__)
 
@@ -4117,40 +4118,21 @@ def trigger_workflow_run(
             raise ApiError(409, "workflow_disabled", "Workflow is disabled")
         # R7 enqueue 期再校验(ADR-0009 Consequences:创建 + enqueue 双门禁)
         spec = _validated_workflow_spec(dict(row["dag_jsonb"] or {}))
-        # 合并变量源:内置 < spec 默认 < 触发时运行时(禁与内置冲突,优先级无歧义)。
-        # spec.variables 已在 _validated_workflow_spec 过校验;trigger 已过 _validated_trigger。
-        merged_variables = {
-            **builtin_when_variables(datetime.now(UTC)),
-            **spec.variables,
-            **trigger_variables,
-        }
-        run_id = new_id()
-        timeout_seconds = sum(node.timeout_seconds for node in spec.nodes) + 600
-        job = Job(
-            id=run_id,
-            kind=JobKind.WORKFLOW_RUN,
-            status=JobStatus.PENDING,
-            owner_user_id=user.id,
+        # 手动触发与 cron tick 共用同一入队构造点(build_workflow_run_job):
+        # 变量合并 builtin < spec.variables < 触发时,在触发时刻冻结进 payload;
+        # run job 优先级 -1(低于交互 sql_query)。cron tick 走同一路径,详见
+        # app/services/workflow_scheduler.py。
+        job = build_workflow_run_job(
+            workflow_id=workflow_id,
+            workflow_name=str(row["name"]),
             project_id=project_id,
-            datasource_ids=[],
-            # run job 优先级 -1(低于交互 sql_query 的 0):claim 序 = priority DESC,
-            # 子 job = run+1 = 0(见 _build_workflow_child_job),与交互同档,
-            # 大工作流爆发时不再压制交互查询(backlog Workflow minor #3)
-            priority=-1,
-            timeout_seconds=timeout_seconds,
-            resource_profile=ResourceProfile(timeout_seconds=timeout_seconds),
-            audit_id=new_id(),
-            payload={
-                "workflow_id": workflow_id,
-                "workflow_name": str(row["name"]),
-                "trigger": "manual",
-                "spec": spec.model_dump(mode="json"),
-                # 变量在触发时刻冻结:执行器每步推进与状态查询共用这份快照,
-                # when 决策 + ${var} 插值在 run 生命周期内确定(跨午夜不翻转)。
-                # 合并优先级 builtin < spec.variables < 触发时(见上)。
-                "when_variables": merged_variables,
-            },
+            owner_user_id=user.id,
+            spec=spec,
+            trigger="manual",
+            now=datetime.now(UTC),
+            extra_variables=trigger_variables,
         )
+        run_id = job.id
         _enqueue_job_txn(conn, services, job)
     _audit_business(
         services,

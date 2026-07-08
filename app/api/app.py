@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import cast
 
 from fastapi import FastAPI
@@ -13,6 +14,7 @@ from app.api.middleware.crosscutting import CrossCuttingMiddleware
 from app.api.routes import router
 from app.api.services import ApiServices, build_api_services
 from app.config import Form, Settings
+from app.services.workflow_scheduler import WorkflowScheduler
 
 ExceptionHandler = Callable[[Request, Exception], Response | Awaitable[Response]]
 
@@ -27,12 +29,26 @@ def create_app(
     frontend_dist = resolve_frontend_dist(
         settings.api.frontend_dist if settings is not None else None
     )
+    scheduler = _build_scheduler(actual_services, settings)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # cron tick 后台线程随 API 进程起停(ADR-0009 §1:进程内调度,无独立进程)。
+        if scheduler is not None:
+            scheduler.start()
+        try:
+            yield
+        finally:
+            if scheduler is not None:
+                scheduler.stop()
+
     app = FastAPI(
         title="DataOps Studio API",
         version="2.0.0a0",
         docs_url="/docs" if expose_docs else None,
         redoc_url="/redoc" if expose_docs else None,
         openapi_url="/openapi.json" if expose_docs else None,
+        lifespan=lifespan,
     )
     app.state.services = actual_services
     app.add_exception_handler(ApiError, cast(ExceptionHandler, api_error_handler))
@@ -54,6 +70,17 @@ def create_app(
         mount_frontend(app, frontend_dist)
 
     return app
+
+
+def _build_scheduler(services: ApiServices, settings: Settings | None) -> WorkflowScheduler | None:
+    # 仅在真实进程(main.py 传 settings)且开关开时启动;测试用 services= 建 app
+    # (settings=None)不起后台线程,行为与现状一致。
+    if settings is None or not settings.scheduler.enabled:
+        return None
+    return WorkflowScheduler(
+        services,
+        tick_interval_seconds=settings.scheduler.tick_interval_seconds,
+    )
 
 
 def _docs_enabled(settings: Settings | None) -> bool:

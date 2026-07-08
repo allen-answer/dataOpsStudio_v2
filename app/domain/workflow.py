@@ -13,7 +13,9 @@ Workflow = Job DAG:只编排 DataOpsStudio 内置 Job,不是低配 Airflow。
 ``on_failure`` 类型层对齐设计稿 ``Literal["abort", "continue", "branch"]``,
 但首版校验拒绝 ``"branch"``(``unsupported_on_failure``,暂不支持)。
 节点级 ``when`` 条件首版只做存储 + 非空校验,表达式求值语义属执行器(PR-4)。
-Cron 只做基本格式校验(5 段 + 字符集受限,不引入 croniter);精确解析属 PR-4。
+Cron 校验两道关(PR-4b 落地精确解析):先 5 段 + 字符集,再 croniter 语义解析,
+拒绝越界 / 不可解析表达式(如 ``99 * * * *``)。运行期"上一触发点"计算属调度器
+(``app/services/workflow_scheduler.py``),本模块只做构造期校验。
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ import re
 from collections.abc import Mapping
 from typing import Any, Literal
 
+from croniter import croniter
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.domain.job import ALLOWED_WORKFLOW_NODE_KINDS
@@ -44,7 +47,7 @@ MAX_RETRIES_LIMIT = 5
 MAX_BACKOFF_SECONDS = 3600
 MAX_WHEN_LENGTH = 512
 
-# cron 单字段字符集:数字 + * , - /(基本校验,精确解析属 PR-4)
+# cron 单字段字符集:数字 + * , - /(第一道关;第二道 croniter 语义解析见 CronSchedule)
 _CRON_FIELD_RE = re.compile(r"^[0-9*,\-/]+$")
 
 # ── workflow ${var} 变量来源校验(C-7 PR2)────────────────────────────────────
@@ -135,7 +138,7 @@ class RetryPolicy(BaseModel):
 
 
 class CronSchedule(BaseModel):
-    """cron 调度(基本格式校验:5 段空格分隔、字符集受限)。"""
+    """cron 调度(两道校验:5 段 + 字符集,再 croniter 语义解析)。"""
 
     model_config = ConfigDict(frozen=True)
 
@@ -154,6 +157,10 @@ class CronSchedule(BaseModel):
                     f"invalid_cron: 第 {index + 1} 段 {cron_field!r} 含非法字符"
                     "(只允许数字与 * , - /)"
                 )
+        # 语义解析:字符集过关但越界 / 组合非法(如 "99 * * * *" / "5-1 * * * *")
+        # croniter 才能识别;调度器用同一 croniter 求触发点,校验口径与运行口径一致。
+        if not croniter.is_valid(value):
+            raise ValueError(f"invalid_cron: cron 表达式 {value!r} 无法解析(字段越界或组合非法)")
         return value
 
 
