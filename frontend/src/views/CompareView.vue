@@ -22,6 +22,7 @@ import {
   Copy,
   Download,
   Eye,
+  FileCode2,
   GitCompareArrows,
   History,
   ListPlus,
@@ -47,11 +48,13 @@ import {
   downloadCompareExport,
   draftCompareTask,
   explainCompareRun,
+  getCompareRunDiffSql,
   getCompareRunProfile,
   getCompareRunResults,
   inferCompareTask,
   listCompareTaskRuns,
   listCompareTasks,
+  precheckComparePk,
   previewCompareData,
   previewCompareFile,
   runCompareTask,
@@ -61,9 +64,11 @@ import {
   type CompareAiAttributionResponse,
   type CompareBucket,
   type CompareDataRef,
+  type CompareDiffSqlResponse,
   type CompareFileFormat,
   type CompareFilePreviewResponse,
   type CompareInferResponse,
+  type ComparePkPrecheckResponse,
   type ComparePreviewResponse,
   type CompareResultRow,
   type CompareRunProfileResponse,
@@ -283,6 +288,15 @@ const resultBucket = ref<CompareBucket>('diff')
 const resultData = ref<CompareRunResultResponse | null>(null)
 const resultLoading = ref(false)
 const resultError = ref<string | null>(null)
+// ── UX-2 C-3(懒展开):大桶明细按需分页追加,不一次性全量渲染 ──
+const resultLoadingMore = ref(false)
+
+// ── UX-2 C-3(差异行定位 SQL):按桶主键生成 SELECT ... WHERE pk IN (...) ──
+const diffSqlOpen = ref(false)
+const diffSqlLoading = ref(false)
+const diffSqlError = ref<string | null>(null)
+const diffSqlData = ref<CompareDiffSqlResponse | null>(null)
+const diffSqlCopied = ref<'source' | 'target' | null>(null)
 
 // ── P0-C1/C2:results tab 信息架构(四状态卡片 + 逐列匹配率 + 只看差异列)──
 const matchRateOpen = ref(true)
@@ -728,6 +742,12 @@ watch(rightTab, (tab) => {
   if (tab === 'history') void loadHistory(true)
 })
 
+// UX-2 C-4:主键选择 / 映射 / 数据源变了,旧预检结果作废(避免展示过期唯一性判断)。
+watch(
+  () => [draft.keyColumns.join(''), draft.sourceId, draft.targetId] as const,
+  () => resetPkPrecheck(),
+)
+
 watch(datasources, (list) => {
   if (!draft.sourceId && list.length > 0) draft.sourceId = list[0].id
   if (!draft.targetId && list.length > 0) draft.targetId = list[0].id
@@ -849,6 +869,84 @@ function applyPkCandidate(candidate: PrimaryKeyCandidate): void {
     const tgtCol = candidate.target_columns[idx]
     if (tgtCol && tgtCol !== srcCol) draft.columnMappings[srcCol] = tgtCol
   })
+}
+
+// ── UX-2 C-4:主键健康预检(唯一性 / 空值)────────────────────────────
+interface PkPrecheckState {
+  loading: boolean
+  error: string | null
+  source: ComparePkPrecheckResponse | null
+  target: ComparePkPrecheckResponse | null
+  sourceSkipped: boolean
+  targetSkipped: boolean
+}
+const pkPrecheck = reactive<PkPrecheckState>({
+  loading: false,
+  error: null,
+  source: null,
+  target: null,
+  sourceSkipped: false,
+  targetSkipped: false,
+})
+
+function resetPkPrecheck(): void {
+  pkPrecheck.error = null
+  pkPrecheck.source = null
+  pkPrecheck.target = null
+  pkPrecheck.sourceSkipped = false
+  pkPrecheck.targetSkipped = false
+}
+
+/** 目标侧主键列名 = 源主键过 column_mappings 映射(与 buildRulesPayload 一致)。 */
+function targetKeyColumns(): string[] {
+  return draft.keyColumns.map((c) => draft.columnMappings[c] ?? c)
+}
+
+const pkPrecheckReady = computed<boolean>(
+  () => draft.keyColumns.length > 0 && Boolean(draft.sourceId) && Boolean(draft.targetId),
+)
+
+/** 任一侧检出重复或空值 → 黄条警告(主键选错时结果全是噪声,跑前先拦一道)。 */
+const pkPrecheckHasWarning = computed<boolean>(() => {
+  const bad = (r: ComparePkPrecheckResponse | null) => Boolean(r && (r.has_duplicates || r.has_nulls))
+  return bad(pkPrecheck.source) || bad(pkPrecheck.target)
+})
+
+async function onPkPrecheck(): Promise<void> {
+  if (!pkPrecheckReady.value || pkPrecheck.loading) return
+  resetPkPrecheck()
+  pkPrecheck.loading = true
+  const sourceRef = buildDataRef('source')
+  const targetRef = buildDataRef('target')
+  // 文件源无 DB 可查,标记跳过(建任务流程里文件侧主键预检不适用)。
+  const sourceSkip = sourceRef.kind === 'file'
+  const targetSkip = targetRef.kind === 'file'
+  pkPrecheck.sourceSkipped = sourceSkip
+  pkPrecheck.targetSkipped = targetSkip
+  try {
+    const [srcRes, tgtRes] = await Promise.all([
+      sourceSkip
+        ? Promise.resolve(null)
+        : precheckComparePk(projectId.value, {
+            datasource_id: draft.sourceId,
+            ref: sourceRef,
+            key_columns: draft.keyColumns,
+          }),
+      targetSkip
+        ? Promise.resolve(null)
+        : precheckComparePk(projectId.value, {
+            datasource_id: draft.targetId,
+            ref: targetRef,
+            key_columns: targetKeyColumns(),
+          }),
+    ])
+    pkPrecheck.source = srcRes
+    pkPrecheck.target = tgtRes
+  } catch (e) {
+    pkPrecheck.error = errorMessage(e)
+  } finally {
+    pkPrecheck.loading = false
+  }
 }
 
 function toggleIgnoreColumn(name: string): void {
@@ -1166,10 +1264,85 @@ async function loadResults(bucket: CompareBucket): Promise<void> {
   }
 }
 
+// UX-2 C-3(懒展开):还有多少行未加载 = 该桶总数 - 已渲染行数。
+const resultLoadedRows = computed<number>(() => resultData.value?.rows.length ?? 0)
+const resultRemaining = computed<number>(() => {
+  if (!resultData.value) return 0
+  const total = bucketCounts.value[resultBucket.value] ?? 0
+  return Math.max(total - resultLoadedRows.value, 0)
+})
+
+/** 追加下一页(offset = 已加载行数),合并进现有 rows,不重拉前面的页。 */
+async function loadMoreResults(): Promise<void> {
+  if (!run.runId || !resultData.value || resultLoadingMore.value) return
+  if (resultRemaining.value <= 0) return
+  resultLoadingMore.value = true
+  resultError.value = null
+  try {
+    const next = await getCompareRunResults(
+      run.runId,
+      resultBucket.value,
+      resultLoadedRows.value,
+      PAGE_SIZE,
+    )
+    // 桶未变才追加(用户可能在等待期间切桶);以最新计数/画像覆盖,rows 合并。
+    if (resultData.value && next.bucket === resultBucket.value) {
+      resultData.value = { ...next, rows: [...resultData.value.rows, ...next.rows] }
+    }
+  } catch (e) {
+    resultError.value = errorMessage(e)
+  } finally {
+    resultLoadingMore.value = false
+  }
+}
+
 async function onSelectBucket(bucket: CompareBucket): Promise<void> {
   // 聚焦列是 diff 桶专属过滤:切去别的桶即清除,避免切回时暗藏过滤。
   if (bucket !== 'diff') focusColumn.value = null
   await loadResults(bucket)
+}
+
+// ── UX-2 C-3:差异行定位 SQL ──────────────────────────────────────────
+/** 当前桶是否可生成定位 SQL(same 桶无定位价值,且必须有主键)。 */
+const diffSqlAvailable = computed<boolean>(
+  () =>
+    Boolean(run.runId) &&
+    resultBucket.value !== 'same' &&
+    (bucketCounts.value[resultBucket.value] ?? 0) > 0,
+)
+
+async function openDiffSql(): Promise<void> {
+  if (!run.runId || !diffSqlAvailable.value) return
+  diffSqlOpen.value = true
+  diffSqlLoading.value = true
+  diffSqlError.value = null
+  diffSqlData.value = null
+  diffSqlCopied.value = null
+  try {
+    diffSqlData.value = await getCompareRunDiffSql(run.runId, resultBucket.value)
+  } catch (e) {
+    diffSqlError.value = errorMessage(e)
+  } finally {
+    diffSqlLoading.value = false
+  }
+}
+
+function closeDiffSql(): void {
+  diffSqlOpen.value = false
+}
+
+async function copyDiffSql(side: 'source' | 'target'): Promise<void> {
+  const sql = side === 'source' ? diffSqlData.value?.source.sql : diffSqlData.value?.target.sql
+  if (!sql) return
+  try {
+    await navigator.clipboard.writeText(sql)
+    diffSqlCopied.value = side
+    window.setTimeout(() => {
+      if (diffSqlCopied.value === side) diffSqlCopied.value = null
+    }, 1500)
+  } catch {
+    diffSqlError.value = t('compare.diff_sql_copy_failed')
+  }
 }
 
 async function loadProfile(): Promise<void> {
@@ -2051,6 +2224,73 @@ const missingTarget = computed(
             </button>
           </div>
 
+          <!-- UX-2 C-4:主键健康预检(唯一性 / 空值)—— 跑前先拦主键选错导致的满屏噪声 -->
+          <div class="rounded-card border chrome-border p-3 space-y-2">
+            <div class="flex items-center gap-2">
+              <span class="text-xs font-medium chrome-text-heading">{{ t('compare.pk_precheck') }}</span>
+              <span class="text-[11px] chrome-text-muted">{{ t('compare.pk_precheck_hint') }}</span>
+              <div class="flex-1" />
+              <button
+                type="button"
+                class="chrome-btn-secondary text-xs"
+                :disabled="!pkPrecheckReady || pkPrecheck.loading"
+                :title="!pkPrecheckReady ? t('compare.pk_precheck_disabled') : ''"
+                @click="onPkPrecheck"
+              >
+                <RefreshCw class="w-3.5 h-3.5" :class="pkPrecheck.loading && 'animate-spin'" />
+                {{ pkPrecheck.loading ? t('compare.pk_precheck_running') : t('compare.pk_precheck_run') }}
+              </button>
+            </div>
+
+            <div v-if="pkPrecheck.error" class="text-xs text-red-600 dark:text-red-400">{{ pkPrecheck.error }}</div>
+
+            <div
+              v-else-if="pkPrecheck.source || pkPrecheck.target || pkPrecheck.sourceSkipped || pkPrecheck.targetSkipped"
+              class="space-y-2"
+            >
+              <div
+                v-if="pkPrecheckHasWarning"
+                class="flex items-start gap-2 rounded-card border border-amber-300 dark:border-amber-500/40 bg-amber-50 dark:bg-amber-500/10 p-2 text-[11px] text-amber-800 dark:text-amber-200"
+              >
+                <AlertTriangle class="w-3.5 h-3.5 mt-0.5 shrink-0" /> {{ t('compare.pk_precheck_warn') }}
+              </div>
+              <div
+                v-else
+                class="flex items-center gap-2 rounded-card border chrome-border-subtle p-2 text-[11px] chrome-text-muted"
+              >
+                <Check class="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                {{ t('compare.pk_precheck_ok') }}
+              </div>
+
+              <div class="grid grid-cols-2 gap-2">
+                <div
+                  v-for="side in (['source', 'target'] as const)"
+                  :key="side"
+                  class="rounded-card border chrome-border-subtle p-2 text-[11px]"
+                >
+                  <div class="font-medium chrome-text-heading mb-1">{{ t(`compare.${side}`) }}</div>
+                  <template v-if="(side === 'source' ? pkPrecheck.sourceSkipped : pkPrecheck.targetSkipped)">
+                    <span class="chrome-text-muted">{{ t('compare.pk_precheck_skipped_file') }}</span>
+                  </template>
+                  <template v-else-if="pkPrecheck[side]">
+                    <div class="flex justify-between chrome-text-muted">
+                      <span>{{ t('compare.pk_precheck_total') }}</span>
+                      <span class="tabular-nums chrome-text-heading">{{ pkPrecheck[side]!.total_rows }}</span>
+                    </div>
+                    <div class="flex justify-between" :class="pkPrecheck[side]!.has_duplicates ? 'text-amber-700 dark:text-amber-300' : 'chrome-text-muted'">
+                      <span>{{ t('compare.pk_precheck_duplicates') }}</span>
+                      <span class="tabular-nums">{{ pkPrecheck[side]!.duplicate_pk_rows }}</span>
+                    </div>
+                    <div class="flex justify-between" :class="pkPrecheck[side]!.has_nulls ? 'text-amber-700 dark:text-amber-300' : 'chrome-text-muted'">
+                      <span>{{ t('compare.pk_precheck_nulls') }}</span>
+                      <span class="tabular-nums">{{ pkPrecheck[side]!.null_pk_rows }}</span>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <!-- 规则 + 限制 -->
           <div class="grid grid-cols-2 gap-4">
             <fieldset class="rounded-card border chrome-border p-3 space-y-2">
@@ -2256,6 +2496,13 @@ const missingTarget = computed(
 
             <!-- diff tab:单元格分裂(主键列固定左侧) -->
             <template v-else>
+              <!-- UX-2 C-3:差异行定位 SQL 逃生口(same 桶无定位价值,不显示) -->
+              <div v-if="diffSqlAvailable" class="mb-2 flex items-center justify-end">
+                <button type="button" class="chrome-btn-secondary text-xs" @click="openDiffSql">
+                  <FileCode2 class="w-3.5 h-3.5" /> {{ t('compare.diff_sql_action') }}
+                </button>
+              </div>
+
               <!-- P0-C2:diff 桶列过滤工具行(聚焦列 chip + 显示全部列开关) -->
               <div v-if="resultBucket === 'diff'" class="mb-2 flex items-center gap-2">
                 <span
@@ -2334,6 +2581,27 @@ const missingTarget = computed(
                 </tr>
               </tbody>
               </table>
+
+              <!-- UX-2 C-3:懒展开 —— 大桶明细按需分页追加,不一次性全量渲染 -->
+              <div class="mt-3 flex items-center gap-3 text-[11px] chrome-text-muted">
+                <span>{{ t('compare.rows_loaded', { loaded: resultLoadedRows, total: bucketCounts[resultBucket] ?? 0 }) }}</span>
+                <button
+                  v-if="resultRemaining > 0"
+                  type="button"
+                  class="chrome-btn-secondary text-xs"
+                  :disabled="resultLoadingMore"
+                  @click="loadMoreResults"
+                >
+                  <ChevronDown class="w-3.5 h-3.5" :class="resultLoadingMore && 'animate-pulse'" />
+                  {{ resultLoadingMore
+                    ? t('compare.rows_loading_more')
+                    : t('compare.rows_load_more', { n: Math.min(resultRemaining, PAGE_SIZE) }) }}
+                </button>
+                <span v-else-if="resultLoadedRows > 0" class="inline-flex items-center gap-1">
+                  <Check class="w-3 h-3 text-emerald-600 dark:text-emerald-400" />
+                  {{ t('compare.rows_all_loaded') }}
+                </span>
+              </div>
             </template>
           </div>
         </div>
@@ -2472,5 +2740,63 @@ const missingTarget = computed(
         </div>
       </div>
     </section>
+
+    <!-- ── UX-2 C-3:差异行定位 SQL 弹窗 ──────────────────────────── -->
+    <div
+      v-if="diffSqlOpen"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      @click.self="closeDiffSql"
+    >
+      <div class="w-full max-w-3xl max-h-[85vh] flex flex-col rounded-card border chrome-border chrome-bg-panel shadow-xl">
+        <div class="flex items-center gap-2 px-4 py-3 border-b chrome-border-subtle">
+          <FileCode2 class="w-4 h-4 chrome-accent" />
+          <span class="text-sm font-semibold chrome-text-heading">
+            {{ t('compare.diff_sql_title', { bucket: t(`compare.bucket_${resultBucket}`) }) }}
+          </span>
+          <div class="flex-1" />
+          <button type="button" class="chrome-btn-ghost" :title="t('common.close')" @click="closeDiffSql">
+            <X class="w-4 h-4" />
+          </button>
+        </div>
+
+        <div class="flex-1 min-h-0 overflow-auto p-4 space-y-4">
+          <div v-if="diffSqlLoading" class="chrome-text-muted text-sm"><LoadingDots /></div>
+          <div v-else-if="diffSqlError" class="text-xs text-red-600 dark:text-red-400">{{ diffSqlError }}</div>
+          <template v-else-if="diffSqlData">
+            <p class="text-[11px] chrome-text-muted">{{ t('compare.diff_sql_hint') }}</p>
+            <div
+              v-if="diffSqlData.truncated"
+              class="flex items-start gap-2 rounded-card border border-amber-300 dark:border-amber-500/40 bg-amber-50 dark:bg-amber-500/10 p-2 text-[11px] text-amber-800 dark:text-amber-200"
+            >
+              <AlertTriangle class="w-3.5 h-3.5 mt-0.5 shrink-0" />
+              {{ t('compare.diff_sql_truncated', { cap: diffSqlData.cap, total: bucketCounts[resultBucket] ?? 0 }) }}
+            </div>
+
+            <div v-for="side in (['source', 'target'] as const)" :key="side">
+              <div class="flex items-center gap-2 mb-1">
+                <span class="text-xs font-medium chrome-text-heading">{{ t(`compare.${side}`) }}</span>
+                <div class="flex-1" />
+                <button
+                  v-if="diffSqlData[side].available"
+                  type="button"
+                  class="chrome-btn-ghost text-[11px]"
+                  @click="copyDiffSql(side)"
+                >
+                  <Copy class="w-3.5 h-3.5" />
+                  {{ diffSqlCopied === side ? t('compare.diff_sql_copied') : t('compare.diff_sql_copy') }}
+                </button>
+              </div>
+              <pre
+                v-if="diffSqlData[side].available"
+                class="text-[11px] font-mono whitespace-pre-wrap break-all rounded-card border chrome-border chrome-bg-elevated p-2 chrome-text-heading"
+              >{{ diffSqlData[side].sql }}</pre>
+              <div v-else class="text-[11px] chrome-text-muted rounded-card border chrome-border-subtle p-2">
+                {{ t(`compare.diff_sql_reason_${diffSqlData[side].reason ?? 'unavailable'}`) }}
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
