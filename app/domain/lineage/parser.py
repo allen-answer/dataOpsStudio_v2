@@ -1438,8 +1438,10 @@ def _normalize_dialect(dialect: str) -> str:
         return "dm"
     if normalized == "postgresql":
         return "postgres"  # sqlglot 原生方言名
-    if normalized not in {"mysql", "oracle", "dm", "postgres"}:
-        raise ValueError("lineage dialect must be mysql, oracle, dm, or postgres")
+    # L-1:放开 sqlglot 原生支持的方言(tsql 随自动识别一并放开);db2 保持不加
+    # (GA 未 Certified,差距矩阵 L-1)。
+    if normalized not in {"mysql", "oracle", "dm", "postgres", "tsql"}:
+        raise ValueError("lineage dialect must be mysql, oracle, dm, postgres, or tsql")
     return normalized
 
 

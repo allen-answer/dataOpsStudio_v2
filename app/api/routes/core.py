@@ -171,6 +171,7 @@ from app.domain.lineage import (
     analyze_sql_lineage,
     build_lineage_edge_rows,
     lineage_sql_hash,
+    resolve_dialect,
     schema_from_metadata_cache_rows,
 )
 from app.domain.lineage.ai_fallback import (
@@ -2626,7 +2627,11 @@ def analyze_project_lineage(
             datasource_id=body.datasource_id,
             user_id=user.id,
         )
-        dialect = (body.dialect or str(datasource_row["db_type"])).lower()
+        # L-1:dialect 缺省跟随数据源 db_type(现行为);显式 "auto" 则从 SQL 自动识别,
+        # 平票 / 无特征回落 db_type。显式真实方言永远原样透传(不改行为)。
+        db_type = str(datasource_row["db_type"])
+        detection = resolve_dialect(body.dialect or db_type, body.sql_text, default=db_type)
+        dialect = detection.dialect
         schema_context = _lineage_schema_context(conn, body.datasource_id, body.default_schema)
         sql_hash = lineage_sql_hash(
             sql_text=body.sql_text,
@@ -2677,6 +2682,9 @@ def analyze_project_lineage(
         now = datetime.now(UTC)
         parse_summary = dict(report.report or {})
         parse_summary["parser_version"] = LINEAGE_PARSER_VERSION
+        if detection.auto_detected:
+            # L-1:识别结果落 parse_summary(前端可显示 "auto-detected: oracle")。
+            parse_summary["dialect_detection"] = detection.as_summary()
         conn.execute(
             insert(lineage_runs).values(
                 id=run_id,

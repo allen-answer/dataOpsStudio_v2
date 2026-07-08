@@ -68,8 +68,16 @@ import LoadingDots from '../components/LoadingDots.vue'
 
 type Tab = 'subgraph' | 'impact' | 'analyze' | 'batch'
 
-// 血缘解析器支持的方言(app/domain/lineage/parser.py _normalize_dialect)
-const LINEAGE_DIALECTS: ReadonlySet<string> = new Set(['mysql', 'oracle', 'dm', 'postgresql'])
+// 血缘解析器支持的方言(app/domain/lineage/parser.py _normalize_dialect);
+// 'auto' 是自动识别哨兵(L-1),非真实 db_type,但作为合法方言不触发 unsupported 提示。
+const LINEAGE_DIALECTS: ReadonlySet<string> = new Set([
+  'auto',
+  'mysql',
+  'oracle',
+  'dm',
+  'postgresql',
+  'tsql',
+])
 
 // ── SVG 布局常量 ────────────────────────────────────────────────────
 const NODE_W = 176
@@ -561,7 +569,7 @@ type BatchPhase = 'idle' | 'uploading' | 'running' | 'done' | 'failed'
 
 // batchDsId === '' 表示「无数据库(纯文本导入)」;此时用 batchManualDialect
 const batchDsId = ref('')
-const batchManualDialect = ref('oracle')
+const batchManualDialect = ref('auto')
 const batchDefaultSchema = ref('')
 const batchFiles = ref<File[]>([])
 const batchFileInput = ref<HTMLInputElement | null>(null)
@@ -581,7 +589,8 @@ const batchReport = ref<LineageBatchReport | null>(null)
 const expandedFiles = ref<Set<string>>(new Set())
 let batchPollTimer: ReturnType<typeof setTimeout> | null = null
 
-const BATCH_DIALECTS = ['mysql', 'oracle', 'dm', 'postgresql'] as const
+// 'auto' = 自动识别(逐文件),默认项;其余为显式方言(L-1)
+const BATCH_DIALECTS = ['auto', 'mysql', 'oracle', 'dm', 'postgresql', 'tsql'] as const
 
 watch(datasources, (list) => {
   if (!batchDsId.value && list.length > 0) batchDsId.value = list[0].id
