@@ -282,6 +282,8 @@ _WORKFLOW_SPEC_ERROR_CODES = frozenset(
         "unknown_edge_node",
         "self_loop",
         "cycle_detected",
+        # C-10 sensor 触发
+        "invalid_sensor_datasource",
         # C-7 PR2 变量来源校验(spec.variables + 触发时 variables 共用错误码;
         # unsafe_variable_value 只含变量名不含取值 —— R5)
         "invalid_variable_name",
@@ -3956,6 +3958,7 @@ def create_project_workflow(
                 dag_jsonb=spec.model_dump(mode="json"),
                 schedule_cron=spec.schedule.cron if spec.schedule else None,
                 schedule_enabled=spec.schedule.enabled if spec.schedule else False,
+                sensor_enabled=spec.sensor.enabled if spec.sensor else False,
                 enabled=True,
                 created_by=user.id,
                 created_at=now,
@@ -4044,6 +4047,7 @@ def update_project_workflow(
                 dag_jsonb=spec.model_dump(mode="json"),
                 schedule_cron=spec.schedule.cron if spec.schedule else None,
                 schedule_enabled=spec.schedule.enabled if spec.schedule else False,
+                sensor_enabled=spec.sensor.enabled if spec.sensor else False,
                 updated_at=datetime.now(UTC),
             )
         )
@@ -4387,10 +4391,23 @@ def _validated_workflow_spec(payload: dict[str, Any]) -> WorkflowSpec:
     (白名单内但首版未实现)必须可区分(ADR-0009 Consequences)。
     """
     try:
-        return WorkflowSpec.model_validate(payload)
+        spec = WorkflowSpec.model_validate(payload)
     except ValidationError as exc:
         code, message = _workflow_spec_error(exc)
         raise ApiError(400, code, message) from exc
+    # C-10:sensor SQL 只读校验(写语句 → 400)。域层不 import dbclients,故 guard 落此;
+    # 所有 create/update 入口都经本函数,故这里是单一门禁。stored spec 复检也走这里
+    # (已存的合法 SQL 幂等通过,成本可忽略)。
+    if spec.sensor is not None:
+        try:
+            validate_readonly_sql(spec.sensor.sql)
+        except SqlGuardError as exc:
+            raise ApiError(
+                400,
+                "sensor_sql_not_readonly",
+                "Sensor SQL must be a read-only SELECT/WITH statement",
+            ) from exc
+    return spec
 
 
 def _validated_trigger_variables(
@@ -4466,6 +4483,7 @@ def _workflow_response(row: RowMapping) -> WorkflowResponse:
         enabled=bool(row["enabled"]),
         schedule_cron=_optional_str(row["schedule_cron"]),
         schedule_enabled=bool(row["schedule_enabled"]),
+        sensor_enabled=bool(row["sensor_enabled"]),
         created_by=_optional_str(row["created_by"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -4482,6 +4500,7 @@ def _workflow_list_item(row: RowMapping) -> WorkflowListItem:
         enabled=bool(row["enabled"]),
         schedule_cron=_optional_str(row["schedule_cron"]),
         schedule_enabled=bool(row["schedule_enabled"]),
+        sensor_enabled=bool(row["sensor_enabled"]),
         created_by=_optional_str(row["created_by"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
