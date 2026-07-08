@@ -105,6 +105,8 @@ from app.api.schemas import (
     SqlExpandStarResponse,
     SqlFormatRequest,
     SqlFormatResponse,
+    SqlGenerateRequest,
+    SqlGenerateResponse,
     SqlHistoryItem,
     SqlTemplateCreateRequest,
     SqlTemplateRenderRequest,
@@ -151,6 +153,12 @@ from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.sql_build import limit_clause, quote_identifier
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.ai import AiContext, AiOptions, ContextItem, EgressLevel
+from app.domain.ai_copilot import (
+    MAX_TABLES,
+    build_nl2sql_prompt,
+    build_schema_context,
+    split_sql_and_explanation,
+)
 from app.domain.compare_infer import (
     CompareInferenceDraft,
     infer_compare_draft,
@@ -210,7 +218,7 @@ from app.services.ai.default_gateway import (
     AiGatewayRuntimeConfig,
     build_gateway_from_runtime_config,
 )
-from app.services.ai.errors import AiGatewayError
+from app.services.ai.errors import AiDisabledError, AiGatewayError
 from app.services.lineage_batch_export import batch_export_sheets
 
 logger = structlog.get_logger(__name__)
@@ -1079,6 +1087,153 @@ def list_datasource_metadata_indexes(
     )
     _audit_metadata(request, services, row, "metadata_indexes_list", datasource_id, refresh)
     return [MetadataIndexItem.model_validate(item) for item in payload]
+
+
+@router.post(
+    "/datasources/{datasource_id}/ai/sql-generate",
+    response_model=SqlGenerateResponse,
+)
+def generate_sql_from_nl(
+    datasource_id: str,
+    body: SqlGenerateRequest,
+    request: Request,
+) -> SqlGenerateResponse:
+    """AI Copilot C1 —— 自然语言 → 用真实 schema 生成只读 SQL(设计稿 §2.7.4,egress L2)。
+
+    流程:取 datasource(校验 project 访问)→ 取 AI 运行配置(未启用 → 结构化 409)→
+    从 metadata 缓存组装 schema 上下文(仅表/列/类型,**绝不带样本数据/行值**)→
+    组 prompt → AiGateway.complete(purpose=ai_copilot_run)→ 拆 SQL + 解释。
+    详见 docs/design/C1-copilot-nl2sql.md。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    row = _datasource_for_current_user(request, datasource_id)
+    project_id = str(row["project_id"])
+
+    def audit(result: str, detail: dict[str, object]) -> None:
+        _audit_business(
+            services,
+            request,
+            user_id=user.id,
+            project_id=project_id,
+            action="ai_copilot_run",
+            resource_type="datasource",
+            resource_id=datasource_id,
+            result=result,
+            detail=detail,
+        )
+
+    with services.engine.connect() as conn:
+        ai_row = _ai_config_row_or_none(conn)
+    runtime = _ai_runtime_config(services, ai_row)
+    if not runtime.enabled or runtime.provider in {None, "off"}:
+        audit("skipped", {"error": "ai_disabled"})
+        raise ApiError(409, "ai_disabled", "AI copilot is not enabled")
+
+    tables, more_tables = _schema_tables_for_ai(services, row, body)
+    schema_payload, tables_used, column_truncated = build_schema_context(tables)
+    truncated = more_tables or column_truncated
+    prompt = build_nl2sql_prompt(body.natural_language, dialect=str(row["db_type"]))
+    context = AiContext(
+        items=[
+            ContextItem(
+                content=json.dumps(
+                    schema_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                # ★ egress L2:仅结构信息(表名/列名/类型),永不含行值(§2.7.5)。
+                egress_level=EgressLevel.L2,
+            )
+        ]
+    )
+    try:
+        response = build_gateway_from_runtime_config(runtime).complete(
+            prompt,
+            context,
+            AiOptions(purpose="ai_copilot_run", max_tokens=800),
+        )
+    except AiDisabledError:
+        audit("skipped", {"error": "ai_disabled"})
+        raise ApiError(409, "ai_disabled", "AI copilot is not enabled") from None
+    except AiGatewayError as exc:
+        error = type(exc).__name__
+        audit("failed", {"error": error})
+        return SqlGenerateResponse(ok=False, error=error)
+
+    sql, explanation = split_sql_and_explanation(response.content)
+    audit(
+        "success",
+        {"provider": response.provider, "tables": len(tables_used), "truncated": truncated},
+    )
+    return SqlGenerateResponse(
+        ok=True,
+        sql=sql,
+        explanation=explanation,
+        provider=response.provider,
+        model=response.model,
+        egress_level=int(EgressLevel.L2),
+        tables_used=tables_used,
+        truncated=truncated,
+    )
+
+
+def _schema_tables_for_ai(
+    services: ApiServices,
+    datasource_row: RowMapping,
+    body: SqlGenerateRequest,
+) -> tuple[list[tuple[str, str, list[Column]]], bool]:
+    """取 C1 上下文所需的 (schema, table, columns) 列表 + 是否还有更多表被略过。
+
+    过滤优先级:显式 table_names(最省)> 单 schema 表清单 > 全 schema 表清单。
+    只为前 MAX_TABLES 张表取列(避免海量表时打爆缓存读),more=True 表示有表被略过。
+    列取用走 metadata 缓存(#65),不额外打库;绝不读行值。
+    """
+    if body.schema_name and body.table_names:
+        table_refs = [(body.schema_name, name) for name in body.table_names]
+    elif body.schema_name:
+        table_payload = _metadata_payload(
+            services,
+            datasource_row,
+            _METADATA_LEVEL_TABLES,
+            schema_name=body.schema_name,
+            table_name="",
+            refresh=False,
+            load=lambda: [
+                MetadataTableItem(
+                    schema_name=item.schema_name,
+                    name=item.name,
+                    table_type=item.table_type,
+                ).model_dump(mode="json")
+                for item in _metadata_adapter(services, datasource_row).list_tables(
+                    body.schema_name or ""
+                )
+            ],
+        )
+        table_refs = [
+            (str(item["schema_name"]), str(item["name"]))
+            for item in table_payload
+            if item.get("name")
+        ]
+    else:
+        table_refs = [
+            (table.schema_name, table.name)
+            for table in _metadata_all_tables(services, datasource_row, refresh=False)
+        ]
+
+    more_tables = len(table_refs) > MAX_TABLES
+    result: list[tuple[str, str, list[Column]]] = []
+    for schema_name, table_name in table_refs[:MAX_TABLES]:
+        columns = _metadata_columns_for_table(
+            services,
+            datasource_row,
+            schema_name=schema_name,
+            table_name=table_name,
+            refresh=False,
+        )
+        result.append((schema_name, table_name, columns))
+    return result, more_tables
 
 
 @router.post("/sql/format", response_model=SqlFormatResponse)

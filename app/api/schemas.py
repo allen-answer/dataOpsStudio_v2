@@ -132,6 +132,31 @@ class SqlExecuteResponse(BaseModel):
     result_set_id: str
 
 
+class SqlGenerateRequest(BaseModel):
+    """AI Copilot C1 —— 自然语言 → SQL 生成入参(设计稿 §2.7.4)。
+
+    schema_name / table_names 是可选过滤:给了就只把这些表的结构送 AI(最省 egress)。
+    """
+
+    natural_language: str = Field(min_length=1, max_length=2000)
+    schema_name: str | None = None
+    table_names: list[str] = Field(default_factory=list)
+
+
+class SqlGenerateResponse(BaseModel):
+    """C1 生成结果。ok=True 时 sql 必有;egress_level 恒 L2(结构信息)。"""
+
+    ok: bool
+    sql: str | None = None
+    explanation: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    error: str | None = None
+    egress_level: int = 2
+    tables_used: list[str] = Field(default_factory=list)
+    truncated: bool = False
+
+
 CompareBucket = Literal["only_source", "only_target", "diff", "same"]
 
 

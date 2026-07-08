@@ -86,6 +86,7 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("GET", "/api/datasources/{datasource_id}/metadata/tables") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/columns") in routes
     assert ("GET", "/api/datasources/{datasource_id}/metadata/indexes") in routes
+    assert ("POST", "/api/datasources/{datasource_id}/ai/sql-generate") in routes
     assert ("GET", "/api/jobs") in routes
     assert ("GET", "/api/jobs/{job_id}") in routes
     assert ("GET", "/api/jobs/{job_id}/result") in routes
@@ -1379,6 +1380,87 @@ def test_compare_ai_attribution_disabled_degrades_without_profile_loss() -> None
     assert response.status_code == 200
     assert response.json()["error"] == "ai_disabled"
     assert response.json()["ok"] is False
+
+
+def test_ai_sql_generate_uses_l2_schema_context_and_audits() -> None:
+    columns_cache = _metadata_cache(
+        [
+            {
+                "name": "id",
+                "type": "integer",
+                "driver_type": "INT",
+                "nullable": False,
+                "primary_key": True,
+                "comment": "pk",
+            },
+            {
+                "name": "amount",
+                "type": "decimal",
+                "driver_type": "DECIMAL(10,2)",
+                "nullable": True,
+                "primary_key": False,
+                "comment": None,
+            },
+        ]
+    )
+    engine = _FakeEngine(
+        [
+            _datasource_row(),  # _datasource_for_current_user: datasources select
+            {"id": "project-1"},  # _require_project_access
+            _ai_config_row(),  # _ai_config_row_or_none
+            columns_cache,  # _metadata_columns_for_table cache read (no adapter)
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={
+            "natural_language": "sum of amount",
+            "schema_name": "app",
+            "table_names": ["users"],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    # MockProvider echoes "ok"; no ```sql fence → whole content is the SQL.
+    assert payload["sql"] == "ok"
+    assert payload["egress_level"] == 2
+    assert payload["tables_used"] == ["app.users"]
+    assert payload["truncated"] is False
+    assert any(audit["action"] == "ai_copilot_run" for audit in services.audits)
+    # No datasource adapter was built (metadata came from cache) and no row values leaked.
+    body = response.body.decode("utf-8")
+    assert "password" not in body
+
+
+def test_ai_sql_generate_disabled_returns_structured_409() -> None:
+    engine = _FakeEngine(
+        [
+            _datasource_row(),  # datasources select
+            {"id": "project-1"},  # _require_project_access
+            None,  # no ai_configs row → AI disabled
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={"natural_language": "list rows"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "ai_disabled"
+    assert any(
+        audit["action"] == "ai_copilot_run" and audit["result"] == "skipped"
+        for audit in services.audits
+    )
 
 
 def test_create_compare_export_enqueues_four_bucket_export_and_token() -> None:
