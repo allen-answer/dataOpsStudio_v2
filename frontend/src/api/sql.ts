@@ -119,6 +119,25 @@ export function explainSql(req: SqlExecuteRequest): Promise<SqlExecuteResponse> 
   })
 }
 
+export interface SqlPreflightFinding {
+  severity: 'warning' | 'info'
+  code: string
+  message: string
+}
+
+export interface SqlPreflightResponse {
+  findings: SqlPreflightFinding[]
+}
+
+/**
+ * POST /sql/preflight —— SQL 体检(C-11 advisory)。纯文本启发式,同步返回;
+ * 只提示不拦截、不连库、不入队。行数估算另走 explainSql(库内 EXPLAIN)。
+ * 源:app/api/routes/core.py preflight_sql + app/services/sql_preflight.py。
+ */
+export function preflightSql(sql: string): Promise<SqlPreflightResponse> {
+  return apiClient.post<SqlPreflightResponse>('/sql/preflight', { sql })
+}
+
 export function listSqlConsoles(): Promise<SqlConsole[]> {
   return apiClient.get<SqlConsole[]>('/sql/consoles')
 }

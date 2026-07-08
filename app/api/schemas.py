@@ -157,6 +157,21 @@ class SqlGenerateResponse(BaseModel):
     truncated: bool = False
 
 
+class SqlPreflightRequest(BaseModel):
+    # 体检只吃 SQL 文本(C-11 advisory,纯文本启发式,不连库、不入队)。
+    sql: str = Field(min_length=1)
+
+
+class SqlPreflightFinding(BaseModel):
+    severity: Literal["warning", "info"]
+    code: str
+    message: str  # 英文兜底;前端优先按 code 走 i18n。
+
+
+class SqlPreflightResponse(BaseModel):
+    findings: list[SqlPreflightFinding] = Field(default_factory=list)
+
+
 CompareBucket = Literal["only_source", "only_target", "diff", "same"]
 
 
@@ -307,6 +322,23 @@ class CompareTaskRunsResponse(BaseModel):
     offset: int
     has_more: bool
     runs: list[CompareTaskRunItem] = Field(default_factory=list)
+
+
+class CompareRunAbortReason(BaseModel):
+    # 非成功 run 的中止原因(取 jobs.error_code;缺失归 "unknown"),按次数倒序 top N。
+    reason: str
+    count: int
+
+
+class CompareRunsDashboardResponse(BaseModel):
+    # run_index 仪表盘(C-12):项目维度近 N 天聚合。磁盘字节 / 峰值 RSS 当前未落库
+    # (run_index 无该列),故本期只聚合 run 数 / 状态分布 / 成功率 / 中止 top 原因。
+    project_id: str
+    days: int
+    total_runs: int
+    status_counts: dict[str, int] = Field(default_factory=dict)
+    success_rate: float  # success / total,total=0 时为 0.0
+    top_abort_reasons: list[CompareRunAbortReason] = Field(default_factory=list)
 
 
 class ComparePreviewRequest(BaseModel):

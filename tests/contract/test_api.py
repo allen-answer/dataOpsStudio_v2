@@ -55,6 +55,7 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("DELETE", "/api/sql/templates/{template_id}") in routes
     assert ("POST", "/api/sql/templates/{template_id}/render") in routes
     assert ("POST", "/api/sql/explain") in routes
+    assert ("POST", "/api/sql/preflight") in routes
     assert ("POST", "/api/sql/format") in routes
     assert ("POST", "/api/sql/expand-star") in routes
     assert ("GET", "/api/compare/tasks") in routes
@@ -71,6 +72,7 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("POST", "/api/projects/{project_id}/compare/pk-precheck") in routes
     assert ("GET", "/api/projects/{project_id}/compare/suggest-tasks") in routes
     assert ("POST", "/api/projects/{project_id}/compare/draft-task") in routes
+    assert ("GET", "/api/projects/{project_id}/compare/runs-dashboard") in routes
     assert ("POST", "/api/projects/{project_id}/lineage/analyze") in routes
     assert ("GET", "/api/projects/{project_id}/lineage/subgraph") in routes
     assert ("GET", "/api/projects/{project_id}/lineage/impact") in routes
