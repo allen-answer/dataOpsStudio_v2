@@ -48,6 +48,8 @@ import {
   getLineageImpact,
   getLineageSubgraph,
   updateLineageEdge,
+  weightedLineageImpact,
+  type LineageAiImpactResponse,
   type LineageBatchFileEntry,
   type LineageBatchJobStatus,
   type LineageBatchReport,
@@ -492,6 +494,47 @@ const impactGroups = computed<[number, LineageImpactItem[]][]>(() => {
     else map.set(item.depth, [item])
   }
   return [...map.entries()].sort((a, b) => a[0] - b[0])
+})
+
+// ── C3 Copilot:AI 加权影响解读(叠加层,不阻塞基础影响清单)──────────
+const aiImpactBusy = ref(false)
+const aiImpactResult = ref<LineageAiImpactResponse | null>(null)
+
+async function runAiImpact(): Promise<void> {
+  const focus = impactData.value?.focus
+  if (!projectId.value || !focus || aiImpactBusy.value) return
+  aiImpactBusy.value = true
+  try {
+    aiImpactResult.value = await weightedLineageImpact(projectId.value, {
+      focus,
+      max_depth: impactData.value?.max_depth ?? impactDepth.value,
+    })
+  } catch (e) {
+    // AI 关闭 → 409 ai_disabled;统一降级为 ok:false 面板(基础清单不受影响)。
+    aiImpactResult.value = {
+      project_id: projectId.value,
+      focus,
+      max_depth: impactData.value?.max_depth ?? impactDepth.value,
+      window_days: 90,
+      ok: false,
+      error: e instanceof ApiError ? (e.code ?? errorMessage(e)) : errorMessage(e),
+      provider: null,
+      model: null,
+      egress_level: 2,
+      impact_count: impactData.value?.impact_count ?? 0,
+      degraded: false,
+      project_owner: null,
+      assessment: null,
+      signals: [],
+    }
+  } finally {
+    aiImpactBusy.value = false
+  }
+}
+
+// 换焦点重查基础影响时,清掉旧的 AI 解读(避免张冠李戴)。
+watch(impactData, () => {
+  aiImpactResult.value = null
 })
 
 // ── SQL 解析(analyze)──────────────────────────────────────────────
@@ -1314,6 +1357,76 @@ function errorMessage(e: unknown): string {
                 >
                   {{ path.join(' → ') }}
                 </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- C3 Copilot:AI 加权解读(叠加层,基础清单不受影响) -->
+          <div
+            v-if="impactData.impacts.length > 0"
+            class="border-t chrome-border-subtle pt-3 space-y-2"
+          >
+            <button
+              type="button"
+              class="chrome-btn-secondary text-sm"
+              :disabled="aiImpactBusy"
+              @click="runAiImpact"
+            >
+              <Sparkles class="w-3.5 h-3.5" :class="aiImpactBusy && 'animate-pulse'" />
+              {{ aiImpactBusy ? t('lineage.ai_impact_running') : t('lineage.ai_impact') }}
+            </button>
+            <p v-if="!aiImpactResult" class="text-[11px] chrome-text-muted max-w-xl">
+              {{ t('lineage.ai_impact_hint') }}
+            </p>
+
+            <div v-if="aiImpactResult">
+              <div
+                v-if="aiImpactResult.ok"
+                class="rounded-card border chrome-border p-3 space-y-2"
+              >
+                <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs chrome-text-muted">
+                  <span class="inline-flex items-center gap-1 chrome-accent">
+                    <Sparkles class="w-3 h-3" /> {{ t('lineage.ai_impact_result') }}
+                  </span>
+                  <span v-if="aiImpactResult.provider">
+                    {{ aiImpactResult.provider }}/{{ aiImpactResult.model }}
+                  </span>
+                  <span>{{ t('lineage.ai_egress', { level: aiImpactResult.egress_level }) }}</span>
+                  <span v-if="aiImpactResult.project_owner">
+                    {{ t('lineage.ai_impact_owner', { owner: aiImpactResult.project_owner }) }}
+                  </span>
+                </div>
+                <div
+                  v-if="aiImpactResult.degraded"
+                  class="flex items-center gap-2 rounded-card border border-amber-300 dark:border-amber-500/40 bg-amber-50 dark:bg-amber-500/10 p-2 text-xs text-amber-800 dark:text-amber-200"
+                >
+                  <AlertTriangle class="w-4 h-4 shrink-0" /> {{ t('lineage.ai_impact_degraded') }}
+                </div>
+                <div class="text-sm chrome-text-normal whitespace-pre-wrap">
+                  {{ aiImpactResult.assessment }}
+                </div>
+                <div v-if="aiImpactResult.signals.length > 0" class="pt-1">
+                  <div class="text-[10px] uppercase tracking-wider chrome-text-muted mb-1">
+                    {{ t('lineage.ai_impact_signals') }}
+                  </div>
+                  <div class="flex flex-wrap gap-1.5">
+                    <span
+                      v-for="sig in aiImpactResult.signals"
+                      :key="sig.node"
+                      class="rounded-full border chrome-border px-2 py-0.5 text-[11px] font-mono chrome-text-muted"
+                    >
+                      {{ sig.column ? `${sig.table}.${sig.column}` : sig.table }} ·
+                      {{ sig.ref_count > 0 ? t('lineage.ai_impact_refs', { count: sig.ref_count }) : t('lineage.ai_impact_never') }}
+                      <template v-if="sig.last_referenced_days_ago != null">
+                        · {{ t('lineage.ai_impact_last_seen', { days: sig.last_referenced_days_ago }) }}
+                      </template>
+                    </span>
+                  </div>
+                </div>
+              </div>
+              <div v-else class="flex items-center gap-2 text-xs chrome-text-muted">
+                <X class="w-4 h-4" /> {{ t('lineage.ai_impact_disabled') }}
+                <span v-if="aiImpactResult.error" class="font-mono">({{ aiImpactResult.error }})</span>
               </div>
             </div>
           </div>

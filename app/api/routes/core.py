@@ -17,7 +17,7 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy import Table as SqlaTable
-from sqlalchemy import and_, delete, func, insert, or_, select, text, update
+from sqlalchemy import and_, delete, func, insert, or_, select, text, union_all, update
 from sqlalchemy.engine import Connection, RowMapping
 from sqlglot import exp
 from sqlglot.errors import ParseError
@@ -67,6 +67,8 @@ from app.api.schemas import (
     JobResultResponse,
     LicenseStatusResponse,
     LineageAiFallbackResult,
+    LineageAiImpactRequest,
+    LineageAiImpactResponse,
     LineageAnalyzeRequest,
     LineageAnalyzeResponse,
     LineageBatchCreateRequest,
@@ -83,6 +85,7 @@ from app.api.schemas import (
     LineageExportRequest,
     LineageImpactItem,
     LineageImpactResponse,
+    LineageImpactSignal,
     LineageSubgraphEdge,
     LineageSubgraphNode,
     LineageSubgraphResponse,
@@ -2954,6 +2957,150 @@ def get_lineage_impact(
             focus=focus,
             max_depth=min(max_depth, 5),
         )
+
+
+@router.post(
+    "/projects/{project_id}/lineage/ai-impact",
+    response_model=LineageAiImpactResponse,
+)
+def weighted_lineage_impact(
+    project_id: str,
+    body: LineageAiImpactRequest,
+    request: Request,
+) -> LineageAiImpactResponse:
+    """C3 Copilot:加权影响分析(设计稿 §2.7.4,L2,提前交付)。
+
+    在基础影响分析(纯图下游遍历,复用 ``_lineage_impact_response``)之上叠加:
+    每个受影响资产近 ``window_days`` 天的引用频率 + 项目负责人 → AiGateway 出
+    加权排序清单 + 每项理由。全程 L2 出站(仅表/列名 + 聚合计数 + 深度 + 负责人
+    名,无行值、无 SQL 原文)。AI 关闭 → 409;gateway 故障 → ok=false 优雅降级
+    (确定性 signals 仍返回)。频率数据稀薄(全 0)→ degraded=true,AI 仅按深度加权。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    max_depth = min(body.max_depth, 5)
+
+    def _audit(result: str, detail: dict[str, object]) -> None:
+        _audit_business(
+            services,
+            request,
+            user_id=user.id,
+            project_id=project_id,
+            action="lineage_ai_impact",
+            resource_type="lineage_impact",
+            resource_id=body.focus,
+            result=result,
+            detail=detail,
+        )
+
+    # AI 配置先读:关闭直接 409(不跑图查询);审计 skipped。
+    try:
+        with services.engine.connect() as conn:
+            _require_project_access(conn, project_id, user.id)
+            ai_row = _ai_config_row_or_none(conn)
+        runtime = _ai_runtime_config(services, ai_row)
+    except ApiError:
+        raise
+    except Exception as exc:
+        _audit("failed", {"error": type(exc).__name__})
+        raise
+    if not runtime.enabled or runtime.provider in {None, "off"}:
+        _audit("skipped", {"error": "ai_disabled"})
+        raise ApiError(409, "ai_disabled", "AI inference is disabled")
+
+    with services.engine.connect() as conn:
+        impact = _lineage_impact_response(
+            conn,
+            project_id=project_id,
+            focus=body.focus,
+            max_depth=max_depth,
+        )
+        owner = _project_owner_username(conn, project_id)
+        signals = _lineage_impact_signals(
+            conn,
+            project_id=project_id,
+            impacts=impact.impacts,
+            window_days=body.window_days,
+        )
+    degraded = all(sig.ref_count == 0 for sig in signals)
+
+    # ★ L2 出站画像:只送名字 + 聚合计数 + 深度 + 负责人名;无行值、无 SQL 原文。
+    outbound = {
+        "focus": body.focus,
+        "window_days": body.window_days,
+        "project_owner": owner,
+        "frequency_available": not degraded,
+        "assets": [
+            {
+                "node": sig.node,
+                "table": sig.table,
+                "column": sig.column,
+                "depth": sig.depth,
+                "ref_count": sig.ref_count,
+                "source_ref_count": sig.source_ref_count,
+                "last_referenced_days_ago": sig.last_referenced_days_ago,
+            }
+            for sig in signals
+        ],
+    }
+    context = AiContext(
+        items=[
+            ContextItem(
+                content=json.dumps(
+                    outbound,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ),
+                egress_level=EgressLevel.L2,
+            )
+        ]
+    )
+    try:
+        response = build_gateway_from_runtime_config(runtime).complete(
+            _LINEAGE_AI_IMPACT_PROMPT,
+            context,
+            AiOptions(purpose="lineage_ai_impact", max_tokens=800),
+        )
+    except AiGatewayError as exc:
+        error = type(exc).__name__
+        _audit("failed", {"error": error})
+        return LineageAiImpactResponse(
+            project_id=project_id,
+            focus=body.focus,
+            max_depth=max_depth,
+            window_days=body.window_days,
+            ok=False,
+            error=error,
+            impact_count=impact.impact_count,
+            degraded=degraded,
+            project_owner=owner,
+            signals=signals,
+        )
+    _audit(
+        "success",
+        {
+            "provider": response.provider,
+            "impact_count": impact.impact_count,
+            "degraded": degraded,
+        },
+    )
+    return LineageAiImpactResponse(
+        project_id=project_id,
+        focus=body.focus,
+        max_depth=max_depth,
+        window_days=body.window_days,
+        ok=True,
+        assessment=response.content,
+        provider=response.provider,
+        model=response.model,
+        egress_level=int(EgressLevel.L2),
+        impact_count=impact.impact_count,
+        degraded=degraded,
+        project_owner=owner,
+        signals=signals,
+    )
 
 
 @router.post(
@@ -6261,6 +6408,135 @@ def _lineage_impact_response(
         impact_count=len(impacts),
         impacts=impacts,
     )
+
+
+_LINEAGE_AI_IMPACT_PROMPT = (
+    "You are a data lineage impact assistant. You are given a focus table/column, the "
+    "downstream assets it impacts, per-asset reference-frequency statistics over a "
+    "recent window, and the project owner — all as aggregate metadata (no row values, "
+    "no SQL text). Produce a WEIGHTED, RANKED impact assessment: order the impacted "
+    "assets by blast radius, combining graph proximity (smaller depth = higher) with "
+    "reference frequency (higher ref_count / more recent = higher). For each ranked "
+    "asset give a one-line reason citing its depth and frequency. If frequency data is "
+    "sparse (ref_count is 0 for most or all assets), say so explicitly and rank "
+    "primarily by depth, flagging lower confidence. Name the project owner as the "
+    "person to notify when it is provided. Use only the provided names and statistics; "
+    "never invent tables, columns, row values, or SQL. Be concise."
+)
+
+
+def _project_owner_username(conn: Connection, project_id: str) -> str | None:
+    """项目负责人(C3 的"负责人"维度)—— 无 per-asset owner,用项目 owner 兜底。"""
+    row = (
+        conn.execute(
+            select(users.c.username)
+            .select_from(projects.join(users, users.c.id == projects.c.owner_user_id))
+            .where(projects.c.id == project_id)
+        )
+        .mappings()
+        .one_or_none()
+    )
+    return str(row["username"]) if row is not None else None
+
+
+def _lineage_impact_signals(
+    conn: Connection,
+    *,
+    project_id: str,
+    impacts: list[LineageImpactItem],
+    window_days: int,
+) -> list[LineageImpactSignal]:
+    """给每个受影响资产附上引用频率画像(按表聚合;同表多列共享频率)。"""
+    tables = sorted({item.table for item in impacts})
+    freq = _lineage_table_reference_frequency(
+        conn,
+        project_id=project_id,
+        tables=tables,
+        window_days=window_days,
+    )
+    now = datetime.now(UTC)
+    signals: list[LineageImpactSignal] = []
+    for item in impacts:
+        stat = freq.get(item.table)
+        ref_count = 0
+        source_ref_count = 0
+        days_ago: int | None = None
+        if stat is not None:
+            ref_count = int(stat["ref_count"])
+            source_ref_count = int(stat["source_ref_count"])
+            last = stat["last_referenced_at"]
+            if isinstance(last, datetime):
+                days_ago = max((now - _as_utc(last)).days, 0)
+        signals.append(
+            LineageImpactSignal(
+                node=item.node,
+                table=item.table,
+                column=item.column,
+                depth=item.depth,
+                ref_count=ref_count,
+                source_ref_count=source_ref_count,
+                last_referenced_days_ago=days_ago,
+            )
+        )
+    return signals
+
+
+def _lineage_table_reference_frequency(
+    conn: Connection,
+    *,
+    project_id: str,
+    tables: list[str],
+    window_days: int,
+) -> dict[str, dict[str, Any]]:
+    """近 window_days 天引用频率(可行路径:锚血缘运行历史,非 jobs 表)。
+
+    一个表被一次 lineage_run 引用 = 该 run 的任一表级边以它为端点。按表聚合:
+    - ref_count:去重 sql_hash 数(引用该表的不同 SQL 语句数)
+    - source_ref_count:去重 source_ref 数(不同脚本/来源)
+    - last_referenced_at:最近一次运行时间
+    这是 C3 "运行频率" 维度在 2.4.0 既有数据面上可复现的信号;jobs 表不落
+    表级归属,重解析成本高,故不用(PR body 记为裁决项)。
+    """
+    if not tables:
+        return {}
+    window_start = datetime.now(UTC) - timedelta(days=window_days)
+    edge_refs = union_all(
+        select(
+            lineage_edges.c.source_table.label("table_name"),
+            lineage_edges.c.run_id.label("run_id"),
+        ).where(
+            and_(
+                lineage_edges.c.project_id == project_id,
+                lineage_edges.c.source_table.in_(tables),
+                lineage_edges.c.inference_status != "rejected",
+            )
+        ),
+        select(
+            lineage_edges.c.target_table.label("table_name"),
+            lineage_edges.c.run_id.label("run_id"),
+        ).where(
+            and_(
+                lineage_edges.c.project_id == project_id,
+                lineage_edges.c.target_table.in_(tables),
+                lineage_edges.c.inference_status != "rejected",
+            )
+        ),
+    ).subquery("edge_refs")
+    statement = (
+        select(
+            edge_refs.c.table_name,
+            func.count(func.distinct(lineage_runs.c.sql_hash)).label("ref_count"),
+            func.count(func.distinct(lineage_runs.c.source_ref)).label("source_ref_count"),
+            func.max(lineage_runs.c.created_at).label("last_referenced_at"),
+        )
+        .select_from(edge_refs.join(lineage_runs, lineage_runs.c.id == edge_refs.c.run_id))
+        .where(lineage_runs.c.created_at >= window_start)
+        .group_by(edge_refs.c.table_name)
+    )
+    return {
+        str(row["table_name"]): dict(row)
+        for row in conn.execute(statement).mappings().all()
+    }
 
 
 def _lineage_export_sheets(
