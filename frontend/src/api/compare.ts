@@ -179,6 +179,40 @@ export interface CompareInferResponse {
   columns: Column[]
 }
 
+// ── AI Copilot C2:残余列映射建议(egress L2 + 可选 L4 样本)──────────
+// 字段锚 app/api/schemas.py: CompareAiMapSuggestRequest / CompareAiMapSuggestResponse。
+export interface CompareAiMapSuggestRequest {
+  source_id: string
+  target_id: string
+  source_table: CompareTableRequest
+  target_table: CompareTableRequest
+  confirmed_mappings: Record<string, string>
+  include_samples: boolean
+}
+
+export interface CompareAiMapSuggestItem {
+  source_column: string
+  target_column: string
+  confidence: number
+  rationale: string | null
+}
+
+export interface CompareAiMapSuggestResponse {
+  ok: boolean
+  suggestions: CompareAiMapSuggestItem[]
+  provider: string | null
+  model: string | null
+  error: string | null
+  egress_level: number
+  history_available: boolean
+  history_count: number
+  samples_included: boolean
+  sample_skip_reason: string | null
+  residual_source_columns: string[]
+  residual_target_columns: string[]
+  truncated: boolean
+}
+
 // ── 任务建议(suggest-tasks)─────────────────────────────────────────
 export interface TablePairSuggestion {
   source_schema: string
@@ -451,6 +485,17 @@ export function getCompareRunsDashboard(
 ): Promise<CompareRunsDashboardResponse> {
   return apiClient.get<CompareRunsDashboardResponse>(
     `/projects/${encodeURIComponent(projectId)}/compare/runs-dashboard?days=${days}`,
+  )
+}
+
+/** POST /projects/{id}/compare/ai-map-suggest —— AI Copilot C2 残余列映射建议。 */
+export function aiMapSuggestCompare(
+  projectId: string,
+  req: CompareAiMapSuggestRequest,
+): Promise<CompareAiMapSuggestResponse> {
+  return apiClient.post<CompareAiMapSuggestResponse>(
+    `/projects/${projectId}/compare/ai-map-suggest`,
+    req,
   )
 }
 

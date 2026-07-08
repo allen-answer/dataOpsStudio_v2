@@ -397,6 +397,24 @@ export default {
     use_this_pk: 'Use this key',
     column_mappings: 'Column mappings',
     no_mappings: 'No column mappings inferred.',
+    ai_map_title: 'AI mapping suggestions (residual columns)',
+    ai_map_desc:
+      'For columns the rules could not map, AI suggests candidates from both schemas and your prior mapping decisions. Suggestions only — adopt them one by one; nothing is applied automatically.',
+    ai_map_samples_label: 'Include sample values (L4).',
+    ai_map_samples_hint:
+      'High risk: sends up to 20 sample rows of the residual columns to the AI provider. Off by default; requires administrator authorization.',
+    ai_map_run: 'Get AI suggestions',
+    ai_map_running: 'Asking AI…',
+    ai_map_no_history: 'No mapping history yet — suggesting from schema only.',
+    ai_map_empty: 'AI returned no confident residual-column mapping.',
+    ai_map_apply: 'Adopt this mapping',
+    ai_map_failed: 'AI could not produce mapping suggestions.',
+    ai_map_needs_tables: 'AI mapping needs both sides configured as tables.',
+    ai_map_l4_blocked:
+      'Sample values (L4) are not authorized for this deployment. Ask an administrator to enable L4 egress.',
+    ai_map_egress_blocked:
+      'AI egress policy blocked this request. Ask an administrator to raise the allowed egress level.',
+    ai_map_samples_skipped: 'Samples were not sent ({reason}); suggested from schema and history only.',
     confidence: 'confidence',
     conflict: 'conflict',
     source_col: 'Source column',
