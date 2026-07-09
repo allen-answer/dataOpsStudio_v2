@@ -127,6 +127,35 @@ def test_end_to_end_injection_defense_applied_by_writer() -> None:
     assert "'=cmd" in sheet_xml  # 前置撇号 → 文本,非公式
 
 
+def test_compare_xlsx_highlights_changed_diff_cells() -> None:
+    decoded = _decoded(
+        {"id": 1},
+        {"name": "old", "amount": 10},
+        {"name": "new", "amount": 10},
+        [{"column": "name", "source": "old", "target": "new"}],
+    )
+    columns = compare_export_columns(DIFF, ["id"], ["name", "amount"])
+    row = compare_export_row(DIFF, decoded, ["id"], ["name", "amount"])
+    stream = io.BytesIO()
+
+    write_xlsx_workbook(
+        stream=stream,
+        sheets=[(DIFF, columns, [row])],
+        limit_bytes=1024 * 1024,
+        compare_highlight=True,
+    )
+
+    stream.seek(0)
+    with zipfile.ZipFile(stream) as workbook:
+        styles_xml = workbook.read("xl/styles.xml").decode("utf-8")
+        sheet_xml = workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
+    assert 'fgColor rgb="FFFFF3C7"' in styles_xml
+    assert '<c r="B2" s="3" t="inlineStr">' in sheet_xml
+    assert '<c r="C2" s="3" t="inlineStr">' in sheet_xml
+    assert '<c r="D2"><v>10</v></c>' in sheet_xml
+    assert '<c r="E2"><v>10</v></c>' in sheet_xml
+
+
 def test_empty_bucket_still_gets_business_headers_from_run_schema() -> None:
     # 空桶无行,但据全 run schema(key=id,value=name)仍产出正确表头。
     columns = compare_export_columns(SAME, ["id"], ["name"])

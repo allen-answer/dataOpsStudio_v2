@@ -102,6 +102,20 @@ def test_openai_compatible_bad_response_raises_provider_error() -> None:
         provider.complete("hi", AiContext(), AiOptions())
 
 
+def test_openai_compatible_empty_content_raises_provider_error() -> None:
+    response: dict[str, object] = {
+        "model": "test-model",
+        "choices": [{"message": {"role": "assistant", "content": "   "}}],
+    }
+    transport = _FakeTransport(response)
+    provider = OpenAICompatibleProvider(
+        api_key="k", endpoint="https://x.invalid", model="m", transport=transport
+    )
+
+    with pytest.raises(ProviderError, match="empty"):
+        provider.complete("hi", AiContext(), AiOptions())
+
+
 def test_redactor_hook_is_called() -> None:
     """★ 脱敏钩子位:Gateway 主流程对每次放行调用确实调到 Redactor。"""
 

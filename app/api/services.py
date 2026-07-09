@@ -10,7 +10,7 @@ from sqlalchemy import URL, create_engine, delete, insert, select, update
 from sqlalchemy.engine import Engine
 
 from app.config import Settings, load_settings
-from app.db.models import audit_logs, license_state, revoked_tokens, users
+from app.db.models import audit_logs, license_state, revoked_tokens, system_settings, users
 from app.domain.license import LicenseMode
 from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
@@ -19,6 +19,11 @@ from app.infrastructure.secretstore.local_file import LocalFileSecretStore
 from app.observability.logging import configure_logging
 
 logger = structlog.get_logger(__name__)
+
+SETTING_ACCESS_TOKEN_TTL_SECONDS = "auth.access_token_ttl_seconds"
+SETTING_LICENSE_ENFORCEMENT_ENABLED = "license.enforcement_enabled"
+DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 3600
+DEFAULT_LICENSE_ENFORCEMENT_ENABLED = True
 
 
 @dataclass
@@ -57,6 +62,29 @@ class ApiServices:
     # 与 worker 推进器同源(Settings.worker.workflow_node_default_max_retries),
     # 避免状态展示与实际执行口径漂移。
     workflow_node_default_max_retries: int = 0
+
+    def access_token_ttl_seconds(self) -> int:
+        value = self._system_setting(SETTING_ACCESS_TOKEN_TTL_SECONDS)
+        if value is None:
+            return DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+        try:
+            ttl = int(value)
+        except ValueError:
+            return DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+        return ttl if 300 <= ttl <= 2_592_000 else DEFAULT_ACCESS_TOKEN_TTL_SECONDS
+
+    def license_enforcement_enabled(self) -> bool:
+        value = self._system_setting(SETTING_LICENSE_ENFORCEMENT_ENABLED)
+        if value is None:
+            return DEFAULT_LICENSE_ENFORCEMENT_ENABLED
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _system_setting(self, key: str) -> str | None:
+        with self.engine.connect() as conn:
+            value = conn.execute(
+                select(system_settings.c.value).where(system_settings.c.key == key)
+            ).scalar_one_or_none()
+        return str(value) if value is not None else None
 
     def current_license_mode(self) -> LicenseMode:
         with self.engine.connect() as conn:

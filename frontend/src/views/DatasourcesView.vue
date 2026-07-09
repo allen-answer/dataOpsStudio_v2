@@ -138,12 +138,11 @@ const policyOpen = ref(false) // 权限折叠面板默认收起
 // ─── inline 必填校验 ───────────────────────────────────────
 // 提交时静默无反应是 UX 走查 nit:点提交后缺失字段要逐项红框 + 行内提示。
 // 校验在提交时跑一次(submitAttempted 置位);此后用户修字段实时清错。
-type RequiredField = 'name' | 'host' | 'username' | 'database' | 'password'
+type RequiredField = 'name' | 'host' | 'username' | 'password'
 const fieldErrors = reactive<Record<RequiredField, boolean>>({
   name: false,
   host: false,
   username: false,
-  database: false,
   password: false,
 })
 const submitAttempted = ref(false)
@@ -156,7 +155,7 @@ function isFieldMissing(f: RequiredField): boolean {
 
 function validateRequired(): boolean {
   let ok = true
-  for (const f of ['name', 'host', 'username', 'database', 'password'] as RequiredField[]) {
+  for (const f of ['name', 'host', 'username', 'password'] as RequiredField[]) {
     const missing = isFieldMissing(f)
     fieldErrors[f] = missing
     if (missing) ok = false
@@ -287,7 +286,7 @@ const createMutation = useMutation({
       host: form.host.trim(),
       port: Number(form.port),
       username: form.username.trim(),
-      database: form.database.trim(),
+      database: form.database.trim() || null,
       password: form.password,
       environment: form.environment || 'sandbox',
       extra: {},
@@ -309,7 +308,7 @@ const updateMutation = useMutation({
       host: form.host.trim(),
       port: Number(form.port),
       username: form.username.trim(),
-      database: form.database.trim(),
+      database: form.database.trim() || null,
       // 密码留空 = 不改(后端 `if body.password:`);只在用户填了才下发。
       ...(form.password ? { password: form.password } : {}),
       environment: form.environment || 'unknown',
@@ -787,14 +786,10 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
             v-model="form.database"
             type="text"
             class="chrome-input w-full"
-            :class="{ 'field-invalid': fieldErrors.database }"
             :placeholder="t('datasources.field_database_placeholder')"
             :disabled="submitting"
             autocomplete="off"
           />
-          <p v-if="fieldErrors.database" class="field-error-text">
-            {{ t('datasources.field_required') }}
-          </p>
         </div>
 
         <!-- 密码(编辑时留空 = 不改)-->

@@ -4,7 +4,7 @@ import csv
 import json
 import math
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import date, datetime
 from datetime import time as dt_time
 from decimal import Decimal
@@ -15,6 +15,7 @@ from xml.sax.saxutils import escape
 from app.domain.schema import Column, Row
 
 ExportFormat = Literal["csv", "excel", "json", "sql"]
+XlsxCellStyleResolver = Callable[[str, int, int, list[object]], int | None]
 
 FORMULA_PREFIXES = ("=", "+", "-", "@")
 
@@ -69,6 +70,7 @@ def write_xlsx_workbook(
     stream: BinaryIO,
     sheets: Iterable[tuple[str, list[Column], Iterable[Row]]],
     limit_bytes: int,
+    compare_highlight: bool = False,
 ) -> int:
     if limit_bytes <= 0:
         raise ValueError("limit_bytes must be positive")
@@ -79,7 +81,8 @@ def write_xlsx_workbook(
     if not normalized_sheets:
         normalized_sheets.append(("Result", [Column(name="value")], []))
     writer = _LimitedBinaryWriter(stream, limit_bytes)
-    _write_xlsx_sheets(writer, normalized_sheets)
+    style_resolver = _compare_cell_style if compare_highlight else None
+    _write_xlsx_sheets(writer, normalized_sheets, cell_style_resolver=style_resolver)
     return writer.bytes_written
 
 
@@ -164,6 +167,8 @@ def _write_xlsx(
 def _write_xlsx_sheets(
     writer: _LimitedBinaryWriter,
     sheets: list[tuple[str, list[Column], Iterable[Row]]],
+    *,
+    cell_style_resolver: XlsxCellStyleResolver | None = None,
 ) -> None:
     with zipfile.ZipFile(cast(Any, writer), mode="w", compression=zipfile.ZIP_DEFLATED) as workbook:
         workbook.writestr("[Content_Types].xml", _content_types_xml(len(sheets)))
@@ -171,18 +176,30 @@ def _write_xlsx_sheets(
         workbook.writestr("xl/workbook.xml", _workbook_xml([name for name, _, _ in sheets]))
         workbook.writestr("xl/_rels/workbook.xml.rels", _workbook_rels_xml(len(sheets)))
         workbook.writestr("xl/styles.xml", _STYLES_XML)
-        for sheet_index, (_, columns, rows) in enumerate(sheets, start=1):
+        for sheet_index, (sheet_name, columns, rows) in enumerate(sheets, start=1):
             with workbook.open(f"xl/worksheets/sheet{sheet_index}.xml", mode="w") as sheet:
                 sheet.write(
                     b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
                     b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
                     b"<sheetData>"
                 )
-                _write_xlsx_row(sheet, 1, [column.name for column in columns])
+                _write_xlsx_row(
+                    sheet,
+                    1,
+                    [column.name for column in columns],
+                    sheet_name=sheet_name,
+                    cell_style_resolver=cell_style_resolver,
+                )
                 width = len(columns)
                 row_number = 2
                 for row in rows:
-                    _write_xlsx_row(sheet, row_number, _padded_values(row, width))
+                    _write_xlsx_row(
+                        sheet,
+                        row_number,
+                        _padded_values(row, width),
+                        sheet_name=sheet_name,
+                        cell_style_resolver=cell_style_resolver,
+                    )
                     row_number += 1
                 sheet.write(b"</sheetData></worksheet>")
 
@@ -249,25 +266,70 @@ def _xml_attr(value: str) -> str:
     return escape(value, {'"': "&quot;", "'": "&apos;"})
 
 
-def _write_xlsx_row(sheet: IO[bytes], row_number: int, values: list[object]) -> None:
+def _write_xlsx_row(
+    sheet: IO[bytes],
+    row_number: int,
+    values: list[object],
+    *,
+    sheet_name: str = "Result",
+    cell_style_resolver: XlsxCellStyleResolver | None = None,
+) -> None:
     sheet.write(f'<row r="{row_number}">'.encode())
     for index, value in enumerate(values, start=1):
         ref = f"{_column_letter(index)}{row_number}"
-        sheet.write(_xlsx_cell_xml(ref, value).encode("utf-8"))
+        style = (
+            cell_style_resolver(sheet_name, row_number, index, values)
+            if cell_style_resolver is not None
+            else None
+        )
+        sheet.write(_xlsx_cell_xml(ref, value, style=style).encode("utf-8"))
     sheet.write(b"</row>")
 
 
-def _xlsx_cell_xml(ref: str, value: object) -> str:
+def _xlsx_cell_xml(ref: str, value: object, *, style: int | None = None) -> str:
+    style_attr = f' s="{style}"' if style is not None else ""
     if value is None:
-        return f'<c r="{ref}"/>'
+        return f'<c r="{ref}"{style_attr}/>'
     if isinstance(value, bool):
-        return f'<c r="{ref}" t="b"><v>{1 if value else 0}</v></c>'
+        return f'<c r="{ref}"{style_attr} t="b"><v>{1 if value else 0}</v></c>'
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         number = float(value)
         if math.isfinite(number):
-            return f'<c r="{ref}"><v>{value}</v></c>'
+            return f'<c r="{ref}"{style_attr}><v>{value}</v></c>'
     text = sanitize_formula_text(_text_value(value))
-    return f'<c r="{ref}" t="inlineStr"><is><t>{escape(text)}</t></is></c>'
+    return f'<c r="{ref}"{style_attr} t="inlineStr"><is><t>{escape(text)}</t></is></c>'
+
+
+def _compare_cell_style(
+    sheet_name: str,
+    row_number: int,
+    column_index: int,
+    values: list[object],
+) -> int | None:
+    if row_number <= 1:
+        return None
+    if sheet_name == "only_source":
+        return 1
+    if sheet_name == "only_target":
+        return 2
+    if sheet_name != "diff":
+        return None
+    key_width = _compare_diff_key_width(values)
+    if column_index <= key_width:
+        return None
+    relative = column_index - key_width - 1
+    pair_start = key_width + (relative // 2) * 2
+    if pair_start + 1 >= len(values):
+        return None
+    return 3 if values[pair_start] != values[pair_start + 1] else None
+
+
+def _compare_diff_key_width(values: list[object]) -> int:
+    for width in range(1, len(values) + 1):
+        tail_width = len(values) - width
+        if tail_width > 0 and tail_width % 2 == 0:
+            return width
+    return 0
 
 
 def _column_letter(index: int) -> str:
@@ -426,9 +488,23 @@ _STYLES_XML = (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
     '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
-    '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
+    '<fills count="5">'
+    '<fill><patternFill patternType="none"/></fill>'
+    '<fill><patternFill patternType="gray125"/></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFFFE2E2"/>'
+    '<bgColor indexed="64"/></patternFill></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFDCFCE7"/>'
+    '<bgColor indexed="64"/></patternFill></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFFFF3C7"/>'
+    '<bgColor indexed="64"/></patternFill></fill>'
+    "</fills>"
     '<borders count="1"><border/></borders>'
     '<cellStyleXfs count="1"><xf/></cellStyleXfs>'
-    '<cellXfs count="1"><xf xfId="0"/></cellXfs>'
+    '<cellXfs count="4">'
+    '<xf xfId="0"/>'
+    '<xf xfId="0" fillId="2" applyFill="1"/>'
+    '<xf xfId="0" fillId="3" applyFill="1"/>'
+    '<xf xfId="0" fillId="4" applyFill="1"/>'
+    "</cellXfs>"
     "</styleSheet>"
 )

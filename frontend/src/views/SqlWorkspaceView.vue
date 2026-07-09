@@ -114,7 +114,7 @@ const PAGE_SIZE = 1000
 const POLL_MS = 500
 const SAVE_DEBOUNCE_MS = 650
 // db2 后端 adapter 已具备执行能力,但 GA 决策维持 Preview,放开执行需单独 PR 人拍板。
-const SUPPORTED_EXECUTION_DB_TYPES = new Set(['mysql', 'dm', 'postgresql'])
+const SUPPORTED_EXECUTION_DB_TYPES = new Set(['mysql', 'dm', 'postgresql', 'db2'])
 // EXPLAIN / expand-star 依赖 sqlglot 方言 + 元数据缓存,与执行同口径(mysql / dm / postgresql)。
 const SUPPORTED_TOOL_DB_TYPES = new Set(['mysql', 'dm', 'postgresql'])
 const EXPORT_FORMATS: ExportFormat[] = ['csv', 'excel', 'json', 'sql']

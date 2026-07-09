@@ -21,6 +21,7 @@ import {
   Tags,
   ArrowLeft,
   ShieldCheck,
+  Settings,
 } from 'lucide-vue-next'
 import { useAuthStore } from '../stores/auth'
 import UserMenu from '../components/UserMenu.vue'
@@ -46,6 +47,7 @@ const items = computed<AdminNavItem[]>(() => [
   { name: 'license', routeName: 'admin-license', icon: KeyRound },
   { name: 'audit', routeName: 'admin-audit', icon: ScrollText },
   { name: 'ai_config', routeName: 'admin-ai-config', icon: Bot },
+  { name: 'settings', routeName: 'admin-settings', icon: Settings },
   // ─── 卡后端:无端点,不建假页面(见 PR 描述)───
   { name: 'scheduler', icon: CalendarClock, blockedReason: t('admin.nav_blocked_no_endpoint') },
   { name: 'aspects', icon: Tags, blockedReason: t('admin.nav_blocked_no_endpoint') },

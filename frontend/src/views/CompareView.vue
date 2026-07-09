@@ -1704,13 +1704,88 @@ function taskSideLabel(task: CompareTaskResponse, side: RefSide): string {
 }
 
 function fmtCell(value: unknown): string {
-  if (value === null || value === undefined) return '∅'
+  if (value === null || value === undefined) return '<NULL>'
+  if (typeof value === 'string') {
+    if (value.length === 0) return '<EMPTY>'
+    return value
+      .replace(/ /g, '␠')
+      .replace(/\u00a0/g, '<NBSP>')
+      .replace(/\t/g, '<TAB>')
+      .replace(/\r/g, '<CR>')
+      .replace(/\n/g, '<LF>')
+  }
   if (typeof value === 'object') return JSON.stringify(value)
   return String(value)
 }
 
+function rawCellTitle(value: unknown): string {
+  if (value === null || value === undefined) return 'type=null; value=<NULL>'
+  if (typeof value === 'string') {
+    const codes = Array.from(value)
+      .slice(0, 32)
+      .map((ch) => ch.charCodeAt(0).toString(16).padStart(4, '0'))
+      .join(' ')
+    return 'type=string; length=' + value.length + '; raw=' + JSON.stringify(value) + '; charCodes=' + codes
+  }
+  return 'type=' + typeof value + '; value=' + fmtCell(value)
+}
+
+function diffReason(cell: { source?: unknown; target?: unknown } | undefined): string {
+  if (!cell) return ''
+  const source = cell.source
+  const target = cell.target
+  if (source === target) return 'strict equal'
+  if ((source === null || source === undefined) && target === '') return 'NULL vs empty string'
+  if (source === '' && (target === null || target === undefined)) return 'empty string vs NULL'
+  if (source === null || source === undefined || target === null || target === undefined) return 'NULL mismatch'
+  if (typeof source !== typeof target) return 'type mismatch: ' + typeof source + ' vs ' + typeof target
+  if (typeof source === 'string' && typeof target === 'string') {
+    if (source.trim() === target.trim()) return 'leading/trailing whitespace differs'
+    if (source.replace(/\s/g, '') === target.replace(/\s/g, '')) return 'whitespace differs'
+    if (source.toLowerCase() === target.toLowerCase()) return 'case differs'
+    return 'string differs: length ' + source.length + ' vs ' + target.length
+  }
+  if (String(source) === String(target)) return 'same text, different stored value/type'
+  return 'value differs'
+}
 function cellDiffFor(row: CompareResultRow, column: string) {
   return row.cells.find((c) => c.column === column)
+}
+
+function resultRowStyle(): Record<string, string> | undefined {
+  if (resultBucket.value === 'only_source' || resultBucket.value === 'only_target') {
+    return {
+      backgroundColor: 'rgb(254 226 226)',
+      boxShadow: 'inset 4px 0 0 rgb(220 38 38)',
+    }
+  }
+  return undefined
+}
+
+function resultKeyCellStyle(): Record<string, string> | undefined {
+  if (resultBucket.value === 'only_source' || resultBucket.value === 'only_target') {
+    return {
+      backgroundColor: 'rgb(254 226 226)',
+      color: 'rgb(127 29 29)',
+    }
+  }
+  return undefined
+}
+
+function resultValueCellStyle(row: CompareResultRow, column: string): Record<string, string> | undefined {
+  if (resultBucket.value === 'diff' && cellDiffFor(row, column)) {
+    return {
+      backgroundColor: 'rgb(254 202 202)',
+      boxShadow: 'inset 0 0 0 1px rgb(248 113 113)',
+    }
+  }
+  if (resultBucket.value === 'only_source' || resultBucket.value === 'only_target') {
+    return {
+      backgroundColor: 'rgb(254 226 226)',
+      color: 'rgb(127 29 29)',
+    }
+  }
+  return undefined
 }
 
 function diffRatePct(rate: number | undefined): number {
@@ -1729,6 +1804,17 @@ function formatDate(iso: string | null): string {
 function errorMessage(e: unknown): string {
   if (e instanceof ApiError) return e.message || t('common.error_unknown')
   return t('common.error_unknown')
+}
+
+function aiAttributionText(value: string | null | undefined): string {
+  return value?.trim() ?? ''
+}
+
+function aiFailureMessage(error: string | null | undefined): string {
+  if (error === 'ai_disabled') return t('compare.ai_disabled')
+  if (error === 'no_diff_profile') return '没有可用于归因的差异画像。'
+  if (error === 'ProviderError') return 'AI 服务没有返回有效内容，请重试或检查模型配置。'
+  return error ? 'AI 归因失败：' + error : t('compare.ai_disabled')
 }
 
 const profileColumns = computed(() => {
@@ -2913,36 +2999,46 @@ const missingTarget = computed(
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="(row, ri) in resultData.rows" :key="ri" class="border-t chrome-border-subtle align-top">
+                <tr
+                    v-for="(row, ri) in resultData.rows"
+                    :key="ri"
+                    class="border-t chrome-border-subtle align-top"
+                    :style="resultRowStyle()"
+                  >
                   <td
                     v-for="kc in keyColumns"
                     :key="`k-${ri}-${kc}`"
                     class="px-3 py-2 font-mono chrome-text-heading sticky left-0 chrome-bg-panel border-r chrome-border"
+                    :style="resultKeyCellStyle()"
                   >
-                    {{ fmtCell(row.pk[kc]) }}
+                    <span :title="rawCellTitle(row.pk[kc])">{{ fmtCell(row.pk[kc]) }}</span>
                   </td>
                   <td
                     v-for="col in visibleColumns"
                     :key="`c-${ri}-${col}`"
                     class="px-3 py-2 font-mono"
+                    :style="resultValueCellStyle(row, col)"
                   >
                     <!-- diff 桶:有 cell 差异 → 上下分裂(红删 / 绿增);否则单行 -->
                     <template v-if="resultBucket === 'diff' && cellDiffFor(row, col)">
-                      <div class="text-red-600 dark:text-red-400 line-through">
-                        {{ fmtCell(cellDiffFor(row, col)?.source) }}
+                      <div class="mb-1 text-[10px] font-semibold uppercase tracking-wide text-red-800 dark:text-red-200">
+                        {{ diffReason(cellDiffFor(row, col)) }}
                       </div>
-                      <div class="text-emerald-600 dark:text-emerald-400">
-                        {{ fmtCell(cellDiffFor(row, col)?.target) }}
+                      <div class="text-red-600 dark:text-red-400 line-through" :title="rawCellTitle(cellDiffFor(row, col)?.source)">
+                        S: {{ fmtCell(cellDiffFor(row, col)?.source) }}
+                      </div>
+                      <div class="text-red-700 dark:text-red-300 font-semibold" :title="rawCellTitle(cellDiffFor(row, col)?.target)">
+                        T: {{ fmtCell(cellDiffFor(row, col)?.target) }}
                       </div>
                     </template>
                     <template v-else-if="resultBucket === 'only_source'">
-                      <span class="chrome-text-heading">{{ fmtCell(row.source?.[col]) }}</span>
+                      <span class="chrome-text-heading" :title="rawCellTitle(row.source?.[col])">{{ fmtCell(row.source?.[col]) }}</span>
                     </template>
                     <template v-else-if="resultBucket === 'only_target'">
-                      <span class="chrome-text-heading">{{ fmtCell(row.target?.[col]) }}</span>
+                      <span class="chrome-text-heading" :title="rawCellTitle(row.target?.[col])">{{ fmtCell(row.target?.[col]) }}</span>
                     </template>
                     <template v-else>
-                      <span class="chrome-text-muted">{{ fmtCell(row.source?.[col] ?? row.target?.[col]) }}</span>
+                      <span class="chrome-text-muted" :title="rawCellTitle(row.source?.[col] ?? row.target?.[col])">{{ fmtCell(row.source?.[col] ?? row.target?.[col]) }}</span>
                     </template>
                   </td>
                 </tr>
@@ -3039,11 +3135,11 @@ const missingTarget = computed(
                     <span v-if="aiResult.provider"> · {{ aiResult.provider }}/{{ aiResult.model }}</span>
                     · {{ t('compare.ai_egress', { level: aiResult.egress_level }) }}
                   </div>
-                  {{ aiResult.attribution }}
+                  <template v-if="aiAttributionText(aiResult.attribution)">{{ aiAttributionText(aiResult.attribution) }}</template>
+                  <div v-else class="text-xs text-red-600 dark:text-red-400">AI 服务没有返回归因内容，请重试或检查模型配置。</div>
                 </div>
                 <div v-else class="flex items-center gap-2 text-xs chrome-text-muted">
-                  <X class="w-4 h-4" /> {{ t('compare.ai_disabled') }}
-                  <span v-if="aiResult.error" class="font-mono">({{ aiResult.error }})</span>
+                  <X class="w-4 h-4" /> {{ aiFailureMessage(aiResult.error) }}
                 </div>
               </div>
             </div>
