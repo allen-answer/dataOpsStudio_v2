@@ -144,6 +144,9 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
     def _check_license(self, request: Request) -> Response | None:
         if request.url.path in _PUBLIC_PATHS:
             return None
+        license_enabled = getattr(self._services, "license_enforcement_enabled", None)
+        if callable(license_enabled) and not license_enabled():
+            return None
         mode = self._services.current_license_mode()
         if mode is LicenseMode.REPAIR and _is_repair_restricted(request):
             return error_response(

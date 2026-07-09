@@ -170,7 +170,29 @@ const testMutation = useMutation({
 })
 async function onTest(): Promise<void> {
   testResult.value = null
+  saveError.value = null
+  if (blockedByUnsupported.value) {
+    testResult.value = {
+      ok: false,
+      provider: form.provider,
+      model: form.model || null,
+      latency_ms: 0,
+      error: 'unsupported_provider',
+    }
+    return
+  }
+  if (form.enabled && form.provider === 'openai_compatible' && !form.base_url.trim()) {
+    testResult.value = {
+      ok: false,
+      provider: form.provider,
+      model: form.model || null,
+      latency_ms: 0,
+      error: 'missing_provider_config',
+    }
+    return
+  }
   try {
+    await saveMutation.mutateAsync()
     await testMutation.mutateAsync()
   } catch (e) {
     // 非结构化错误(如 403):合成一个失败结果展示。

@@ -902,6 +902,16 @@ result_sets = Table(
 # ─────────────────────────────────────────────────────────────────────────────
 # license_state —— singleton(只一行 id=1)
 # ─────────────────────────────────────────────────────────────────────────────
+system_settings = Table(
+    "system_settings",
+    metadata,
+    Column("key", String(128), primary_key=True),
+    Column("value", Text(), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+)
+
+
 license_state = Table(
     "license_state",
     metadata,
@@ -976,6 +986,7 @@ __all__ = [
     "secret_refs",
     "sql_consoles",
     "sql_templates",
+    "system_settings",
     "uploads",
     "users",
     "workflow_templates",

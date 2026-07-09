@@ -79,7 +79,7 @@ class DatasourceConnInfo(BaseModel):
     host: str = Field(min_length=1)
     port: int = Field(ge=1, le=65535)
     username: str = Field(min_length=1)
-    database: str = Field(min_length=1)
+    database: str | None = Field(default=None, min_length=1)
     password_ref: SecretRef
     db_type: DbType
     extra: dict[str, Any] = Field(default_factory=dict)

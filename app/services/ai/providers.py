@@ -162,6 +162,8 @@ def _parse_chat_completion(
     content = message.get("content") if isinstance(message, dict) else None
     if not isinstance(content, str):
         raise ProviderError("provider response content not a string")
+    if not content.strip():
+        raise ProviderError("provider response content is empty")
 
     usage_raw = payload.get("usage")
     usage = usage_raw if isinstance(usage_raw, dict) else {}
