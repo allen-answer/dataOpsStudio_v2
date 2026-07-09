@@ -133,7 +133,17 @@ def test_login_uses_admin_configured_access_token_ttl() -> None:
 
 
 def test_admin_system_settings_roundtrip_updates_auth_and_license_flags() -> None:
-    engine = _FakeEngine([[], None, None, [_setting_row("auth.access_token_ttl_seconds", "86400"), _setting_row("license.enforcement_enabled", "false")]])
+    engine = _FakeEngine(
+        [
+            [],
+            None,
+            None,
+            [
+                _setting_row("auth.access_token_ttl_seconds", "86400"),
+                _setting_row("license.enforcement_enabled", "false"),
+            ],
+        ]
+    )
     services = _Services(engine)
     app = create_app(services=cast(ApiServices, services))
 

@@ -183,11 +183,23 @@ def _write_xlsx_sheets(
                     b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
                     b"<sheetData>"
                 )
-                _write_xlsx_row(sheet, 1, [column.name for column in columns], sheet_name=sheet_name, cell_style_resolver=cell_style_resolver)
+                _write_xlsx_row(
+                    sheet,
+                    1,
+                    [column.name for column in columns],
+                    sheet_name=sheet_name,
+                    cell_style_resolver=cell_style_resolver,
+                )
                 width = len(columns)
                 row_number = 2
                 for row in rows:
-                    _write_xlsx_row(sheet, row_number, _padded_values(row, width), sheet_name=sheet_name, cell_style_resolver=cell_style_resolver)
+                    _write_xlsx_row(
+                        sheet,
+                        row_number,
+                        _padded_values(row, width),
+                        sheet_name=sheet_name,
+                        cell_style_resolver=cell_style_resolver,
+                    )
                     row_number += 1
                 sheet.write(b"</sheetData></worksheet>")
 
@@ -288,7 +300,12 @@ def _xlsx_cell_xml(ref: str, value: object, *, style: int | None = None) -> str:
     return f'<c r="{ref}"{style_attr} t="inlineStr"><is><t>{escape(text)}</t></is></c>'
 
 
-def _compare_cell_style(sheet_name: str, row_number: int, column_index: int, values: list[object]) -> int | None:
+def _compare_cell_style(
+    sheet_name: str,
+    row_number: int,
+    column_index: int,
+    values: list[object],
+) -> int | None:
     if row_number <= 1:
         return None
     if sheet_name == "only_source":
@@ -474,9 +491,12 @@ _STYLES_XML = (
     '<fills count="5">'
     '<fill><patternFill patternType="none"/></fill>'
     '<fill><patternFill patternType="gray125"/></fill>'
-    '<fill><patternFill patternType="solid"><fgColor rgb="FFFFE2E2"/><bgColor indexed="64"/></patternFill></fill>'
-    '<fill><patternFill patternType="solid"><fgColor rgb="FFDCFCE7"/><bgColor indexed="64"/></patternFill></fill>'
-    '<fill><patternFill patternType="solid"><fgColor rgb="FFFFF3C7"/><bgColor indexed="64"/></patternFill></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFFFE2E2"/>'
+    '<bgColor indexed="64"/></patternFill></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFDCFCE7"/>'
+    '<bgColor indexed="64"/></patternFill></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FFFFF3C7"/>'
+    '<bgColor indexed="64"/></patternFill></fill>'
     '</fills>'
     '<borders count="1"><border/></borders>'
     '<cellStyleXfs count="1"><xf/></cellStyleXfs>'

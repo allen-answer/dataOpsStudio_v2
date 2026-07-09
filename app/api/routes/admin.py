@@ -34,9 +34,9 @@ from app.api.schemas import (
     AuditLogItem,
     LicenseStatusResponse,
     LicenseUploadRequest,
+    ProjectResponse,
     SystemSettingsResponse,
     SystemSettingsUpdateRequest,
-    ProjectResponse,
 )
 from app.api.services import ApiServices
 from app.db.models import (
