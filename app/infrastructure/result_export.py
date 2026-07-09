@@ -497,7 +497,7 @@ _STYLES_XML = (
     '<bgColor indexed="64"/></patternFill></fill>'
     '<fill><patternFill patternType="solid"><fgColor rgb="FFFFF3C7"/>'
     '<bgColor indexed="64"/></patternFill></fill>'
-    '</fills>'
+    "</fills>"
     '<borders count="1"><border/></borders>'
     '<cellStyleXfs count="1"><xf/></cellStyleXfs>'
     '<cellXfs count="4">'
@@ -505,6 +505,6 @@ _STYLES_XML = (
     '<xf xfId="0" fillId="2" applyFill="1"/>'
     '<xf xfId="0" fillId="3" applyFill="1"/>'
     '<xf xfId="0" fillId="4" applyFill="1"/>'
-    '</cellXfs>'
+    "</cellXfs>"
     "</styleSheet>"
 )
