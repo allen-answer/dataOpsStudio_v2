@@ -103,7 +103,7 @@ def test_openai_compatible_bad_response_raises_provider_error() -> None:
 
 
 def test_openai_compatible_empty_content_raises_provider_error() -> None:
-    response = {
+    response: dict[str, object] = {
         "model": "test-model",
         "choices": [{"message": {"role": "assistant", "content": "   "}}],
     }
