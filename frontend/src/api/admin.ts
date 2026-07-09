@@ -18,6 +18,8 @@ import type {
   AuditLogFilters,
   AuditLogItem,
   LicenseStatus,
+  SystemSettingsResponse,
+  SystemSettingsUpdateRequest,
 } from './types'
 
 // ─── License ───────────────────────────────────────────────────────────
@@ -34,6 +36,17 @@ export function getAdminLicense(): Promise<LicenseStatus> {
 /** admin 上传 / 替换 license 文件文本(签名验证后落库)。 */
 export function putAdminLicense(licenseText: string): Promise<LicenseStatus> {
   return apiClient.put<LicenseStatus>('/admin/license', { license_text: licenseText })
+}
+
+// ─── System settings ──────────────────────────────────────────────────
+export function getSystemSettings(): Promise<SystemSettingsResponse> {
+  return apiClient.get<SystemSettingsResponse>('/admin/system-settings')
+}
+
+export function putSystemSettings(
+  req: SystemSettingsUpdateRequest,
+): Promise<SystemSettingsResponse> {
+  return apiClient.put<SystemSettingsResponse>('/admin/system-settings', req)
 }
 
 // ─── Users ─────────────────────────────────────────────────────────────

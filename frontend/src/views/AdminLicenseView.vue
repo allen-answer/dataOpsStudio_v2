@@ -13,7 +13,7 @@
 import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query'
-import { KeyRound, AlertTriangle, CheckCircle2, Clock, ShieldAlert, Upload } from 'lucide-vue-next'
+import { KeyRound, AlertTriangle, CheckCircle2, Clock, ShieldAlert, Upload, Clipboard, Download, FileText } from 'lucide-vue-next'
 import { getAdminLicense, putAdminLicense } from '../api/admin'
 import { ApiError, type LicenseStatus } from '../api/types'
 import LoadingDots from '../components/LoadingDots.vue'
@@ -29,6 +29,25 @@ const mode = computed(() => status.value?.mode ?? null)
 const licenseText = ref('')
 const uploadError = ref<string | null>(null)
 const uploadOk = ref(false)
+const templateOk = ref(false)
+
+const LICENSE_TEMPLATE = JSON.stringify(
+  {
+    payload: {
+      edition: 'enterprise',
+      customer: 'example-customer',
+      expires_at: '2027-12-31T23:59:59Z',
+      features: ['sql_workspace', 'compare', 'lineage', 'workflow'],
+      limits: {
+        users: 20,
+        datasources: 50,
+      },
+    },
+    signature: '<signature>',
+  },
+  null,
+  2,
+)
 
 const uploadMutation = useMutation({
   mutationFn: () => putAdminLicense(licenseText.value),
@@ -61,6 +80,26 @@ async function onFile(event: Event): Promise<void> {
   if (!file) return
   licenseText.value = await file.text()
   input.value = ''
+}
+
+function fillTemplate(): void {
+  licenseText.value = LICENSE_TEMPLATE
+}
+
+async function copyTemplate(): Promise<void> {
+  await navigator.clipboard.writeText(LICENSE_TEMPLATE)
+  templateOk.value = true
+  setTimeout(() => (templateOk.value = false), 2500)
+}
+
+function downloadTemplate(): void {
+  const blob = new Blob([LICENSE_TEMPLATE], { type: 'application/json;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = 'license-template.json'
+  a.click()
+  URL.revokeObjectURL(url)
 }
 
 // ─── 展示 ─────────────────────────────────────────────────
@@ -138,6 +177,13 @@ function errorMessage(): string {
           </div>
         </div>
 
+        <div
+          v-if="!status.license_enforcement_enabled"
+          class="mb-4 border border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 rounded-card px-3 py-2 text-sm text-amber-700 dark:text-amber-300"
+        >
+          {{ t('admin.license.enforcement_disabled') }}
+        </div>
+
         <dl class="grid grid-cols-2 gap-x-6 gap-y-2.5 text-sm">
           <div class="flex justify-between gap-4 border-b chrome-border-subtle pb-2">
             <dt class="chrome-text-muted">{{ t('admin.license.edition') }}</dt>
@@ -176,6 +222,24 @@ function errorMessage(): string {
           <h2 class="text-section font-semibold chrome-text-heading">{{ t('admin.license.upload_title') }}</h2>
         </div>
         <p class="text-sm chrome-text-muted mb-3">{{ t('admin.license.upload_hint') }}</p>
+
+        <div class="flex flex-wrap gap-2 mb-3">
+          <button type="button" class="chrome-btn-secondary" @click="fillTemplate">
+            <FileText class="w-3.5 h-3.5" />
+            {{ t('admin.license.template_fill') }}
+          </button>
+          <button type="button" class="chrome-btn-secondary" @click="copyTemplate">
+            <Clipboard class="w-3.5 h-3.5" />
+            {{ t('admin.license.template_copy') }}
+          </button>
+          <button type="button" class="chrome-btn-secondary" @click="downloadTemplate">
+            <Download class="w-3.5 h-3.5" />
+            {{ t('admin.license.template_download') }}
+          </button>
+          <span v-if="templateOk" class="text-xs text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-1 px-1">
+            <CheckCircle2 class="w-3.5 h-3.5" /> {{ t('admin.license.template_copied') }}
+          </span>
+        </div>
 
         <div class="space-y-3">
           <label class="chrome-btn-secondary cursor-pointer inline-flex">

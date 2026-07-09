@@ -35,6 +35,8 @@ from app.api.schemas import (
     LicenseStatusResponse,
     LicenseUploadRequest,
     ProjectResponse,
+    SystemSettingsResponse,
+    SystemSettingsUpdateRequest,
 )
 from app.api.services import ApiServices
 from app.db.models import (
@@ -46,6 +48,7 @@ from app.db.models import (
     mfa_recovery_codes,
     project_members,
     projects,
+    system_settings,
     users,
 )
 from app.domain.ai import AiContext, AiOptions
@@ -59,6 +62,11 @@ from app.services.ai import (
 )
 
 router = APIRouter(prefix="/admin")
+
+_SETTING_ACCESS_TOKEN_TTL_SECONDS = "auth.access_token_ttl_seconds"
+_SETTING_LICENSE_ENFORCEMENT_ENABLED = "license.enforcement_enabled"
+_DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 3600
+_DEFAULT_LICENSE_ENFORCEMENT_ENABLED = True
 
 
 @router.get("/license", response_model=LicenseStatusResponse)
@@ -85,6 +93,61 @@ def put_admin_license(body: LicenseUploadRequest, request: Request) -> LicenseSt
         user_id=user.id,
     )
     return _current_license_response(services)
+
+
+@router.get("/system-settings", response_model=SystemSettingsResponse)
+def get_admin_system_settings(request: Request) -> SystemSettingsResponse:
+    _require_admin(request)
+    return _system_settings_response(services_from(request))
+
+
+@router.put("/system-settings", response_model=SystemSettingsResponse)
+def put_admin_system_settings(
+    body: SystemSettingsUpdateRequest,
+    request: Request,
+) -> SystemSettingsResponse:
+    actor = _require_admin(request)
+    services = services_from(request)
+    with services.engine.begin() as conn:
+        existing_keys = {
+            str(row["key"])
+            for row in conn.execute(
+                select(system_settings.c.key).where(
+                    system_settings.c.key.in_(
+                        [
+                            _SETTING_ACCESS_TOKEN_TTL_SECONDS,
+                            _SETTING_LICENSE_ENFORCEMENT_ENABLED,
+                        ]
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        }
+        values = {
+            _SETTING_ACCESS_TOKEN_TTL_SECONDS: str(body.access_token_ttl_seconds),
+            _SETTING_LICENSE_ENFORCEMENT_ENABLED: (
+                "true" if body.license_enforcement_enabled else "false"
+            ),
+        }
+        for key, value in values.items():
+            _upsert_system_setting(conn, existing_keys=existing_keys, key=key, value=value)
+    _audit_admin(
+        services,
+        request,
+        action="admin_system_settings_update",
+        resource_type="system_settings",
+        resource_id="global",
+        user_id=actor.id,
+        detail={
+            "access_token_ttl_seconds": body.access_token_ttl_seconds,
+            "license_enforcement_enabled": body.license_enforcement_enabled,
+        },
+    )
+    return SystemSettingsResponse(
+        access_token_ttl_seconds=body.access_token_ttl_seconds,
+        license_enforcement_enabled=body.license_enforcement_enabled,
+    )
 
 
 @router.get("/users", response_model=list[AdminUserItem])
@@ -556,6 +619,74 @@ def _update_ai_secret_ref(
         )
         return old_ref
     return services.secret_store.store_secret(body.api_key, SecretKind.AI_API_KEY).ref
+
+
+def _system_settings_response(services: ApiServices) -> SystemSettingsResponse:
+    with services.engine.connect() as conn:
+        rows = (
+            conn.execute(
+                select(system_settings.c.key, system_settings.c.value).where(
+                    system_settings.c.key.in_(
+                        [
+                            _SETTING_ACCESS_TOKEN_TTL_SECONDS,
+                            _SETTING_LICENSE_ENFORCEMENT_ENABLED,
+                        ]
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
+    values = {str(row["key"]): str(row["value"]) for row in rows}
+    return SystemSettingsResponse(
+        access_token_ttl_seconds=_int_setting(
+            values.get(_SETTING_ACCESS_TOKEN_TTL_SECONDS),
+            _DEFAULT_ACCESS_TOKEN_TTL_SECONDS,
+        ),
+        license_enforcement_enabled=_bool_setting(
+            values.get(_SETTING_LICENSE_ENFORCEMENT_ENABLED),
+            _DEFAULT_LICENSE_ENFORCEMENT_ENABLED,
+        ),
+    )
+
+
+def _upsert_system_setting(
+    conn: Connection,
+    *,
+    existing_keys: set[str],
+    key: str,
+    value: str,
+) -> None:
+    now = datetime.now(UTC)
+    if key in existing_keys:
+        conn.execute(
+            update(system_settings)
+            .where(system_settings.c.key == key)
+            .values(value=value, updated_at=now)
+        )
+        return
+    conn.execute(insert(system_settings).values(key=key, value=value, updated_at=now))
+
+
+def _int_setting(value: str | None, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if 300 <= parsed <= 2_592_000 else default
+
+
+def _bool_setting(value: str | None, default: bool) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _ai_config_row_or_none(conn: Connection) -> RowMapping | None:

@@ -70,7 +70,7 @@ export interface DatasourceCreateRequest {
   host: string
   port: number
   username: string
-  database: string
+  database: string | null
   password: string
   environment?: string
   extra?: Record<string, unknown>
@@ -89,7 +89,7 @@ export interface DatasourceUpdateRequest {
   host?: string
   port?: number
   username?: string
-  database?: string
+  database?: string | null
   password?: string
   environment?: string
   extra?: Record<string, unknown>
@@ -230,6 +230,17 @@ export interface LicenseStatus {
   features: string[]
   repair_reason: string | null
   trial_days_remaining: number | null
+  license_enforcement_enabled: boolean
+}
+
+export interface SystemSettingsResponse {
+  access_token_ttl_seconds: number
+  license_enforcement_enabled: boolean
+}
+
+export interface SystemSettingsUpdateRequest {
+  access_token_ttl_seconds: number
+  license_enforcement_enabled: boolean
 }
 
 /** GET /api/admin/users → AdminUserItem。 */

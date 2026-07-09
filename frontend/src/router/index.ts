@@ -19,6 +19,7 @@ const AdminProjectsView = () => import('../views/AdminProjectsView.vue')
 const AdminAuditLogsView = () => import('../views/AdminAuditLogsView.vue')
 const AdminLicenseView = () => import('../views/AdminLicenseView.vue')
 const AdminAiConfigView = () => import('../views/AdminAiConfigView.vue')
+const AdminSystemSettingsView = () => import('../views/AdminSystemSettingsView.vue')
 
 const routes: RouteRecordRaw[] = [
   {
@@ -95,6 +96,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'license', name: 'admin-license', component: AdminLicenseView },
       { path: 'audit-logs', name: 'admin-audit', component: AdminAuditLogsView },
       { path: 'ai-config', name: 'admin-ai-config', component: AdminAiConfigView },
+      { path: 'settings', name: 'admin-settings', component: AdminSystemSettingsView },
     ],
   },
   {

@@ -11,7 +11,7 @@ from fastapi.routing import APIRoute
 
 from app.api.app import create_app
 from app.api.routes import core as core_routes
-from app.api.security import create_access_token
+from app.api.security import create_access_token, decode_access_token
 from app.api.services import ApiServices
 from app.dbclients.protocol import AdapterConnectionError
 from app.domain.ai import AiResponse
@@ -112,6 +112,72 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("GET", "/api/admin/ai-config") in routes
     assert ("PUT", "/api/admin/ai-config") in routes
     assert ("POST", "/api/admin/ai-config/test") in routes
+    assert ("GET", "/api/admin/system-settings") in routes
+    assert ("PUT", "/api/admin/system-settings") in routes
+
+
+def test_login_uses_admin_configured_access_token_ttl() -> None:
+    engine = _FakeEngine([_user_row_for_login()])
+    services = _Services(engine, access_token_ttl_seconds=86_400)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/auth/login",
+        json_body={"username": "admin", "password": "secret"},
+    )
+
+    assert response.status_code == 200
+    token = response.json()["access_token"]
+    claims = decode_access_token(token, secret=services.jwt_secret)
+    assert claims.expires_at - claims.issued_at == 86_400
+
+
+def test_admin_system_settings_roundtrip_updates_auth_and_license_flags() -> None:
+    engine = _FakeEngine(
+        [
+            [],
+            None,
+            None,
+            [
+                _setting_row("auth.access_token_ttl_seconds", "86400"),
+                _setting_row("license.enforcement_enabled", "false"),
+            ],
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/admin/system-settings",
+        headers=_auth_headers(),
+        json_body={"access_token_ttl_seconds": 86_400, "license_enforcement_enabled": False},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["access_token_ttl_seconds"] == 86_400
+    assert payload["license_enforcement_enabled"] is False
+    assert any(audit["action"] == "admin_system_settings_update" for audit in services.audits)
+
+
+def test_license_status_includes_enforcement_flag_from_system_settings() -> None:
+    row = {
+        "id": 1,
+        "mode": "trial",
+        "edition": None,
+        "customer": None,
+        "expires_at": _dt(1),
+        "features": [],
+        "repair_reason": None,
+    }
+    services = _Services(_FakeEngine([row]), license_enforcement_enabled=False)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).get("/api/license/status", headers=_auth_headers())
+
+    assert response.status_code == 200
+    assert response.json()["license_enforcement_enabled"] is False
 
 
 def test_list_datasources_filters_by_authz_and_hides_secret_fields() -> None:
@@ -389,6 +455,35 @@ def test_update_datasource_keeps_password_when_blank_and_returns_policy() -> Non
     assert "secret-old" not in response.body.decode("utf-8")
     assert any("UPDATE datasources" in statement for statement in engine.statements)
     assert any(audit["action"] == "datasource_update" for audit in services.audits)
+
+
+def test_update_datasource_clears_database_when_null_is_sent() -> None:
+    cleared_row = _datasource_row()
+    cleared_row["database_name"] = None
+    engine = _FakeEngine(
+        [
+            _datasource_row(password_secret_ref="secret-old"),
+            {"id": "project-1"},
+            cleared_row,
+            {"id": "project-1"},
+        ]
+    )
+    services = _Services(engine, secret_store=_SecretStore())
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/datasources/ds-1",
+        headers=_auth_headers(),
+        json_body={"database": None},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["database"] is None
+    update_stmt = next(stmt for stmt in engine.executed if "UPDATE datasources" in str(stmt))
+    compiled = update_stmt.compile()
+    assert "database_name" in compiled.params
+    assert compiled.params["database_name"] is None
 
 
 def test_update_datasource_rotates_password_when_new_value_present() -> None:
@@ -5087,6 +5182,20 @@ def _workflow_row() -> dict[str, object]:
     }
 
 
+def _setting_row(key: str, value: str) -> dict[str, object]:
+    return {"key": key, "value": value, "updated_at": _dt(1)}
+
+
+def _user_row_for_login() -> dict[str, object]:
+    return {
+        "id": "user-1",
+        "username": "admin",
+        "role": "admin",
+        "password_hash": "hash",
+        "mfa_secret_ref": None,
+    }
+
+
 def _auth_headers(user_id: str = "user-1") -> dict[str, str]:
     token = create_access_token(user_id=user_id, role="admin", secret=_Services.jwt_secret)
     return {"Authorization": f"Bearer {token}"}
@@ -5234,6 +5343,8 @@ class _Services:
         download_url_ttl_seconds: int = 300,
         upload_max_mb: int = 100,
         workflow_node_default_max_retries: int = 0,
+        access_token_ttl_seconds: int = 3600,
+        license_enforcement_enabled: bool = True,
     ) -> None:
         self.engine = engine
         self.rate_limiter = _RateLimiter()
@@ -5245,7 +5356,15 @@ class _Services:
         self.download_url_ttl_seconds = download_url_ttl_seconds
         self.upload_max_mb = upload_max_mb
         self.workflow_node_default_max_retries = workflow_node_default_max_retries
+        self._access_token_ttl_seconds = access_token_ttl_seconds
+        self._license_enforcement_enabled = license_enforcement_enabled
         self.audits: list[dict[str, object]] = []
+
+    def access_token_ttl_seconds(self) -> int:
+        return self._access_token_ttl_seconds
+
+    def license_enforcement_enabled(self) -> bool:
+        return self._license_enforcement_enabled
 
     def current_license_mode(self) -> LicenseMode:
         return LicenseMode.TRIAL
@@ -5439,6 +5558,10 @@ class _SecretStore:
     def __init__(self) -> None:
         self.stored: list[str] = []
         self.deleted: list[str] = []
+
+    def verify_password(self, plaintext: str, ref: object) -> bool:
+        del ref
+        return plaintext == "secret"
 
     def store_secret(self, plaintext: str, kind: object) -> object:
         self.stored.append(plaintext)

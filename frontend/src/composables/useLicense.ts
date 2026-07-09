@@ -30,13 +30,14 @@ export function useLicense() {
   const isInGrace = computed(() => mode.value === 'in_grace')
   const isExpired = computed(() => mode.value === 'expired')
   const isTrial = computed(() => mode.value === 'trial')
+  const enforcementEnabled = computed(() => status.value?.license_enforcement_enabled ?? true)
 
   /** 是否应阻止普通写操作(REPAIR 全锁;IN_GRACE 部分锁)。横条/按钮共用。 */
-  const writesBlocked = computed(() => isRepair.value || isInGrace.value)
+  const writesBlocked = computed(() => enforcementEnabled.value && (isRepair.value || isInGrace.value))
 
   /** 横条是否显示(VALID 不显示)。 */
   const showBanner = computed(
-    () => mode.value != null && mode.value !== 'valid',
+    () => enforcementEnabled.value && mode.value != null && mode.value !== 'valid',
   )
 
   return {
@@ -47,6 +48,7 @@ export function useLicense() {
     isInGrace,
     isExpired,
     isTrial,
+    enforcementEnabled,
     writesBlocked,
     showBanner,
   }

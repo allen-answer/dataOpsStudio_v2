@@ -831,6 +831,7 @@ class WorkerRunner:
                 stream=binary_stream,
                 sheets=sheets,
                 limit_bytes=limit_bytes,
+                compare_highlight=True,
             )
             binary_stream.seek(0)
             result_ref = self._result_store.put_export_artifact(job.id, filename, binary_stream)
@@ -1864,15 +1865,11 @@ class PostgresDatasourceLoader:
         if row is None:
             raise LookupError(f"Datasource not found: {datasource_id}")
 
-        database_name = row["database_name"]
-        if database_name is None:
-            raise ValueError(f"Datasource database_name is required: {datasource_id}")
-
         return DatasourceConnInfo(
             host=str(row["host"]),
             port=int(row["port"]),
             username=str(row["username"]),
-            database=str(database_name),
+            database=str(row["database_name"]) if row["database_name"] is not None else None,
             password_ref=SecretRef(
                 ref=str(row["password_secret_ref"]),
                 kind=SecretKind.DATASOURCE_PASSWORD,

@@ -41,7 +41,7 @@ class DatasourceCreateRequest(BaseModel):
     host: str = Field(min_length=1)
     port: int = Field(ge=1, le=65535)
     username: str = Field(min_length=1)
-    database: str = Field(min_length=1)
+    database: str | None = Field(default=None, min_length=1)
     password: str = Field(min_length=1)
     environment: str = "dev"
     extra: dict[str, Any] = Field(default_factory=dict)
@@ -70,7 +70,7 @@ class DatasourceResponse(BaseModel):
     host: str
     port: int
     username: str
-    database: str
+    database: str | None = None
     environment: str
     extra: dict[str, Any] = Field(default_factory=dict)
     operation_policy: OperationPolicy = Field(default_factory=OperationPolicy)
@@ -1063,6 +1063,16 @@ class SqlTemplateRenderResponse(BaseModel):
     sql_text: str
 
 
+class SystemSettingsResponse(BaseModel):
+    access_token_ttl_seconds: int = Field(ge=300, le=2_592_000)
+    license_enforcement_enabled: bool
+
+
+class SystemSettingsUpdateRequest(BaseModel):
+    access_token_ttl_seconds: int = Field(ge=300, le=2_592_000)
+    license_enforcement_enabled: bool
+
+
 class LicenseStatusResponse(BaseModel):
     mode: str
     edition: str | None = None
@@ -1072,6 +1082,7 @@ class LicenseStatusResponse(BaseModel):
     features: list[str] = Field(default_factory=list)
     repair_reason: str | None = None
     trial_days_remaining: int | None = None
+    license_enforcement_enabled: bool = True
 
 
 class LicenseUploadRequest(BaseModel):

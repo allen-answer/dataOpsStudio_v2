@@ -591,6 +591,7 @@ def login(body: LoginRequest, request: Request) -> TokenResponse:
         user_id=str(row["id"]),
         role=str(row["role"]),
         secret=services.jwt_secret,
+        ttl_seconds=_access_token_ttl_seconds(services),
     )
     _audit_business(
         services,
@@ -642,6 +643,7 @@ def list_projects(request: Request) -> list[ProjectResponse]:
 def create_datasource(body: DatasourceCreateRequest, request: Request) -> DatasourceResponse:
     services = services_from(request)
     user = current_user_from(request)
+    database_name = _optional_stripped(body.database)
     with services.engine.begin() as conn:
         _require_project_access(conn, body.project_id, user.id)
         secret_ref = services.secret_store.store_secret(
@@ -658,7 +660,7 @@ def create_datasource(body: DatasourceCreateRequest, request: Request) -> Dataso
                 host=body.host,
                 port=body.port,
                 username=body.username,
-                database_name=body.database,
+                database_name=database_name,
                 password_secret_ref=secret_ref.ref,
                 environment=body.environment,
                 capability_profile=body.extra,
@@ -684,7 +686,7 @@ def create_datasource(body: DatasourceCreateRequest, request: Request) -> Dataso
         host=body.host,
         port=body.port,
         username=body.username,
-        database=body.database,
+        database=database_name,
         environment=body.environment,
         extra=body.extra,
         operation_policy=body.operation_policy,
@@ -770,8 +772,8 @@ def update_datasource(
             values["port"] = body.port
         if body.username is not None:
             values["username"] = body.username
-        if body.database is not None:
-            values["database_name"] = body.database
+        if "database" in body.model_fields_set:
+            values["database_name"] = _optional_stripped(body.database)
         if body.environment is not None:
             values["environment"] = body.environment
         if body.extra is not None:
@@ -6041,7 +6043,11 @@ def get_license_status(request: Request) -> LicenseStatusResponse:
             .one_or_none()
         )
     if row is None:
-        return LicenseStatusResponse(mode="trial", trial_days_remaining=30)
+        return LicenseStatusResponse(
+            mode="trial",
+            trial_days_remaining=30,
+            license_enforcement_enabled=_license_enforcement_enabled(services),
+        )
 
     expires_at = row["expires_at"] if isinstance(row["expires_at"], datetime) else None
     mode = str(row["mode"])
@@ -6053,6 +6059,7 @@ def get_license_status(request: Request) -> LicenseStatusResponse:
         features=list(row["features"] or []),
         repair_reason=_optional_str(row["repair_reason"]),
         trial_days_remaining=_trial_days_remaining(mode, expires_at),
+        license_enforcement_enabled=_license_enforcement_enabled(services),
     )
 
 
@@ -6292,13 +6299,11 @@ def _metadata_adapter(services: ApiServices, datasource_row: RowMapping) -> Data
 
 def _datasource_conn_info(row: RowMapping) -> DatasourceConnInfo:
     database_name = row["database_name"]
-    if database_name is None:
-        raise ApiError(400, "invalid_datasource", "Datasource database is required")
     return DatasourceConnInfo(
         host=str(row["host"]),
         port=int(row["port"]),
         username=str(row["username"]),
-        database=str(database_name),
+        database=str(database_name) if database_name is not None else None,
         password_ref=SecretRef(
             ref=str(row["password_secret_ref"]),
             kind=SecretKind.DATASOURCE_PASSWORD,
@@ -8256,7 +8261,7 @@ def _datasource_response(row: RowMapping) -> DatasourceResponse:
         host=str(row["host"]),
         port=int(row["port"]),
         username=str(row["username"]),
-        database=str(row["database_name"]),
+        database=_optional_str(row["database_name"]),
         environment=str(row["environment"]),
         extra=dict(row["capability_profile"] or {}),
         operation_policy=OperationPolicy.model_validate(row["operation_policy"] or {}),
@@ -8562,6 +8567,23 @@ def _columns_from_manifest(manifest: dict[str, Any] | None) -> list[Column]:
 
 def _optional_str(value: object) -> str | None:
     return str(value) if value is not None else None
+
+
+def _access_token_ttl_seconds(services: ApiServices) -> int:
+    method = getattr(services, "access_token_ttl_seconds", None)
+    return int(method()) if callable(method) else 3600
+
+
+def _license_enforcement_enabled(services: ApiServices) -> bool:
+    method = getattr(services, "license_enforcement_enabled", None)
+    return bool(method()) if callable(method) else True
+
+
+def _optional_stripped(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 
 def _trial_days_remaining(mode: str, expires_at: datetime | None) -> int | None:

@@ -102,6 +102,7 @@ def test_metadata_has_26_tables() -> None:
         "sql_consoles",
         "sql_templates",
         "metadata_caches",
+        "system_settings",
         "license_state",
         "lineage_ai_enrichments",  # 0022:L-7 整份报告 AI 解读(纯追加)
         "lineage_column_edges",
