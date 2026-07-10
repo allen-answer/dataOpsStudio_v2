@@ -78,6 +78,12 @@ from app.domain.compare_result import (
     empty_bucket_counts,
     encode_compare_result_row,
 )
+from app.domain.compare_sql import (
+    CompareSqlProjectionError,
+    inspect_compare_sql,
+    legacy_generated_aliases,
+    normalize_compare_sql,
+)
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.lineage import (
@@ -871,6 +877,17 @@ class WorkerRunner:
 
         source_ref = _payload_compare_data_ref(payload, "source_ref")
         target_ref = _payload_compare_data_ref(payload, "target_ref")
+        configured_names = [column.name for column in columns]
+        for data_ref in (source_ref, target_ref):
+            sql = data_ref.get("sql") if data_ref.get("kind") == "sql" else None
+            if not isinstance(sql, str):
+                continue
+            try:
+                projections = inspect_compare_sql(sql)
+            except CompareSqlProjectionError:
+                continue
+            if legacy_generated_aliases(configured_names, projections):
+                raise CompareSqlProjectionError("stale_generated_aliases")
         # 文件侧(C-1)天然走"客户端哈希 + 全量物化",不下推/不分段/不流式:
         # 任一侧 file 即整体走内存全量 diff(也解决跨类型/无序问题)。
         file_mode = source_ref.get("kind") == "file" or target_ref.get("kind") == "file"
@@ -3279,6 +3296,10 @@ def _compare_table_expression(db_type: DbType, data_ref: dict[str, object]) -> s
         sql = data_ref.get("sql")
         if not isinstance(sql, str) or not sql.strip():
             raise ValueError("sql compare ref requires sql")
+        try:
+            sql = normalize_compare_sql(sql, db_type).sql
+        except CompareSqlProjectionError:
+            pass
         return f"({sql}) DATAOPS_COMPARE_SOURCE"
     table_name = data_ref.get("table_name")
     if not isinstance(table_name, str) or not table_name:
