@@ -541,7 +541,7 @@ def test_admin_ai_config(request: Request) -> AdminAiConfigTestResponse:
         response = gateway.complete(
             "ping",
             AiContext(),
-            AiOptions(purpose="admin_ai_config_test", max_tokens=8),
+            AiOptions(purpose="admin_ai_config_test", max_tokens=256),
         )
     except AiGatewayError as exc:
         result = _ai_test_response(runtime, started, ok=False, error=type(exc).__name__)

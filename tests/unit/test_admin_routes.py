@@ -3,9 +3,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, cast
 
+import pytest
+
 from app.api.app import create_app
 from app.api.security import create_access_token
 from app.api.services import ApiServices
+from app.domain.ai import AiContext, AiOptions, AiResponse
 from app.domain.license import LicenseMode
 from app.domain.secret import SecretKind, SecretRef
 from tests._asgi_client import AsgiClient
@@ -180,7 +183,32 @@ def test_admin_put_ai_config_rejects_disabling_l4_optin() -> None:
     assert services.secret_store.stored == []
 
 
-def test_admin_ai_config_test_uses_mock_provider_and_audits() -> None:
+def test_admin_ai_config_test_uses_reasoning_safe_budget_and_audits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_max_tokens: list[int | None] = []
+
+    class _Gateway:
+        def complete(
+            self,
+            prompt: str,
+            context: AiContext,
+            options: AiOptions,
+        ) -> AiResponse:
+            del prompt, context
+            captured_max_tokens.append(options.max_tokens)
+            return AiResponse(
+                content="pong",
+                tokens_in=1,
+                tokens_out=1,
+                provider="mock",
+                model="mock-model",
+            )
+
+    monkeypatch.setattr(
+        "app.api.routes.admin.build_gateway_from_runtime_config",
+        lambda runtime: _Gateway(),
+    )
     services = _AdminServices(_QueueEngine([[_ai_config_row(provider="mock")]]))
     app = create_app(services=cast(ApiServices, services))
     token = create_access_token(user_id="admin-1", role="admin", secret=services.jwt_secret)
@@ -195,6 +223,7 @@ def test_admin_ai_config_test_uses_mock_provider_and_audits() -> None:
     assert payload["ok"] is True
     assert payload["provider"] == "mock"
     assert payload["error"] is None
+    assert captured_max_tokens == [256]
     assert any(item["action"] == "admin_ai_config_test" for item in services.audits)
 
 
