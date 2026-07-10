@@ -1035,6 +1035,60 @@ def test_compare_preview_returns_bounded_rows(monkeypatch: pytest.MonkeyPatch) -
     assert any(audit["action"] == "compare_preview" for audit in services.audits)
 
 
+def test_compare_preview_generates_alias_metadata_for_unaliased_expression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_sql: list[str] = []
+
+    class _PreviewAdapter:
+        def __init__(self, column_sink: Callable[[list[Column]], None]) -> None:
+            self._column_sink = column_sink
+
+        def execute_select(self, sql: str, params: dict[str, object]) -> Iterator[Row]:
+            del params
+            captured_sql.append(sql)
+            self._column_sink(
+                [
+                    Column(name="CUST_NO", type=ColumnType.STRING),
+                    Column(name="RESULT_1", type=ColumnType.DECIMAL),
+                ]
+            )
+            yield Row(values=["C1", 3])
+
+    monkeypatch.setattr(
+        core_routes,
+        "build_database_adapter",
+        lambda conn_info, secret_store, **kwargs: _PreviewAdapter(kwargs["column_sink"]),
+    )
+    datasource_row = _datasource_row(operation_policy=_policy(allow_select=True))
+    datasource_row["db_type"] = "db2"
+    datasource_row["port"] = 50000
+    engine = _FakeEngine([{"id": "project-1"}, datasource_row])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/preview",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "ref": {
+                "kind": "sql",
+                "sql": "SELECT CUST_NO, SUM(AMOUNT) FROM T GROUP BY CUST_NO",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert "AS RESULT_1" in captured_sql[0].upper()
+    assert response.json()["columns"] == ["CUST_NO", "RESULT_1"]
+    assert response.json()["column_details"][1] == {
+        "name": "RESULT_1",
+        "generated": True,
+        "projection_index": 2,
+        "expression": "SUM(AMOUNT)",
+    }
+
+
 def test_compare_preview_rejects_non_readonly_sql() -> None:
     engine = _FakeEngine(
         [
@@ -1131,6 +1185,47 @@ def test_compare_pk_precheck_reports_duplicates_and_nulls(
     assert any("COUNT(*)" in sql and "`id` IS NULL" in sql for sql in captured_sql)
     assert any("DISTINCT `id`" in sql for sql in captured_sql)
     assert any(audit["action"] == "compare_pk_precheck" for audit in services.audits)
+
+
+def test_compare_pk_precheck_uses_generated_alias_for_sql_expression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_sql: list[str] = []
+
+    class _PrecheckAdapter:
+        def execute_select(self, sql: str, params: dict[str, object]) -> Iterator[Row]:
+            del params
+            captured_sql.append(sql)
+            yield Row(values=[1]) if "DISTINCT" in sql else Row(values=[1, 0])
+
+    monkeypatch.setattr(
+        core_routes,
+        "build_database_adapter",
+        lambda conn_info, secret_store, **kwargs: _PrecheckAdapter(),
+    )
+    datasource_row = _datasource_row(operation_policy=_policy(allow_select=True))
+    datasource_row["db_type"] = "db2"
+    datasource_row["port"] = 50000
+    app = create_app(
+        services=cast(
+            ApiServices,
+            _Services(_FakeEngine([{"id": "project-1"}, datasource_row])),
+        )
+    )
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/pk-precheck",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "ref": {"kind": "sql", "sql": "SELECT SUM(AMOUNT) FROM T"},
+            "key_columns": ["RESULT_1"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(captured_sql) == 2
+    assert all("SUM(AMOUNT) AS RESULT_1" in sql.upper() for sql in captured_sql)
 
 
 def test_compare_pk_precheck_rejects_file_source() -> None:
@@ -1467,6 +1562,87 @@ def test_compare_task_run_enqueues_compare_job_and_run_index() -> None:
     }
     assert any("INSERT INTO run_index" in statement for statement in engine.statements)
     assert any(audit["action"] == "compare_run" for audit in services.audits)
+
+
+def test_compare_sql_task_response_includes_projection_details() -> None:
+    task_row = _sql_compare_task_row()
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            [
+                {"id": "ds-source", "project_id": "project-1"},
+                {"id": "ds-target", "project_id": "project-1"},
+            ],
+            task_row,
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/compare/tasks",
+        headers=_auth_headers(),
+        json_body={
+            "project_id": "project-1",
+            "name": "aggregate compare",
+            "source_id": "ds-source",
+            "target_id": "ds-target",
+            "source_ref": task_row["source_ref"],
+            "target_ref": task_row["target_ref"],
+            "columns": task_row["columns"],
+            "compare_rules": task_row["compare_rules"],
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["source_ref"]["sql"] == task_row["source_ref"]["sql"]
+    assert payload["source_projection_details"][-1]["name"] == "RESULT_1"
+    assert payload["target_projection_details"][-1]["generated"] is True
+
+
+def test_compare_task_run_rejects_proven_legacy_numeric_aliases() -> None:
+    task_row = _sql_compare_task_row(legacy_numeric=True)
+    job_backend = _JobBackend()
+    app = create_app(
+        services=cast(
+            ApiServices,
+            _Services(
+                _FakeEngine([task_row, {"id": "project-1"}]),
+                job_backend=job_backend,
+            ),
+        )
+    )
+
+    response = AsgiClient(app).post(
+        "/api/compare/tasks/task-1/run",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "compare_sql_aliases_stale"
+    assert job_backend.enqueued == []
+
+
+def test_compare_task_run_allows_explicit_numeric_alias() -> None:
+    task_row = _sql_compare_task_row(explicit_numeric=True)
+    job_backend = _JobBackend()
+    app = create_app(
+        services=cast(
+            ApiServices,
+            _Services(
+                _FakeEngine([task_row, {"id": "project-1"}]),
+                job_backend=job_backend,
+            ),
+        )
+    )
+
+    response = AsgiClient(app).post(
+        "/api/compare/tasks/task-1/run",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 202
+    assert len(job_backend.enqueued) == 1
 
 
 def test_compare_run_result_contract_returns_bucket_counts_and_cell_diffs() -> None:
@@ -5288,6 +5464,33 @@ def _compare_task_row() -> dict[str, object]:
         "created_at": _dt(1),
         "updated_at": _dt(2),
     }
+
+
+def _sql_compare_task_row(
+    *,
+    legacy_numeric: bool = False,
+    explicit_numeric: bool = False,
+) -> dict[str, object]:
+    row = _compare_task_row()
+    if explicit_numeric:
+        sql = 'SELECT 1 AS "6" FROM T'
+        row["columns"] = [{"name": "6", "type": "integer"}]
+        row["compare_rules"] = {"key_columns": ["6"], "schema_policy": "strict"}
+    else:
+        sql = "SELECT CUST_NO, SUM(AMOUNT) FROM T GROUP BY CUST_NO"
+        result_name = "2" if legacy_numeric else "RESULT_1"
+        row["columns"] = [
+            {"name": "CUST_NO", "type": "string"},
+            {"name": result_name, "type": "decimal"},
+        ]
+        row["compare_rules"] = {
+            "key_columns": ["CUST_NO"],
+            "schema_policy": "strict",
+        }
+    row["name"] = "aggregate compare"
+    row["source_ref"] = {"kind": "sql", "sql": sql}
+    row["target_ref"] = {"kind": "sql", "sql": sql}
+    return row
 
 
 def _diff_profile_payload() -> dict[str, object]:

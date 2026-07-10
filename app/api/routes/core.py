@@ -45,6 +45,7 @@ from app.api.schemas import (
     ComparePkPrecheckResponse,
     ComparePreviewRequest,
     ComparePreviewResponse,
+    CompareProjectionDetail,
     CompareResultRow,
     CompareRulesPayload,
     CompareRunAbortReason,
@@ -214,6 +215,13 @@ from app.domain.compare_result import (
     COMPARE_BUCKETS,
     decode_compare_result_row,
     empty_bucket_counts,
+)
+from app.domain.compare_sql import (
+    CompareSqlProjection,
+    CompareSqlProjectionError,
+    inspect_compare_sql,
+    legacy_generated_aliases,
+    normalize_compare_sql,
 )
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
@@ -2397,6 +2405,9 @@ def _create_compare_task_record(
     body: CompareTaskCreateRequest,
     audit_action: str,
 ) -> CompareTaskResponse:
+    request_columns = cast(list[object], list(body.columns))
+    _reject_stale_compare_aliases(request_columns, body.source_ref)
+    _reject_stale_compare_aliases(request_columns, body.target_ref)
     now = datetime.now(UTC)
     task_id = new_id()
     with services.engine.begin() as conn:
@@ -2686,13 +2697,21 @@ def preview_compare_data(
     if not bool(policy.get("allow_select", False)):
         raise ApiError(403, "select_not_allowed", "Datasource operation policy denies SELECT")
     db_type = DbType(str(ds_row["db_type"]))
+    projection_details: tuple[CompareSqlProjection, ...] = ()
     if body.ref.kind == "sql":
         try:
             inner_sql = validate_readonly_sql(body.ref.sql or "")
         except SqlGuardError as exc:
             raise ApiError(400, "invalid_sql", "Only read-only SELECT/WITH SQL is allowed") from exc
+        try:
+            plan = normalize_compare_sql(inner_sql, db_type)
+        except CompareSqlProjectionError:
+            normalized_sql = inner_sql
+        else:
+            normalized_sql = plan.sql
+            projection_details = plan.projections
         # 与 worker _compare_table_expression 同形:子查询别名不带引用
-        source_expr = f"({inner_sql}) DATAOPS_PREVIEW"
+        source_expr = f"({normalized_sql}) DATAOPS_PREVIEW"
     else:
         identifier = (
             f"{body.ref.schema_name}.{body.ref.table_name}"
@@ -2734,6 +2753,15 @@ def preview_compare_data(
         raise ApiError(400, "preview_failed", "Preview query failed") from exc
     truncated = len(fetched) > body.limit
     rows_out = fetched[: body.limit]
+    explicit_numeric_names = {
+        item.name for item in projection_details if not item.generated and item.name.isdigit()
+    }
+    if any(name.isdigit() and name not in explicit_numeric_names for name in columns):
+        raise ApiError(
+            400,
+            "compare_sql_alias_required",
+            "Computed SQL columns require explicit aliases",
+        )
     _audit_business(
         services,
         request,
@@ -2747,6 +2775,7 @@ def preview_compare_data(
     )
     return ComparePreviewResponse(
         columns=columns,
+        column_details=_compare_projection_details(projection_details),
         rows=rows_out,
         row_count=len(rows_out),
         truncated=truncated,
@@ -2818,6 +2847,10 @@ def precheck_compare_primary_key(
             inner_sql = validate_readonly_sql(body.ref.sql or "")
         except SqlGuardError as exc:
             raise ApiError(400, "invalid_sql", "Only read-only SELECT/WITH SQL is allowed") from exc
+        try:
+            inner_sql = normalize_compare_sql(inner_sql, db_type).sql
+        except CompareSqlProjectionError:
+            pass
         source_expr = f"({inner_sql}) DATAOPS_PRECHECK"
     else:
         identifier = (
@@ -3126,6 +3159,14 @@ def update_compare_task(
         changed_refs = [ref for ref in (body.source_ref, body.target_ref) if ref is not None]
         if changed_refs:
             _validate_compare_file_uploads(conn, project_id=project_id, refs=changed_refs)
+        effective_columns = cast(
+            list[object],
+            list(body.columns) if body.columns is not None else list(row["columns"] or []),
+        )
+        effective_source_ref: object = body.source_ref or row["source_ref"]
+        effective_target_ref: object = body.target_ref or row["target_ref"]
+        _reject_stale_compare_aliases(effective_columns, effective_source_ref)
+        _reject_stale_compare_aliases(effective_columns, effective_target_ref)
         values: dict[str, object] = {}
         if body.name is not None:
             values["name"] = body.name
@@ -3218,6 +3259,8 @@ def run_compare_task(task_id: str, request: Request) -> CompareRunCreateResponse
     target_id = _optional_str(row["target_id"])
     source_ref = dict(row["source_ref"] or {})
     target_ref = dict(row["target_ref"] or {})
+    _reject_stale_compare_aliases(cast(list[object], columns), source_ref)
+    _reject_stale_compare_aliases(cast(list[object], columns), target_ref)
     # 文件侧:把 upload_id 解析成 storage_uri + filename 注入 ref(worker 回读用),
     # 与 lineage_batch 同范式(API 侧解析上传件,worker 不直连 uploads 表)。
     with services.engine.connect() as conn:
@@ -6647,16 +6690,75 @@ def _sql_template_response(row: RowMapping) -> SqlTemplateResponse:
     )
 
 
+def _compare_ref_projections(ref: object) -> tuple[CompareSqlProjection, ...]:
+    if isinstance(ref, CompareDataRef):
+        if ref.kind != "sql":
+            return ()
+        sql = ref.sql
+    elif isinstance(ref, Mapping):
+        if ref.get("kind") != "sql":
+            return ()
+        raw_sql = ref.get("sql")
+        sql = raw_sql if isinstance(raw_sql, str) else None
+    else:
+        return ()
+    if not sql:
+        return ()
+    try:
+        return inspect_compare_sql(sql)
+    except CompareSqlProjectionError:
+        return ()
+
+
+def _compare_projection_details(
+    projections: tuple[CompareSqlProjection, ...],
+) -> list[CompareProjectionDetail]:
+    return [
+        CompareProjectionDetail(
+            name=item.name,
+            generated=item.generated,
+            projection_index=item.projection_index,
+            expression=item.expression,
+        )
+        for item in projections
+    ]
+
+
+def _legacy_compare_aliases(columns: list[object], ref: object) -> dict[str, str]:
+    names: list[str] = []
+    for column in columns:
+        if isinstance(column, Column):
+            names.append(column.name)
+        elif isinstance(column, Mapping) and isinstance(column.get("name"), str):
+            names.append(str(column["name"]))
+        else:
+            names.append("")
+    return legacy_generated_aliases(names, _compare_ref_projections(ref))
+
+
+def _reject_stale_compare_aliases(columns: list[object], ref: object) -> None:
+    if _legacy_compare_aliases(columns, ref):
+        raise ApiError(
+            409,
+            "compare_sql_aliases_stale",
+            "Compare SQL columns must be updated before running",
+        )
+
+
 def _compare_task_response(row: RowMapping) -> CompareTaskResponse:
+    source_ref = row["source_ref"]
+    target_ref = row["target_ref"]
     return CompareTaskResponse(
         id=str(row["id"]),
         project_id=str(row["project_id"]),
         name=str(row["name"]),
         source_id=_optional_str(row["source_id"]),
         target_id=_optional_str(row["target_id"]),
-        source_ref=row["source_ref"],
-        target_ref=row["target_ref"],
+        source_ref=source_ref,
+        target_ref=target_ref,
         columns=[Column.model_validate(item) for item in row["columns"] or []],
+        source_projection_details=_compare_projection_details(_compare_ref_projections(source_ref)),
+        target_projection_details=_compare_projection_details(_compare_ref_projections(target_ref)),
         compare_rules=CompareRulesPayload.model_validate(row["compare_rules"] or {}),
         run_limits=CompareRunLimitsPayload.model_validate(row["run_limits"] or {}),
         created_by=_optional_str(row["created_by"]),
