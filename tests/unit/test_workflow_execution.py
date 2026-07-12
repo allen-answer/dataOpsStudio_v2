@@ -38,6 +38,8 @@ def _child(
     retry_count: int = 0,
     finished_at: datetime | None = None,
     error: str | None = None,
+    error_code: str | None = None,
+    outputs: dict[str, str | int | float | bool | None] | None = None,
 ) -> WorkflowChildJob:
     return WorkflowChildJob(
         node_id=node_id,
@@ -46,6 +48,23 @@ def _child(
         retry_count=retry_count,
         finished_at=finished_at,
         error=error,
+        error_code=error_code,
+        outputs=outputs or {},
+    )
+
+
+def _routed_spec(
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    *,
+    variables: dict[str, str] | None = None,
+) -> WorkflowSpec:
+    return WorkflowSpec.model_validate(
+        {
+            "nodes": [{"job_kind": "sql_query", "timeout_seconds": 60, **node} for node in nodes],
+            "edges": edges,
+            "variables": variables or {},
+        }
     )
 
 
@@ -234,6 +253,242 @@ def test_cancelled_child_blocks_downstream_and_fails_run() -> None:
 
     assert plan.node_states["b"].status is WorkflowNodeExecStatus.SKIPPED
     assert plan.run_status is JobStatus.FAILED
+
+
+def test_branch_selects_first_matching_success_edge_and_skips_other_route() -> None:
+    spec = _routed_spec(
+        [
+            {"id": "query"},
+            {"id": "route", "job_kind": "branch", "payload": {}},
+            {"id": "has_rows"},
+            {"id": "empty"},
+        ],
+        [
+            {"source": "query", "target": "route"},
+            {
+                "source": "route",
+                "target": "has_rows",
+                "when": "${nodes.query.loaded_rows} > 0",
+            },
+            {"source": "route", "target": "empty", "is_default": True},
+        ],
+    )
+    children = {
+        "query": _child("query", JobStatus.SUCCESS, outputs={"loaded_rows": 2}),
+        "route": _child("route", JobStatus.SUCCESS),
+    }
+
+    plan = plan_workflow_step(spec, children, now=_NOW)
+
+    assert plan.enqueue_node_ids == ("has_rows",)
+    assert plan.node_states["empty"].status is WorkflowNodeExecStatus.SKIPPED
+    assert plan.node_states["route"].outputs["selected_target"] == "has_rows"
+
+
+def test_branch_default_route_and_reconvergent_join() -> None:
+    spec = _routed_spec(
+        [
+            {"id": "query"},
+            {"id": "route", "job_kind": "branch", "payload": {}},
+            {"id": "left"},
+            {"id": "right"},
+            {"id": "join"},
+        ],
+        [
+            {"source": "query", "target": "route"},
+            {
+                "source": "route",
+                "target": "left",
+                "when": "${nodes.query.loaded_rows} > 0",
+            },
+            {"source": "route", "target": "right", "is_default": True},
+            {"source": "left", "target": "join"},
+            {"source": "right", "target": "join"},
+        ],
+    )
+    children = {
+        "query": _child("query", JobStatus.SUCCESS, outputs={"loaded_rows": 0}),
+        "route": _child("route", JobStatus.SUCCESS),
+        "right": _child("right", JobStatus.SUCCESS),
+    }
+
+    plan = plan_workflow_step(spec, children, now=_NOW)
+
+    assert plan.node_states["left"].status is WorkflowNodeExecStatus.SKIPPED
+    assert plan.enqueue_node_ids == ("join",)
+    assert plan.node_states["route"].outputs["selected_target"] == "right"
+
+
+def test_failure_branch_runs_selected_compensation_but_run_stays_failed() -> None:
+    spec = _routed_spec(
+        [
+            {"id": "source", "on_failure": "branch"},
+            {"id": "timeout_recovery"},
+            {"id": "fallback"},
+        ],
+        [
+            {
+                "source": "source",
+                "target": "timeout_recovery",
+                "trigger": "failure",
+                "when": "${nodes.source.error_code} == 'timeout'",
+            },
+            {
+                "source": "source",
+                "target": "fallback",
+                "trigger": "failure",
+                "is_default": True,
+            },
+        ],
+    )
+    children = {
+        "source": _child(
+            "source",
+            JobStatus.FAILED,
+            error="timed out",
+            error_code="timeout",
+        )
+    }
+
+    plan = plan_workflow_step(spec, children, now=_NOW)
+    assert plan.enqueue_node_ids == ("timeout_recovery",)
+    assert plan.node_states["fallback"].status is WorkflowNodeExecStatus.SKIPPED
+    assert plan.run_status is None
+
+    children["timeout_recovery"] = _child("timeout_recovery", JobStatus.SUCCESS)
+    plan = plan_workflow_step(spec, children, now=_NOW)
+    assert plan.run_status is JobStatus.FAILED
+    assert "source" in (plan.run_error or "")
+
+
+def test_failure_branch_evaluation_error_is_observable_on_source_and_run() -> None:
+    spec = _routed_spec(
+        [
+            {"id": "source", "on_failure": "branch"},
+            {"id": "recovery"},
+            {"id": "fallback"},
+        ],
+        [
+            {
+                "source": "source",
+                "target": "recovery",
+                "trigger": "failure",
+                "when": "${nodes.source.error_code} ==",
+            },
+            {
+                "source": "source",
+                "target": "fallback",
+                "trigger": "failure",
+                "is_default": True,
+            },
+        ],
+    )
+    children = {
+        "source": _child(
+            "source",
+            JobStatus.FAILED,
+            error="timed out",
+            error_code="timeout",
+        )
+    }
+
+    plan = plan_workflow_step(spec, children, now=_NOW)
+
+    assert plan.enqueue_node_ids == ()
+    assert plan.node_states["recovery"].status is WorkflowNodeExecStatus.SKIPPED
+    assert plan.node_states["fallback"].status is WorkflowNodeExecStatus.SKIPPED
+    source_error = plan.node_states["source"].error or ""
+    assert "timed out" in source_error
+    assert "failure branch evaluation failed: invalid_when_syntax:" in source_error
+    assert plan.run_status is JobStatus.FAILED
+    assert "failure branch evaluation failed: invalid_when_syntax:" in (plan.run_error or "")
+
+
+def test_upstream_output_reference_is_available_to_payload_validation() -> None:
+    spec = _routed_spec(
+        [
+            {"id": "query"},
+            {
+                "id": "export",
+                "job_kind": "export_excel",
+                "payload": {"source_result_set_id": "${nodes.query.result_set_id}"},
+            },
+        ],
+        [{"source": "query", "target": "export"}],
+    )
+    children = {
+        "query": _child(
+            "query",
+            JobStatus.SUCCESS,
+            outputs={"result_set_id": "rs-1"},
+        )
+    }
+
+    plan = plan_workflow_step(spec, children, now=_NOW)
+    assert plan.enqueue_node_ids == ("export",)
+
+
+def test_child_outputs_are_filtered_by_node_kind_runtime_whitelist() -> None:
+    spec = _spec([{"id": "query"}])
+    children = {
+        "query": _child(
+            "query",
+            JobStatus.SUCCESS,
+            outputs={
+                "result_set_id": "rs-1",
+                "loaded_rows": 7,
+                "sent_count": 1,
+                "password": "sensitive-value",
+                "uri": "sensitive-uri",
+                "secret_ref": "sensitive-ref",
+                "metadata": "sensitive-metadata",
+            },
+        )
+    }
+
+    plan = plan_workflow_step(spec, children, now=_NOW)
+
+    assert plan.node_states["query"].outputs == {
+        "result_set_id": "rs-1",
+        "loaded_rows": 7,
+        "status": "success",
+        "job_id": "job-query",
+        "error_code": None,
+    }
+
+
+def test_mutated_nested_payload_cannot_resolve_non_whitelisted_output() -> None:
+    spec = _routed_spec(
+        [
+            {"id": "query"},
+            {
+                "id": "export",
+                "job_kind": "export_excel",
+                "payload": {"nested": {"source": "literal"}},
+            },
+        ],
+        [{"source": "query", "target": "export"}],
+    )
+    nested = spec.nodes[1].payload["nested"]
+    assert isinstance(nested, dict)
+    nested["source"] = "${nodes.query.sent_count}"
+
+    plan = plan_workflow_step(
+        spec,
+        {
+            "query": _child(
+                "query",
+                JobStatus.SUCCESS,
+                outputs={"sent_count": 17},
+            )
+        },
+        now=_NOW,
+    )
+
+    export_state = plan.node_states["export"]
+    assert export_state.status is WorkflowNodeExecStatus.FAILED
+    assert "export" not in plan.enqueue_node_ids
+    assert "17" not in (export_state.error or "")
 
 
 # ── retry 计数(per-node RetryPolicy;None 继承全局)─────────────────────────

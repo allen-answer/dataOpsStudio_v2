@@ -715,7 +715,19 @@ class WorkflowNode:
     retry_policy: RetryPolicy
     timeout_seconds: int
     on_failure: Literal["abort", "continue", "branch"]
+
+class WorkflowEdge:
+    source: str
+    target: str
+    trigger: Literal["success", "failure"] = "success"
+    when: Optional[str] = None
+    is_default: bool = False
 ```
+
+2.4.x 开放 `notify/sleep/branch` 后,实际支持 8 种节点;Scenario 两种仍等 2.6.0。
+条件边按声明顺序 first-match + 唯一 default。节点 payload / `when` 允许
+`${nodes.<ancestor>.<field>}` 安全输出引用,但只开放按 kind 定义的标量元数据,
+不开放结果行、ResultRef URI、SecretRef 或任意 metadata。
 
 ```
 POST   /api/workflows

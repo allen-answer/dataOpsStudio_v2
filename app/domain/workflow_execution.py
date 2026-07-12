@@ -23,13 +23,14 @@ run 是否终态」。worker 侧执行器与 API 侧状态查询共用同一函�
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 
 from app.domain.job import JobStatus
-from app.domain.workflow import WorkflowNode, WorkflowSpec
+from app.domain.workflow import WorkflowEdge, WorkflowNode, WorkflowSpec
 from app.domain.workflow_interpolate import ParamInterpolationError, interpolate_payload
+from app.domain.workflow_outputs import NODE_OUTPUT_FIELDS_BY_KIND, NodeOutputValue
 from app.domain.workflow_when import WhenEvaluationError, evaluate_when
 
 # RetryPolicy=None 继承全局 max_retries 时的固定退避秒数:
@@ -58,15 +59,6 @@ TERMINAL_NODE_STATUSES: frozenset[WorkflowNodeExecStatus] = frozenset(
     }
 )
 
-# 上游处于这些终态时,下游(纯下游闭包)标 SKIPPED
-_BLOCKING_UPSTREAM_STATUSES: frozenset[WorkflowNodeExecStatus] = frozenset(
-    {
-        WorkflowNodeExecStatus.FAILED,
-        WorkflowNodeExecStatus.SKIPPED,
-        WorkflowNodeExecStatus.CANCELLED,
-    }
-)
-
 
 @dataclass(frozen=True)
 class WorkflowChildJob:
@@ -78,6 +70,8 @@ class WorkflowChildJob:
     retry_count: int = 0
     finished_at: datetime | None = None
     error: str | None = None
+    error_code: str | None = None
+    outputs: dict[str, NodeOutputValue] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -87,6 +81,7 @@ class WorkflowNodeState:
     job_id: str | None = None
     attempts: int = 0
     error: str | None = None
+    outputs: dict[str, NodeOutputValue] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -115,12 +110,15 @@ def plan_workflow_step(
     ``children``:node_id → 子 job 快照(未 enqueue 的节点不在其中)。
     """
     nodes_by_id = {node.id: node for node in spec.nodes}
-    upstreams: dict[str, list[str]] = {node.id: [] for node in spec.nodes}
+    incoming_edges: dict[str, list[WorkflowEdge]] = {node.id: [] for node in spec.nodes}
+    outgoing_edges: dict[str, list[WorkflowEdge]] = {node.id: [] for node in spec.nodes}
     for edge in spec.edges:
-        upstreams[edge.target].append(edge.source)
+        incoming_edges[edge.target].append(edge)
+        outgoing_edges[edge.source].append(edge)
 
     variables = dict(when_variables or {})
     states: dict[str, WorkflowNodeState] = {}
+    route_selections: dict[tuple[str, str], tuple[str | None, str | None]] = {}
     enqueue: list[str] = []
     retry: list[str] = []
     wait_candidates: list[float] = []
@@ -128,7 +126,7 @@ def plan_workflow_step(
     for node in _topological_nodes(spec):
         child = children.get(node.id)
         if child is not None:
-            states[node.id] = _state_from_child(
+            state = _state_from_child(
                 node,
                 child,
                 now=now,
@@ -136,21 +134,75 @@ def plan_workflow_step(
                 retry_job_ids=retry,
                 wait_candidates=wait_candidates,
             )
+            states[node.id] = state
+            if node.job_kind == "branch" and state.status is WorkflowNodeExecStatus.SUCCESS:
+                selected, route_error = _selected_route(
+                    node_id=node.id,
+                    trigger="success",
+                    edges=outgoing_edges[node.id],
+                    variables=variables,
+                    states=states,
+                    cache=route_selections,
+                )
+                if route_error is not None:
+                    states[node.id] = replace(
+                        state,
+                        status=WorkflowNodeExecStatus.FAILED,
+                        error=f"branch evaluation failed: {route_error}",
+                        outputs={**state.outputs, "status": WorkflowNodeExecStatus.FAILED.value},
+                    )
+                else:
+                    states[node.id] = replace(
+                        state,
+                        outputs={**state.outputs, "selected_target": selected},
+                    )
+            if state.status is WorkflowNodeExecStatus.FAILED and node.on_failure == "branch":
+                _, route_error = _selected_route(
+                    node_id=node.id,
+                    trigger="failure",
+                    edges=outgoing_edges[node.id],
+                    variables=variables,
+                    states=states,
+                    cache=route_selections,
+                )
+                if route_error is not None:
+                    detail = f"failure branch evaluation failed: {route_error}"
+                    states[node.id] = replace(
+                        state,
+                        error=f"{state.error}; {detail}" if state.error else detail,
+                    )
             continue
-        upstream_statuses = [states[up].status for up in upstreams[node.id]]
-        if any(status in _BLOCKING_UPSTREAM_STATUSES for status in upstream_statuses):
-            states[node.id] = WorkflowNodeState(
-                node_id=node.id, status=WorkflowNodeExecStatus.SKIPPED
-            )
-            continue
-        if not all(status is WorkflowNodeExecStatus.SUCCESS for status in upstream_statuses):
-            states[node.id] = WorkflowNodeState(
-                node_id=node.id, status=WorkflowNodeExecStatus.WAITING
-            )
-            continue
+        incoming = incoming_edges[node.id]
+        if incoming:
+            decisions = [
+                _edge_is_active(
+                    edge,
+                    nodes_by_id=nodes_by_id,
+                    outgoing_edges=outgoing_edges,
+                    variables=variables,
+                    states=states,
+                    route_selections=route_selections,
+                )
+                for edge in incoming
+            ]
+            if any(decision is None for decision in decisions):
+                states[node.id] = WorkflowNodeState(
+                    node_id=node.id, status=WorkflowNodeExecStatus.WAITING
+                )
+                continue
+            if not any(decisions):
+                states[node.id] = WorkflowNodeState(
+                    node_id=node.id, status=WorkflowNodeExecStatus.SKIPPED
+                )
+                continue
         # 就绪:所有上游终态成功(根节点上游为空,视为就绪)
+        output_context = _output_context(states)
         try:
-            should_run = evaluate_when(node.when, variables)
+            should_run = evaluate_when(
+                node.when,
+                variables,
+                node_outputs=output_context,
+            )
         except WhenEvaluationError as exc:
             states[node.id] = WorkflowNodeState(
                 node_id=node.id,
@@ -167,7 +219,11 @@ def plan_workflow_step(
         # 但这里先做一次纯校验:未解析变量 / 不支持的引用是确定性错误,与 when 求值
         # 异常同路径 —— 节点直接 FAILED、不重试、按 on_failure 语义处理,永不把 run 打挂
         try:
-            interpolate_payload(node.payload, variables)
+            interpolate_payload(
+                node.payload,
+                variables,
+                node_outputs=output_context,
+            )
         except ParamInterpolationError as exc:
             states[node.id] = WorkflowNodeState(
                 node_id=node.id,
@@ -239,6 +295,88 @@ def plan_workflow_step(
     )
 
 
+def _output_context(
+    states: Mapping[str, WorkflowNodeState],
+) -> dict[str, Mapping[str, NodeOutputValue]]:
+    return {node_id: state.outputs for node_id, state in states.items()}
+
+
+def _selected_route(
+    *,
+    node_id: str,
+    trigger: str,
+    edges: list[WorkflowEdge],
+    variables: Mapping[str, str | list[str]],
+    states: Mapping[str, WorkflowNodeState],
+    cache: dict[tuple[str, str], tuple[str | None, str | None]],
+) -> tuple[str | None, str | None]:
+    key = (node_id, trigger)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    matching_edges = [edge for edge in edges if edge.trigger == trigger]
+    default_edge = next(edge for edge in matching_edges if edge.is_default)
+    decision: tuple[str | None, str | None]
+    try:
+        selected = default_edge.target
+        for edge in matching_edges:
+            if edge.is_default:
+                continue
+            if evaluate_when(
+                edge.when,
+                variables,
+                node_outputs=_output_context(states),
+            ):
+                selected = edge.target
+                break
+    except WhenEvaluationError as exc:
+        decision = (None, str(exc))
+    else:
+        decision = (selected, None)
+    cache[key] = decision
+    return decision
+
+
+def _edge_is_active(
+    edge: WorkflowEdge,
+    *,
+    nodes_by_id: Mapping[str, WorkflowNode],
+    outgoing_edges: Mapping[str, list[WorkflowEdge]],
+    variables: Mapping[str, str | list[str]],
+    states: Mapping[str, WorkflowNodeState],
+    route_selections: dict[tuple[str, str], tuple[str | None, str | None]],
+) -> bool | None:
+    source_state = states[edge.source]
+    if source_state.status not in TERMINAL_NODE_STATUSES:
+        return None
+    source_node = nodes_by_id[edge.source]
+    if edge.trigger == "success":
+        if source_state.status is not WorkflowNodeExecStatus.SUCCESS:
+            return False
+        if source_node.job_kind != "branch":
+            return True
+        selected, error = _selected_route(
+            node_id=edge.source,
+            trigger="success",
+            edges=outgoing_edges[edge.source],
+            variables=variables,
+            states=states,
+            cache=route_selections,
+        )
+        return error is None and selected == edge.target
+    if source_state.status is not WorkflowNodeExecStatus.FAILED:
+        return False
+    selected, error = _selected_route(
+        node_id=edge.source,
+        trigger="failure",
+        edges=outgoing_edges[edge.source],
+        variables=variables,
+        states=states,
+        cache=route_selections,
+    )
+    return error is None and selected == edge.target
+
+
 def _topological_nodes(spec: WorkflowSpec) -> list[WorkflowNode]:
     """确定性拓扑序(Kahn;并列就绪时按 nodes 声明顺序,同 1.x)。"""
     index_by_id = {node.id: index for index, node in enumerate(spec.nodes)}
@@ -283,6 +421,7 @@ def _state_from_child(
             status=WorkflowNodeExecStatus.SUCCESS,
             job_id=child.job_id,
             attempts=child.retry_count,
+            outputs=_child_outputs(node, child),
         )
     if child.status is JobStatus.CANCELLED:
         return WorkflowNodeState(
@@ -291,6 +430,7 @@ def _state_from_child(
             job_id=child.job_id,
             attempts=child.retry_count,
             error=child.error,
+            outputs=_child_outputs(node, child),
         )
     if child.status in {JobStatus.FAILED, JobStatus.TIMEOUT}:
         if node.retry_policy is not None:
@@ -312,6 +452,7 @@ def _state_from_child(
                 job_id=child.job_id,
                 attempts=child.retry_count,
                 error=child.error,
+                outputs=_child_outputs(node, child),
             )
         return WorkflowNodeState(
             node_id=node.id,
@@ -319,6 +460,7 @@ def _state_from_child(
             job_id=child.job_id,
             attempts=child.retry_count,
             error=child.error,
+            outputs=_child_outputs(node, child),
         )
     # pending / running
     return WorkflowNodeState(
@@ -326,7 +468,21 @@ def _state_from_child(
         status=WorkflowNodeExecStatus.RUNNING,
         job_id=child.job_id,
         attempts=child.retry_count,
+        outputs=_child_outputs(node, child),
     )
+
+
+def _child_outputs(
+    node: WorkflowNode,
+    child: WorkflowChildJob,
+) -> dict[str, NodeOutputValue]:
+    allowed_fields = NODE_OUTPUT_FIELDS_BY_KIND[node.job_kind]
+    return {
+        **{key: value for key, value in child.outputs.items() if key in allowed_fields},
+        "status": child.status.value,
+        "job_id": child.job_id,
+        "error_code": child.error_code,
+    }
 
 
 def _abort_error(

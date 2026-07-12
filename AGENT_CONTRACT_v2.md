@@ -306,6 +306,30 @@ class Job:
     parent_workflow_run_id: Optional[str]
 ```
 
+### 3.7 Workflow 2.4.x 追加契约
+
+```python
+class WorkflowEdge:
+    source: str
+    target: str
+    trigger: Literal["success", "failure"] = "success"
+    when: Optional[str] = None
+    is_default: bool = False
+
+SUPPORTED_WORKFLOW_NODE_KINDS = {
+    "sql_query", "sql_explain", "compare_run", "lineage_analyze",
+    "export_excel", "notify", "sleep", "branch",
+}
+```
+
+- 旧 `{source,target}` 边保持成功依赖语义。`branch` 与
+  `on_failure="branch"` 均采用按边声明顺序 first-match、唯一 default 的路由。
+- 节点 payload / `when` 可读取 `${nodes.<ancestor>.<field>}`,但仅限构造期验证过的
+  拓扑上游和按节点 kind 声明的标量白名单。禁止结果行、ResultRef URI、SecretRef
+  与任意 metadata 进入输出上下文。
+- `notify` 只引用 Workflow 已配置的通知 target id;`sleep` 只接受
+  `duration_seconds`;`branch` payload 为空。Scenario 两种节点留待 2.6.0。
+
 ---
 
 ## 4. 红线(全部有 CI 检查,违反即拦)
@@ -328,6 +352,10 @@ class Job:
 {"sql_query","sql_explain","compare_run","scenario_materialize",
  "scenario_run_all","lineage_analyze","export_excel","notify","sleep","branch"}
 ```
+
+2.4.x 实际开放其中 8 种:`sql_query/sql_explain/compare_run/lineage_analyze/
+export_excel/notify/sleep/branch`。Scenario 两种仍是白名单内但暂不支持,必须返回
+`unsupported_node_kind`,不得与白名单外的 `forbidden_node_kind` 混淆。
 
 **脱敏 processor(R5,Step 1 优先做)**:
 - 按 key 名拦截:含 password/secret/token/api_key/mfa/authorization/cookie/ciphertext → `***REDACTED***`

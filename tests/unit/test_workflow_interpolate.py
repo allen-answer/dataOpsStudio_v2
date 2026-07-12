@@ -63,11 +63,87 @@ def test_missing_variable_raises_with_name_only_never_value() -> None:
     assert "super-sensitive-value" not in message
 
 
-def test_node_reference_unsupported() -> None:
+def test_node_output_exact_placeholder_preserves_scalar_type() -> None:
+    outputs = {"n1": {"loaded_rows": 7, "cached": False, "error_code": None}}
+    assert interpolate_payload(
+        {
+            "rows": "${nodes.n1.loaded_rows}",
+            "cached": "${nodes.n1.cached}",
+            "error": "${nodes.n1.error_code}",
+        },
+        _VARS,
+        node_outputs=outputs,
+    ) == {"rows": 7, "cached": False, "error": None}
+
+
+def test_node_output_embedded_placeholder_stringifies_scalar() -> None:
+    result = interpolate_payload(
+        {"source": "result-${nodes.query.result_set_id}"},
+        _VARS,
+        node_outputs={"query": {"result_set_id": "rs-1"}},
+    )
+    assert result == {"source": "result-rs-1"}
+
+
+@pytest.mark.parametrize("node_id", ["extract.v1", "导出"])
+def test_node_output_reference_supports_legacy_nonblank_node_ids(node_id: str) -> None:
+    placeholder = f"${{nodes.{node_id}.loaded_rows}}"
+
+    result = interpolate_payload(
+        {"rows": placeholder},
+        _VARS,
+        node_outputs={node_id: {"loaded_rows": 7}},
+    )
+
+    assert result == {"rows": 7}
+
+
+def test_node_output_missing_or_container_value_rejected_path_only() -> None:
+    with pytest.raises(ParamInterpolationError, match="unresolved_node_output"):
+        interpolate_payload(
+            {"value": "${nodes.n1.loaded_rows}"},
+            _VARS,
+            node_outputs={"n1": {}},
+        )
+    with pytest.raises(ParamInterpolationError, match="unsafe_node_output_value"):
+        interpolate_payload(
+            {"value": "${nodes.n1.loaded_rows}"},
+            _VARS,
+            node_outputs={"n1": {"loaded_rows": ["secret-row"]}},
+        )
+
+
+def test_arbitrary_scalar_node_output_is_rejected_at_runtime_boundary() -> None:
     with pytest.raises(ParamInterpolationError) as exc_info:
-        interpolate_payload({"sql": "${nodes.n1.rows}"}, _VARS)
-    assert "unsupported_param_reference" in str(exc_info.value)
-    assert "nodes.n1.rows" in str(exc_info.value)
+        interpolate_payload(
+            {"value": "${nodes.query.password}"},
+            _VARS,
+            node_outputs={"query": {"password": "sensitive-value"}},
+        )
+
+    message = str(exc_info.value)
+    assert "forbidden_node_output_field" in message
+    assert "sensitive-value" not in message
+
+
+def test_invalid_node_output_reference_uses_stable_code_without_raw_expression() -> None:
+    raw_expression = "nodes.query.bad-field"
+    payload_secret = "sensitive-payload-value"
+
+    with pytest.raises(ParamInterpolationError) as exc_info:
+        interpolate_payload(
+            {
+                "value": f"${{{raw_expression}}}",
+                "metadata": payload_secret,
+            },
+            _VARS,
+            node_outputs={"query": {}},
+        )
+
+    message = str(exc_info.value)
+    assert message == "invalid_node_output_reference"
+    assert raw_expression not in message
+    assert payload_secret not in message
 
 
 def test_dotted_reference_unsupported() -> None:
@@ -162,8 +238,12 @@ def test_filter_on_missing_variable_still_name_only() -> None:
 
 def test_filter_on_node_reference_rejected() -> None:
     with pytest.raises(ParamInterpolationError) as exc_info:
-        interpolate_payload({"sql": "${nodes.n1.rows | sql_in}"}, _LIST_VARS)
-    assert "unsupported_param_reference" in str(exc_info.value)
+        interpolate_payload(
+            {"sql": "${nodes.n1.loaded_rows | sql_in}"},
+            _LIST_VARS,
+            node_outputs={"n1": {"loaded_rows": 3}},
+        )
+    assert "unsupported_node_output_filter" in str(exc_info.value)
 
 
 def test_custom_variable_resolves_in_compare_table_name() -> None:

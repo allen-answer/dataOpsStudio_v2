@@ -1,5 +1,11 @@
 # C-7 Workflow 节点参数化 + `${var}` 插值 设计稿
 
+> **2.4.x 追加决策(2026-07-11):** 下文关于“不移植 `${nodes.*}`”的内容记录的是
+> 2.4.0 首版边界,不再代表 2.4.x 当前能力。现仅开放
+> `${nodes.<topological-ancestor>.<whitelisted-field>}`:构造期校验严格上游关系与
+> 节点 kind 字段白名单;完整占位符保留标量/null 类型,嵌入字符串时转字符串。
+> 结果行、SQL、ResultRef URI、SecretRef、dict/list 与任意 metadata 仍禁止。
+
 > 2026-07-07,Opus 4.8。方法:两路考古 —— 本仓 main 测绘 2.0 workflow 节点/spec、run 变量
 > 现有机制(`when` 求值)、compare_run 执行接入点、child job 构造点;`ssh daily-server` 只读
 > 1.x `~/dataops-studio/app/services/workflow_engine.py` 测绘 `${var}` 插值实现(语法/作用域/
