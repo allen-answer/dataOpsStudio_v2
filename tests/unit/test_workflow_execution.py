@@ -404,6 +404,100 @@ def test_failure_branch_evaluation_error_is_observable_on_source_and_run() -> No
     assert "failure branch evaluation failed: invalid_when_syntax:" in (plan.run_error or "")
 
 
+@pytest.mark.parametrize(
+    ("node_overrides", "expected_error_code"),
+    [
+        ({"when": "${missing} == '1'"}, "when_evaluation_failed"),
+        ({"payload": {"sql": "${missing}"}}, "param_interpolation_failed"),
+    ],
+    ids=["when", "payload_interpolation"],
+)
+def test_pre_enqueue_failure_routes_with_safe_common_outputs(
+    node_overrides: dict[str, Any],
+    expected_error_code: str,
+) -> None:
+    spec = _routed_spec(
+        [
+            {"id": "source", "on_failure": "branch", **node_overrides},
+            {"id": "recovery"},
+            {"id": "fallback"},
+        ],
+        [
+            {
+                "source": "source",
+                "target": "recovery",
+                "trigger": "failure",
+                "when": "${nodes.source.status} == 'failed'",
+            },
+            {
+                "source": "source",
+                "target": "fallback",
+                "trigger": "failure",
+                "is_default": True,
+            },
+        ],
+    )
+
+    plan = plan_workflow_step(spec, {}, now=_NOW)
+
+    source = plan.node_states["source"]
+    assert source.status is WorkflowNodeExecStatus.FAILED
+    assert source.outputs == {
+        "status": "failed",
+        "job_id": None,
+        "error_code": expected_error_code,
+    }
+    assert plan.enqueue_node_ids == ("recovery",)
+    assert plan.node_states["fallback"].status is WorkflowNodeExecStatus.SKIPPED
+    assert plan.run_status is None
+
+
+@pytest.mark.parametrize(
+    ("node_overrides", "original_error"),
+    [
+        ({"when": "${missing} == '1'"}, "when evaluation failed"),
+        ({"payload": {"sql": "${missing}"}}, "param interpolation failed"),
+    ],
+    ids=["when", "payload_interpolation"],
+)
+def test_pre_enqueue_failure_route_error_is_observable_on_source_and_run(
+    node_overrides: dict[str, Any],
+    original_error: str,
+) -> None:
+    spec = _routed_spec(
+        [
+            {"id": "source", "on_failure": "branch", **node_overrides},
+            {"id": "recovery"},
+            {"id": "fallback"},
+        ],
+        [
+            {
+                "source": "source",
+                "target": "recovery",
+                "trigger": "failure",
+                "when": "${nodes.source.status} ==",
+            },
+            {
+                "source": "source",
+                "target": "fallback",
+                "trigger": "failure",
+                "is_default": True,
+            },
+        ],
+    )
+
+    plan = plan_workflow_step(spec, {}, now=_NOW)
+
+    source_error = plan.node_states["source"].error or ""
+    assert original_error in source_error
+    assert "failure branch evaluation failed: invalid_when_syntax:" in source_error
+    assert plan.enqueue_node_ids == ()
+    assert plan.node_states["recovery"].status is WorkflowNodeExecStatus.SKIPPED
+    assert plan.node_states["fallback"].status is WorkflowNodeExecStatus.SKIPPED
+    assert plan.run_status is JobStatus.FAILED
+    assert "failure branch evaluation failed: invalid_when_syntax:" in (plan.run_error or "")
+
+
 def test_upstream_output_reference_is_available_to_payload_validation() -> None:
     spec = _routed_spec(
         [
@@ -455,6 +549,38 @@ def test_child_outputs_are_filtered_by_node_kind_runtime_whitelist() -> None:
         "job_id": "job-query",
         "error_code": None,
     }
+
+
+@pytest.mark.parametrize(
+    "unsafe_output",
+    [["sensitive-row"], float("nan")],
+    ids=["container", "non_finite_float"],
+)
+def test_allowed_child_output_with_unsafe_runtime_value_fails_node(
+    unsafe_output: object,
+) -> None:
+    spec = _spec([{"id": "query"}])
+    children = {
+        "query": WorkflowChildJob(
+            node_id="query",
+            job_id="job-query",
+            status=JobStatus.SUCCESS,
+            outputs={"loaded_rows": unsafe_output},
+        )
+    }
+
+    plan = plan_workflow_step(spec, children, now=_NOW)
+
+    state = plan.node_states["query"]
+    assert state.status is WorkflowNodeExecStatus.FAILED
+    assert state.error == "unsafe_node_output_value"
+    assert state.outputs == {
+        "status": "failed",
+        "job_id": "job-query",
+        "error_code": "unsafe_node_output_value",
+    }
+    assert "sensitive-row" not in (state.error or "")
+    assert "sensitive-row" not in repr(state.outputs)
 
 
 def test_mutated_nested_payload_cannot_resolve_non_whitelisted_output() -> None:

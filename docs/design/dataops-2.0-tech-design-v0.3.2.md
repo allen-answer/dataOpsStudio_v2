@@ -698,7 +698,7 @@ ALLOWED_WORKFLOW_NODE_KINDS = {
 }
 ```
 
-**禁止节点(2.0 主线永不开放)**:shell / system command、Python script / 任意代码、浏览器自动化、任意 HTTP request(带 secret / 任意 URL)、任意 DDL/DML 直接执行。`notify` 只允许内置 webhook 目标白名单。
+**禁止节点(2.0 主线永不开放)**:shell / system command、Python script / 任意代码、浏览器自动化、任意 HTTP request(带 secret / 任意 URL)、任意 DDL/DML 直接执行。`notify` 只允许引用 Workflow 现有已配置的 webhook、企业微信(WeCom)或邮件目标。
 
 #### 2.8.2 数据模型与 API
 

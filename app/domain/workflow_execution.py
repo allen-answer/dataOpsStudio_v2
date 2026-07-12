@@ -26,16 +26,25 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
+from math import isfinite
+from typing import TypeGuard
 
 from app.domain.job import JobStatus
 from app.domain.workflow import WorkflowEdge, WorkflowNode, WorkflowSpec
 from app.domain.workflow_interpolate import ParamInterpolationError, interpolate_payload
-from app.domain.workflow_outputs import NODE_OUTPUT_FIELDS_BY_KIND, NodeOutputValue
+from app.domain.workflow_outputs import (
+    COMMON_NODE_OUTPUT_FIELDS,
+    NODE_OUTPUT_FIELDS_BY_KIND,
+    NodeOutputValue,
+)
 from app.domain.workflow_when import WhenEvaluationError, evaluate_when
 
 # RetryPolicy=None 继承全局 max_retries 时的固定退避秒数:
 # 全局重试语义来自 reaper 立即重排,继承路径保持一致(0 = 立即重试)。
 INHERITED_RETRY_BACKOFF_SECONDS = 0
+UNSAFE_NODE_OUTPUT_ERROR_CODE = "unsafe_node_output_value"
+WHEN_EVALUATION_ERROR_CODE = "when_evaluation_failed"
+PARAM_INTERPOLATION_ERROR_CODE = "param_interpolation_failed"
 
 
 class WorkflowNodeExecStatus(StrEnum):
@@ -71,7 +80,7 @@ class WorkflowChildJob:
     finished_at: datetime | None = None
     error: str | None = None
     error_code: str | None = None
-    outputs: dict[str, NodeOutputValue] = field(default_factory=dict)
+    outputs: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -156,21 +165,14 @@ def plan_workflow_step(
                         state,
                         outputs={**state.outputs, "selected_target": selected},
                     )
-            if state.status is WorkflowNodeExecStatus.FAILED and node.on_failure == "branch":
-                _, route_error = _selected_route(
-                    node_id=node.id,
-                    trigger="failure",
-                    edges=outgoing_edges[node.id],
-                    variables=variables,
-                    states=states,
-                    cache=route_selections,
-                )
-                if route_error is not None:
-                    detail = f"failure branch evaluation failed: {route_error}"
-                    states[node.id] = replace(
-                        state,
-                        error=f"{state.error}; {detail}" if state.error else detail,
-                    )
+            states[node.id] = _with_failure_route_error(
+                node=node,
+                state=states[node.id],
+                edges=outgoing_edges[node.id],
+                variables=variables,
+                states=states,
+                cache=route_selections,
+            )
             continue
         incoming = incoming_edges[node.id]
         if incoming:
@@ -208,6 +210,18 @@ def plan_workflow_step(
                 node_id=node.id,
                 status=WorkflowNodeExecStatus.FAILED,
                 error=f"when evaluation failed: {exc}",
+                outputs=_failed_node_outputs(
+                    job_id=None,
+                    error_code=WHEN_EVALUATION_ERROR_CODE,
+                ),
+            )
+            states[node.id] = _with_failure_route_error(
+                node=node,
+                state=states[node.id],
+                edges=outgoing_edges[node.id],
+                variables=variables,
+                states=states,
+                cache=route_selections,
             )
             continue
         if not should_run:
@@ -229,6 +243,18 @@ def plan_workflow_step(
                 node_id=node.id,
                 status=WorkflowNodeExecStatus.FAILED,
                 error=f"param interpolation failed: {exc}",
+                outputs=_failed_node_outputs(
+                    job_id=None,
+                    error_code=PARAM_INTERPOLATION_ERROR_CODE,
+                ),
+            )
+            states[node.id] = _with_failure_route_error(
+                node=node,
+                state=states[node.id],
+                edges=outgoing_edges[node.id],
+                variables=variables,
+                states=states,
+                cache=route_selections,
             )
             continue
         states[node.id] = WorkflowNodeState(node_id=node.id, status=WorkflowNodeExecStatus.WAITING)
@@ -299,6 +325,34 @@ def _output_context(
     states: Mapping[str, WorkflowNodeState],
 ) -> dict[str, Mapping[str, NodeOutputValue]]:
     return {node_id: state.outputs for node_id, state in states.items()}
+
+
+def _with_failure_route_error(
+    *,
+    node: WorkflowNode,
+    state: WorkflowNodeState,
+    edges: list[WorkflowEdge],
+    variables: Mapping[str, str | list[str]],
+    states: Mapping[str, WorkflowNodeState],
+    cache: dict[tuple[str, str], tuple[str | None, str | None]],
+) -> WorkflowNodeState:
+    if state.status is not WorkflowNodeExecStatus.FAILED or node.on_failure != "branch":
+        return state
+    _, route_error = _selected_route(
+        node_id=node.id,
+        trigger="failure",
+        edges=edges,
+        variables=variables,
+        states=states,
+        cache=cache,
+    )
+    if route_error is None:
+        return state
+    detail = f"failure branch evaluation failed: {route_error}"
+    return replace(
+        state,
+        error=f"{state.error}; {detail}" if state.error else detail,
+    )
 
 
 def _selected_route(
@@ -415,13 +469,26 @@ def _state_from_child(
     retry_job_ids: list[str],
     wait_candidates: list[float],
 ) -> WorkflowNodeState:
+    child_outputs = _child_outputs(node, child)
+    if child_outputs is None:
+        return WorkflowNodeState(
+            node_id=node.id,
+            status=WorkflowNodeExecStatus.FAILED,
+            job_id=child.job_id,
+            attempts=child.retry_count,
+            error=UNSAFE_NODE_OUTPUT_ERROR_CODE,
+            outputs=_failed_node_outputs(
+                job_id=child.job_id,
+                error_code=UNSAFE_NODE_OUTPUT_ERROR_CODE,
+            ),
+        )
     if child.status is JobStatus.SUCCESS:
         return WorkflowNodeState(
             node_id=node.id,
             status=WorkflowNodeExecStatus.SUCCESS,
             job_id=child.job_id,
             attempts=child.retry_count,
-            outputs=_child_outputs(node, child),
+            outputs=child_outputs,
         )
     if child.status is JobStatus.CANCELLED:
         return WorkflowNodeState(
@@ -430,7 +497,7 @@ def _state_from_child(
             job_id=child.job_id,
             attempts=child.retry_count,
             error=child.error,
-            outputs=_child_outputs(node, child),
+            outputs=child_outputs,
         )
     if child.status in {JobStatus.FAILED, JobStatus.TIMEOUT}:
         if node.retry_policy is not None:
@@ -452,7 +519,7 @@ def _state_from_child(
                 job_id=child.job_id,
                 attempts=child.retry_count,
                 error=child.error,
-                outputs=_child_outputs(node, child),
+                outputs=child_outputs,
             )
         return WorkflowNodeState(
             node_id=node.id,
@@ -460,7 +527,7 @@ def _state_from_child(
             job_id=child.job_id,
             attempts=child.retry_count,
             error=child.error,
-            outputs=_child_outputs(node, child),
+            outputs=child_outputs,
         )
     # pending / running
     return WorkflowNodeState(
@@ -468,20 +535,45 @@ def _state_from_child(
         status=WorkflowNodeExecStatus.RUNNING,
         job_id=child.job_id,
         attempts=child.retry_count,
-        outputs=_child_outputs(node, child),
+        outputs=child_outputs,
     )
 
 
 def _child_outputs(
     node: WorkflowNode,
     child: WorkflowChildJob,
-) -> dict[str, NodeOutputValue]:
+) -> dict[str, NodeOutputValue] | None:
     allowed_fields = NODE_OUTPUT_FIELDS_BY_KIND[node.job_kind]
+    filtered: dict[str, NodeOutputValue] = {}
+    for key, value in child.outputs.items():
+        if key not in allowed_fields or key in COMMON_NODE_OUTPUT_FIELDS:
+            continue
+        if not _is_safe_node_output_value(value):
+            return None
+        filtered[key] = value
     return {
-        **{key: value for key, value in child.outputs.items() if key in allowed_fields},
+        **filtered,
         "status": child.status.value,
         "job_id": child.job_id,
         "error_code": child.error_code,
+    }
+
+
+def _is_safe_node_output_value(value: object) -> TypeGuard[NodeOutputValue]:
+    if value is None or isinstance(value, (str, bool, int)):
+        return True
+    return isinstance(value, float) and isfinite(value)
+
+
+def _failed_node_outputs(
+    *,
+    job_id: str | None,
+    error_code: str,
+) -> dict[str, NodeOutputValue]:
+    return {
+        "status": WorkflowNodeExecStatus.FAILED.value,
+        "job_id": job_id,
+        "error_code": error_code,
     }
 
 

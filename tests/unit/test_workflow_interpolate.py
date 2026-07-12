@@ -98,6 +98,27 @@ def test_node_output_reference_supports_legacy_nonblank_node_ids(node_id: str) -
     assert result == {"rows": 7}
 
 
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        ("${nodes.a|b.loaded_rows}", 7),
+        ("rows=${nodes.a|b.loaded_rows}", "rows=7"),
+    ],
+    ids=["exact", "embedded"],
+)
+def test_pipe_in_legacy_node_id_is_not_treated_as_filter(
+    template: str,
+    expected: object,
+) -> None:
+    result = interpolate_payload(
+        {"value": template},
+        _VARS,
+        node_outputs={"a|b": {"loaded_rows": 7}},
+    )
+
+    assert result == {"value": expected}
+
+
 def test_node_output_missing_or_container_value_rejected_path_only() -> None:
     with pytest.raises(ParamInterpolationError, match="unresolved_node_output"):
         interpolate_payload(
@@ -244,6 +265,27 @@ def test_filter_on_node_reference_rejected() -> None:
             node_outputs={"n1": {"loaded_rows": 3}},
         )
     assert "unsupported_node_output_filter" in str(exc_info.value)
+
+
+def test_node_output_filter_error_is_code_only_without_payload_echo() -> None:
+    raw_expression = "nodes.n1.loaded_rows | sensitive-filter-sentinel"
+    payload_sentinel = "sensitive-payload-sentinel"
+
+    with pytest.raises(ParamInterpolationError) as exc_info:
+        interpolate_payload(
+            {
+                "value": f"${{{raw_expression}}}",
+                "metadata": payload_sentinel,
+            },
+            _LIST_VARS,
+            node_outputs={"n1": {"loaded_rows": 3}},
+        )
+
+    message = str(exc_info.value)
+    assert message == "unsupported_node_output_filter"
+    assert raw_expression not in message
+    assert "sensitive-filter-sentinel" not in message
+    assert payload_sentinel not in message
 
 
 def test_custom_variable_resolves_in_compare_table_name() -> None:

@@ -143,7 +143,7 @@ def _interpolate_str(
     exact = _PLACEHOLDER_RE.fullmatch(text)
     if exact is not None:
         exact_expr = exact.group(1).strip()
-        if "|" not in exact_expr and parse_node_output_reference(exact_expr) is not None:
+        if parse_node_output_reference(exact_expr) is not None:
             try:
                 return resolve_node_output(exact_expr, node_outputs)
             except NodeOutputReferenceError as exc:
@@ -151,12 +151,17 @@ def _interpolate_str(
 
     def replace(match: re.Match[str]) -> str:
         expr = match.group(1).strip()
+        if parse_node_output_reference(expr) is not None:
+            try:
+                return str(resolve_node_output(expr, node_outputs))
+            except NodeOutputReferenceError as exc:
+                raise ParamInterpolationError(str(exc)) from exc
         if "|" in expr:
-            raw_name, _, raw_filter = expr.partition("|")
+            raw_name, _, raw_filter = expr.rpartition("|")
             name = raw_name.strip()
             filter_name = raw_filter.strip()
             if parse_node_output_reference(name) is not None:
-                raise ParamInterpolationError(f"unsupported_node_output_filter: {expr}")
+                raise ParamInterpolationError("unsupported_node_output_filter")
             if name.startswith("nodes."):
                 raise ParamInterpolationError("invalid_node_output_reference")
             value = _resolve_variable(name, variables, expr)
@@ -166,11 +171,6 @@ def _interpolate_str(
                 return _format_csv(value)
             # 未知过滤器:显式报错,消息带原始表达式(无取值)
             raise ParamInterpolationError(f"unsupported_param_filter: {expr}")
-        if parse_node_output_reference(expr) is not None:
-            try:
-                return str(resolve_node_output(expr, node_outputs))
-            except NodeOutputReferenceError as exc:
-                raise ParamInterpolationError(str(exc)) from exc
         if expr.startswith("nodes."):
             raise ParamInterpolationError("invalid_node_output_reference")
         value = _resolve_variable(expr, variables, expr)
