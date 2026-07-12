@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, BinaryIO, Protocol
 from unittest.mock import patch
 
+import pytest
 from sqlalchemy.exc import IntegrityError
 
 from app.dbclients.factory import UnsupportedDbTypeError
@@ -1950,12 +1951,15 @@ def test_worker_executes_branch_immediately_with_safe_result_ref() -> None:
     ]
 
 
-def test_build_workflow_sleep_child_sets_available_at_from_supplied_now() -> None:
+@pytest.mark.parametrize("duration_seconds", [1, 86_400])
+def test_build_workflow_sleep_child_accepts_duration_boundaries(
+    duration_seconds: int,
+) -> None:
     now = datetime(2026, 7, 12, 4, 0, tzinfo=UTC)
     node = WorkflowNode(
         id="pause",
         job_kind="sleep",
-        payload={"duration_seconds": 45},
+        payload={"duration_seconds": duration_seconds},
         timeout_seconds=60,
     )
 
@@ -1966,17 +1970,20 @@ def test_build_workflow_sleep_child_sets_available_at_from_supplied_now() -> Non
         now=now,
     )
 
-    assert child.available_at == now + timedelta(seconds=45)
+    assert child.available_at == now + timedelta(seconds=duration_seconds)
     assert child.payload == {
         "workflow_node_id": "pause",
-        "duration_seconds": 45,
+        "duration_seconds": duration_seconds,
     }
 
 
-def test_worker_completes_due_sleep_without_duration_sleep_call() -> None:
+@pytest.mark.parametrize("duration_seconds", [1, 86_400])
+def test_worker_completes_due_sleep_at_duration_boundaries_without_sleep_call(
+    duration_seconds: int,
+) -> None:
     job = _make_job(
         kind=JobKind.SLEEP,
-        payload={"workflow_node_id": "pause", "duration_seconds": 45},
+        payload={"workflow_node_id": "pause", "duration_seconds": duration_seconds},
     ).model_copy(
         update={
             "parent_workflow_run_id": "run-1",
@@ -1997,10 +2004,25 @@ def test_worker_completes_due_sleep_without_duration_sleep_call() -> None:
             ResultRef(
                 backend="sleep",
                 uri="sleep/job-1",
-                metadata={"duration_seconds": 45},
+                metadata={"duration_seconds": duration_seconds},
             ),
         )
     ]
+
+
+@pytest.mark.parametrize("duration_seconds", [0, 86_401])
+def test_worker_rejects_sleep_duration_outside_public_range(duration_seconds: int) -> None:
+    job = _make_job(
+        kind=JobKind.SLEEP,
+        payload={"workflow_node_id": "pause", "duration_seconds": duration_seconds},
+    ).model_copy(update={"parent_workflow_run_id": "run-1"})
+    backend = _FakeBackend([job])
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert backend.completed == []
+    assert backend.failed == [("job-1", "internal")]
 
 
 def test_workflow_run_cancel_cancels_future_pending_sleep() -> None:

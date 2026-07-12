@@ -1581,7 +1581,7 @@ class WorkerRunner:
         )
 
     def _execute_sleep(self, job: Job) -> _ExecutionOutcome:
-        duration_seconds = _payload_non_negative_int(job.payload, "duration_seconds")
+        duration_seconds = _payload_sleep_duration_seconds(job.payload)
         return _ExecutionOutcome(
             ResultRef(
                 backend="sleep",
@@ -2384,6 +2384,13 @@ def _payload_non_negative_int(payload: dict[str, object], key: str) -> int:
     return value
 
 
+def _payload_sleep_duration_seconds(payload: dict[str, object]) -> int:
+    value = payload.get("duration_seconds")
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 86_400:
+        raise ValueError("Job payload requires duration_seconds in range 1..86400")
+    return value
+
+
 def _sensor_first_cell(rows: Iterable[Row]) -> object:
     """取只读结果第一行第一列(无行返回 ``_NO_SENSOR_ROW``)。
 
@@ -2555,7 +2562,7 @@ def _build_workflow_child_job(
             payload["result_set_id"] = child_job_id
     available_at = now or datetime.now(UTC)
     if node.job_kind == JobKind.SLEEP.value:
-        available_at += timedelta(seconds=_payload_non_negative_int(payload, "duration_seconds"))
+        available_at += timedelta(seconds=_payload_sleep_duration_seconds(payload))
     if node.job_kind == JobKind.COMPARE_RUN.value:
         # compare_run 每次执行都要一次性 run 身份 + bucket result set 占位:
         # API 直连路径在 core.run_compare_task 铸造,workflow 路径此处铸造。

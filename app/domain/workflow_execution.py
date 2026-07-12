@@ -385,6 +385,14 @@ def _selected_route(
     matching_edges = [edge for edge in edges if edge.trigger == trigger]
     default_edge = next(edge for edge in matching_edges if edge.is_default)
     decision: tuple[str | None, str | None]
+    output_context = _output_context(states)
+    if trigger == "success" and node_id not in output_context:
+        output_context[node_id] = {
+            "status": WorkflowNodeExecStatus.SUCCESS.value,
+            "job_id": None,
+            "error_code": None,
+            "selected_target": None,
+        }
     try:
         selected = default_edge.target
         for edge in matching_edges:
@@ -393,7 +401,7 @@ def _selected_route(
             if evaluate_when(
                 edge.when,
                 variables,
-                node_outputs=_output_context(states),
+                node_outputs=output_context,
             ):
                 selected = edge.target
                 break

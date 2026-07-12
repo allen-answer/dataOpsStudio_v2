@@ -464,6 +464,35 @@ def test_branch_freezes_first_matching_route_before_child_enqueue() -> None:
     assert plan.node_states["route"].outputs == {"selected_target": "first"}
 
 
+def test_branch_pre_enqueue_selection_preserves_source_self_outputs() -> None:
+    spec = _routed_spec(
+        [
+            {"id": "route", "job_kind": "branch", "payload": {}},
+            {"id": "selected"},
+            {"id": "fallback"},
+        ],
+        [
+            {
+                "source": "route",
+                "target": "selected",
+                "when": (
+                    "${nodes.route.status} == 'success'"
+                    " && ${nodes.route.job_id} == null"
+                    " && ${nodes.route.error_code} == null"
+                    " && ${nodes.route.selected_target} == null"
+                ),
+            },
+            {"source": "route", "target": "fallback", "is_default": True},
+        ],
+    )
+
+    plan = plan_workflow_step(spec, {}, now=_NOW)
+
+    assert plan.enqueue_node_ids == ("route",)
+    assert plan.node_states["route"].status is WorkflowNodeExecStatus.WAITING
+    assert plan.node_states["route"].outputs == {"selected_target": "selected"}
+
+
 def test_branch_condition_error_fails_deterministically_before_enqueue() -> None:
     spec = _routed_spec(
         [
