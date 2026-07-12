@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 from collections import Counter
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -56,6 +57,101 @@ def test_pg_queue_concurrent_claims_are_disjoint() -> None:
     assert sorted(claimed) == sorted(job_ids)
     counts = Counter(claimed)
     assert all(count == 1 for count in counts.values())
+
+
+def test_future_high_priority_job_is_skipped_for_lower_priority_due_job() -> None:
+    engine = _pg_engine_or_skip()
+    owner_id, project_id = _prepare_db(engine)
+    backend = PostgresJobBackend(engine)
+    future = _make_job(
+        str(uuid4()),
+        owner_id,
+        project_id,
+        priority=100,
+        available_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    due = _make_job(
+        str(uuid4()),
+        owner_id,
+        project_id,
+        priority=1,
+    )
+    backend.enqueue(future)
+    backend.enqueue(due)
+
+    claimed = backend.claim_next("worker-due")
+
+    assert claimed is not None
+    assert claimed.id == due.id
+    assert backend.claim_next("worker-future") is None
+
+
+def test_future_job_becomes_claimable_exactly_once_after_moving_due() -> None:
+    engine = _pg_engine_or_skip()
+    owner_id, project_id = _prepare_db(engine)
+    backend = PostgresJobBackend(engine)
+    job = _make_job(
+        str(uuid4()),
+        owner_id,
+        project_id,
+        available_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    backend.enqueue(job)
+    assert backend.claim_next("worker-before-due") is None
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE jobs SET available_at = now() WHERE id = :job_id"),
+            {"job_id": job.id},
+        )
+
+    claimed: list[str] = []
+    errors: list[Exception] = []
+    claimed_lock = threading.Lock()
+    barrier = threading.Barrier(8)
+
+    def worker(worker_index: int) -> None:
+        try:
+            local_backend = PostgresJobBackend(engine)
+            barrier.wait()
+            result = local_backend.claim_next(f"due-worker-{worker_index}")
+            if result is not None:
+                with claimed_lock:
+                    claimed.append(result.id)
+        except Exception as exc:
+            with claimed_lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(index,)) for index in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors
+    assert not any(thread.is_alive() for thread in threads)
+    assert claimed == [job.id]
+
+
+def test_future_pending_job_can_be_cancelled_without_being_claimed() -> None:
+    engine = _pg_engine_or_skip()
+    owner_id, project_id = _prepare_db(engine)
+    backend = PostgresJobBackend(engine)
+    available_at = datetime.now(UTC) + timedelta(hours=1)
+    job = _make_job(
+        str(uuid4()),
+        owner_id,
+        project_id,
+        available_at=available_at,
+    )
+    backend.enqueue(job)
+
+    backend.cancel_pending_job(job.id, "workflow aborted")
+
+    cancelled = backend.get_job(job.id)
+    assert cancelled is not None
+    assert cancelled.status == JobStatus.CANCELLED
+    assert cancelled.available_at == available_at
+    assert backend.claim_next("worker-cancelled") is None
 
 
 def test_reaper_requeues_stale_running_jobs_once_under_concurrency() -> None:
@@ -236,8 +332,9 @@ def _make_job(
     project_id: str,
     *,
     priority: int = 0,
+    available_at: datetime | None = None,
 ) -> Job:
-    return Job(
+    job = Job(
         id=job_id,
         kind=JobKind.SQL_QUERY,
         status=JobStatus.PENDING,
@@ -250,3 +347,6 @@ def _make_job(
         audit_id=str(uuid4()),
         payload={"sql": "SELECT 1"},
     )
+    if available_at is None:
+        return job
+    return job.model_copy(update={"available_at": available_at})

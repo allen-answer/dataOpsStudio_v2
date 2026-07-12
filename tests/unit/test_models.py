@@ -6,9 +6,14 @@
 
 from __future__ import annotations
 
+import importlib
 import pathlib
 import re
+from datetime import UTC, datetime
+from unittest.mock import MagicMock
 
+import pytest
+from pydantic import ValidationError
 from sqlalchemy import CheckConstraint
 
 from app.db.models import (
@@ -36,6 +41,49 @@ from app.db.models import (
     workflow_templates,
     workflows,
 )
+from app.domain.job import Job, JobKind, JobStatus
+from app.domain.resource import ResourceProfile
+
+
+def test_job_kind_contains_workflow_intrinsics() -> None:
+    job_kinds = {kind.value for kind in JobKind}
+
+    assert {"notify", "sleep", "branch"} <= job_kinds
+
+
+def test_job_available_at_defaults_to_current_aware_utc_time() -> None:
+    before = datetime.now(UTC)
+    job = Job(
+        id="j-available-default",
+        kind=JobKind.SQL_QUERY,
+        status=JobStatus.PENDING,
+        owner_user_id="u-1",
+        project_id="p-1",
+        priority=0,
+        timeout_seconds=300,
+        resource_profile=ResourceProfile(),
+        audit_id="a-1",
+    )
+    after = datetime.now(UTC)
+
+    assert job.available_at.tzinfo is not None
+    assert before <= job.available_at <= after
+
+
+def test_job_available_at_rejects_naive_datetime() -> None:
+    with pytest.raises(ValidationError, match="timezone"):
+        Job(
+            id="j-available-naive",
+            kind=JobKind.SQL_QUERY,
+            status=JobStatus.PENDING,
+            owner_user_id="u-1",
+            project_id="p-1",
+            priority=0,
+            available_at=datetime(2026, 1, 1),
+            timeout_seconds=300,
+            resource_profile=ResourceProfile(),
+            audit_id="a-1",
+        )
 
 
 def test_datasources_has_database_name_column() -> None:
@@ -495,8 +543,66 @@ def test_secret_ref_columns_have_no_foreign_key() -> None:
 
 def test_jobs_queue_pending_partial_index_exists() -> None:
     """FOR UPDATE SKIP LOCKED 用的偏序索引必须存在(契约 §2.2.2)。"""
-    index_names = {idx.name for idx in jobs.indexes}
-    assert "ix_jobs_queue_pending" in index_names
+    pending_index = next(idx for idx in jobs.indexes if idx.name == "ix_jobs_queue_pending")
+
+    assert {column.name for column in pending_index.columns} == {
+        "available_at",
+        "priority",
+        "created_at",
+    }
+
+
+def test_jobs_available_at_column_is_required_and_timezone_aware() -> None:
+    column = jobs.columns["available_at"]
+
+    assert column.nullable is False
+    assert column.type.timezone is True
+    assert column.server_default is not None
+    assert str(column.server_default.arg) == "now()"
+
+
+def test_job_available_at_migration_replaces_pending_queue_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration = importlib.import_module("app.db.migrations.versions.0026_job_available_at")
+    operation = MagicMock()
+    monkeypatch.setattr(migration, "op", operation)
+
+    assert migration.revision == "0026_job_available_at"
+    assert migration.down_revision == "0025_system_settings"
+
+    migration.upgrade()
+
+    assert [called[0] for called in operation.method_calls] == [
+        "add_column",
+        "drop_index",
+        "create_index",
+    ]
+    added_column = operation.add_column.call_args.args[1]
+    assert added_column.name == "available_at"
+    assert added_column.nullable is False
+    assert added_column.type.timezone is True
+    assert str(added_column.server_default.arg) == "now()"
+    assert operation.create_index.call_args.args[:3] == (
+        "ix_jobs_queue_pending",
+        "jobs",
+        ["available_at", "priority", "created_at"],
+    )
+
+    operation.reset_mock()
+    migration.downgrade()
+
+    assert [called[0] for called in operation.method_calls] == [
+        "drop_index",
+        "create_index",
+        "drop_column",
+    ]
+    assert operation.create_index.call_args.args[:3] == (
+        "ix_jobs_queue_pending",
+        "jobs",
+        ["priority", "created_at"],
+    )
+    operation.drop_column.assert_called_once_with("jobs", "available_at")
 
 
 def test_jobs_has_required_queue_fields() -> None:
