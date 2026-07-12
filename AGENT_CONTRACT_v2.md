@@ -282,14 +282,33 @@ class AiGateway(Protocol):
 ```python
 class Job:
     id: str
-    kind: Literal["sql_query","test_connection","sql_explain","compare_run","export_excel",
-                  "scenario_materialize","scenario_run_all","workflow_run",
-                  "ai_assist_call","ai_copilot_run","lineage_analyze"]
+    kind: Literal[
+        "sql_query",
+        "test_connection",
+        "sql_explain",
+        "compare_run",
+        "result_export",
+        "export_excel",
+        "scenario_materialize",
+        "scenario_run_all",
+        "workflow_run",
+        "notify",
+        "sleep",
+        "branch",
+        "workflow_sensor_check",
+        "ai_assist_call",
+        "ai_copilot_run",
+        "lineage_analyze",
+        "lineage_batch",
+    ]
     status: Literal["pending","running","success","failed","cancelled","timeout"]
     owner_user_id: str
     project_id: str
     datasource_ids: list[str]
     priority: int
+    # aware-only;当前 UTC 默认使旧调用方创建的 Job 立即可 claim
+    # PostgreSQL 仅领取 status='pending' 且 available_at <= now() 的 Job
+    available_at: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC))
     timeout_seconds: int
     resource_profile: ResourceProfile          # 见 app/domain/resource.py;2.0.0 字段:memory_limit_mb / timeout_seconds(均 Optional[int])
     result_ref: Optional[ResultRef]
@@ -301,6 +320,7 @@ class Job:
     cancel_requested: bool
     cancel_reason: Optional[str]
     error: Optional[str]
+    error_code: Optional[JobErrorCode]
     retry_count: int
     payload: dict
     parent_workflow_run_id: Optional[str]
