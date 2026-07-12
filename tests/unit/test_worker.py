@@ -7,7 +7,9 @@ import threading
 import time
 import zipfile
 from collections.abc import Callable, Iterable
+from datetime import UTC, datetime, timedelta
 from typing import Any, BinaryIO, Protocol
+from unittest.mock import patch
 
 from sqlalchemy.exc import IntegrityError
 
@@ -36,6 +38,7 @@ from app.worker import (
     WorkerRunnerConfig,
     _build_workflow_child_job,
     _compare_export_row_cap,
+    _workflow_children_snapshots,
 )
 
 
@@ -170,6 +173,68 @@ def test_worker_runs_sql_explain_to_spool_and_completes() -> None:
     assert backend.completed == [("job-1", ResultRef(backend="local_fs", uri="spool/rs-1"))]
     assert catalog.completed[-1]["loaded_rows"] == 1
     assert catalog.completed[-1]["console_id"] == "console-1"
+
+
+def test_workflow_sql_query_completion_persists_safe_output_metadata() -> None:
+    job = _make_job(payload={"sql": "SELECT 1", "result_set_id": "rs-workflow"}).model_copy(
+        update={
+            "parent_workflow_run_id": "run-1",
+            "payload": {
+                "sql": "SELECT 1",
+                "result_set_id": "rs-workflow",
+                "workflow_node_id": "query",
+            },
+        }
+    )
+    backend = _FakeBackend([job])
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([Row(values=[1]), Row(values=[2])])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.completed[0][1].metadata == {
+        "result_set_id": "rs-workflow",
+        "loaded_rows": 2,
+    }
+
+
+def test_workflow_sql_explain_completion_persists_safe_output_metadata() -> None:
+    job = _make_job(
+        kind=JobKind.SQL_EXPLAIN,
+        payload={"sql": "SELECT 1", "result_set_id": "rs-workflow-plan"},
+    ).model_copy(
+        update={
+            "parent_workflow_run_id": "run-1",
+            "payload": {
+                "sql": "SELECT 1",
+                "result_set_id": "rs-workflow-plan",
+                "workflow_node_id": "plan",
+            },
+        }
+    )
+    backend = _FakeBackend([job])
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(
+            datasource_id,
+            operation_policy=OperationPolicy(allow_explain=True),
+        ),
+        _adapter_factory(_FakeAdapter([], explain_rows=[{"id": 1}])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.completed[0][1].metadata == {
+        "result_set_id": "rs-workflow-plan",
+        "loaded_rows": 1,
+    }
 
 
 def test_worker_updates_catalog_while_streaming_batches() -> None:
@@ -1431,7 +1496,7 @@ class _FakeCompareRunCatalog:
 
 def _workflow_spec_payload(
     nodes: list[dict[str, object]] | None = None,
-    edges: list[dict[str, str]] | None = None,
+    edges: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
         "nodes": nodes
@@ -1494,6 +1559,32 @@ def _workflow_child(
         retry_count=retry_count,
         error=error,
     )
+
+
+def test_workflow_child_snapshot_maps_error_code_and_only_safe_result_outputs() -> None:
+    child = _workflow_child("job-1", "n1", JobStatus.FAILED, error="timed out").model_copy(
+        update={
+            "error_code": JobErrorCode.TIMEOUT,
+            "result_ref": ResultRef(
+                backend="local_fs",
+                uri="spool/internal-sensitive-location",
+                metadata={
+                    "result_set_id": "rs-1",
+                    "loaded_rows": 7,
+                    "sql": "SELECT sensitive_value",
+                    "rows": [["secret-row"]],
+                    "arbitrary": {"secret": "value"},
+                },
+            ),
+        }
+    )
+
+    snapshot = _workflow_children_snapshots([child])["n1"]
+
+    assert snapshot.error_code == "timeout"
+    assert snapshot.outputs == {"result_set_id": "rs-1", "loaded_rows": 7}
+    assert "internal-sensitive-location" not in repr(snapshot.outputs)
+    assert "secret-row" not in repr(snapshot.outputs)
 
 
 def test_workflow_run_first_step_enqueues_root_child_and_yields() -> None:
@@ -1705,6 +1796,247 @@ def test_build_workflow_child_job_expands_list_variable_via_sql_in() -> None:
 
     assert child.payload["source_ref"]["sql"] == "SELECT * FROM t WHERE id IN (1, 2, 3)"
     assert child.kind is JobKind.COMPARE_RUN
+
+
+def test_build_workflow_sql_children_default_result_set_id_to_child_id() -> None:
+    run_job = _workflow_run_job()
+    variables = {"today": "2026-07-07"}
+
+    for job_kind in ("sql_query", "sql_explain"):
+        node = WorkflowNode(
+            id=job_kind,
+            job_kind=job_kind,
+            payload={"sql": "SELECT 1", "datasource_id": "ds-9"},
+            timeout_seconds=60,
+        )
+
+        child = _build_workflow_child_job(run_job, node, variables)
+
+        assert child.payload["result_set_id"] == child.id
+
+
+def test_workflow_sql_to_export_child_receives_safe_upstream_output_context() -> None:
+    spec = _workflow_spec_payload(
+        nodes=[
+            {
+                "id": "query",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 1", "datasource_id": "ds-9"},
+                "timeout_seconds": 60,
+            },
+            {
+                "id": "export",
+                "job_kind": "export_excel",
+                "payload": {
+                    "source_result_set_id": "${nodes.query.result_set_id}",
+                    "loaded_rows": "${nodes.query.loaded_rows}",
+                    "filename": "result.xlsx",
+                },
+                "timeout_seconds": 60,
+            },
+        ],
+        edges=[{"source": "query", "target": "export"}],
+    )
+    query_child = _workflow_child("job-1", "query", JobStatus.SUCCESS).model_copy(
+        update={
+            "result_ref": ResultRef(
+                backend="local_fs",
+                uri="spool/private-location",
+                metadata={
+                    "result_set_id": "rs-query",
+                    "loaded_rows": 7,
+                    "rows": [["secret-row"]],
+                },
+            )
+        }
+    )
+    backend = _FakeBackend([_workflow_run_job(spec)])
+    backend.children_by_parent["job-1"] = [query_child]
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert len(backend.enqueued) == 1
+    export_child = backend.enqueued[0]
+    assert export_child.kind is JobKind.EXPORT_EXCEL
+    assert export_child.payload["source_result_set_id"] == "rs-query"
+    assert export_child.payload["loaded_rows"] == 7
+    assert isinstance(export_child.payload["loaded_rows"], int)
+    assert "secret-row" not in repr(export_child.payload)
+
+
+def test_workflow_branch_child_is_enqueued_with_frozen_selected_target() -> None:
+    spec = _workflow_spec_payload(
+        nodes=[
+            {
+                "id": "query",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 1", "datasource_id": "ds-9"},
+                "timeout_seconds": 60,
+            },
+            {
+                "id": "route",
+                "job_kind": "branch",
+                "payload": {},
+                "timeout_seconds": 60,
+            },
+            {
+                "id": "has_rows",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 1", "datasource_id": "ds-9"},
+                "timeout_seconds": 60,
+            },
+            {
+                "id": "empty",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 0", "datasource_id": "ds-9"},
+                "timeout_seconds": 60,
+            },
+        ],
+        edges=[
+            {"source": "query", "target": "route"},
+            {
+                "source": "route",
+                "target": "has_rows",
+                "when": "${nodes.query.loaded_rows} > 0",
+            },
+            {"source": "route", "target": "empty", "is_default": True},
+        ],
+    )
+    query_child = _workflow_child("job-1", "query", JobStatus.SUCCESS).model_copy(
+        update={
+            "result_ref": ResultRef(
+                backend="local_fs",
+                uri="spool/private-location",
+                metadata={"result_set_id": "rs-query", "loaded_rows": 2},
+            )
+        }
+    )
+    backend = _FakeBackend([_workflow_run_job(spec)])
+    backend.children_by_parent["job-1"] = [query_child]
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert len(backend.enqueued) == 1
+    branch_child = backend.enqueued[0]
+    assert branch_child.kind is JobKind.BRANCH
+    assert branch_child.payload == {
+        "workflow_node_id": "route",
+        "selected_target": "has_rows",
+    }
+
+
+def test_worker_executes_branch_immediately_with_safe_result_ref() -> None:
+    job = _make_job(
+        kind=JobKind.BRANCH,
+        payload={"workflow_node_id": "route", "selected_target": "has_rows"},
+    ).model_copy(update={"parent_workflow_run_id": "run-1"})
+    backend = _FakeBackend([job])
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert backend.failed == []
+    assert backend.completed == [
+        (
+            "job-1",
+            ResultRef(
+                backend="branch",
+                uri="branch/job-1",
+                metadata={"selected_target": "has_rows"},
+            ),
+        )
+    ]
+
+
+def test_build_workflow_sleep_child_sets_available_at_from_supplied_now() -> None:
+    now = datetime(2026, 7, 12, 4, 0, tzinfo=UTC)
+    node = WorkflowNode(
+        id="pause",
+        job_kind="sleep",
+        payload={"duration_seconds": 45},
+        timeout_seconds=60,
+    )
+
+    child = _build_workflow_child_job(
+        _workflow_run_job(),
+        node,
+        {"today": "2026-07-12"},
+        now=now,
+    )
+
+    assert child.available_at == now + timedelta(seconds=45)
+    assert child.payload == {
+        "workflow_node_id": "pause",
+        "duration_seconds": 45,
+    }
+
+
+def test_worker_completes_due_sleep_without_duration_sleep_call() -> None:
+    job = _make_job(
+        kind=JobKind.SLEEP,
+        payload={"workflow_node_id": "pause", "duration_seconds": 45},
+    ).model_copy(
+        update={
+            "parent_workflow_run_id": "run-1",
+            "available_at": datetime(2026, 7, 12, 4, 0, tzinfo=UTC),
+        }
+    )
+    backend = _FakeBackend([job])
+    runner = _workflow_runner(backend)
+
+    with patch("app.worker.time.sleep") as duration_sleep:
+        assert runner.run_once() is True
+
+    duration_sleep.assert_not_called()
+    assert backend.failed == []
+    assert backend.completed == [
+        (
+            "job-1",
+            ResultRef(
+                backend="sleep",
+                uri="sleep/job-1",
+                metadata={"duration_seconds": 45},
+            ),
+        )
+    ]
+
+
+def test_workflow_run_cancel_cancels_future_pending_sleep() -> None:
+    run_job = _workflow_run_job(
+        _workflow_spec_payload(
+            nodes=[
+                {
+                    "id": "pause",
+                    "job_kind": "sleep",
+                    "payload": {"duration_seconds": 3600},
+                    "timeout_seconds": 60,
+                }
+            ]
+        )
+    )
+    future_sleep = _make_job(
+        kind=JobKind.SLEEP,
+        payload={"workflow_node_id": "pause", "duration_seconds": 3600},
+    ).model_copy(
+        update={
+            "id": "child-pause",
+            "status": JobStatus.PENDING,
+            "parent_workflow_run_id": "job-1",
+            "available_at": datetime.now(UTC) + timedelta(hours=1),
+        }
+    )
+    backend = _FakeBackend([run_job])
+    backend.children_by_parent["job-1"] = [future_sleep]
+    backend.cancel_after_checks = 1
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert "child-pause" in backend.cancel_requested_ids
+    assert ("child-pause", "workflow run cancelled") in backend.cancelled_pending
+    assert backend.cancelled == [("job-1", "cancel requested")]
 
 
 def _compare_run_node_payload() -> dict[str, object]:

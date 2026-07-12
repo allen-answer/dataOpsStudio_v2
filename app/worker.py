@@ -115,6 +115,7 @@ from app.domain.workflow_execution import (
     plan_workflow_step,
 )
 from app.domain.workflow_interpolate import interpolate_payload
+from app.domain.workflow_outputs import extract_workflow_node_outputs
 from app.domain.workflow_when import builtin_when_variables, when_variables_from_payload
 from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
@@ -532,6 +533,10 @@ class WorkerRunner:
                 outcome = self._execute_lineage_batch(job)
             elif job.kind is JobKind.WORKFLOW_RUN:
                 outcome = self._execute_workflow_run(job)
+            elif job.kind is JobKind.BRANCH:
+                outcome = self._execute_branch(job)
+            elif job.kind is JobKind.SLEEP:
+                outcome = self._execute_sleep(job)
             elif job.kind is JobKind.WORKFLOW_SENSOR_CHECK:
                 outcome = self._execute_sensor_check(job)
             else:
@@ -576,7 +581,8 @@ class WorkerRunner:
                     elapsed_seconds=_elapsed_seconds(started_at),
                 )
                 return
-            self._backend.complete(job.id, outcome.result_ref)
+            result_ref = _workflow_sql_result_ref(job, outcome)
+            self._backend.complete(job.id, result_ref)
             self._notify_workflow_run_terminal(job, JobStatus.SUCCESS.value)
             logger.info(
                 "worker job complete",
@@ -1474,8 +1480,15 @@ class WorkerRunner:
             when_variables=variables,
         )
         nodes_by_id = {node.id: node for node in spec.nodes}
+        node_outputs = {node_id: state.outputs for node_id, state in plan.node_states.items()}
         for node_id in plan.enqueue_node_ids:
-            child_job = _build_workflow_child_job(job, nodes_by_id[node_id], variables)
+            child_job = _build_workflow_child_job(
+                job,
+                nodes_by_id[node_id],
+                variables,
+                node_outputs=node_outputs,
+                now=now,
+            )
             try:
                 self._backend.enqueue(child_job)
             except IntegrityError:
@@ -1554,6 +1567,26 @@ class WorkerRunner:
                     "workflow_id": _payload_optional_str(job.payload, "workflow_id"),
                     "nodes": summary,
                 },
+            )
+        )
+
+    def _execute_branch(self, job: Job) -> _ExecutionOutcome:
+        selected_target = _required_payload_str(job.payload, "selected_target")
+        return _ExecutionOutcome(
+            ResultRef(
+                backend="branch",
+                uri=f"branch/{job.id}",
+                metadata={"selected_target": selected_target},
+            )
+        )
+
+    def _execute_sleep(self, job: Job) -> _ExecutionOutcome:
+        duration_seconds = _payload_non_negative_int(job.payload, "duration_seconds")
+        return _ExecutionOutcome(
+            ResultRef(
+                backend="sleep",
+                uri=f"sleep/{job.id}",
+                metadata={"duration_seconds": duration_seconds},
             )
         )
 
@@ -2487,18 +2520,42 @@ def _workflow_children_snapshots(children: list[Job]) -> dict[str, WorkflowChild
             retry_count=child.retry_count,
             finished_at=child.finished_at,
             error=child.error,
+            error_code=child.error_code.value if child.error_code is not None else None,
+            outputs=extract_workflow_node_outputs(child.kind.value, child.result_ref),
         )
     return snapshots
 
 
 def _build_workflow_child_job(
-    run_job: Job, node: WorkflowNode, variables: Mapping[str, str | list[str]]
+    run_job: Job,
+    node: WorkflowNode,
+    variables: Mapping[str, str | list[str]],
+    *,
+    node_outputs: Mapping[str, Mapping[str, object]] | None = None,
+    now: datetime | None = None,
 ) -> Job:
     # 入队时刻渲染 payload 里的 ${var} 占位符(用触发时冻结的变量快照);
     # 未解析变量等确定性错误已在 plan_workflow_step 侧拦成节点 FAILED,故走到这里
     # 的节点插值必定成功。job_kind 只按原始 node.job_kind 构造,插值只碰 payload(R7)
-    payload: dict[str, Any] = interpolate_payload(node.payload, variables)
+    child_job_id = str(uuid4())
+    payload: dict[str, Any] = interpolate_payload(
+        node.payload,
+        variables,
+        node_outputs=node_outputs,
+    )
     payload["workflow_node_id"] = node.id
+    if node.job_kind == JobKind.BRANCH.value:
+        selected_target = (node_outputs or {}).get(node.id, {}).get("selected_target")
+        if not isinstance(selected_target, str) or not selected_target:
+            raise ValueError("branch_selected_target_missing")
+        payload["selected_target"] = selected_target
+    if node.job_kind in {JobKind.SQL_QUERY.value, JobKind.SQL_EXPLAIN.value}:
+        result_set_id = payload.get("result_set_id")
+        if not isinstance(result_set_id, str) or not result_set_id:
+            payload["result_set_id"] = child_job_id
+    available_at = now or datetime.now(UTC)
+    if node.job_kind == JobKind.SLEEP.value:
+        available_at += timedelta(seconds=_payload_non_negative_int(payload, "duration_seconds"))
     if node.job_kind == JobKind.COMPARE_RUN.value:
         # compare_run 每次执行都要一次性 run 身份 + bucket result set 占位:
         # API 直连路径在 core.run_compare_task 铸造,workflow 路径此处铸造。
@@ -2508,7 +2565,7 @@ def _build_workflow_child_job(
         payload["run_id"] = str(uuid4())
         payload["bucket_result_set_ids"] = {bucket: str(uuid4()) for bucket in COMPARE_BUCKETS}
     return Job(
-        id=str(uuid4()),
+        id=child_job_id,
         kind=JobKind(node.job_kind),
         status=JobStatus.PENDING,
         owner_user_id=run_job.owner_user_id,
@@ -2519,11 +2576,31 @@ def _build_workflow_child_job(
         # run job = -1(见 trigger_workflow_run),故子 job = 0,与交互 sql_query
         # 同档,大工作流爆发时不压制交互查询(backlog Workflow minor #3)
         priority=run_job.priority + 1,
+        available_at=available_at,
         timeout_seconds=node.timeout_seconds,
         resource_profile=ResourceProfile(timeout_seconds=node.timeout_seconds),
         audit_id=str(uuid4()),
         payload=payload,
         parent_workflow_run_id=run_job.id,
+    )
+
+
+def _workflow_sql_result_ref(job: Job, outcome: _ExecutionOutcome) -> ResultRef:
+    if (
+        job.parent_workflow_run_id is None
+        or job.kind not in {JobKind.SQL_QUERY, JobKind.SQL_EXPLAIN}
+        or outcome.loaded_rows is None
+    ):
+        return outcome.result_ref
+    result_set_id = _payload_optional_str(job.payload, "result_set_id") or job.id
+    return outcome.result_ref.model_copy(
+        update={
+            "metadata": {
+                **outcome.result_ref.metadata,
+                "result_set_id": result_set_id,
+                "loaded_rows": outcome.loaded_rows,
+            }
+        }
     )
 
 

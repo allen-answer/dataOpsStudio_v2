@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator, Mapping
 
+from app.domain.result import ResultRef
+
 type NodeOutputValue = str | int | float | bool | None
 type NodeOutputMap = Mapping[str, Mapping[str, object]]
 
@@ -35,6 +37,70 @@ class NodeOutputReferenceError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+def extract_workflow_node_outputs(
+    job_kind: str,
+    result_ref: ResultRef | None,
+) -> dict[str, NodeOutputValue]:
+    """Project a child ResultRef through the Workflow scalar output whitelist."""
+    if result_ref is None:
+        return {}
+    metadata = result_ref.metadata
+    outputs: dict[str, NodeOutputValue] = {}
+    if job_kind in {"sql_query", "sql_explain"}:
+        _copy_string(metadata, "result_set_id", outputs)
+        _copy_int(metadata, "loaded_rows", outputs)
+    elif job_kind == "compare_run":
+        _copy_string(metadata, "run_id", outputs)
+        bucket_counts = metadata.get("bucket_counts")
+        if isinstance(bucket_counts, Mapping):
+            for bucket in ("same", "only_source", "only_target", "diff"):
+                _copy_int(bucket_counts, bucket, outputs, target=f"{bucket}_count")
+    elif job_kind == "lineage_analyze":
+        _copy_string(metadata, "lineage_run_id", outputs, target="run_id")
+        _copy_bool(metadata, "cached", outputs)
+        for field_name in ("table_edge_count", "column_edge_count", "parse_error_count"):
+            _copy_int(metadata, field_name, outputs)
+    elif job_kind == "branch":
+        _copy_string(metadata, "selected_target", outputs)
+    elif job_kind == "sleep":
+        _copy_int(metadata, "duration_seconds", outputs)
+    return outputs
+
+
+def _copy_string(
+    source: Mapping[str, object],
+    field_name: str,
+    outputs: dict[str, NodeOutputValue],
+    *,
+    target: str | None = None,
+) -> None:
+    value = source.get(field_name)
+    if isinstance(value, str) and value:
+        outputs[target or field_name] = value
+
+
+def _copy_int(
+    source: Mapping[str, object],
+    field_name: str,
+    outputs: dict[str, NodeOutputValue],
+    *,
+    target: str | None = None,
+) -> None:
+    value = source.get(field_name)
+    if isinstance(value, int) and not isinstance(value, bool):
+        outputs[target or field_name] = value
+
+
+def _copy_bool(
+    source: Mapping[str, object],
+    field_name: str,
+    outputs: dict[str, NodeOutputValue],
+) -> None:
+    value = source.get(field_name)
+    if isinstance(value, bool):
+        outputs[field_name] = value
 
 
 def parse_node_output_reference(expression: str) -> tuple[str, str] | None:

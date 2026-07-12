@@ -45,6 +45,7 @@ INHERITED_RETRY_BACKOFF_SECONDS = 0
 UNSAFE_NODE_OUTPUT_ERROR_CODE = "unsafe_node_output_value"
 WHEN_EVALUATION_ERROR_CODE = "when_evaluation_failed"
 PARAM_INTERPOLATION_ERROR_CODE = "param_interpolation_failed"
+BRANCH_EVALUATION_ERROR_CODE = "branch_evaluation_failed"
 
 
 class WorkflowNodeExecStatus(StrEnum):
@@ -80,7 +81,7 @@ class WorkflowChildJob:
     finished_at: datetime | None = None
     error: str | None = None
     error_code: str | None = None
-    outputs: dict[str, object] = field(default_factory=dict)
+    outputs: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -144,27 +145,6 @@ def plan_workflow_step(
                 wait_candidates=wait_candidates,
             )
             states[node.id] = state
-            if node.job_kind == "branch" and state.status is WorkflowNodeExecStatus.SUCCESS:
-                selected, route_error = _selected_route(
-                    node_id=node.id,
-                    trigger="success",
-                    edges=outgoing_edges[node.id],
-                    variables=variables,
-                    states=states,
-                    cache=route_selections,
-                )
-                if route_error is not None:
-                    states[node.id] = replace(
-                        state,
-                        status=WorkflowNodeExecStatus.FAILED,
-                        error=f"branch evaluation failed: {route_error}",
-                        outputs={**state.outputs, "status": WorkflowNodeExecStatus.FAILED.value},
-                    )
-                else:
-                    states[node.id] = replace(
-                        state,
-                        outputs={**state.outputs, "selected_target": selected},
-                    )
             states[node.id] = _with_failure_route_error(
                 node=node,
                 state=states[node.id],
@@ -257,7 +237,41 @@ def plan_workflow_step(
                 cache=route_selections,
             )
             continue
-        states[node.id] = WorkflowNodeState(node_id=node.id, status=WorkflowNodeExecStatus.WAITING)
+        ready_outputs: dict[str, NodeOutputValue] = {}
+        if node.job_kind == "branch":
+            selected_target, route_error = _selected_route(
+                node_id=node.id,
+                trigger="success",
+                edges=outgoing_edges[node.id],
+                variables=variables,
+                states=states,
+                cache=route_selections,
+            )
+            if route_error is not None:
+                states[node.id] = WorkflowNodeState(
+                    node_id=node.id,
+                    status=WorkflowNodeExecStatus.FAILED,
+                    error=f"branch evaluation failed: {route_error}",
+                    outputs=_failed_node_outputs(
+                        job_id=None,
+                        error_code=BRANCH_EVALUATION_ERROR_CODE,
+                    ),
+                )
+                states[node.id] = _with_failure_route_error(
+                    node=node,
+                    state=states[node.id],
+                    edges=outgoing_edges[node.id],
+                    variables=variables,
+                    states=states,
+                    cache=route_selections,
+                )
+                continue
+            ready_outputs["selected_target"] = selected_target
+        states[node.id] = WorkflowNodeState(
+            node_id=node.id,
+            status=WorkflowNodeExecStatus.WAITING,
+            outputs=ready_outputs,
+        )
         enqueue.append(node.id)
 
     # on_failure=abort:任一最终失败节点要求 abort → 取消剩余,run 立即失败
@@ -409,15 +423,7 @@ def _edge_is_active(
             return False
         if source_node.job_kind != "branch":
             return True
-        selected, error = _selected_route(
-            node_id=edge.source,
-            trigger="success",
-            edges=outgoing_edges[edge.source],
-            variables=variables,
-            states=states,
-            cache=route_selections,
-        )
-        return error is None and selected == edge.target
+        return source_state.outputs.get("selected_target") == edge.target
     if source_state.status is not WorkflowNodeExecStatus.FAILED:
         return False
     selected, error = _selected_route(

@@ -7,7 +7,9 @@ from typing import Any
 
 import pytest
 
+from app.domain import workflow_outputs
 from app.domain.job import JobStatus
+from app.domain.result import ResultRef
 from app.domain.workflow import WorkflowEdge, WorkflowNode, WorkflowSpec
 from app.domain.workflow_execution import (
     WorkflowChildJob,
@@ -17,6 +19,107 @@ from app.domain.workflow_execution import (
 )
 
 _NOW = datetime(2026, 7, 2, 8, 0, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("job_kind", "metadata", "expected"),
+    [
+        (
+            "sql_query",
+            {
+                "result_set_id": "rs-1",
+                "loaded_rows": 7,
+                "sql": "SELECT secret_value FROM private_table",
+                "rows": [["secret-row"]],
+                "unknown": {"secret": "value"},
+            },
+            {"result_set_id": "rs-1", "loaded_rows": 7},
+        ),
+        (
+            "sql_explain",
+            {"result_set_id": "rs-plan", "loaded_rows": 1, "loaded_rows_copy": [1]},
+            {"result_set_id": "rs-plan", "loaded_rows": 1},
+        ),
+        (
+            "compare_run",
+            {
+                "run_id": "compare-1",
+                "bucket_counts": {
+                    "same": 11,
+                    "only_source": 2,
+                    "only_target": 3,
+                    "diff": 4,
+                    "unknown": 99,
+                },
+                "diff_profile": {"sample": ["secret-row"]},
+            },
+            {
+                "run_id": "compare-1",
+                "same_count": 11,
+                "only_source_count": 2,
+                "only_target_count": 3,
+                "diff_count": 4,
+            },
+        ),
+        (
+            "lineage_analyze",
+            {
+                "lineage_run_id": "lineage-1",
+                "cached": False,
+                "table_edge_count": 5,
+                "column_edge_count": 6,
+                "parse_error_count": 1,
+                "sql_text": "sensitive-sql",
+            },
+            {
+                "run_id": "lineage-1",
+                "cached": False,
+                "table_edge_count": 5,
+                "column_edge_count": 6,
+                "parse_error_count": 1,
+            },
+        ),
+        (
+            "branch",
+            {"selected_target": "has_rows", "condition": {"secret": True}},
+            {"selected_target": "has_rows"},
+        ),
+        (
+            "sleep",
+            {"duration_seconds": 30, "debug": ["secret"]},
+            {"duration_seconds": 30},
+        ),
+        ("export_excel", {"source_result_set_id": "rs-secret"}, {}),
+    ],
+)
+def test_extract_workflow_node_outputs_uses_exact_safe_whitelist(
+    job_kind: str,
+    metadata: dict[str, object],
+    expected: dict[str, object],
+) -> None:
+    result_ref = ResultRef(
+        backend="test",
+        uri="internal://sensitive-result-location",
+        metadata=metadata,
+    )
+
+    outputs = workflow_outputs.extract_workflow_node_outputs(job_kind, result_ref)
+
+    assert outputs == expected
+    assert "internal://sensitive-result-location" not in repr(outputs)
+
+
+def test_extract_workflow_node_outputs_drops_known_fields_with_unsafe_types() -> None:
+    result_ref = ResultRef(
+        backend="test",
+        uri="internal://result",
+        metadata={
+            "result_set_id": ["rs-secret"],
+            "loaded_rows": {"count": 7},
+        },
+    )
+
+    assert workflow_outputs.extract_workflow_node_outputs("sql_query", result_ref) == {}
 
 
 def _spec(
@@ -275,7 +378,11 @@ def test_branch_selects_first_matching_success_edge_and_skips_other_route() -> N
     )
     children = {
         "query": _child("query", JobStatus.SUCCESS, outputs={"loaded_rows": 2}),
-        "route": _child("route", JobStatus.SUCCESS),
+        "route": _child(
+            "route",
+            JobStatus.SUCCESS,
+            outputs={"selected_target": "has_rows"},
+        ),
     }
 
     plan = plan_workflow_step(spec, children, now=_NOW)
@@ -308,7 +415,11 @@ def test_branch_default_route_and_reconvergent_join() -> None:
     )
     children = {
         "query": _child("query", JobStatus.SUCCESS, outputs={"loaded_rows": 0}),
-        "route": _child("route", JobStatus.SUCCESS),
+        "route": _child(
+            "route",
+            JobStatus.SUCCESS,
+            outputs={"selected_target": "right"},
+        ),
         "right": _child("right", JobStatus.SUCCESS),
     }
 
@@ -317,6 +428,109 @@ def test_branch_default_route_and_reconvergent_join() -> None:
     assert plan.node_states["left"].status is WorkflowNodeExecStatus.SKIPPED
     assert plan.enqueue_node_ids == ("join",)
     assert plan.node_states["route"].outputs["selected_target"] == "right"
+
+
+def test_branch_freezes_first_matching_route_before_child_enqueue() -> None:
+    spec = _routed_spec(
+        [
+            {"id": "query"},
+            {"id": "route", "job_kind": "branch", "payload": {}},
+            {"id": "first"},
+            {"id": "second"},
+            {"id": "fallback"},
+        ],
+        [
+            {"source": "query", "target": "route"},
+            {
+                "source": "route",
+                "target": "first",
+                "when": "${nodes.query.loaded_rows} > 0",
+            },
+            {
+                "source": "route",
+                "target": "second",
+                "when": "${nodes.query.loaded_rows} >= 0",
+            },
+            {"source": "route", "target": "fallback", "is_default": True},
+        ],
+    )
+    children = {
+        "query": _child("query", JobStatus.SUCCESS, outputs={"loaded_rows": 2}),
+    }
+
+    plan = plan_workflow_step(spec, children, now=_NOW)
+
+    assert plan.enqueue_node_ids == ("route",)
+    assert plan.node_states["route"].outputs == {"selected_target": "first"}
+
+
+def test_branch_condition_error_fails_deterministically_before_enqueue() -> None:
+    spec = _routed_spec(
+        [
+            {"id": "query"},
+            {"id": "route", "job_kind": "branch", "payload": {}},
+            {"id": "selected"},
+            {"id": "fallback"},
+        ],
+        [
+            {"source": "query", "target": "route"},
+            {
+                "source": "route",
+                "target": "selected",
+                "when": "${nodes.query.loaded_rows} >",
+            },
+            {"source": "route", "target": "fallback", "is_default": True},
+        ],
+    )
+    children = {
+        "query": _child("query", JobStatus.SUCCESS, outputs={"loaded_rows": 2}),
+    }
+
+    plan = plan_workflow_step(spec, children, now=_NOW)
+
+    route = plan.node_states["route"]
+    assert "route" not in plan.enqueue_node_ids
+    assert route.status is WorkflowNodeExecStatus.FAILED
+    assert route.outputs == {
+        "status": "failed",
+        "job_id": None,
+        "error_code": "branch_evaluation_failed",
+    }
+    assert route.error is not None
+    assert route.error.startswith("branch evaluation failed: invalid_when_syntax:")
+
+
+def test_completed_branch_uses_persisted_target_without_re_evaluating_condition() -> None:
+    spec = _routed_spec(
+        [
+            {"id": "query"},
+            {"id": "route", "job_kind": "branch", "payload": {}},
+            {"id": "persisted"},
+            {"id": "would_now_default"},
+        ],
+        [
+            {"source": "query", "target": "route"},
+            {
+                "source": "route",
+                "target": "persisted",
+                "when": "${nodes.query.loaded_rows} > 0",
+            },
+            {"source": "route", "target": "would_now_default", "is_default": True},
+        ],
+    )
+    children = {
+        "query": _child("query", JobStatus.SUCCESS, outputs={"loaded_rows": 0}),
+        "route": _child(
+            "route",
+            JobStatus.SUCCESS,
+            outputs={"selected_target": "persisted"},
+        ),
+    }
+
+    plan = plan_workflow_step(spec, children, now=_NOW)
+
+    assert plan.enqueue_node_ids == ("persisted",)
+    assert plan.node_states["would_now_default"].status is WorkflowNodeExecStatus.SKIPPED
 
 
 def test_failure_branch_runs_selected_compensation_but_run_stays_failed() -> None:
