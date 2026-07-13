@@ -48,6 +48,13 @@ PARAM_INTERPOLATION_ERROR_CODE = "param_interpolation_failed"
 BRANCH_EVALUATION_ERROR_CODE = "branch_evaluation_failed"
 
 
+class _EdgeDecision(StrEnum):
+    WAITING = "waiting"
+    INACTIVE = "inactive"
+    SATISFIED = "satisfied"
+    BLOCKED = "blocked"
+
+
 class WorkflowNodeExecStatus(StrEnum):
     """节点执行态(子 job 状态 + DAG 编排态的合并口径)。"""
 
@@ -129,6 +136,7 @@ def plan_workflow_step(
     variables = dict(when_variables or {})
     states: dict[str, WorkflowNodeState] = {}
     route_selections: dict[tuple[str, str], tuple[str | None, str | None]] = {}
+    inactive_node_ids: set[str] = set()
     enqueue: list[str] = []
     retry: list[str] = []
     wait_candidates: list[float] = []
@@ -157,22 +165,29 @@ def plan_workflow_step(
         incoming = incoming_edges[node.id]
         if incoming:
             decisions = [
-                _edge_is_active(
+                _edge_decision(
                     edge,
                     nodes_by_id=nodes_by_id,
                     outgoing_edges=outgoing_edges,
                     variables=variables,
                     states=states,
                     route_selections=route_selections,
+                    inactive_node_ids=inactive_node_ids,
                 )
                 for edge in incoming
             ]
-            if any(decision is None for decision in decisions):
+            if _EdgeDecision.WAITING in decisions:
                 states[node.id] = WorkflowNodeState(
                     node_id=node.id, status=WorkflowNodeExecStatus.WAITING
                 )
                 continue
-            if not any(decisions):
+            if all(decision is _EdgeDecision.INACTIVE for decision in decisions):
+                states[node.id] = WorkflowNodeState(
+                    node_id=node.id, status=WorkflowNodeExecStatus.SKIPPED
+                )
+                inactive_node_ids.add(node.id)
+                continue
+            if _EdgeDecision.BLOCKED in decisions:
                 states[node.id] = WorkflowNodeState(
                     node_id=node.id, status=WorkflowNodeExecStatus.SKIPPED
                 )
@@ -413,7 +428,7 @@ def _selected_route(
     return decision
 
 
-def _edge_is_active(
+def _edge_decision(
     edge: WorkflowEdge,
     *,
     nodes_by_id: Mapping[str, WorkflowNode],
@@ -421,19 +436,31 @@ def _edge_is_active(
     variables: Mapping[str, str | list[str]],
     states: Mapping[str, WorkflowNodeState],
     route_selections: dict[tuple[str, str], tuple[str | None, str | None]],
-) -> bool | None:
+    inactive_node_ids: set[str],
+) -> _EdgeDecision:
     source_state = states[edge.source]
     if source_state.status not in TERMINAL_NODE_STATUSES:
-        return None
+        return _EdgeDecision.WAITING
+    if edge.source in inactive_node_ids:
+        return _EdgeDecision.INACTIVE
     source_node = nodes_by_id[edge.source]
     if edge.trigger == "success":
-        if source_state.status is not WorkflowNodeExecStatus.SUCCESS:
-            return False
-        if source_node.job_kind != "branch":
-            return True
-        return source_state.outputs.get("selected_target") == edge.target
+        if source_node.job_kind == "branch":
+            if source_state.status is not WorkflowNodeExecStatus.SUCCESS:
+                return _EdgeDecision.INACTIVE
+            if source_state.outputs.get("selected_target") == edge.target:
+                return _EdgeDecision.SATISFIED
+            return _EdgeDecision.INACTIVE
+        if source_state.status is WorkflowNodeExecStatus.SUCCESS:
+            return _EdgeDecision.SATISFIED
+        if (
+            source_state.status is WorkflowNodeExecStatus.FAILED
+            and source_node.on_failure == "branch"
+        ):
+            return _EdgeDecision.INACTIVE
+        return _EdgeDecision.BLOCKED
     if source_state.status is not WorkflowNodeExecStatus.FAILED:
-        return False
+        return _EdgeDecision.INACTIVE
     selected, error = _selected_route(
         node_id=edge.source,
         trigger="failure",
@@ -442,7 +469,9 @@ def _edge_is_active(
         states=states,
         cache=route_selections,
     )
-    return error is None and selected == edge.target
+    if error is None and selected == edge.target:
+        return _EdgeDecision.SATISFIED
+    return _EdgeDecision.INACTIVE
 
 
 def _topological_nodes(spec: WorkflowSpec) -> list[WorkflowNode]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, TypeVar
 
 from sqlalchemy import RowMapping, delete, insert, select, text, update
@@ -210,9 +211,15 @@ class PostgresJobBackend(JobBackend):
 
         return self._read(op)
 
-    def requeue_workflow_run(self, job_id: str) -> None:
-        """workflow_run 推进一步后让位:running → pending(高频,不写事件)。"""
+    def requeue_workflow_run(
+        self,
+        job_id: str,
+        *,
+        available_at: datetime | None = None,
+    ) -> None:
+        """workflow_run 推进一步后让位,并可在队列中延后下一次领取。"""
         worker_id = self._require_worker_id("requeue_workflow_run")
+        next_available_at = available_at if available_at is not None else text("now()")
 
         def op(conn: Connection) -> None:
             conn.execute(
@@ -225,7 +232,7 @@ class PostgresJobBackend(JobBackend):
                     worker_id=None,
                     started_at=None,
                     last_heartbeat=None,
-                    available_at=text("now()"),
+                    available_at=next_available_at,
                 )
             )
 

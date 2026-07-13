@@ -274,6 +274,28 @@ def _enqueue_in_txn(conn: Connection, job: Job) -> None:
     PostgresJobBackend(conn).enqueue(job)
 
 
+def _locked_workflow_execution_row(
+    conn: Connection,
+    workflow_id: str,
+) -> dict[str, object] | None:
+    row = (
+        conn.execute(
+            select(
+                workflows.c.id,
+                workflows.c.project_id,
+                workflows.c.name,
+                workflows.c.created_by,
+                workflows.c.dag_jsonb,
+            )
+            .where(workflows.c.id == workflow_id)
+            .with_for_update()
+        )
+        .mappings()
+        .one_or_none()
+    )
+    return None if row is None else dict(row)
+
+
 class WorkflowScheduler:
     """进程内 cron tick 后台线程。start() 于 API 启动,stop() 于关闭。"""
 
@@ -387,6 +409,7 @@ class WorkflowScheduler:
         # SEED 与 FIRE 都在此认领(SEED 只推进锚点不入队),同一事务里连带入队 job。
         run_id: str | None = None
         owner_id: str | None = None
+        current_project_id: str | None = None
         with self._services.engine.begin() as conn:
             claimed = conn.execute(
                 update(workflows)
@@ -411,7 +434,10 @@ class WorkflowScheduler:
                     fire_at=fire_at.isoformat(),
                 )
                 return
-            created_by = row["created_by"]
+            current = _locked_workflow_execution_row(conn, workflow_id)
+            if current is None:
+                return
+            created_by = current["created_by"]
             if not isinstance(created_by, str) or not created_by:
                 # 创建者被删(created_by SET NULL):无法归属 owner(jobs.owner NOT NULL)。
                 # 锚点已推进 → 只告警一次(不逐 tick 刷屏),调度暂停至有人重存该 workflow。
@@ -421,23 +447,27 @@ class WorkflowScheduler:
                 )
                 return
             owner_id = created_by
-            spec = WorkflowSpec.model_validate(row["dag_jsonb"] or {})
+            current_project_id = str(current["project_id"])
+            spec = WorkflowSpec.model_validate(current["dag_jsonb"] or {})
             job = build_workflow_run_job(
                 workflow_id=workflow_id,
-                workflow_name=str(row["name"]),
-                project_id=str(row["project_id"]),
+                workflow_name=str(current["name"]),
+                project_id=current_project_id,
                 owner_user_id=owner_id,
                 spec=spec,
                 trigger="schedule",
-                now=now,
+                # Freeze built-ins at the nominal UTC fire point, not at a
+                # potentially delayed tick scan (ADR-0009 2.4.x addendum).
+                now=fire_at,
             )
             _enqueue_in_txn(conn, job)
             run_id = job.id
 
         # 到此只可能是 FIRE 已成功入队(其余分支均在事务内 return)。
+        assert current_project_id is not None
         self._services.write_audit(
             user_id=owner_id,
-            project_id=str(row["project_id"]),
+            project_id=current_project_id,
             action="workflow_run_trigger",
             resource_type="workflow",
             resource_id=workflow_id,
@@ -495,7 +525,6 @@ class WorkflowScheduler:
         if decision.action is SensorAction.SKIP:
             return
 
-        created_by = row["created_by"]
         prev_checked = last_checked if isinstance(last_checked, datetime) else None
         # 原子认领 sensor_last_checked_at(compare-and-swap 读到的旧值):单 API 实例本
         # 无竞争,此守卫顺带兜住 HA 多实例误重复(HA 去重仍属后置,ADR-0009 Non-Goals)。
@@ -513,6 +542,14 @@ class WorkflowScheduler:
             claimed = conn.execute(claim.values(sensor_last_checked_at=now)).rowcount
             if claimed != 1:
                 return
+            current = _locked_workflow_execution_row(conn, workflow_id)
+            if current is None:
+                return
+            spec = WorkflowSpec.model_validate(current["dag_jsonb"] or {})
+            sensor = spec.sensor
+            if sensor is None or not sensor.enabled:
+                return
+            created_by = current["created_by"]
             if not isinstance(created_by, str) or not created_by:
                 # 创建者被删(created_by SET NULL):无法归属 owner(jobs.owner NOT NULL)。
                 # 锚点已推进 → 只告警一次(不逐 tick 刷屏),sensor 暂停至有人重存该 workflow。
@@ -523,8 +560,8 @@ class WorkflowScheduler:
                 return
             job = build_sensor_check_job(
                 workflow_id=workflow_id,
-                workflow_name=str(row["name"]),
-                project_id=str(row["project_id"]),
+                workflow_name=str(current["name"]),
+                project_id=str(current["project_id"]),
                 owner_user_id=created_by,
                 datasource_id=sensor.datasource_id,
                 sensor_sql=sensor.sql,

@@ -215,6 +215,49 @@ def test_downstream_becomes_ready_only_after_all_upstreams_succeed() -> None:
     assert plan.enqueue_node_ids == ("join",)
 
 
+def test_legacy_fan_in_does_not_run_after_an_ordinary_dependency_fails() -> None:
+    spec = _spec(
+        [{"id": "a"}, {"id": "b", "on_failure": "continue"}, {"id": "join"}],
+        [("a", "join"), ("b", "join")],
+    )
+    children = {
+        "a": _child("a", JobStatus.SUCCESS),
+        "b": _child("b", JobStatus.FAILED, error="boom"),
+    }
+
+    plan = plan_workflow_step(spec, children, now=_NOW)
+
+    assert plan.enqueue_node_ids == ()
+    assert plan.node_states["join"].status is WorkflowNodeExecStatus.SKIPPED
+
+
+def test_legacy_fan_in_does_not_run_after_an_active_dependency_is_skipped() -> None:
+    spec = _routed_spec(
+        [
+            {"id": "a"},
+            {"id": "b", "when": "${run_b} == 'yes'"},
+            {"id": "join"},
+        ],
+        [
+            {"source": "a", "target": "join"},
+            {"source": "b", "target": "join"},
+        ],
+        variables={"run_b": "no"},
+    )
+    children = {"a": _child("a", JobStatus.SUCCESS)}
+
+    plan = plan_workflow_step(
+        spec,
+        children,
+        now=_NOW,
+        when_variables={"run_b": "no"},
+    )
+
+    assert plan.node_states["b"].status is WorkflowNodeExecStatus.SKIPPED
+    assert plan.enqueue_node_ids == ()
+    assert plan.node_states["join"].status is WorkflowNodeExecStatus.SKIPPED
+
+
 def test_parallel_branches_enqueue_together() -> None:
     spec = _spec(
         [{"id": "root"}, {"id": "left"}, {"id": "right"}],
@@ -438,6 +481,37 @@ def test_branch_default_route_and_reconvergent_join() -> None:
     assert plan.node_states["left"].status is WorkflowNodeExecStatus.SKIPPED
     assert plan.enqueue_node_ids == ("join",)
     assert plan.node_states["route"].outputs["selected_target"] == "right"
+
+
+def test_failure_branch_reconverges_through_selected_compensation() -> None:
+    spec = _routed_spec(
+        [
+            {"id": "source", "on_failure": "branch"},
+            {"id": "normal"},
+            {"id": "recovery"},
+            {"id": "join"},
+        ],
+        [
+            {"source": "source", "target": "normal"},
+            {
+                "source": "source",
+                "target": "recovery",
+                "trigger": "failure",
+                "is_default": True,
+            },
+            {"source": "normal", "target": "join"},
+            {"source": "recovery", "target": "join"},
+        ],
+    )
+    children = {
+        "source": _child("source", JobStatus.FAILED, error="boom"),
+        "recovery": _child("recovery", JobStatus.SUCCESS),
+    }
+
+    plan = plan_workflow_step(spec, children, now=_NOW)
+
+    assert plan.node_states["normal"].status is WorkflowNodeExecStatus.SKIPPED
+    assert plan.enqueue_node_ids == ("join",)
 
 
 def test_branch_freezes_first_matching_route_before_child_enqueue() -> None:

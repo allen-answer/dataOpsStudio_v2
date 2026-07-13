@@ -4423,6 +4423,44 @@ def test_workflow_create_rejects_unsupported_node_kind_distinct_from_forbidden()
     assert engine.statements == []
 
 
+def test_workflow_create_returns_unknown_notify_target_error_code() -> None:
+    spec = _workflow_spec_payload(job_kind="notify")
+    nodes = cast(list[dict[str, object]], spec["nodes"])
+    nodes[0]["payload"] = {"target_ids": ["missing-target"]}
+    engine = _FakeEngine([])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows",
+        headers=_auth_headers(),
+        json_body={"name": "bad-notify", "spec": spec},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "unknown_notify_target"
+    assert engine.statements == []
+
+
+def test_workflow_create_returns_code_only_node_output_reference_error() -> None:
+    raw_expression = "nodes.query.bad-field"
+    spec = _workflow_spec_payload()
+    nodes = cast(list[dict[str, object]], spec["nodes"])
+    nodes[0]["payload"] = {"sql": f"SELECT '${{{raw_expression}}}'"}
+    engine = _FakeEngine([])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows",
+        headers=_auth_headers(),
+        json_body={"name": "bad-output-ref", "spec": spec},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_node_output_reference"
+    assert raw_expression not in response.body.decode("utf-8")
+    assert engine.statements == []
+
+
 def test_workflow_create_rejects_cyclic_dag() -> None:
     engine = _FakeEngine([])
     app = create_app(services=cast(ApiServices, _Services(engine)))
@@ -4667,6 +4705,44 @@ def test_workflow_update_omitting_notifications_preserves_existing_targets() -> 
     assert len(dag["notifications"]) == 1
     assert dag["notifications"][0]["id"] == "nt-1"
     assert dag["notifications"][0]["url_secret_ref"] == "secret-existing"
+    # PUT 必须与通知子资源写入串行化,否则两边从同一旧 dag_jsonb 回写会丢目标。
+    _assert_workflow_row_read_uses_for_update(engine)
+
+
+def test_workflow_update_omitting_notifications_validates_after_preserving_notify_refs() -> None:
+    existing = _workflow_row_with_notify_node()
+    request_spec = dict(cast(dict[str, Any], existing["dag_jsonb"]))
+    request_spec.pop("notifications")
+    engine = _FakeEngine([{"id": "project-1"}, existing, None, existing])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={"name": "nightly-report", "spec": request_spec},
+    )
+
+    assert response.status_code == 200
+    dag = _persisted_workflow_dag(engine)
+    assert dag["nodes"][0]["payload"]["target_ids"] == ["nt-1"]
+    assert dag["notifications"][0]["id"] == "nt-1"
+
+
+def test_workflow_update_explicit_empty_notifications_rejects_remaining_notify_refs() -> None:
+    request_spec = dict(cast(dict[str, Any], _workflow_row_with_notify_node()["dag_jsonb"]))
+    request_spec["notifications"] = []
+    engine = _FakeEngine([])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={"name": "nightly-report", "spec": request_spec},
+    )
+
+    assert response.status_code == 400
 
 
 def test_workflow_update_explicit_empty_notifications_clears_targets() -> None:
@@ -4800,6 +4876,52 @@ def _workflow_row_with_notification(
     return row
 
 
+def _workflow_row_with_notify_node() -> dict[str, object]:
+    row = _workflow_row_with_notification()
+    dag = dict(cast(dict[str, Any], row["dag_jsonb"]))
+    dag["nodes"] = [
+        {
+            "id": "notify-1",
+            "job_kind": "notify",
+            "payload": {"target_ids": ["nt-1"]},
+            "timeout_seconds": 60,
+        }
+    ]
+    row["dag_jsonb"] = dag
+    return row
+
+
+def _workflow_run_referencing_notification(
+    *,
+    target_id: str = "nt-1",
+    status: str = "running",
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "payload": {
+            "workflow_id": "wf-1",
+            "spec": {
+                "nodes": [
+                    {
+                        "id": "notify-1",
+                        "job_kind": "notify",
+                        "payload": {"target_ids": [target_id]},
+                        "timeout_seconds": 60,
+                    }
+                ],
+                "edges": [],
+                "notifications": [
+                    {
+                        "id": target_id,
+                        "channel": "wecom",
+                        "url_secret_ref": "secret-frozen",
+                    }
+                ],
+            },
+        },
+    }
+
+
 def _persisted_workflow_dag(engine: _FakeEngine) -> dict[str, Any]:
     """从最近一条 UPDATE workflows 语句里 compile 出持久化的 dag_jsonb。"""
     statement = next(
@@ -4808,6 +4930,17 @@ def _persisted_workflow_dag(engine: _FakeEngine) -> dict[str, Any]:
         if str(stmt).lstrip().upper().startswith("UPDATE WORKFLOWS")
     )
     return dict(statement.compile().params["dag_jsonb"])
+
+
+def _assert_workflow_row_read_uses_for_update(engine: _FakeEngine) -> None:
+    workflow_reads = [
+        str(statement).upper()
+        for statement in engine.executed
+        if str(statement).lstrip().upper().startswith("SELECT")
+        and "FROM WORKFLOWS" in str(statement).upper()
+    ]
+    assert workflow_reads
+    assert any("FOR UPDATE" in statement for statement in workflow_reads)
 
 
 def test_workflow_notify_create_stores_ref_and_hides_url() -> None:
@@ -4842,6 +4975,8 @@ def test_workflow_notify_create_stores_ref_and_hides_url() -> None:
     assert "url" not in target
     assert _NOTIFY_URL not in json.dumps(dag)
     assert any(audit["action"] == "workflow_notify_add" for audit in services.audits)
+    # 先锁 workflow 行再读取 spec,避免并发 PUT 用旧快照覆盖新 target、孤儿化 ref。
+    _assert_workflow_row_read_uses_for_update(engine)
 
 
 def test_workflow_notify_create_unknown_workflow_returns_404_without_orphan_secret() -> None:
@@ -4908,7 +5043,7 @@ def test_workflow_notify_create_email_stores_password_ref_and_hides_it() -> None
 
 
 def test_workflow_notify_update_replaces_ref_and_deletes_old() -> None:
-    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification()])
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification(), []])
     secret_store = _SecretStore()
     services = _Services(engine, secret_store=secret_store)
     app = create_app(services=cast(ApiServices, services))
@@ -4933,10 +5068,11 @@ def test_workflow_notify_update_replaces_ref_and_deletes_old() -> None:
     assert dag["notifications"][0]["url_secret_ref"] == "secret-new"
     assert _NOTIFY_URL_ROTATED not in json.dumps(dag)
     assert any(audit["action"] == "workflow_notify_update" for audit in services.audits)
+    _assert_workflow_row_read_uses_for_update(engine)
 
 
 def test_workflow_notify_update_without_url_keeps_ref_and_stores_nothing() -> None:
-    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification()])
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification(), []])
     secret_store = _SecretStore()
     services = _Services(engine, secret_store=secret_store)
     app = create_app(services=cast(ApiServices, services))
@@ -4974,8 +5110,72 @@ def test_workflow_notify_update_unknown_target_returns_404() -> None:
     assert secret_store.stored == []
 
 
+def test_workflow_notify_update_rejects_target_referenced_by_active_frozen_run() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_row_with_notification(),
+            [_workflow_run_referencing_notification()],
+        ]
+    )
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1/notifications/nt-1",
+        headers=_auth_headers(),
+        json_body={"url": _NOTIFY_URL_ROTATED},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "workflow_notify_target_active_run"
+    assert secret_store.stored == []
+    assert secret_store.deleted == []
+    assert not any(
+        str(statement).lstrip().upper().startswith("UPDATE WORKFLOWS")
+        for statement in engine.executed
+    )
+
+
+def test_workflow_notify_update_rejects_target_referenced_by_pending_sensor_check() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_row_with_notification(),
+            [_workflow_run_referencing_notification(status="pending")],
+        ]
+    )
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1/notifications/nt-1",
+        headers=_auth_headers(),
+        json_body={"url": _NOTIFY_URL_ROTATED},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "workflow_notify_target_active_run"
+    job_read = next(
+        statement
+        for statement in engine.executed
+        if str(statement).lstrip().upper().startswith("SELECT")
+        and "FROM JOBS" in str(statement).upper()
+    )
+    kind_values = [
+        value for key, value in job_read.compile().params.items() if key.startswith("kind_")
+    ]
+    assert kind_values == [["workflow_run", "workflow_sensor_check"]]
+    assert secret_store.stored == []
+    assert secret_store.deleted == []
+
+
 def test_workflow_notify_delete_removes_target_and_secret() -> None:
-    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification()])
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification(), []])
     secret_store = _SecretStore()
     services = _Services(engine, secret_store=secret_store)
     app = create_app(services=cast(ApiServices, services))
@@ -4990,6 +5190,55 @@ def test_workflow_notify_delete_removes_target_and_secret() -> None:
     assert secret_store.deleted == ["secret-existing"]
     assert _persisted_workflow_dag(engine)["notifications"] == []
     assert any(audit["action"] == "workflow_notify_remove" for audit in services.audits)
+    _assert_workflow_row_read_uses_for_update(engine)
+
+
+def test_workflow_notify_delete_rejects_target_referenced_by_current_dag() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notify_node()])
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "DELETE",
+        "/api/projects/project-1/workflows/wf-1/notifications/nt-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "workflow_notify_target_in_use"
+    assert secret_store.deleted == []
+    assert not any(
+        str(statement).lstrip().upper().startswith("UPDATE WORKFLOWS")
+        for statement in engine.executed
+    )
+
+
+def test_workflow_notify_delete_rejects_target_referenced_by_active_frozen_run() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_row_with_notification(),
+            [_workflow_run_referencing_notification()],
+        ]
+    )
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "DELETE",
+        "/api/projects/project-1/workflows/wf-1/notifications/nt-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "workflow_notify_target_active_run"
+    assert secret_store.deleted == []
+    assert not any(
+        str(statement).lstrip().upper().startswith("UPDATE WORKFLOWS")
+        for statement in engine.executed
+    )
 
 
 def test_workflow_notify_delete_unknown_target_returns_404() -> None:
@@ -5041,6 +5290,7 @@ def test_workflow_run_trigger_contract_enqueues_workflow_run_job() -> None:
     assert set(frozen) == {"today", "now", "year", "month", "day"}
     assert all(isinstance(value, str) for value in frozen.values())
     assert any(audit["action"] == "workflow_run_trigger" for audit in services.audits)
+    _assert_workflow_row_read_uses_for_update(engine)
 
 
 def test_workflow_run_trigger_disabled_workflow_returns_409() -> None:

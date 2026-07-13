@@ -188,7 +188,9 @@ def test_workflow_run_requeue_yields_running_back_to_pending(
     assert requeued is not None
     assert requeued.status == JobStatus.PENDING
     assert requeued.worker_id is None
-    assert requeued.available_at <= datetime.now(UTC)
+    # PostgreSQL writes and evaluates due times with its own clock.  Compare
+    # against the previous future value, then let claim_next prove it is due.
+    assert requeued.available_at < future
     reclaimed = jobbackend.claim_next("worker-1")
     assert reclaimed is not None and reclaimed.id == "j_wf"
 
@@ -213,9 +215,10 @@ def test_retry_workflow_node_requeues_failed_and_increments_retry_count(
     assert retried.status == JobStatus.PENDING
     assert retried.retry_count == 1
     assert retried.error is None
-    assert retried.available_at <= datetime.now(UTC)
+    assert retried.available_at < future
     # 非 failed/timeout 状态不重排(幂等防护)
-    jobbackend.claim_next("worker-1")
+    reclaimed = jobbackend.claim_next("worker-1")
+    assert reclaimed is not None and reclaimed.id == "j_node"
     jobbackend.retry_workflow_node("j_node")
     running = jobbackend.get_job("j_node")
     assert running is not None

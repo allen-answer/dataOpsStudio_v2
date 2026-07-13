@@ -164,14 +164,15 @@ def test_notify_payload_shape_and_caps() -> None:
         payload={"target_ids": ["a", "b"], "message": "finished"},
     )
     assert node.payload["target_ids"] == ["a", "b"]
-    for payload in (
+    payloads: tuple[dict[str, object], ...] = (
         {},
         {"target_ids": []},
         {"target_ids": ["a", "a"]},
         {"target_ids": [""]},
         {"target_ids": ["a"], "message": "x" * 513},
         {"target_ids": ["a"], "extra": True},
-    ):
+    )
+    for payload in payloads:
         with pytest.raises(ValidationError, match="invalid_notify_payload"):
             make_node(job_kind="notify", payload=payload)
 

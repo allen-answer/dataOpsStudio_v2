@@ -86,6 +86,39 @@ def test_future_high_priority_job_is_skipped_for_lower_priority_due_job() -> Non
     assert backend.claim_next("worker-future") is None
 
 
+def test_requeued_workflow_run_yields_to_newer_due_job_until_available() -> None:
+    engine = _pg_engine_or_skip()
+    owner_id, project_id = _prepare_db(engine)
+    backend = PostgresJobBackend(engine, worker_id="worker-fairness")
+    workflow_run = _make_job(
+        str(uuid4()),
+        owner_id,
+        project_id,
+        priority=-1,
+    ).model_copy(update={"kind": JobKind.WORKFLOW_RUN})
+    newer_due = _make_job(
+        str(uuid4()),
+        owner_id,
+        project_id,
+        priority=-1,
+    )
+    backend.enqueue(workflow_run)
+    backend.enqueue(newer_due)
+
+    claimed = backend.claim_next("worker-fairness")
+    assert claimed is not None
+    assert claimed.id == workflow_run.id
+
+    backend.requeue_workflow_run(
+        workflow_run.id,
+        available_at=datetime.now(UTC) + timedelta(seconds=1),
+    )
+
+    next_claimed = backend.claim_next("worker-fairness")
+    assert next_claimed is not None
+    assert next_claimed.id == newer_due.id
+
+
 def test_future_job_becomes_claimable_exactly_once_after_moving_due() -> None:
     engine = _pg_engine_or_skip()
     owner_id, project_id = _prepare_db(engine)

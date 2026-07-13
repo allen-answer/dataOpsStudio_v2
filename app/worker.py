@@ -249,7 +249,12 @@ class BackendLike(Protocol):
 
     def get_job(self, job_id: str) -> Job | None: ...
 
-    def requeue_workflow_run(self, job_id: str) -> None: ...
+    def requeue_workflow_run(
+        self,
+        job_id: str,
+        *,
+        available_at: datetime | None = None,
+    ) -> None: ...
 
     def retry_workflow_node(self, job_id: str) -> None: ...
 
@@ -428,7 +433,8 @@ class WorkerRunnerConfig:
     cancel_check_row_interval: int = 5000
     result_gc_interval_seconds: float = 600.0
     export_limit_mb: int = 1024
-    # workflow_run 推进器:一步无进展时让位前的节流睡眠(避免 claim/requeue 热循环)
+    # workflow_run 推进器:一步无进展时在队列中延后领取(避免 claim/requeue 热循环,
+    # 同时不占 worker 槽位)
     workflow_advance_interval_seconds: float = 1.0
     # RetryPolicy=None 时继承的全局重试次数(与 PostgresJobBackend
     # job_default_max_retries 同口径;当前部署默认 0 = 不重试)
@@ -1544,14 +1550,17 @@ class WorkerRunner:
 
         if plan.run_status is None:
             made_progress = bool(plan.enqueue_node_ids or plan.retry_job_ids)
+            next_available_at: datetime | None = None
             if not made_progress:
-                # 无进展(子 job 在跑 / 等 backoff):节流后让位,避免热循环
+                # 无进展(子 job 在跑 / 等 backoff):把父 run 在队列中短暂延后。
+                # 不在 worker 线程 sleep,否则较早创建的父 run 会反复抢占同优先级
+                # 的新任务,使 future sleep 实际拖住整个单 worker 队列。
                 delay = self._config.workflow_advance_interval_seconds
                 if plan.wait_seconds is not None:
                     delay = min(max(plan.wait_seconds, 0.05), delay)
-                time.sleep(delay)
+                next_available_at = now + timedelta(seconds=max(delay, 0.0))
             self._heartbeat(job.id)
-            self._backend.requeue_workflow_run(job.id)
+            self._backend.requeue_workflow_run(job.id, available_at=next_available_at)
             return None
 
         summary = {

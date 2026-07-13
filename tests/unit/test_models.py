@@ -14,7 +14,8 @@ from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import CheckConstraint
+from sqlalchemy import CheckConstraint, DateTime
+from sqlalchemy.schema import DefaultClause
 
 from app.db.models import (
     APPLICATION_SECRET_KINDS,
@@ -556,8 +557,9 @@ def test_jobs_available_at_column_is_required_and_timezone_aware() -> None:
     column = jobs.columns["available_at"]
 
     assert column.nullable is False
+    assert isinstance(column.type, DateTime)
     assert column.type.timezone is True
-    assert column.server_default is not None
+    assert isinstance(column.server_default, DefaultClause)
     assert str(column.server_default.arg) == "now()"
 
 

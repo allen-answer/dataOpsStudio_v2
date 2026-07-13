@@ -81,6 +81,10 @@ The three intrinsic nodes deferred above are now opened without changing the R7 
 
 - Edges are additive and backward compatible: `trigger=success|failure`, optional `when`, and
   `is_default`. Legacy edges remain ordinary success dependencies.
+- A join ignores only route paths proven inactive. Every active legacy success dependency must
+  still succeed; failed, cancelled, or node-level-skipped ordinary dependencies block the join.
+  Inactive branch paths propagate through skipped route nodes so selected success or compensation
+  paths can reconverge without weakening legacy fan-in semantics.
 - A branch uses edge declaration order, chooses the first true condition, and otherwise chooses
   its single default. `on_failure=branch` uses the same rule on failure edges. Compensation never
   rewrites the original failed run to success.
@@ -89,11 +93,20 @@ The three intrinsic nodes deferred above are now opened without changing the R7 
 - `notify` references existing configured Workflow notification targets (webhook/WeCom/email);
   arbitrary HTTP remains forbidden.
   `sleep` is a delayed queue job rather than a worker-blocking sleep.
+- Workflow definition updates, notification target create/update/delete, manual trigger, cron
+  dispatch, and sensor dispatch serialize on the Workflow row. Workflow updates that omit
+  `notifications` merge the locked current targets; the structured editor always omits this
+  dedicated subresource so a stale draft cannot restore rotated SecretRefs. Cron/sensor claims
+  re-read the locked current spec before freezing a job.
+  Target deletion is rejected while the current DAG references it; update/delete are also rejected
+  while a pending/running WorkflowRun or sensor check holds its frozen target. This keeps versioned
+  SecretRefs alive for every in-flight execution without exposing or logging their values.
 - Cron expressions use one process-wide IANA scheduler timezone. An explicit
   `DATAOPS_SCHEDULER_TIMEZONE` value is validated at startup; otherwise the server local zone is
   resolved. Fire points are converted back to UTC before comparison, persistence, audit, and Job
-  construction. Configuration changes require restart; per-workflow timezones and backfill remain
-  out of scope.
+  construction. Built-in run variables are frozen at that nominal UTC fire point rather than a
+  delayed scheduler tick. Configuration changes require restart; per-workflow timezones and
+  backfill remain out of scope.
 
 ## Non-Goals
 

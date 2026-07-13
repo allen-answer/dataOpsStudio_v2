@@ -319,16 +319,38 @@ _LINEAGE_INCLUDE_COLUMNS_QUERY = Query(default=False)
 # 不在集合内的 pydantic 校验问题(缺字段 / 类型错)统一映射 invalid_workflow_spec。
 _WORKFLOW_SPEC_ERROR_CODES = frozenset(
     {
+        # WorkflowNode kind / common fields
         "forbidden_node_kind",
         "unsupported_node_kind",
         "unsupported_on_failure",
         "invalid_node_id",
         "invalid_when",
+        # Intrinsic node payloads
+        "invalid_branch_payload",
+        "invalid_sleep_payload",
+        "invalid_notify_payload",
+        # Edges / DAG / routing
+        "invalid_edge_when",
         "invalid_cron",
         "duplicate_node_id",
         "unknown_edge_node",
         "self_loop",
+        "duplicate_edge",
         "cycle_detected",
+        "invalid_branch_routes",
+        "conditional_edge_requires_branch",
+        "missing_failure_route",
+        "invalid_failure_routes",
+        "failure_edge_requires_branch",
+        # Notify target references
+        "duplicate_notify_target_id",
+        "unknown_notify_target",
+        # Upstream node output references. These are deliberately code-only
+        # ValueError messages so raw expressions never enter the API response.
+        "invalid_node_output_reference",
+        "unknown_node_output",
+        "forbidden_node_output_field",
+        "non_upstream_node_output",
         # C-10 sensor 触发
         "invalid_sensor_datasource",
         # C-7 PR2 变量来源校验(spec.variables + 触发时 variables 共用错误码;
@@ -338,6 +360,7 @@ _WORKFLOW_SPEC_ERROR_CODES = frozenset(
         "invalid_variable_value",
         "variable_value_too_long",
         "unsafe_variable_value",
+        "variable_list_too_long",
         "too_many_variables",
     }
 )
@@ -4993,10 +5016,19 @@ def update_project_workflow(
 ) -> WorkflowResponse:
     services = services_from(request)
     user = current_user_from(request)
-    spec = _validated_workflow_spec(body.spec)
+    # ``notifications`` 省略且仍有 notify 节点时,单独校验请求体会把合法的
+    # 既有 target 引用误判为 unknown_notify_target;此形状必须等旧 targets
+    # 合并后再校验。其余请求保留 DB 前门禁(尤其 R7 forbidden kind)。
+    defer_spec_validation = _workflow_update_needs_stored_notifications(body.spec)
+    spec = None if defer_spec_validation else _validated_workflow_spec(body.spec)
     with services.engine.begin() as conn:
         _require_project_access(conn, project_id, user.id)
-        existing = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+        existing = _workflow_row_for_project(
+            conn,
+            project_id=project_id,
+            workflow_id=workflow_id,
+            for_update=True,
+        )
         # preserve-on-omit(C-9/C-7 数据丢失防护):body.spec 是原始 dict,PUT 未
         # 显式带 notifications / variables 时沿用库里既有值,避免 GET-then-PUT
         # 少带字段就静默清空已配置的 notify 目标(连带孤儿化其 SecretStore
@@ -5007,10 +5039,11 @@ def update_project_workflow(
             preserved["notifications"] = stored_dag.get("notifications", [])
         if "variables" not in body.spec:
             preserved["variables"] = stored_dag.get("variables", {})
-        if preserved:
+        if preserved or spec is None:
             # 合并后再过一遍 _validated_workflow_spec:R7 / notify id 唯一 / 变量
             # 校验仍作用于最终落库 spec(沿用值本就来自旧的合法 spec)。
             spec = _validated_workflow_spec({**body.spec, **preserved})
+        assert spec is not None  # 已在 DB 前或 preserve 合并后完成构造期校验
         _require_workflow_name_available(
             conn,
             project_id=project_id,
@@ -5101,7 +5134,12 @@ def create_workflow_notification(
     target_id = new_id()
     with services.engine.begin() as conn:
         _require_project_access(conn, project_id, user.id)
-        row = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+        row = _workflow_row_for_project(
+            conn,
+            project_id=project_id,
+            workflow_id=workflow_id,
+            for_update=True,
+        )
         spec = _validated_workflow_spec(dict(row["dag_jsonb"] or {}))
         # 先确认 workflow 存在再 store_secret,避免 404 时留下孤儿 secret。
         url_secret_ref: str | None = None
@@ -5157,9 +5195,20 @@ def update_workflow_notification(
     old_password_ref: str | None = None
     with services.engine.begin() as conn:
         _require_project_access(conn, project_id, user.id)
-        row = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+        row = _workflow_row_for_project(
+            conn,
+            project_id=project_id,
+            workflow_id=workflow_id,
+            for_update=True,
+        )
         spec = _validated_workflow_spec(dict(row["dag_jsonb"] or {}))
         existing = _require_notify_target(spec, target_id)
+        _require_no_active_workflow_run_notify_target(
+            conn,
+            project_id=project_id,
+            workflow_id=workflow_id,
+            target_id=target_id,
+        )
         url_secret_ref = existing.url_secret_ref
         password_secret_ref = existing.password_secret_ref
         if existing.channel == "email":
@@ -5218,15 +5267,36 @@ def delete_workflow_notification(
     removed_password_ref: str | None = None
     with services.engine.begin() as conn:
         _require_project_access(conn, project_id, user.id)
-        row = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+        row = _workflow_row_for_project(
+            conn,
+            project_id=project_id,
+            workflow_id=workflow_id,
+            for_update=True,
+        )
         spec = _validated_workflow_spec(dict(row["dag_jsonb"] or {}))
         existing = _require_notify_target(spec, target_id)
+        if _workflow_spec_notify_node_references_target(spec, target_id):
+            raise ApiError(
+                409,
+                "workflow_notify_target_in_use",
+                "Notify target is referenced by a workflow node",
+            )
+        _require_no_active_workflow_run_notify_target(
+            conn,
+            project_id=project_id,
+            workflow_id=workflow_id,
+            target_id=target_id,
+        )
         if existing.channel == "email":
             removed_password_ref = existing.password_secret_ref
         else:
             removed_url_ref = existing.url_secret_ref
         notifications = [item for item in spec.notifications if item.id != target_id]
-        updated = spec.model_copy(update={"notifications": notifications})
+        updated_payload = spec.model_dump(mode="json")
+        updated_payload["notifications"] = [item.model_dump(mode="json") for item in notifications]
+        # model_copy 不运行 WorkflowSpec 的 after-validator;从最终 payload 重建,
+        # 保证任何未来的 notifications 交叉约束也在落库前生效。
+        updated = _validated_workflow_spec(updated_payload)
         _persist_workflow_notifications(conn, workflow_id, updated)
     if removed_url_ref is not None:
         services.secret_store.delete_secret(
@@ -5334,6 +5404,62 @@ def _require_notify_target(spec: WorkflowSpec, target_id: str) -> NotifyTarget:
     raise ApiError(404, "not_found", "Notify target not found")
 
 
+def _workflow_spec_notify_node_references_target(spec: WorkflowSpec, target_id: str) -> bool:
+    return any(
+        node.job_kind == "notify" and target_id in node.payload["target_ids"] for node in spec.nodes
+    )
+
+
+def _require_no_active_workflow_run_notify_target(
+    conn: Connection,
+    *,
+    project_id: str,
+    workflow_id: str,
+    target_id: str,
+) -> None:
+    active_statuses = (JobStatus.PENDING.value, JobStatus.RUNNING.value)
+    rows = (
+        conn.execute(
+            select(jobs.c.status, jobs.c.payload)
+            .where(
+                jobs.c.kind.in_(
+                    (
+                        JobKind.WORKFLOW_RUN.value,
+                        JobKind.WORKFLOW_SENSOR_CHECK.value,
+                    )
+                )
+            )
+            .where(jobs.c.project_id == project_id)
+            .where(jobs.c.status.in_(active_statuses))
+            .where(jobs.c.payload["workflow_id"].astext == workflow_id)
+        )
+        .mappings()
+        .all()
+    )
+    for row in rows:
+        # SQL 已过滤;Python 再核对使防护面对测试替身/异常行时仍保持确定。
+        if str(row.get("status")) not in active_statuses:
+            continue
+        payload = row.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        frozen_spec = payload.get("spec")
+        if not isinstance(frozen_spec, Mapping):
+            continue
+        notifications = frozen_spec.get("notifications")
+        if not isinstance(notifications, list):
+            continue
+        if any(
+            isinstance(target, Mapping) and target.get("id") == target_id
+            for target in notifications
+        ):
+            raise ApiError(
+                409,
+                "workflow_notify_target_active_run",
+                "Notify target is referenced by an active workflow run",
+            )
+
+
 def _persist_workflow_notifications(
     conn: Connection,
     workflow_id: str,
@@ -5360,6 +5486,15 @@ def _notify_target_response(target: NotifyTarget) -> NotifyTargetResponse:
         smtp_from=target.smtp_from if is_email else None,
         smtp_to=list(target.smtp_to) if is_email else None,
         smtp_user=target.smtp_user if is_email else None,
+    )
+
+
+def _workflow_update_needs_stored_notifications(payload: Mapping[str, Any]) -> bool:
+    if "notifications" in payload:
+        return False
+    nodes = payload.get("nodes")
+    return isinstance(nodes, list) and any(
+        isinstance(node, Mapping) and node.get("job_kind") == "notify" for node in nodes
     )
 
 
@@ -5408,8 +5543,9 @@ def _workflow_spec_error(exc: ValidationError) -> tuple[str, str]:
     # 且带 "Value error, " 前缀。取第一条可识别 code(按节点声明顺序,确定性)。
     for error in exc.errors():
         message = str(error.get("msg", "")).removeprefix(_PYDANTIC_VALUE_ERROR_PREFIX)
-        code, sep, _ = message.partition(":")
-        if sep and code in _WORKFLOW_SPEC_ERROR_CODES:
+        code, _, _ = message.partition(":")
+        code = code.strip()
+        if code in _WORKFLOW_SPEC_ERROR_CODES:
             return code, message
     return "invalid_workflow_spec", "Workflow spec is invalid"
 
@@ -5438,16 +5574,16 @@ def _workflow_row_for_project(
     *,
     project_id: str,
     workflow_id: str,
+    for_update: bool = False,
 ) -> RowMapping:
-    row = (
-        conn.execute(
-            select(workflows)
-            .where(workflows.c.id == workflow_id)
-            .where(workflows.c.project_id == project_id)
-        )
-        .mappings()
-        .one_or_none()
+    query = (
+        select(workflows)
+        .where(workflows.c.id == workflow_id)
+        .where(workflows.c.project_id == project_id)
     )
+    if for_update:
+        query = query.with_for_update()
+    row = conn.execute(query).mappings().one_or_none()
     if row is None:
         raise ApiError(404, "not_found", "Workflow not found")
     return row
@@ -5512,7 +5648,12 @@ def trigger_workflow_run(
     trigger_variables = _validated_trigger_variables(body.variables) if body is not None else {}
     with services.engine.begin() as conn:
         _require_project_access(conn, project_id, user.id)
-        row = _workflow_row_for_project(conn, project_id=project_id, workflow_id=workflow_id)
+        row = _workflow_row_for_project(
+            conn,
+            project_id=project_id,
+            workflow_id=workflow_id,
+            for_update=True,
+        )
         if not bool(row["enabled"]):
             raise ApiError(409, "workflow_disabled", "Workflow is disabled")
         # R7 enqueue 期再校验(ADR-0009 Consequences:创建 + enqueue 双门禁)

@@ -1027,6 +1027,7 @@ class _FakeBackend:
         self.enqueued: list[Job] = []
         self.children_by_parent: dict[str, list[Job]] = {}
         self.requeued_workflow_runs: list[str] = []
+        self.requeued_workflow_run_times: list[datetime | None] = []
         self.retried_nodes: list[str] = []
         self.cancel_requested_ids: list[str] = []
         self.cancelled_pending: list[tuple[str, str]] = []
@@ -1072,8 +1073,14 @@ class _FakeBackend:
         self.get_job_calls.append(job_id)
         return self.jobs_by_id.get(job_id)
 
-    def requeue_workflow_run(self, job_id: str) -> None:
+    def requeue_workflow_run(
+        self,
+        job_id: str,
+        *,
+        available_at: datetime | None = None,
+    ) -> None:
         self.requeued_workflow_runs.append(job_id)
+        self.requeued_workflow_run_times.append(available_at)
 
     def retry_workflow_node(self, job_id: str) -> None:
         self.retried_nodes.append(job_id)
@@ -2015,6 +2022,46 @@ def test_worker_completes_due_sleep_at_duration_boundaries_without_sleep_call(
             ),
         )
     ]
+
+
+def test_workflow_run_waiting_for_future_sleep_requeues_without_blocking_worker() -> None:
+    run_job = _workflow_run_job(
+        _workflow_spec_payload(
+            nodes=[
+                {
+                    "id": "pause",
+                    "job_kind": "sleep",
+                    "payload": {"duration_seconds": 60},
+                    "timeout_seconds": 60,
+                }
+            ]
+        )
+    )
+    future_sleep = _make_job(
+        kind=JobKind.SLEEP,
+        payload={"workflow_node_id": "pause", "duration_seconds": 60},
+    ).model_copy(
+        update={
+            "id": "child-pause",
+            "status": JobStatus.PENDING,
+            "parent_workflow_run_id": run_job.id,
+            "available_at": datetime.now(UTC) + timedelta(seconds=60),
+        }
+    )
+    backend = _FakeBackend([run_job])
+    backend.children_by_parent[run_job.id] = [future_sleep]
+    runner = _workflow_runner(backend)
+    before = datetime.now(UTC)
+
+    with patch("app.worker.time.sleep") as blocking_sleep:
+        assert runner.run_once() is True
+
+    blocking_sleep.assert_not_called()
+    assert backend.requeued_workflow_runs == [run_job.id]
+    assert len(backend.requeued_workflow_run_times) == 1
+    available_at = backend.requeued_workflow_run_times[0]
+    assert available_at is not None
+    assert before < available_at <= datetime.now(UTC) + timedelta(seconds=2)
 
 
 @pytest.mark.parametrize("duration_seconds", [0, 86_401])

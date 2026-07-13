@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 from zoneinfo import ZoneInfo
@@ -13,6 +14,7 @@ from pydantic import ValidationError
 import app.services.workflow_scheduler as scheduler_module
 from app.api.app import _build_scheduler
 from app.config import SchedulerConfig, Settings
+from app.domain.job import Job
 from app.domain.workflow import CronSchedule, WorkflowSpec
 from app.services.workflow_scheduler import (
     ScheduleAction,
@@ -44,6 +46,51 @@ def _spec(**overrides: object) -> WorkflowSpec:
     }
     payload.update(overrides)
     return WorkflowSpec.model_validate(payload)
+
+
+class _SchedulerResult:
+    def __init__(self, row: dict[str, object] | None = None, *, rowcount: int = 1) -> None:
+        self._row = row
+        self.rowcount = rowcount
+
+    def mappings(self) -> _SchedulerResult:
+        return self
+
+    def one_or_none(self) -> dict[str, object] | None:
+        return None if self._row is None else dict(self._row)
+
+
+class _SchedulerConnection:
+    def __init__(self, current_row: Mapping[str, object]) -> None:
+        self._current_row = dict(current_row)
+
+    def __enter__(self) -> _SchedulerConnection:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        del exc_type, exc, traceback
+
+    def execute(self, statement: object) -> _SchedulerResult:
+        if str(statement).lstrip().upper().startswith("UPDATE"):
+            return _SchedulerResult(rowcount=1)
+        return _SchedulerResult(self._current_row)
+
+
+class _SchedulerEngine:
+    def __init__(self, current_row: Mapping[str, object]) -> None:
+        self._current_row = dict(current_row)
+
+    def begin(self) -> _SchedulerConnection:
+        return _SchedulerConnection(self._current_row)
+
+
+class _SchedulerServices:
+    def __init__(self, current_row: Mapping[str, object]) -> None:
+        self.engine = _SchedulerEngine(current_row)
+        self.audits: list[dict[str, object]] = []
+
+    def write_audit(self, **kwargs: object) -> None:
+        self.audits.append(kwargs)
 
 
 # ── most_recent_fire ─────────────────────────────────────────────────────────
@@ -298,6 +345,102 @@ def test_scheduler_cron_path_uses_process_timezone(
     assert captured_timezone is configured_timezone
 
 
+def test_scheduler_cron_path_freezes_variables_at_nominal_utc_fire_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed tick must not move built-ins past the scheduled fire point."""
+
+    enqueued: list[Job] = []
+
+    def fake_enqueue(conn: object, job: Job) -> None:
+        del conn
+        enqueued.append(job)
+
+    monkeypatch.setattr(scheduler_module, "_enqueue_in_txn", fake_enqueue)
+    current_row = {
+        "id": "wf-1",
+        "project_id": "proj-1",
+        "name": "daily",
+        "created_by": "user-1",
+        "dag_jsonb": _spec().model_dump(mode="json"),
+    }
+    scheduler = WorkflowScheduler(
+        cast("ApiServices", _SchedulerServices(current_row)),
+        tick_interval_seconds=30.0,
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+
+    # Local 03:00 is 19:00 UTC on the prior date. The API tick is seven minutes
+    # late and has crossed UTC midnight, so using tick time would freeze July 8.
+    scheduler._process_row(
+        {
+            "id": "wf-1",
+            "project_id": "proj-1",
+            "name": "daily",
+            "enabled": True,
+            "schedule_enabled": True,
+            "schedule_cron": "0 3 * * *",
+            "schedule_last_fired_at": datetime(2026, 7, 6, 19, 0, tzinfo=UTC),
+            "created_by": "user-1",
+            "dag_jsonb": _spec().model_dump(mode="json"),
+        },
+        datetime(2026, 7, 8, 0, 7, tzinfo=UTC),
+    )
+
+    assert len(enqueued) == 1
+    variables = enqueued[0].payload["when_variables"]
+    assert isinstance(variables, dict)
+    assert variables["today"] == "2026-07-07"
+    assert variables["now"] == "2026-07-07T19:00:00+00:00"
+
+
+def test_scheduler_cron_claim_freezes_current_locked_workflow_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enqueued: list[Job] = []
+    monkeypatch.setattr(
+        scheduler_module,
+        "_enqueue_in_txn",
+        lambda conn, job: enqueued.append(job),
+    )
+    current_row = {
+        "id": "wf-1",
+        "project_id": "project-current",
+        "name": "current-name",
+        "created_by": "owner-current",
+        "dag_jsonb": _spec(variables={"version": "current"}).model_dump(mode="json"),
+    }
+    services = _SchedulerServices(current_row)
+    scheduler = WorkflowScheduler(
+        cast("ApiServices", services),
+        tick_interval_seconds=30.0,
+        timezone=ZoneInfo("UTC"),
+    )
+
+    scheduler._process_row(
+        {
+            "id": "wf-1",
+            "project_id": "project-stale",
+            "name": "stale-name",
+            "enabled": True,
+            "schedule_enabled": True,
+            "schedule_cron": "*/15 * * * *",
+            "schedule_last_fired_at": datetime(2026, 7, 8, 9, 45, tzinfo=UTC),
+            "created_by": "owner-stale",
+            "dag_jsonb": _spec(variables={"version": "stale"}).model_dump(mode="json"),
+        },
+        datetime(2026, 7, 8, 10, 7, tzinfo=UTC),
+    )
+
+    assert len(enqueued) == 1
+    job = enqueued[0]
+    assert job.project_id == "project-current"
+    assert job.owner_user_id == "owner-current"
+    assert job.payload["workflow_name"] == "current-name"
+    assert job.payload["spec"]["variables"] == {"version": "current"}
+    assert services.audits[0]["project_id"] == "project-current"
+
+
 def test_build_scheduler_passes_configured_timezone() -> None:
     settings = Settings(
         scheduler=SchedulerConfig.model_validate({"timezone": "Asia/Shanghai"}),
@@ -454,3 +597,66 @@ def test_build_sensor_check_job_shape() -> None:
     assert job.payload["sensor_sql"] == "SELECT 1"
     assert job.payload["cooldown_seconds"] == 300
     assert job.payload["spec"]["sensor"]["datasource_id"] == "ds-1"
+
+
+def test_scheduler_sensor_claim_freezes_current_locked_workflow_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    enqueued: list[Job] = []
+    monkeypatch.setattr(
+        scheduler_module,
+        "_enqueue_in_txn",
+        lambda conn, job: enqueued.append(job),
+    )
+    current_spec = _spec(
+        variables={"version": "current"},
+        sensor={
+            "sql": "SELECT 2",
+            "datasource_id": "ds-current",
+            "check_interval_seconds": 60,
+            "cooldown_seconds": 300,
+        },
+    )
+    services = _SchedulerServices(
+        {
+            "id": "wf-1",
+            "project_id": "project-current",
+            "name": "current-name",
+            "created_by": "owner-current",
+            "dag_jsonb": current_spec.model_dump(mode="json"),
+        }
+    )
+    scheduler = WorkflowScheduler(cast("ApiServices", services), tick_interval_seconds=30.0)
+    stale_spec = _spec(
+        variables={"version": "stale"},
+        sensor={
+            "sql": "SELECT 1",
+            "datasource_id": "ds-stale",
+            "check_interval_seconds": 60,
+            "cooldown_seconds": 300,
+        },
+    )
+
+    scheduler._process_sensor_row(
+        {
+            "id": "wf-1",
+            "project_id": "project-stale",
+            "name": "stale-name",
+            "enabled": True,
+            "created_by": "owner-stale",
+            "dag_jsonb": stale_spec.model_dump(mode="json"),
+            "sensor_enabled": True,
+            "sensor_last_checked_at": None,
+            "sensor_last_triggered_at": None,
+        },
+        _SENSOR_NOW,
+    )
+
+    assert len(enqueued) == 1
+    job = enqueued[0]
+    assert job.project_id == "project-current"
+    assert job.owner_user_id == "owner-current"
+    assert job.datasource_ids == ["ds-current"]
+    assert job.payload["workflow_name"] == "current-name"
+    assert job.payload["sensor_sql"] == "SELECT 2"
+    assert job.payload["spec"]["variables"] == {"version": "current"}

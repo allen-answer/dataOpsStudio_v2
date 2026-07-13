@@ -87,7 +87,7 @@ def test_unknown_variable_and_unknown_node_output_rejected() -> None:
 
 
 def test_when_compares_scalar_node_outputs_without_string_coercion() -> None:
-    outputs = {
+    outputs: dict[str, dict[str, object]] = {
         "compare": {"diff_count": 2, "status": "success"},
         "lineage": {"cached": False},
     }
