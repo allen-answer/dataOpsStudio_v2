@@ -698,7 +698,7 @@ ALLOWED_WORKFLOW_NODE_KINDS = {
 }
 ```
 
-**禁止节点(2.0 主线永不开放)**:shell / system command、Python script / 任意代码、浏览器自动化、任意 HTTP request(带 secret / 任意 URL)、任意 DDL/DML 直接执行。`notify` 只允许内置 webhook 目标白名单。
+**禁止节点(2.0 主线永不开放)**:shell / system command、Python script / 任意代码、浏览器自动化、任意 HTTP request(带 secret / 任意 URL)、任意 DDL/DML 直接执行。`notify` 只允许引用 Workflow 现有已配置的 webhook、企业微信(WeCom)或邮件目标。
 
 #### 2.8.2 数据模型与 API
 
@@ -715,7 +715,19 @@ class WorkflowNode:
     retry_policy: RetryPolicy
     timeout_seconds: int
     on_failure: Literal["abort", "continue", "branch"]
+
+class WorkflowEdge:
+    source: str
+    target: str
+    trigger: Literal["success", "failure"] = "success"
+    when: Optional[str] = None
+    is_default: bool = False
 ```
+
+2.4.x 开放 `notify/sleep/branch` 后,实际支持 8 种节点;Scenario 两种仍等 2.6.0。
+条件边按声明顺序 first-match + 唯一 default。节点 payload / `when` 允许
+`${nodes.<ancestor>.<field>}` 安全输出引用,但只开放按 kind 定义的标量元数据,
+不开放结果行、ResultRef URI、SecretRef 或任意 metadata。
 
 ```
 POST   /api/workflows

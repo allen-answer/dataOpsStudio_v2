@@ -169,6 +169,27 @@ def test_run_notification_short_error_untouched() -> None:
     assert payload.error == "boom"
 
 
+def test_run_notification_accepts_message_at_512_characters() -> None:
+    message = "m" * 512
+    payload = RunNotification(
+        workflow_id="w1",
+        run_job_id="j1",
+        status="running",
+        message=message,
+    )
+    assert payload.message == message
+
+
+def test_run_notification_rejects_message_at_513_characters() -> None:
+    with pytest.raises(ValidationError):
+        RunNotification(
+            workflow_id="w1",
+            run_job_id="j1",
+            status="running",
+            message="m" * 513,
+        )
+
+
 def test_notify_result_shape() -> None:
     result = NotifyResult(
         channel="webhook", target_id="t1", ok=False, error="http_error status=500"

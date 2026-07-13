@@ -282,14 +282,33 @@ class AiGateway(Protocol):
 ```python
 class Job:
     id: str
-    kind: Literal["sql_query","test_connection","sql_explain","compare_run","export_excel",
-                  "scenario_materialize","scenario_run_all","workflow_run",
-                  "ai_assist_call","ai_copilot_run","lineage_analyze"]
+    kind: Literal[
+        "sql_query",
+        "test_connection",
+        "sql_explain",
+        "compare_run",
+        "result_export",
+        "export_excel",
+        "scenario_materialize",
+        "scenario_run_all",
+        "workflow_run",
+        "notify",
+        "sleep",
+        "branch",
+        "workflow_sensor_check",
+        "ai_assist_call",
+        "ai_copilot_run",
+        "lineage_analyze",
+        "lineage_batch",
+    ]
     status: Literal["pending","running","success","failed","cancelled","timeout"]
     owner_user_id: str
     project_id: str
     datasource_ids: list[str]
     priority: int
+    # aware-only;当前 UTC 默认使旧调用方创建的 Job 立即可 claim
+    # PostgreSQL 仅领取 status='pending' 且 available_at <= now() 的 Job
+    available_at: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC))
     timeout_seconds: int
     resource_profile: ResourceProfile          # 见 app/domain/resource.py;2.0.0 字段:memory_limit_mb / timeout_seconds(均 Optional[int])
     result_ref: Optional[ResultRef]
@@ -301,10 +320,58 @@ class Job:
     cancel_requested: bool
     cancel_reason: Optional[str]
     error: Optional[str]
+    error_code: Optional[JobErrorCode]
     retry_count: int
     payload: dict
     parent_workflow_run_id: Optional[str]
 ```
+
+### 3.7 Workflow 2.4.x 追加契约
+
+```python
+class WorkflowEdge:
+    source: str
+    target: str
+    trigger: Literal["success", "failure"] = "success"
+    when: Optional[str] = None
+    is_default: bool = False
+
+SUPPORTED_WORKFLOW_NODE_KINDS = {
+    "sql_query", "sql_explain", "compare_run", "lineage_analyze",
+    "export_excel", "notify", "sleep", "branch",
+}
+```
+
+- 旧 `{source,target}` 边保持成功依赖语义。`branch` 与
+  `on_failure="branch"` 均采用按边声明顺序 first-match、唯一 default 的路由。
+- 节点 payload / `when` 可读取 `${nodes.<ancestor>.<field>}`,但仅限构造期验证过的
+  拓扑上游和按节点 kind 声明的标量白名单。禁止结果行、ResultRef URI、SecretRef
+  与任意 metadata 进入输出上下文。
+- DAG Notify 的公开 payload 仅含 1..10 个唯一非空 target_ids 与可选
+  message(最长 512 字符);RunNotification.message 与
+  WorkflowNotifyService.notify_node 均为向后兼容的纯追加接口。
+- Worker 必须通过 parent_workflow_run_id 读取冻结的父 workflow_run payload.spec
+  解析 NotifyTarget,不得把目标配置或 SecretRef 复制进子 Job payload。DAG Notify
+  尊重 target.enabled,但忽略 target.events(events 仅过滤 run 终态通知)。
+- DAG Notify 按 target_ids 声明顺序尝试全部启用目标;仅当全部成功时子 Job 才成功,
+  任一失败走既有节点 retry。投递发生在 backend.complete 之前,语义为 at-least-once,
+  retry / stale worker 可重复投递;不承诺 exactly-once。
+- DAG Notify 成功输出仅允许当前尝试的整数 sent_count;不得输出 ResultRef URI 或其它
+  metadata。run 终态通知与 DAG Notify 隔离:终态通知失败不得改变 workflow_run 状态。
+- `notify` 只引用 Workflow 已配置的通知 target id;`sleep` 只接受
+  `duration_seconds`;`branch` payload 为空。Scenario 两种节点留待 2.6.0。
+- Workflow 创建请求可选 `enabled: bool = true`,更新请求可选
+  `enabled: bool | None = None`;省略更新字段时保留 `workflows.enabled`,显式布尔值才改列。
+  `workflows.enabled` 是唯一权威来源,不得复制进 WorkflowSpec / `dag_jsonb`。
+- 单 run 状态节点追加只读 `outputs`,值域仅 `str/int/float/bool/None`。kind-specific
+  字段必须由 `extract_workflow_node_outputs` 从防御性解析的 ResultRef 投影,common
+  `status/job_id/error_code` 来自权威 job 行;禁止 URI、任意 metadata、SQL/rows、
+  SecretRef、容器值或未知字段。损坏 ResultRef 与损坏/缺失 spec fallback 均不得 500,
+  且使用同一安全投影。run 历史列表保持轻量,不含节点 `outputs`。
+- 接口追加: scheduler_timezone。全局 `DATAOPS_SCHEDULER_TIMEZONE` 只接受 IANA
+  ZoneInfo key;缺省用 `tzlocal.get_localzone()` 解析服务器本地时区,显式非法值即使
+  scheduler 禁用也必须拒绝启动。cron 按该进程级时区求值,fire point 转回 UTC 后
+  才比较、入库、审计与构造 Job。修改配置需重启;不支持 per-workflow 时区或 backfill。
 
 ---
 
@@ -328,6 +395,10 @@ class Job:
 {"sql_query","sql_explain","compare_run","scenario_materialize",
  "scenario_run_all","lineage_analyze","export_excel","notify","sleep","branch"}
 ```
+
+2.4.x 实际开放其中 8 种:`sql_query/sql_explain/compare_run/lineage_analyze/
+export_excel/notify/sleep/branch`。Scenario 两种仍是白名单内但暂不支持,必须返回
+`unsupported_node_kind`,不得与白名单外的 `forbidden_node_kind` 混淆。
 
 **脱敏 processor(R5,Step 1 优先做)**:
 - 按 key 名拦截:含 password/secret/token/api_key/mfa/authorization/cookie/ciphertext → `***REDACTED***`

@@ -1,8 +1,8 @@
 """Workflow 领域模型单测(设计稿 §2.8、R7、用户拍板语义)。
 
-覆盖:R7 拒绝(forbidden)与首版暂不支持(unsupported)两层错误区分、
+覆盖:R7 拒绝(forbidden)与白名单内暂不支持(unsupported)两层错误区分、
 DAG 环检测(直接 + 间接)、边引用不存在节点、自环、retry 边界、
-on_failure='branch' 拒绝、cron 基本格式、when 校验、合法 spec 全字段构造往返。
+条件/失败边、intrinsic payload、输出引用、cron、when 与合法 spec 往返。
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ def test_forbidden_node_kind_rejected_as_r7(kind: str) -> None:
     "kind", sorted(ALLOWED_WORKFLOW_NODE_KINDS - SUPPORTED_WORKFLOW_NODE_KINDS_V1)
 )
 def test_allowed_but_unsupported_kind_rejected_as_unsupported(kind: str) -> None:
-    """白名单内但首版不支持(notify/sleep/branch/scenario_*)→ unsupported_node_kind。"""
+    """白名单内但 2.4.x 暂不支持的 Scenario 节点 → unsupported_node_kind。"""
     with pytest.raises(ValidationError, match="unsupported_node_kind"):
         make_node(job_kind=kind)
 
@@ -64,32 +64,45 @@ def test_unsupported_and_forbidden_messages_are_distinct() -> None:
     with pytest.raises(ValidationError) as forbidden:
         make_node(job_kind="shell")
     with pytest.raises(ValidationError) as unsupported:
-        make_node(job_kind="notify")
+        make_node(job_kind="scenario_run_all")
     assert "forbidden_node_kind" in str(forbidden.value)
     assert "unsupported_node_kind" not in str(forbidden.value)
     assert "unsupported_node_kind" in str(unsupported.value)
     assert "forbidden_node_kind" not in str(unsupported.value)
 
 
+def _valid_payload_for_kind(kind: str) -> dict[str, object]:
+    if kind == "branch":
+        return {}
+    if kind == "sleep":
+        return {"duration_seconds": 30}
+    if kind == "notify":
+        return {"target_ids": ["notify-1"], "message": "done"}
+    return {"sql": "SELECT 1"}
+
+
 @pytest.mark.parametrize("kind", sorted(SUPPORTED_WORKFLOW_NODE_KINDS_V1))
 def test_all_v1_supported_kinds_accepted(kind: str) -> None:
-    assert make_node(job_kind=kind).job_kind == kind
+    assert make_node(job_kind=kind, payload=_valid_payload_for_kind(kind)).job_kind == kind
 
 
 def test_v1_supported_set_is_subset_of_r7_allowlist() -> None:
     assert SUPPORTED_WORKFLOW_NODE_KINDS_V1 <= ALLOWED_WORKFLOW_NODE_KINDS
 
 
+def test_supported_workflow_kinds_open_intrinsics_only() -> None:
+    assert SUPPORTED_WORKFLOW_NODE_KINDS_V1 == ALLOWED_WORKFLOW_NODE_KINDS - {
+        "scenario_materialize",
+        "scenario_run_all",
+    }
+    assert len(SUPPORTED_WORKFLOW_NODE_KINDS_V1) == 8
+
+
 # ---------------------------------------------------------------- 节点其余字段
 
 
-def test_on_failure_branch_rejected_as_unsupported() -> None:
-    with pytest.raises(ValidationError, match="unsupported_on_failure"):
-        make_node(on_failure="branch")
-
-
-@pytest.mark.parametrize("value", ["abort", "continue"])
-def test_on_failure_abort_and_continue_accepted(value: str) -> None:
+@pytest.mark.parametrize("value", ["abort", "continue", "branch"])
+def test_on_failure_literal_values_accepted_on_node(value: str) -> None:
     assert make_node(on_failure=value).on_failure == value
 
 
@@ -116,6 +129,52 @@ def test_when_stored_and_blank_rejected() -> None:
         make_node(when="   ")
     with pytest.raises(ValidationError):
         make_node(when="x" * 513)
+
+
+def test_branch_payload_must_be_empty() -> None:
+    assert make_node(job_kind="branch", payload={}).payload == {}
+    with pytest.raises(ValidationError, match="invalid_branch_payload"):
+        make_node(job_kind="branch", payload={"expression": "true"})
+
+
+@pytest.mark.parametrize("duration", [1, 30, 86_400])
+def test_sleep_payload_duration_bounds(duration: int) -> None:
+    node = make_node(job_kind="sleep", payload={"duration_seconds": duration})
+    assert node.payload == {"duration_seconds": duration}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"duration_seconds": 0},
+        {"duration_seconds": 86_401},
+        {"duration_seconds": True},
+        {"duration_seconds": 1, "extra": 1},
+    ],
+)
+def test_sleep_payload_invalid_rejected(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError, match="invalid_sleep_payload"):
+        make_node(job_kind="sleep", payload=payload)
+
+
+def test_notify_payload_shape_and_caps() -> None:
+    node = make_node(
+        job_kind="notify",
+        payload={"target_ids": ["a", "b"], "message": "finished"},
+    )
+    assert node.payload["target_ids"] == ["a", "b"]
+    payloads: tuple[dict[str, object], ...] = (
+        {},
+        {"target_ids": []},
+        {"target_ids": ["a", "a"]},
+        {"target_ids": [""]},
+        {"target_ids": ["a"], "message": "x" * 513},
+        {"target_ids": ["a"], "extra": True},
+    )
+    for payload in payloads:
+        with pytest.raises(ValidationError, match="invalid_notify_payload"):
+            make_node(job_kind="notify", payload=payload)
 
 
 # ---------------------------------------------------------------- RetryPolicy 边界
@@ -216,6 +275,26 @@ def test_self_loop_rejected() -> None:
         make_spec(["a"], [("a", "a")])
 
 
+def test_workflow_edge_routing_fields_default_and_roundtrip() -> None:
+    legacy = WorkflowEdge(source="a", target="b")
+    assert legacy.trigger == "success"
+    assert legacy.when is None
+    assert legacy.is_default is False
+
+    conditional = WorkflowEdge(
+        source="a",
+        target="b",
+        trigger="failure",
+        when="${nodes.a.error_code} == 'timeout'",
+    )
+    assert WorkflowEdge.model_validate(conditional.model_dump()) == conditional
+
+
+def test_workflow_edge_blank_condition_rejected() -> None:
+    with pytest.raises(ValidationError, match="invalid_edge_when"):
+        WorkflowEdge(source="a", target="b", when="   ")
+
+
 def _reported_cycle_nodes(error: ValidationError) -> set[str]:
     """从错误信息中提取「环上节点: x -> y -> z」报告的节点集合。"""
     match = re.search(r"环上节点: ([^\[\n]+)", str(error))
@@ -242,6 +321,183 @@ def test_indirect_cycle_rejected_with_cycle_nodes() -> None:
 def test_diamond_dag_is_acyclic_and_valid() -> None:
     spec = make_spec(["a", "b", "c", "d"], [("a", "b"), ("a", "c"), ("b", "d"), ("c", "d")])
     assert len(spec.edges) == 4
+
+
+def test_duplicate_edge_by_source_target_and_trigger_rejected() -> None:
+    nodes = [make_node("a"), make_node("b")]
+    edges = [
+        WorkflowEdge(source="a", target="b"),
+        WorkflowEdge(source="a", target="b"),
+    ]
+    with pytest.raises(ValidationError, match="duplicate_edge"):
+        WorkflowSpec(nodes=nodes, edges=edges)
+
+
+def test_ordinary_success_edge_cannot_be_conditional() -> None:
+    with pytest.raises(ValidationError, match="conditional_edge_requires_branch"):
+        WorkflowSpec(
+            nodes=[make_node("a"), make_node("b")],
+            edges=[WorkflowEdge(source="a", target="b", when="${env} == 'prod'")],
+            variables={"env": "prod"},
+        )
+
+
+def test_branch_success_routes_require_first_match_conditions_and_default() -> None:
+    nodes = [
+        make_node("route", job_kind="branch", payload={}),
+        make_node("prod"),
+        make_node("fallback"),
+    ]
+    edges = [
+        WorkflowEdge(source="route", target="prod", when="${env} == 'prod'"),
+        WorkflowEdge(source="route", target="fallback", is_default=True),
+    ]
+    spec = WorkflowSpec(nodes=nodes, edges=edges, variables={"env": "prod"})
+    assert [edge.target for edge in spec.edges] == ["prod", "fallback"]
+
+    with pytest.raises(ValidationError, match="invalid_branch_routes"):
+        WorkflowSpec(nodes=nodes, edges=edges[:1], variables={"env": "prod"})
+
+
+def test_failure_routes_require_on_failure_branch_and_one_default() -> None:
+    failing = make_node("source", on_failure="branch")
+    recovery = make_node("recovery")
+    valid = WorkflowSpec(
+        nodes=[failing, recovery],
+        edges=[
+            WorkflowEdge(
+                source="source",
+                target="recovery",
+                trigger="failure",
+                is_default=True,
+            )
+        ],
+    )
+    assert valid.edges[0].trigger == "failure"
+
+    with pytest.raises(ValidationError, match="failure_edge_requires_branch"):
+        WorkflowSpec(
+            nodes=[make_node("source"), recovery],
+            edges=[
+                WorkflowEdge(
+                    source="source",
+                    target="recovery",
+                    trigger="failure",
+                    is_default=True,
+                )
+            ],
+        )
+
+    with pytest.raises(ValidationError, match="missing_failure_route"):
+        WorkflowSpec(nodes=[failing], edges=[])
+
+
+def test_notify_node_targets_must_exist_in_workflow_notifications() -> None:
+    notify_node = make_node(
+        "notify",
+        job_kind="notify",
+        payload={"target_ids": ["ops"]},
+    )
+    with pytest.raises(ValidationError, match="unknown_notify_target"):
+        WorkflowSpec(nodes=[notify_node], edges=[])
+
+    spec = WorkflowSpec.model_validate(
+        {
+            "nodes": [notify_node],
+            "edges": [],
+            "notifications": [
+                {
+                    "id": "ops",
+                    "channel": "webhook",
+                    "url_secret_ref": "secret-ref",
+                    "events": ["all"],
+                }
+            ],
+        }
+    )
+    assert spec.nodes[0].payload["target_ids"] == ["ops"]
+
+
+def test_node_output_reference_must_be_whitelisted_strict_ancestor() -> None:
+    query = make_node("query")
+    export = make_node(
+        "export",
+        job_kind="export_excel",
+        payload={"source_result_set_id": "${nodes.query.result_set_id}"},
+    )
+    spec = WorkflowSpec(
+        nodes=[query, export],
+        edges=[WorkflowEdge(source="query", target="export")],
+    )
+    assert spec.nodes[1].payload["source_result_set_id"] == "${nodes.query.result_set_id}"
+
+    with pytest.raises(ValidationError, match="non_upstream_node_output"):
+        WorkflowSpec(
+            nodes=[query, export],
+            edges=[],
+        )
+
+    bad_field = export.model_copy(
+        update={"payload": {"source_result_set_id": "${nodes.query.rows}"}}
+    )
+    with pytest.raises(ValidationError, match="forbidden_node_output_field"):
+        WorkflowSpec(
+            nodes=[query, bad_field],
+            edges=[WorkflowEdge(source="query", target="export")],
+        )
+
+
+def test_edge_condition_can_reference_source_or_source_ancestor() -> None:
+    root = make_node("root")
+    route = make_node("route", job_kind="branch", payload={})
+    left = make_node("left")
+    right = make_node("right")
+    spec = WorkflowSpec(
+        nodes=[root, route, left, right],
+        edges=[
+            WorkflowEdge(source="root", target="route"),
+            WorkflowEdge(
+                source="route",
+                target="left",
+                when=("${nodes.root.loaded_rows} > 0 && ${nodes.route.status} == 'success'"),
+            ),
+            WorkflowEdge(source="route", target="right", is_default=True),
+        ],
+    )
+    assert spec.edges[1].when is not None
+
+
+def test_unknown_node_output_reference_rejected_at_spec_construction() -> None:
+    with pytest.raises(ValidationError, match="unknown_node_output"):
+        WorkflowSpec(
+            nodes=[
+                make_node(
+                    "consumer",
+                    payload={"sql": "SELECT '${nodes.ghost.status}'"},
+                )
+            ],
+            edges=[],
+        )
+
+
+def test_invalid_output_reference_validation_does_not_echo_spec_payload() -> None:
+    raw_expression = "nodes.query.bad-field"
+    payload_secret = "sensitive-payload-value"
+    consumer = make_node(
+        "consumer",
+        payload={
+            "sql": f"SELECT '${{{raw_expression}}}'",
+            "metadata": payload_secret,
+        },
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        WorkflowSpec(nodes=[consumer], edges=[])
+
+    message = str(exc_info.value)
+    assert "invalid_node_output_reference" in message
+    assert raw_expression not in message
+    assert payload_secret not in message
 
 
 # ---------------------------------------------------------------- 合法 spec 全字段往返

@@ -364,3 +364,20 @@ Compare/Lineage 范式建构**(§二)。
 | 路由 / 导航 | `frontend/src/router/index.ts:52-77`、`frontend/src/components/NavRail.vue:26-32` |
 | api 层范式(锚 schema) | `frontend/src/api/compare.ts:1-33`、`api/jobs.ts:45` |
 | i18n 分域 | `frontend/src/i18n/zh-CN.ts:334` |
+
+---
+
+## 九、2.4.x 完成补记（2026-07-13）
+
+本轮在既有 Workflow 主从视图和统一 API 网关内完成结构化定义编辑器；不新增前端路由，也不改变后端领域边界。本节取代上文关于“五种节点、JSON 主编辑、Email/branch/notify/sleep 延后”的历史规划口径：
+
+- 节点编辑器覆盖 `sql_query`、`sql_explain`、`compare_run`、`lineage_analyze`、`export_excel`、`notify`、`sleep`、`branch` 八种实际支持的 kind，并保留超时、重试、节点 `when` 与失败策略。
+- 执行顺序以编号轨道表达；普通、条件、默认和 failure 边都可编辑，first-match 路由可上下排序。Branch success 至少两条边；failure branch 至少一条边；两者都必须且只能有一个 default。
+- 结构化表单是主入口；同页“高级 DAG JSON”用于无损往返节点、边、schedule、sensor 与变量。通知目标继续由通知子资源管理，内部 secret ref 不进入 JSON 文本区或 Workflow 保存请求；后端在 Workflow 行锁内合并当前通知数组，避免长时间打开的草稿恢复已轮换的旧引用。
+- Workflow 可编辑 `enabled`、五段 cron、SQL Sensor、标量/列表变量。Compare 节点快照排除当前执行路径不支持的文件型任务；Export 从上游 SQL/Explain 节点生成 `${nodes.<id>.result_set_id}` 并补齐 success 边。
+- 变量单值/列表项与后端一致最多 512 字符。Export 通过实际 SQL/Explain 节点 id 精确匹配来源，节点 id 含 `.` 时仍可无损回填，同时继续要求直接 success 边。
+- 新建 Workflow 时 Notify 不可选；首次保存后先在同一详情页配置目标，再添加 Notify。通知目标支持 Webhook、企业微信和 Email；URL/SMTP 密码均只写，提交或关闭后立即清空。
+- 删除仍被 Notify 节点引用的目标、或更新/删除被 pending/running Run/Sensor 冻结的目标会返回结构化 409；页面翻译该冲突及全部 Workflow 域校验错误码，不回显原始表达式或 SecretRef。Workflow 保存、通知目标增改删、手动触发、cron 与 sensor 都以同一 Workflow 行锁串行化，并在锁后读取当前 spec，防止丢更新、孤儿 SecretRef 或冻结旧引用。
+- Run 历史按 20 条做 offset 分页，节点详情只渲染 API 返回的安全标量 outputs。
+
+继续后延：拖拽画布、动态节点元数据端点、Scenario、单 Workflow 时区、HA/backfill、任意 HTTP 节点和复杂结果浏览器。

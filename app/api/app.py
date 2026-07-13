@@ -80,6 +80,7 @@ def _build_scheduler(services: ApiServices, settings: Settings | None) -> Workfl
     return WorkflowScheduler(
         services,
         tick_interval_seconds=settings.scheduler.tick_interval_seconds,
+        timezone=settings.scheduler.timezone,
     )
 
 

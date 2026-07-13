@@ -105,7 +105,10 @@ class WebhookChannel:
     ) -> NotifyResult:
         try:
             url = _resolve_url(target, reveal)
-            body = json.dumps(payload.model_dump(mode="json")).encode("utf-8")
+            payload_json = payload.model_dump(mode="json")
+            if payload.message is None:
+                payload_json.pop("message")
+            body = json.dumps(payload_json).encode("utf-8")
             _post_json(url, body, timeout=target.timeout_seconds)
         except Exception as exc:  # 失败隔离:渠道永不抛
             error = _classify_error(exc)
@@ -156,6 +159,8 @@ def _wecom_body(payload: RunNotification) -> dict[str, object]:
     if payload.node_status_counts:
         counts = ", ".join(f"{k}={v}" for k, v in sorted(payload.node_status_counts.items()))
         lines.append(f"- nodes: {counts}")
+    if payload.message:
+        lines.append(f"- message: {payload.message}")
     if payload.error:
         lines.append(f"- error: {payload.error}")
     return {"msgtype": "markdown", "markdown": {"content": "\n".join(lines)}}
@@ -219,6 +224,8 @@ def _email_body(payload: RunNotification) -> str:
     if payload.node_status_counts:
         counts = ", ".join(f"{k}={v}" for k, v in sorted(payload.node_status_counts.items()))
         lines.append(f"nodes: {counts}")
+    if payload.message:
+        lines.append(f"message: {payload.message}")
     if payload.error:
         lines.append(f"error: {payload.error}")
     return "\n".join(lines)
