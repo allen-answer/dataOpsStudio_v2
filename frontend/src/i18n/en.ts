@@ -298,6 +298,8 @@ export default {
     ai_prompt_placeholder: 'e.g. total order amount per customer in the last 30 days',
     ai_generating: 'Generating…',
     ai_failed: 'AI could not generate SQL. Try rephrasing your request.',
+    ai_metadata_unavailable:
+      'Unable to read the datasource schema. Test the datasource connection and refresh metadata, then try again.',
     ai_disabled: 'AI Copilot is not enabled. Ask an administrator to configure the AI Gateway.',
     expand_needs_metadata: 'Refresh the metadata browser first, then expand *.',
     plan_running: 'Computing plan…',
