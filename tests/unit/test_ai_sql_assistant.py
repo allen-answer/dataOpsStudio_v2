@@ -93,3 +93,113 @@ def test_response_diagnostics_and_repair_policy_are_bounded() -> None:
     assert should_repair("sql_parse_failed", attempts=1) is True
     assert should_repair("provider_auth_failed", attempts=1) is False
     assert should_repair("sql_parse_failed", attempts=2) is False
+
+
+def test_unqualified_column_ignores_unused_candidate_tables() -> None:
+    validation = validate_generated_sql(
+        "SELECT amount FROM app.users",
+        dialect="mysql",
+        tables=[USERS, ORDERS],
+    )
+
+    assert validation.ok is False
+    assert validation.diagnostic_code == "sql_unknown_column"
+
+
+def test_schema_qualified_table_is_not_shadowed_by_same_named_cte() -> None:
+    validation = validate_generated_sql(
+        "WITH accounts AS (SELECT id FROM app.users) SELECT id FROM app.accounts",
+        dialect="mysql",
+        tables=[USERS],
+    )
+
+    assert validation.ok is False
+    assert validation.diagnostic_code == "sql_unknown_table"
+
+
+def test_derived_table_columns_are_validated_from_their_projection() -> None:
+    valid = validate_generated_sql(
+        "SELECT d.name FROM (SELECT name FROM app.users) AS d",
+        dialect="mysql",
+        tables=[USERS],
+    )
+    unknown = validate_generated_sql(
+        "SELECT d.missing FROM (SELECT name FROM app.users) AS d",
+        dialect="mysql",
+        tables=[USERS],
+    )
+
+    assert valid.ok is True
+    assert valid.columns == "passed"
+    assert unknown.ok is False
+    assert unknown.diagnostic_code == "sql_unknown_column"
+
+
+def test_uncertain_derived_projections_are_partial() -> None:
+    wildcard = validate_generated_sql(
+        "SELECT d.name FROM (SELECT * FROM app.users) AS d",
+        dialect="mysql",
+        tables=[USERS],
+    )
+    explicit_cte_columns = validate_generated_sql(
+        "WITH renamed(user_id) AS (SELECT id FROM app.users) SELECT r.user_id FROM renamed AS r",
+        dialect="mysql",
+        tables=[USERS],
+    )
+    set_operation = validate_generated_sql(
+        "SELECT d.id FROM (SELECT id FROM app.users UNION SELECT id FROM app.orders) AS d",
+        dialect="mysql",
+        tables=[USERS, ORDERS],
+    )
+    expression = validate_generated_sql(
+        "SELECT d.label FROM (SELECT CONCAT(name, '-x') AS label FROM app.users) AS d",
+        dialect="mysql",
+        tables=[USERS],
+    )
+
+    for validation in (wildcard, explicit_cte_columns, set_operation, expression):
+        assert validation.ok is True
+        assert validation.columns == "partial"
+        assert validation.warnings == ("sql_column_validation_partial",)
+
+
+def test_explicit_table_alias_hides_original_table_name_qualifier() -> None:
+    validation = validate_generated_sql(
+        "SELECT users.id FROM app.users AS u",
+        dialect="mysql",
+        tables=[USERS],
+    )
+
+    assert validation.ok is False
+    assert validation.diagnostic_code == "sql_unknown_column"
+
+
+def test_projection_alias_is_not_visible_in_where_clause() -> None:
+    validation = validate_generated_sql(
+        "SELECT id AS label FROM app.users WHERE label = 1",
+        dialect="mysql",
+        tables=[USERS],
+    )
+
+    assert validation.ok is False
+    assert validation.diagnostic_code == "sql_unknown_column"
+
+
+def test_nested_and_correlated_subqueries_use_their_own_visible_relations() -> None:
+    correlated = validate_generated_sql(
+        "SELECT u.name FROM app.users AS u "
+        "WHERE EXISTS (SELECT 1 FROM app.orders AS o WHERE o.customer_id = u.id)",
+        dialect="mysql",
+        tables=[USERS, ORDERS],
+    )
+    nested_unknown = validate_generated_sql(
+        "SELECT u.name FROM app.users AS u "
+        "WHERE EXISTS (SELECT amount FROM app.users AS inner_users)",
+        dialect="mysql",
+        tables=[USERS, ORDERS],
+    )
+
+    assert correlated.ok is True
+    assert correlated.columns == "passed"
+    assert nested_unknown.ok is False
+    assert nested_unknown.diagnostic_code == "sql_unknown_column"

@@ -6,7 +6,8 @@ from typing import Literal
 
 import sqlglot
 from sqlglot import exp
-from sqlglot.errors import ParseError
+from sqlglot.errors import OptimizeError, ParseError
+from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.ai import AiResponse, ReasoningMode
@@ -49,6 +50,12 @@ class SqlValidation:
     columns: ValidationState
     diagnostic_code: str | None = None
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _RelationColumns:
+    names: frozenset[str]
+    exhaustive: bool
 
 
 def classify_reasoning_mode(natural_language: str, tables: list[TableSchema]) -> ReasoningMode:
@@ -177,9 +184,149 @@ def _table_match(node: exp.Table, tables: list[TableSchema]) -> TableSchema | No
     return matches[0] if len(matches) == 1 else None
 
 
-def _has_column(table: TableSchema, name: str) -> bool:
-    lowered = name.casefold()
-    return any(column.name.casefold() == lowered for column in table.columns)
+def _scope_output(scope: Scope) -> _RelationColumns:
+    if scope.outer_columns:
+        return _RelationColumns(
+            names=frozenset(name.casefold() for name in scope.outer_columns),
+            exhaustive=False,
+        )
+
+    expression = scope.expression
+    if isinstance(expression, exp.SetOperation):
+        return _RelationColumns(
+            names=frozenset(
+                name.casefold() for name in expression.named_selects if name and name != "*"
+            ),
+            exhaustive=False,
+        )
+    if not isinstance(expression, exp.Select):
+        return _RelationColumns(names=frozenset(), exhaustive=False)
+
+    names: set[str] = set()
+    exhaustive = True
+    for projection in expression.selects:
+        name = projection.alias_or_name
+        if name and name != "*":
+            names.add(name.casefold())
+
+        projected = projection.this if isinstance(projection, exp.Alias) else projection
+        if not isinstance(projected, exp.Column) or projected.name == "*":
+            exhaustive = False
+
+    return _RelationColumns(names=frozenset(names), exhaustive=exhaustive)
+
+
+def _physical_relation(table: TableSchema) -> _RelationColumns:
+    return _RelationColumns(
+        names=frozenset(column.name.casefold() for column in table.columns),
+        exhaustive=True,
+    )
+
+
+def _build_scope_relations(
+    scopes: list[Scope],
+    outputs: dict[int, _RelationColumns],
+    tables: list[TableSchema],
+) -> dict[int, dict[str, _RelationColumns]] | None:
+    relations_by_scope: dict[int, dict[str, _RelationColumns]] = {}
+    for scope in scopes:
+        relations: dict[str, _RelationColumns] = {}
+        for alias, (_, source) in scope.selected_sources.items():
+            if isinstance(source, exp.Table):
+                matched = _table_match(source, tables)
+                if matched is None:
+                    return None
+                relation = _physical_relation(matched)
+            else:
+                relation = outputs[id(source)]
+            relations[alias.casefold()] = relation
+        relations_by_scope[id(scope)] = relations
+    return relations_by_scope
+
+
+def _projection_aliases(scope: Scope) -> frozenset[str]:
+    expression = scope.expression
+    if not isinstance(expression, exp.Select):
+        return frozenset()
+    return frozenset(
+        projection.alias.casefold() for projection in expression.selects if projection.alias
+    )
+
+
+def _is_top_level_clause(column: exp.Column, clause_type: type[exp.Expr], scope: Scope) -> bool:
+    clause = column.find_ancestor(clause_type)
+    if clause is None:
+        return False
+    query = clause.find_ancestor(exp.Select, exp.SetOperation)
+    return query is scope.expression
+
+
+def _projection_alias_allowed(column: exp.Column, scope: Scope, dialect: str) -> bool:
+    if column.name.casefold() not in _projection_aliases(scope):
+        return False
+
+    order = column.find_ancestor(exp.Order)
+    if (
+        order is not None
+        and order.find_ancestor(exp.Window, exp.WithinGroup) is None
+        and _is_top_level_clause(column, exp.Order, scope)
+    ):
+        return True
+
+    normalized_dialect = dialect.casefold()
+    if normalized_dialect == "mysql":
+        return _is_top_level_clause(column, exp.Group, scope) or _is_top_level_clause(
+            column, exp.Having, scope
+        )
+    if normalized_dialect in {"bigquery", "duckdb", "snowflake"}:
+        return _is_top_level_clause(column, exp.Qualify, scope)
+    return False
+
+
+def _resolve_column(
+    column: exp.Column,
+    scope: Scope,
+    relations_by_scope: dict[int, dict[str, _RelationColumns]],
+    *,
+    dialect: str,
+) -> ValidationState:
+    relations = relations_by_scope[id(scope)]
+    name = column.name.casefold()
+    qualifier = column.table.casefold() if column.table else ""
+
+    if qualifier:
+        relation = relations.get(qualifier)
+        if relation is not None:
+            if not relation.exhaustive:
+                return "partial"
+            return "passed" if name in relation.names else "failed"
+        if scope.can_be_correlated and scope.parent is not None:
+            return _resolve_column(
+                column,
+                scope.parent,
+                relations_by_scope,
+                dialect=dialect,
+            )
+        return "failed"
+
+    definite_matches = sum(
+        relation.exhaustive and name in relation.names for relation in relations.values()
+    )
+    has_uncertain_source = any(not relation.exhaustive for relation in relations.values())
+    if definite_matches:
+        return "partial" if definite_matches != 1 or has_uncertain_source else "passed"
+    if has_uncertain_source:
+        return "partial"
+    if _projection_alias_allowed(column, scope, dialect):
+        return "passed"
+    if scope.can_be_correlated and scope.parent is not None:
+        return _resolve_column(
+            column,
+            scope.parent,
+            relations_by_scope,
+            dialect=dialect,
+        )
+    return "failed"
 
 
 def validate_generated_sql(sql: str, *, dialect: str, tables: list[TableSchema]) -> SqlValidation:
@@ -214,64 +361,39 @@ def validate_generated_sql(sql: str, *, dialect: str, tables: list[TableSchema])
             diagnostic_code="sql_parse_failed",
         )
 
-    statement = statements[0]
-    cte_names = {
-        cte.alias_or_name.casefold() for cte in statement.find_all(exp.CTE) if cte.alias_or_name
-    }
-    cte_columns: dict[str, set[str]] = {}
-    for cte in statement.find_all(exp.CTE):
-        select_query = cte.this.find(exp.Select) if cte.this is not None else None
-        if not cte.alias_or_name or not isinstance(select_query, exp.Select):
-            continue
-        cte_columns[cte.alias_or_name.casefold()] = {
-            select.alias_or_name.casefold()
-            for select in select_query.selects
-            if select.alias_or_name
-        }
-    alias_tables: dict[str, TableSchema] = {}
-    derived_aliases = set(cte_names)
-    derived_columns = dict(cte_columns)
-    for node in statement.find_all(exp.Table):
-        if node.name.casefold() in cte_names:
-            alias = node.alias_or_name.casefold()
-            derived_aliases.add(alias)
-            derived_columns[alias] = cte_columns[node.name.casefold()]
-            continue
-        matched = _table_match(node, tables)
-        if matched is None:
-            return SqlValidation(
-                ok=False,
-                readonly="passed",
-                tables="failed",
-                columns="failed",
-                diagnostic_code="sql_unknown_table",
-            )
-        alias_tables[node.alias_or_name.casefold()] = matched
-        alias_tables[node.name.casefold()] = matched
+    scopes = traverse_scope(statements[0])
+    outputs = {id(scope): _scope_output(scope) for scope in scopes}
+    try:
+        relations_by_scope = _build_scope_relations(scopes, outputs, tables)
+    except OptimizeError:
+        return SqlValidation(
+            ok=False,
+            readonly="passed",
+            tables="failed",
+            columns="failed",
+            diagnostic_code="sql_parse_failed",
+        )
+    if relations_by_scope is None:
+        return SqlValidation(
+            ok=False,
+            readonly="passed",
+            tables="failed",
+            columns="failed",
+            diagnostic_code="sql_unknown_table",
+        )
 
-    projected_aliases = (
-        {select.alias.casefold() for select in statement.selects if select.alias}
-        if isinstance(statement, exp.Select)
-        else set()
-    )
     partial = False
-    for column in statement.find_all(exp.Column):
-        if column.name == "*":
-            continue
-        qualifier = column.table.casefold() if column.table else ""
-        if qualifier:
-            if qualifier in derived_aliases:
-                if column.name.casefold() not in derived_columns.get(qualifier, set()):
-                    return SqlValidation(
-                        ok=False,
-                        readonly="passed",
-                        tables="passed",
-                        columns="failed",
-                        diagnostic_code="sql_unknown_column",
-                    )
+    for scope in scopes:
+        for column in scope.find_all(exp.Column):
+            if column.name == "*":
                 continue
-            table = alias_tables.get(qualifier)
-            if table is None or not _has_column(table, column.name):
+            resolution = _resolve_column(
+                column,
+                scope,
+                relations_by_scope,
+                dialect=dialect,
+            )
+            if resolution == "failed":
                 return SqlValidation(
                     ok=False,
                     readonly="passed",
@@ -279,18 +401,7 @@ def validate_generated_sql(sql: str, *, dialect: str, tables: list[TableSchema])
                     columns="failed",
                     diagnostic_code="sql_unknown_column",
                 )
-            continue
-        matches = [table for table in tables if _has_column(table, column.name)]
-        if not matches and column.name.casefold() not in projected_aliases:
-            return SqlValidation(
-                ok=False,
-                readonly="passed",
-                tables="passed",
-                columns="failed",
-                diagnostic_code="sql_unknown_column",
-            )
-        if len(matches) != 1:
-            partial = True
+            partial = partial or resolution == "partial"
 
     return SqlValidation(
         ok=True,
