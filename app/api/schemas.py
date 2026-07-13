@@ -313,6 +313,13 @@ class CompareTaskUpdateRequest(BaseModel):
     run_limits: CompareRunLimitsPayload | None = None
 
 
+class CompareProjectionDetail(BaseModel):
+    name: str
+    generated: bool = False
+    projection_index: int = Field(ge=1)
+    expression: str | None = None
+
+
 class CompareTaskResponse(BaseModel):
     id: str
     project_id: str
@@ -322,6 +329,8 @@ class CompareTaskResponse(BaseModel):
     source_ref: CompareDataRef
     target_ref: CompareDataRef
     columns: list[Column] = Field(default_factory=list)
+    source_projection_details: list[CompareProjectionDetail] = Field(default_factory=list)
+    target_projection_details: list[CompareProjectionDetail] = Field(default_factory=list)
     compare_rules: CompareRulesPayload
     run_limits: CompareRunLimitsPayload
     created_by: str | None = None
@@ -377,6 +386,7 @@ class ComparePreviewRequest(BaseModel):
 
 class ComparePreviewResponse(BaseModel):
     columns: list[str] = Field(default_factory=list)
+    column_details: list[CompareProjectionDetail] = Field(default_factory=list)
     rows: list[list[Any]] = Field(default_factory=list)
     row_count: int
     truncated: bool

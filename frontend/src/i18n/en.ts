@@ -520,6 +520,22 @@ export default {
     preview_err_select_not_allowed: 'Datasource operation policy denies SELECT.',
     preview_err_unreachable: 'Datasource connection failed.',
     preview_err_failed: 'Preview query failed.',
+    preview_err_alias_required:
+      'A computed SQL column needs an explicit AS alias because it could not be named automatically.',
+    stale_aliases_error: 'Update the legacy generated column names before saving or running.',
+    expression_inspect: 'Inspect expression for {name}',
+    expression_close: 'Close expression details',
+    expression_original: 'Original projection expression',
+    expression_position: 'Projection {index}',
+    expression_generated: 'System-generated alias',
+    expression_copy: 'Copy expression',
+    expression_copied: 'Copied',
+    expression_copy_failed: 'Could not copy the expression.',
+    legacy_alias_warning:
+      'This task contains legacy unnamed expression columns. Update them to stable RESULT_n aliases before running.',
+    legacy_alias_action: 'Update generated aliases',
+    legacy_alias_confirm:
+      'Replace proven legacy numeric columns with RESULT_n aliases and save this task?',
     preview_adopt_source: 'Adopt as source columns',
     preview_adopt_source_hint:
       'Replaces the compare column list with these source column names (type resets to string; keys, ignores and target mappings are cleared). Confirms first if columns already exist.',
@@ -576,6 +592,7 @@ export default {
     bucket_diff: 'Changed',
     bucket_same: 'Same',
     bucket_empty: 'No rows in this bucket.',
+    run_failed: 'Compare execution failed',
     pk_column: 'Key',
     progress: 'Scan progress',
     progress_scanned: 'Scanned segments',

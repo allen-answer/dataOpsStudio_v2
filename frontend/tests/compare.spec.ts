@@ -166,6 +166,16 @@ const progress = { scanned_segments: 2, skipped_segments: 1, skipped_rows: 7, ro
 
 async function mockBase(page: Page): Promise<void> {
   await mockLicense(page)
+  await page.route(/\/api\/projects\/project-1\/compare\/runs-dashboard/, (r) =>
+    json(r, 200, {
+      project_id: 'project-1',
+      days: 30,
+      total_runs: 0,
+      status_counts: {},
+      success_rate: 0,
+      top_abort_reasons: [],
+    }),
+  )
   await page.route(/\/api\/datasources\?/, (r) =>
     json(r, 200, [datasource(), datasource({ id: 'ds-target', name: 'warehouse_b' })]),
   )
@@ -266,6 +276,126 @@ test('suggestions list table pairs and create a draft task', async ({ page }) =>
   await page.getByRole('button', { name: 'Find table pairs' }).click()
   await expect(page.getByText('src_customer')).toBeVisible()
   await expect(page.getByText('normalized', { exact: true })).toBeVisible()
+  expectNoConsoleErrors()
+})
+
+test('generated expression preview shows summary and full expression', async ({ page }) => {
+  await mockBase(page)
+  const expression =
+    "CASE WHEN BALANCE > 100000 THEN 'HIGH' WHEN BALANCE > 10000 THEN 'MEDIUM' ELSE 'LOW' END"
+  await page.route('**/api/projects/project-1/compare/preview', (r) =>
+    json(r, 200, {
+      columns: ['CUST_NO', 'RESULT_1'],
+      column_details: [
+        { name: 'CUST_NO', generated: false, projection_index: 1, expression: null },
+        { name: 'RESULT_1', generated: true, projection_index: 2, expression },
+      ],
+      rows: [['C1', 'HIGH']],
+      row_count: 1,
+      truncated: false,
+    }),
+  )
+
+  await page.goto('/projects/project-1/compare')
+  await page.getByRole('button', { name: 'Custom SQL' }).first().click()
+  await page.locator('textarea').first().fill(`SELECT CUST_NO, ${expression} FROM ACCOUNT`)
+  await page.getByRole('button', { name: 'Preview', exact: true }).first().click()
+
+  const inspect = page.getByRole('button', { name: 'Inspect expression for RESULT_1' })
+  await expect(inspect).toBeVisible()
+  await expect(inspect).toHaveAttribute('title', /CASE WHEN BALANCE/)
+  await inspect.click()
+  await expect(page.getByText('Original projection expression')).toBeVisible()
+  await expect(page.getByText(expression, { exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: 'Close expression details' }).click()
+  page.once('dialog', (dialog) => dialog.accept())
+  await page.getByRole('button', { name: 'Adopt as source columns' }).click()
+  await expect(page.locator('input[placeholder="Column"]').nth(1)).toHaveValue('RESULT_1')
+  expectNoConsoleErrors()
+})
+
+test('legacy aliases can be repaired and saved through the task API', async ({ page }) => {
+  const expressions = ['SUM(A)', 'SUM(B)', 'SUM(C)']
+  const baseNames = ['OCCUR_DATE', 'CUST_NO', 'SEC_CODE', 'SEC_TYPE', 'BUSINESS_CODE']
+  const details = [
+    ...baseNames.map((name, index) => ({
+      name,
+      generated: false,
+      projection_index: index + 1,
+      expression: null,
+    })),
+    ...expressions.map((expression, index) => ({
+      name: `RESULT_${index + 1}`,
+      generated: true,
+      projection_index: index + 6,
+      expression,
+    })),
+  ]
+  const sql =
+    'SELECT OCCUR_DATE, CUST_NO, SEC_CODE, SEC_TYPE, BUSINESS_CODE, SUM(A), SUM(B), SUM(C) FROM T GROUP BY OCCUR_DATE, CUST_NO, SEC_CODE, SEC_TYPE, BUSINESS_CODE'
+  const legacyTask = compareTask({
+    name: 'legacy aggregate',
+    source_ref: { kind: 'sql', sql },
+    target_ref: { kind: 'sql', sql },
+    columns: [...baseNames, '6', '7', '8'].map((name) => ({ name, type: 'string' })),
+    source_projection_details: details,
+    target_projection_details: details,
+    compare_rules: {
+      ...compareTask().compare_rules,
+      key_columns: ['6'],
+      ignore_columns: ['7'],
+      column_mappings: { '6': '6', '7': '7', '8': '8' },
+    },
+  })
+  await mockBase(page)
+  await page.route(/\/api\/compare\/tasks(\?|$)/, (r) => json(r, 200, [legacyTask]))
+  let patchBody: Record<string, unknown> | null = null
+  await page.route('**/api/compare/tasks/task-1', async (r) => {
+    if (r.request().method() !== 'PATCH') return r.fallback()
+    patchBody = r.request().postDataJSON() as Record<string, unknown>
+    return json(r, 200, { ...legacyTask, ...patchBody })
+  })
+
+  await page.goto('/projects/project-1/compare')
+  await expect(page.getByText(/legacy unnamed expression columns/i)).toBeVisible()
+  page.once('dialog', (dialog) => dialog.accept())
+  await page.getByRole('button', { name: 'Update generated aliases' }).click()
+
+  await expect.poll(() => patchBody).not.toBeNull()
+  const serialized = JSON.stringify(patchBody)
+  expect(serialized).toContain('RESULT_1')
+  expect(serialized).toContain('RESULT_2')
+  expect(serialized).toContain('RESULT_3')
+  expect(serialized).not.toMatch(/"(?:6|7|8)"/)
+  expectNoConsoleErrors()
+})
+
+test('execution failed state does not render zero buckets as empty results', async ({ page }) => {
+  await mockBase(page)
+  await page.route('**/api/compare/tasks/task-1/run', (r) =>
+    json(r, 202, { job_id: 'job-failed', run_id: 'run-failed' }),
+  )
+  await page.route('**/api/jobs/job-failed', (r) =>
+    json(r, 200, {
+      id: 'job-failed',
+      kind: 'compare_run',
+      status: 'failed',
+      created_at: now,
+      finished_at: now,
+      error: 'sql_failed',
+      error_code: 'sql_failed',
+      message: null,
+      result_set_id: null,
+    }),
+  )
+
+  await page.goto('/projects/project-1/compare')
+  await page.getByRole('button', { name: 'Start compare' }).click()
+
+  await expect(page.getByText('Compare execution failed')).toBeVisible()
+  await expect(page.getByText('No rows in this bucket.')).toBeHidden()
+  await expect(page.getByRole('button', { name: /^Changed\s+0/ })).toBeHidden()
   expectNoConsoleErrors()
 })
 

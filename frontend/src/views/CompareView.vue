@@ -73,6 +73,7 @@ import {
   type CompareInferResponse,
   type ComparePkPrecheckResponse,
   type ComparePreviewResponse,
+  type CompareProjectionDetail,
   type CompareResultRow,
   type CompareRunProfileResponse,
   type CompareRunResultResponse,
@@ -86,6 +87,7 @@ import { getJob, cancelJob, type JobResponse } from '../api/jobs'
 import { ApiError, type ColumnType, type DatasourceListItem, type JobStatus } from '../api/types'
 import LoadingDots from '../components/LoadingDots.vue'
 import JobStatusBadge from '../components/JobStatusBadge.vue'
+import CompareExpressionLabel from '../components/CompareExpressionLabel.vue'
 import { useToast } from '../composables/useToast'
 
 const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>([
@@ -345,6 +347,9 @@ const aiResult = ref<CompareAiAttributionResponse | null>(null)
 const aiBusy = ref(false)
 
 const runActive = computed<boolean>(() => (run.status ? ACTIVE.has(run.status) : false))
+const runFailed = computed<boolean>(
+  () => run.status === 'failed' || run.status === 'timeout' || run.status === 'cancelled',
+)
 const exportBusy = ref(false)
 const exportError = ref<string | null>(null)
 const exportReady = ref<{ token: string; filename: string } | null>(null)
@@ -364,6 +369,32 @@ const sampleResult = computed(
 const diffProfile = computed(
   () => resultData.value?.diff_profile ?? profileData.value?.diff_profile ?? {},
 )
+
+function detailByName(
+  details: CompareProjectionDetail[] | undefined,
+  name: string,
+): CompareProjectionDetail | null {
+  return details?.find((item) => item.name.toLowerCase() === name.toLowerCase()) ?? null
+}
+
+function previewDetail(side: RefSide, name: string): CompareProjectionDetail | null {
+  const data = previews[side].data
+  if (!data || !('column_details' in data)) return null
+  return detailByName(data.column_details, name)
+}
+
+function sourceColumnDetail(index: number, name: string): CompareProjectionDetail | null {
+  const details = activeTask.value?.source_projection_details
+  return (
+    detailByName(details, name) ??
+    details?.find((item) => item.generated && item.projection_index === index + 1) ??
+    null
+  )
+}
+
+function resultColumnDetail(name: string): CompareProjectionDetail | null {
+  return detailByName(activeTask.value?.source_projection_details, name)
+}
 
 // 主键列固定左侧:diff tab 表头依推断/规则的 key_columns 决定。
 const keyColumns = computed<string[]>(() => draft.keyColumns)
@@ -635,6 +666,58 @@ function onTargetColInput(index: number, event: Event): void {
   const val = (event.target as HTMLInputElement).value.trim()
   if (!val || val === src) delete draft.columnMappings[src]
   else draft.columnMappings[src] = val
+}
+
+interface LegacyAliasRepair {
+  index: number
+  oldName: string
+  newName: string
+}
+
+function legacyAliasRepairs(
+  details: CompareProjectionDetail[] | undefined,
+  side: RefSide,
+): LegacyAliasRepair[] {
+  if (!details) return []
+  const repairs: LegacyAliasRepair[] = []
+  for (const detail of details) {
+    if (!detail.generated) continue
+    const index = detail.projection_index - 1
+    const sourceName = draft.columns[index]?.name
+    if (!sourceName) continue
+    const currentName = side === 'source' ? sourceName : targetColName(sourceName)
+    if (currentName === String(detail.projection_index)) {
+      repairs.push({ index, oldName: currentName, newName: detail.name })
+    }
+  }
+  return repairs
+}
+
+const sourceLegacyRepairs = computed<LegacyAliasRepair[]>(() =>
+  legacyAliasRepairs(activeTask.value?.source_projection_details, 'source'),
+)
+const targetLegacyRepairs = computed<LegacyAliasRepair[]>(() =>
+  legacyAliasRepairs(activeTask.value?.target_projection_details, 'target'),
+)
+const hasLegacyAliases = computed<boolean>(
+  () => sourceLegacyRepairs.value.length > 0 || targetLegacyRepairs.value.length > 0,
+)
+
+async function applyLegacyAliases(): Promise<void> {
+  if (!hasLegacyAliases.value || !confirm(t('compare.legacy_alias_confirm'))) return
+  const sourceRepairs = [...sourceLegacyRepairs.value]
+  const targetRepairs = new Map(
+    targetLegacyRepairs.value.map((item) => [item.oldName, item.newName]),
+  )
+  for (const repair of sourceRepairs) renameColumn(repair.index, repair.newName)
+  for (const column of draft.columns) {
+    const currentTarget = targetColName(column.name)
+    const repairedTarget = targetRepairs.get(currentTarget)
+    if (!repairedTarget) continue
+    if (repairedTarget === column.name) delete draft.columnMappings[column.name]
+    else draft.columnMappings[column.name] = repairedTarget
+  }
+  await onSaveTask()
 }
 
 /** 清空所有比较列配置(列 / 主键 / 忽略 / 映射),先确认。 */
@@ -1193,6 +1276,13 @@ function buildLimitsPayload() {
   }
 }
 
+function compareTaskErrorMessage(e: unknown): string {
+  if (e instanceof ApiError && e.code === 'compare_sql_aliases_stale') {
+    return t('compare.stale_aliases_error')
+  }
+  return errorMessage(e)
+}
+
 async function onSaveTask(): Promise<void> {
   if (!draft.name.trim() || !refReady('source') || !refReady('target')) {
     editorError.value = t('compare.save_incomplete')
@@ -1232,7 +1322,7 @@ async function onSaveTask(): Promise<void> {
       mergeTask(updated)
     }
   } catch (e) {
-    editorError.value = errorMessage(e)
+    editorError.value = compareTaskErrorMessage(e)
   } finally {
     savingTask.value = false
   }
@@ -1350,7 +1440,12 @@ async function onRun(): Promise<void> {
     startPoll()
   } catch (e) {
     run.status = null
-    run.error = errorMessage(e)
+    if (e instanceof ApiError && e.code === 'compare_sql_aliases_stale') {
+      editorError.value = t('compare.stale_aliases_error')
+      rightTab.value = 'editor'
+    } else {
+      run.error = errorMessage(e)
+    }
   }
 }
 
@@ -1665,6 +1760,7 @@ function previewErrorMessage(e: unknown): string {
     if (e.code === 'invalid_identifier') return t('compare.preview_err_invalid_identifier')
     if (e.code === 'select_not_allowed') return t('compare.preview_err_select_not_allowed')
     if (e.code === 'datasource_unreachable') return t('compare.preview_err_unreachable')
+    if (e.code === 'compare_sql_alias_required') return t('compare.preview_err_alias_required')
     if (e.code === 'preview_failed') return t('compare.preview_err_failed')
   }
   return errorMessage(e)
@@ -2204,7 +2300,9 @@ const missingTarget = computed(
                             :key="col"
                             class="px-2 py-1 font-medium border-b border-r chrome-border-subtle align-top"
                           >
-                            <div class="min-w-[4.5rem] max-w-[14rem] truncate" :title="col">{{ col }}</div>
+                            <div class="min-w-[4.5rem] max-w-[14rem] truncate">
+                              <CompareExpressionLabel :name="col" :detail="previewDetail('source', col)" />
+                            </div>
                           </th>
                         </tr>
                       </thead>
@@ -2353,7 +2451,9 @@ const missingTarget = computed(
                             :key="col"
                             class="px-2 py-1 font-medium border-b border-r chrome-border-subtle align-top"
                           >
-                            <div class="min-w-[4.5rem] max-w-[14rem] truncate" :title="col">{{ col }}</div>
+                            <div class="min-w-[4.5rem] max-w-[14rem] truncate">
+                              <CompareExpressionLabel :name="col" :detail="previewDetail('target', col)" />
+                            </div>
                           </th>
                         </tr>
                       </thead>
@@ -2575,6 +2675,17 @@ const missingTarget = computed(
             </div>
           </div>
 
+          <div
+            v-if="hasLegacyAliases"
+            class="flex items-start gap-3 rounded-card border border-amber-300 dark:border-amber-500/40 bg-amber-50 dark:bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-200"
+          >
+            <AlertTriangle class="w-4 h-4 mt-0.5 shrink-0" />
+            <span class="flex-1">{{ t('compare.legacy_alias_warning') }}</span>
+            <button type="button" class="chrome-btn-secondary text-xs" @click="applyLegacyAliases">
+              {{ t('compare.legacy_alias_action') }}
+            </button>
+          </div>
+
           <!-- 列与主键配置:table 模式 infer 灌入后可微调;SQL 模式手动添加或从预览带入 -->
           <div>
             <div class="text-xs font-medium chrome-text-heading mb-2">{{ t('compare.compare_columns') }}</div>
@@ -2610,6 +2721,9 @@ const missingTarget = computed(
                       :placeholder="t('compare.col_name')"
                       @input="onColumnNameInput(ci, $event)"
                     />
+                    <div v-if="sourceColumnDetail(ci, col.name)?.generated" class="mt-1 text-[10px]">
+                      <CompareExpressionLabel :name="sourceColumnDetail(ci, col.name)?.name ?? col.name" :detail="sourceColumnDetail(ci, col.name)" />
+                    </div>
                   </td>
                   <td class="px-2 py-1.5">
                     <input
@@ -2835,6 +2949,17 @@ const missingTarget = computed(
 
         <!-- ============ 结果 tab ============ -->
         <div v-show="rightTab === 'results'" class="flex flex-col min-h-0 h-full">
+          <div
+            v-if="runFailed"
+            class="m-4 flex items-start gap-2 rounded-card border border-red-300 dark:border-red-500/40 bg-red-50 dark:bg-red-500/10 p-3 text-sm text-red-700 dark:text-red-300"
+          >
+            <AlertTriangle class="w-4 h-4 mt-0.5 shrink-0" />
+            <div>
+              <div class="font-medium">{{ t('compare.run_failed') }}</div>
+              <div v-if="run.error" class="mt-1 text-xs">{{ run.error }}</div>
+            </div>
+          </div>
+          <template v-else>
           <!-- 进度摘要 -->
           <div class="px-4 py-2 border-b chrome-border-subtle flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] chrome-text-muted">
             <span>{{ t('compare.progress') }}:</span>
@@ -2896,14 +3021,19 @@ const missingTarget = computed(
               </button>
               <div v-if="matchRateOpen" class="px-3 pb-3 space-y-1.5">
                 <div v-for="col in columnMatchRates" :key="col.name" class="flex items-center gap-2">
-                  <button
-                    type="button"
-                    class="w-44 shrink-0 truncate text-left text-xs font-mono chrome-text-heading hover:chrome-accent hover:underline"
-                    :title="t('compare.match_focus_title', { column: col.name })"
-                    @click="focusProfileColumn(col.name)"
-                  >
-                    {{ col.name }}
-                  </button>
+                  <div class="w-44 shrink-0 flex items-center gap-1 text-left text-xs font-mono chrome-text-heading">
+                    <span class="min-w-0 flex-1 truncate">
+                      <CompareExpressionLabel :name="col.name" :detail="resultColumnDetail(col.name)" />
+                    </span>
+                    <button
+                      type="button"
+                      class="chrome-btn-ghost shrink-0"
+                      :title="t('compare.match_focus_title', { column: col.name })"
+                      @click="focusProfileColumn(col.name)"
+                    >
+                      <Eye class="w-3 h-3" />
+                    </button>
+                  </div>
                   <div class="flex-1 h-2 rounded-full chrome-bg-elevated overflow-hidden">
                     <div
                       class="h-full rounded-full"
@@ -2994,7 +3124,7 @@ const missingTarget = computed(
                     :key="`c-${col}`"
                     class="px-3 py-2 font-medium"
                   >
-                    {{ col }}
+                    <CompareExpressionLabel :name="col" :detail="resultColumnDetail(col)" />
                   </th>
                 </tr>
               </thead>
@@ -3067,6 +3197,7 @@ const missingTarget = computed(
               </div>
             </template>
           </div>
+          </template>
         </div>
 
         <!-- ============ 画像 tab ============ -->
@@ -3082,7 +3213,9 @@ const missingTarget = computed(
               <div class="text-xs font-medium chrome-text-heading mb-2">{{ t('compare.profile_column_rates') }}</div>
               <div v-for="col in profileColumns" :key="col.name" class="mb-3">
                 <div class="flex items-center justify-between text-xs mb-1">
-                  <span class="font-mono chrome-text-heading">{{ col.name }}</span>
+                  <span class="font-mono chrome-text-heading">
+                    <CompareExpressionLabel :name="col.name" :detail="resultColumnDetail(col.name)" />
+                  </span>
                   <span class="chrome-text-muted">
                     {{ t('compare.profile_changed_of', { changed: col.info.changed_rows ?? 0, observed: col.info.observed_rows ?? 0 }) }}
                     · {{ diffRatePct(col.info.diff_rate) }}%

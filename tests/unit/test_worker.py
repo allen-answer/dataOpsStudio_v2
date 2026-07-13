@@ -368,6 +368,104 @@ def test_worker_runs_compare_run_to_four_bucket_spools() -> None:
     assert result_ref.metadata["diff_profile"] == diff_profile
 
 
+def test_compare_sql_reader_uses_generated_aliases_in_inner_and_outer_queries() -> None:
+    sql_calls: list[str] = []
+
+    class _RecordingAdapter(_FakeAdapter):
+        def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
+            sql_calls.append(sql)
+            yield from super().execute_select(sql, params)
+
+    sql = "SELECT CUST_NO, SUM(A), SUM(B), SUM(C) FROM T GROUP BY CUST_NO"
+    job = _make_job(
+        kind=JobKind.COMPARE_RUN,
+        payload={
+            "run_id": "run-sql",
+            "task_id": "task-sql",
+            "source_id": "ds-source",
+            "target_id": "ds-target",
+            "source_ref": {"kind": "sql", "sql": sql},
+            "target_ref": {"kind": "sql", "sql": sql},
+            "columns": [
+                {"name": "CUST_NO", "type": "string"},
+                {"name": "RESULT_1", "type": "decimal"},
+                {"name": "RESULT_2", "type": "decimal"},
+                {"name": "RESULT_3", "type": "decimal"},
+            ],
+            "compare_rules": {"key_columns": ["CUST_NO"]},
+            "run_limits": {"recursive_checksum": False, "persist_same_bucket": False},
+            "bucket_result_set_ids": {
+                "only_source": "rs-only-source",
+                "only_target": "rs-only-target",
+                "diff": "rs-diff",
+                "same": "rs-same",
+            },
+        },
+    )
+    adapter = _RecordingAdapter([Row(values=["C1", "C1", 1, 2, 3])])
+    backend = _FakeBackend([job])
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id).model_copy(update={"db_type": DbType.DB2}),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=_FakeCompareRunCatalog(),
+    )
+
+    assert runner.run_once() is True
+
+    executed = "\n".join(sql_calls).upper()
+    assert "SUM(A) AS RESULT_1" in executed
+    assert '"RESULT_1" AS "RESULT_1"' in executed
+    assert '"2"' not in executed
+    assert '"3"' not in executed
+    assert '"4"' not in executed
+    assert backend.failed == []
+
+
+def test_compare_sql_worker_rejects_legacy_numeric_alias_before_query() -> None:
+    sql = "SELECT CUST_NO, SUM(AMOUNT) FROM T GROUP BY CUST_NO"
+    job = _make_job(
+        kind=JobKind.COMPARE_RUN,
+        payload={
+            "run_id": "run-legacy",
+            "task_id": "task-legacy",
+            "source_id": "ds-source",
+            "target_id": "ds-target",
+            "source_ref": {"kind": "sql", "sql": sql},
+            "target_ref": {"kind": "sql", "sql": sql},
+            "columns": [
+                {"name": "CUST_NO", "type": "string"},
+                {"name": "2", "type": "decimal"},
+            ],
+            "compare_rules": {"key_columns": ["CUST_NO"]},
+            "run_limits": {"recursive_checksum": False},
+            "bucket_result_set_ids": {
+                "only_source": "rs-only-source",
+                "only_target": "rs-only-target",
+                "diff": "rs-diff",
+                "same": "rs-same",
+            },
+        },
+    )
+    adapter = _FakeAdapter([])
+    backend = _FakeBackend([job])
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id).model_copy(update={"db_type": DbType.DB2}),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=_FakeCompareRunCatalog(),
+    )
+
+    assert runner.run_once() is True
+
+    assert adapter.execute_select_calls == 0
+    assert backend.failed == [("job-1", "sql_failed")]
+
+
 def test_worker_sample_quick_check_reports_zero_defect_upper_bound() -> None:
     job = _make_job(
         kind=JobKind.COMPARE_RUN,
