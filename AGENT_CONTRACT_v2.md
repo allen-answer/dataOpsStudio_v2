@@ -360,6 +360,14 @@ SUPPORTED_WORKFLOW_NODE_KINDS = {
   metadata。run 终态通知与 DAG Notify 隔离:终态通知失败不得改变 workflow_run 状态。
 - `notify` 只引用 Workflow 已配置的通知 target id;`sleep` 只接受
   `duration_seconds`;`branch` payload 为空。Scenario 两种节点留待 2.6.0。
+- Workflow 创建请求可选 `enabled: bool = true`,更新请求可选
+  `enabled: bool | None = None`;省略更新字段时保留 `workflows.enabled`,显式布尔值才改列。
+  `workflows.enabled` 是唯一权威来源,不得复制进 WorkflowSpec / `dag_jsonb`。
+- 单 run 状态节点追加只读 `outputs`,值域仅 `str/int/float/bool/None`。kind-specific
+  字段必须由 `extract_workflow_node_outputs` 从防御性解析的 ResultRef 投影,common
+  `status/job_id/error_code` 来自权威 job 行;禁止 URI、任意 metadata、SQL/rows、
+  SecretRef、容器值或未知字段。损坏 ResultRef 与损坏/缺失 spec fallback 均不得 500,
+  且使用同一安全投影。run 历史列表保持轻量,不含节点 `outputs`。
 
 ---
 

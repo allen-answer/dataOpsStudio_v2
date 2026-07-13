@@ -20,6 +20,7 @@ from app.domain.job import Job, JobKind
 from app.domain.license import LicenseMode
 from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Index, Row, Schema, Table
+from app.domain.workflow import WorkflowSpec
 from tests._asgi_client import AsgiClient
 
 pytestmark = pytest.mark.contract
@@ -4363,6 +4364,32 @@ def test_workflow_create_contract_persists_spec_and_schedule_redundant_columns()
     assert any(audit["action"] == "workflow_create" for audit in services.audits)
 
 
+def test_workflow_create_explicit_false_persists_disabled() -> None:
+    disabled_row = _workflow_row()
+    disabled_row["enabled"] = False
+    engine = _FakeEngine([{"id": "project-1"}, None, disabled_row])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows",
+        headers=_auth_headers(),
+        json_body={
+            "name": "disabled-report",
+            "spec": _workflow_spec_payload(),
+            "enabled": False,
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["enabled"] is False
+    insert_statement = next(
+        statement
+        for statement in engine.executed
+        if str(statement).lstrip().upper().startswith("INSERT INTO WORKFLOWS")
+    )
+    assert insert_statement.compile().params["enabled"] is False
+
+
 def test_workflow_create_rejects_forbidden_node_kind_before_any_db_write() -> None:
     engine = _FakeEngine([])
     app = create_app(services=cast(ApiServices, _Services(engine)))
@@ -4385,7 +4412,10 @@ def test_workflow_create_rejects_unsupported_node_kind_distinct_from_forbidden()
     response = AsgiClient(app).post(
         "/api/projects/project-1/workflows",
         headers=_auth_headers(),
-        json_body={"name": "bad", "spec": _workflow_spec_payload(job_kind="notify")},
+        json_body={
+            "name": "bad",
+            "spec": _workflow_spec_payload(job_kind="scenario_materialize"),
+        },
     )
 
     assert response.status_code == 400
@@ -4529,6 +4559,62 @@ def test_workflow_update_contract_revalidates_spec_and_syncs_schedule_columns() 
     assert "updated_at" in update_statement
     assert "schedule_cron" in update_statement
     assert any(audit["action"] == "workflow_update" for audit in services.audits)
+
+
+def test_workflow_update_omitted_enabled_preserves_disabled() -> None:
+    disabled_row = _workflow_row()
+    disabled_row["enabled"] = False
+    engine = _FakeEngine([{"id": "project-1"}, disabled_row, None, disabled_row])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={"name": "nightly-report", "spec": _workflow_spec_payload()},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["enabled"] is False
+    update_statement = next(
+        statement
+        for statement in engine.executed
+        if str(statement).lstrip().upper().startswith("UPDATE WORKFLOWS")
+    )
+    assert "enabled" not in update_statement.compile().params
+
+
+@pytest.mark.parametrize(("existing", "requested"), [(False, True), (True, False)])
+def test_workflow_update_explicit_enabled_toggles(
+    existing: bool,
+    requested: bool,
+) -> None:
+    existing_row = _workflow_row()
+    existing_row["enabled"] = existing
+    updated_row = _workflow_row()
+    updated_row["enabled"] = requested
+    engine = _FakeEngine([{"id": "project-1"}, existing_row, None, updated_row])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={
+            "name": "nightly-report",
+            "spec": _workflow_spec_payload(),
+            "enabled": requested,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["enabled"] is requested
+    update_statement = next(
+        statement
+        for statement in engine.executed
+        if str(statement).lstrip().upper().startswith("UPDATE WORKFLOWS")
+    )
+    assert update_statement.compile().params["enabled"] is requested
 
 
 def test_workflow_update_rejects_forbidden_node_kind_before_any_db_write() -> None:
@@ -5121,6 +5207,213 @@ def test_workflow_run_status_contract_returns_run_and_node_states() -> None:
     assert node["attempts"] == 0
 
 
+@pytest.mark.parametrize(
+    ("job_kind", "metadata", "expected_kind_outputs"),
+    [
+        (
+            "sql_query",
+            {"result_set_id": "rs-1", "loaded_rows": 7},
+            {"result_set_id": "rs-1", "loaded_rows": 7},
+        ),
+        (
+            "sql_explain",
+            {"result_set_id": "rs-plan", "loaded_rows": 1},
+            {"result_set_id": "rs-plan", "loaded_rows": 1},
+        ),
+        (
+            "compare_run",
+            {
+                "run_id": "compare-1",
+                "bucket_counts": {"same": 11, "only_source": 2, "only_target": 3, "diff": 4},
+            },
+            {
+                "run_id": "compare-1",
+                "same_count": 11,
+                "only_source_count": 2,
+                "only_target_count": 3,
+                "diff_count": 4,
+            },
+        ),
+        (
+            "lineage_analyze",
+            {
+                "lineage_run_id": "lineage-1",
+                "cached": False,
+                "table_edge_count": 5,
+                "column_edge_count": 6,
+                "parse_error_count": 1,
+            },
+            {
+                "run_id": "lineage-1",
+                "cached": False,
+                "table_edge_count": 5,
+                "column_edge_count": 6,
+                "parse_error_count": 1,
+            },
+        ),
+        ("export_excel", {}, {}),
+        ("notify", {"sent_count": 2}, {"sent_count": 2}),
+        ("sleep", {"duration_seconds": 30}, {"duration_seconds": 30}),
+        ("branch", {"selected_target": "n2"}, {"selected_target": "n2"}),
+    ],
+)
+def test_workflow_run_status_returns_only_safe_scalar_node_outputs(
+    job_kind: str,
+    metadata: dict[str, object],
+    expected_kind_outputs: dict[str, object],
+) -> None:
+    sentinels = {
+        "rows": ["rows-sentinel"],
+        "password": "password-sentinel",
+        "token": "token-sentinel",
+        "message": "message-sentinel",
+        "nested": {"secret": "nested-sentinel"},
+        "unknown": "unknown-sentinel",
+    }
+    status_spec = _workflow_status_spec(job_kind)
+    WorkflowSpec.model_validate(status_spec)
+    run_row = _workflow_run_job_row(status="running")
+    cast(dict[str, Any], run_row["payload"])["spec"] = status_spec
+    child = _workflow_child_job_row(
+        "n1",
+        status="success",
+        job_kind=job_kind,
+        result_ref={
+            "backend": "test",
+            "uri": "uri-sentinel",
+            "metadata": {**metadata, **sentinels},
+        },
+    )
+    engine = _FakeEngine([{"id": "project-1"}, run_row, [child]])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflow-runs/run-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    node = response.json()["nodes"][0]
+    assert node["outputs"] == {
+        **expected_kind_outputs,
+        "status": "success",
+        "job_id": "child-1",
+        "error_code": None,
+    }
+    serialized = response.body.decode("utf-8")
+    for sentinel in (
+        "uri-sentinel",
+        "rows-sentinel",
+        "password-sentinel",
+        "token-sentinel",
+        "message-sentinel",
+        "nested-sentinel",
+        "unknown-sentinel",
+    ):
+        assert sentinel not in serialized
+
+
+def test_workflow_run_status_maps_child_error_code_into_common_outputs() -> None:
+    child = _workflow_child_job_row(
+        "n1",
+        status="failed",
+        error_code="sql_failed",
+    )
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_run_job_row(status="running"),
+            [child],
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflow-runs/run-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["nodes"][0]["outputs"] == {
+        "status": "failed",
+        "job_id": "child-1",
+        "error_code": "sql_failed",
+    }
+
+
+def test_workflow_run_status_malformed_result_ref_keeps_safe_common_outputs() -> None:
+    child = _workflow_child_job_row(
+        "n1",
+        status="success",
+        result_ref={
+            "backend": "test",
+            "uri": ["malformed-uri-sentinel"],
+            "metadata": {"result_set_id": "metadata-sentinel"},
+        },
+    )
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_run_job_row(status="running"),
+            [child],
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflow-runs/run-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["nodes"][0]["outputs"] == {
+        "status": "success",
+        "job_id": "child-1",
+        "error_code": None,
+    }
+    assert "malformed-uri-sentinel" not in response.body.decode("utf-8")
+    assert "metadata-sentinel" not in response.body.decode("utf-8")
+
+
+def test_workflow_run_status_invalid_spec_fallback_uses_safe_projection() -> None:
+    run_row = _workflow_run_job_row(status="running")
+    cast(dict[str, Any], run_row["payload"])["spec"] = {"nodes": "invalid-spec"}
+    child = _workflow_child_job_row(
+        "n1",
+        status="success",
+        result_ref={
+            "backend": "test",
+            "uri": "fallback-uri-sentinel",
+            "metadata": {
+                "result_set_id": "rs-fallback",
+                "loaded_rows": 3,
+                "rows": ["fallback-row-sentinel"],
+                "token": "fallback-token-sentinel",
+            },
+        },
+    )
+    engine = _FakeEngine([{"id": "project-1"}, run_row, [child]])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflow-runs/run-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["nodes"][0]["outputs"] == {
+        "result_set_id": "rs-fallback",
+        "loaded_rows": 3,
+        "status": "success",
+        "job_id": "child-1",
+        "error_code": None,
+    }
+    serialized = response.body.decode("utf-8")
+    assert "fallback-uri-sentinel" not in serialized
+    assert "fallback-row-sentinel" not in serialized
+    assert "fallback-token-sentinel" not in serialized
+
+
 def test_workflow_run_status_uses_configured_node_default_max_retries() -> None:
     # RetryPolicy=None 的失败节点:worker 若配 default_max_retries>=1 会重排(retry_wait)。
     # API 状态查询必须与 worker 同源读该配置,而非硬编码 0(否则展示为终态 failed,漂移)。
@@ -5211,6 +5504,7 @@ def test_workflow_runs_list_contract_returns_runs_desc() -> None:
     assert first["status"] == "success"
     # 节点明细不在列表项里(走单 run 状态端点)
     assert "nodes" not in first
+    assert "outputs" not in first
 
 
 def test_workflow_runs_list_has_more_when_over_limit() -> None:
@@ -5332,15 +5626,20 @@ def _workflow_child_job_row(
     *,
     status: str,
     job_id: str = "child-1",
+    job_kind: str = "sql_query",
+    error_code: str | None = None,
+    result_ref: object | None = None,
 ) -> dict[str, object]:
     return {
         "id": job_id,
-        "kind": "sql_query",
+        "kind": job_kind,
         "status": status,
         "owner_user_id": "user-1",
         "project_id": "project-1",
         "payload": {"sql": "SELECT 1", "workflow_node_id": node_id},
         "error": None,
+        "error_code": error_code,
+        "result_ref": result_ref,
         "retry_count": 0,
         "created_at": _dt(3),
         "started_at": _dt(4),
@@ -5359,6 +5658,44 @@ def _workflow_spec_payload(
         "edges": [],
         "schedule": schedule,
     }
+
+
+def _workflow_status_spec(job_kind: str) -> dict[str, object]:
+    payload_by_kind: dict[str, dict[str, object]] = {
+        "notify": {"target_ids": ["nt-1"]},
+        "sleep": {"duration_seconds": 30},
+    }
+    spec: dict[str, object] = {
+        "nodes": [
+            {
+                "id": "n1",
+                "job_kind": job_kind,
+                "payload": payload_by_kind.get(job_kind, {}),
+                "timeout_seconds": 60,
+            }
+        ],
+        "edges": [],
+    }
+    if job_kind == "branch":
+        cast(list[dict[str, object]], spec["nodes"]).extend(
+            [
+                {"id": "n2", "job_kind": "sql_query", "payload": {}, "timeout_seconds": 60},
+                {"id": "n3", "job_kind": "sql_query", "payload": {}, "timeout_seconds": 60},
+            ]
+        )
+        spec["edges"] = [
+            {"source": "n1", "target": "n2", "when": "1 == 1"},
+            {"source": "n1", "target": "n3", "is_default": True},
+        ]
+    if job_kind == "notify":
+        spec["notifications"] = [
+            {
+                "id": "nt-1",
+                "channel": "webhook",
+                "url_secret_ref": "secret-ref-1",
+            }
+        ]
+    return spec
 
 
 def _workflow_row() -> dict[str, object]:

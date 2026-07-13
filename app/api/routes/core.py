@@ -267,6 +267,7 @@ from app.domain.workflow_execution import (
     WorkflowNodeExecStatus,
     plan_workflow_step,
 )
+from app.domain.workflow_outputs import NodeOutputValue, extract_workflow_node_outputs
 from app.domain.workflow_when import builtin_when_variables, when_variables_from_payload
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.result_export import (
@@ -4936,7 +4937,7 @@ def create_project_workflow(
                 schedule_cron=spec.schedule.cron if spec.schedule else None,
                 schedule_enabled=spec.schedule.enabled if spec.schedule else False,
                 sensor_enabled=spec.sensor.enabled if spec.sensor else False,
-                enabled=True,
+                enabled=body.enabled,
                 created_by=user.id,
                 created_at=now,
                 updated_at=now,
@@ -5016,17 +5017,18 @@ def update_project_workflow(
             name=body.name,
             exclude_workflow_id=workflow_id,
         )
+        workflow_values: dict[str, Any] = {
+            "name": body.name,
+            "dag_jsonb": spec.model_dump(mode="json"),
+            "schedule_cron": spec.schedule.cron if spec.schedule else None,
+            "schedule_enabled": spec.schedule.enabled if spec.schedule else False,
+            "sensor_enabled": spec.sensor.enabled if spec.sensor else False,
+            "updated_at": datetime.now(UTC),
+        }
+        if body.enabled is not None:
+            workflow_values["enabled"] = body.enabled
         conn.execute(
-            update(workflows)
-            .where(workflows.c.id == workflow_id)
-            .values(
-                name=body.name,
-                dag_jsonb=spec.model_dump(mode="json"),
-                schedule_cron=spec.schedule.cron if spec.schedule else None,
-                schedule_enabled=spec.schedule.enabled if spec.schedule else False,
-                sensor_enabled=spec.sensor.enabled if spec.sensor else False,
-                updated_at=datetime.now(UTC),
-            )
+            update(workflows).where(workflows.c.id == workflow_id).values(**workflow_values)
         )
         updated = (
             conn.execute(select(workflows).where(workflows.c.id == workflow_id))
@@ -5751,18 +5753,23 @@ def _workflow_run_node_items(
         spec = WorkflowSpec.model_validate(raw_spec)
     except ValidationError:
         # spec 快照缺失/损坏时退化为子 job 平铺(不 500,保底可观测)
-        return [
-            WorkflowRunNodeItem(
-                node_id=str(child["payload"].get("workflow_node_id") or child["id"]),
-                job_kind=str(child["kind"]),
-                status=str(child["status"]),
-                job_id=str(child["id"]),
-                attempts=int(child["retry_count"] or 0),
-                error=_optional_str(child["error"]),
+        fallback_items: list[WorkflowRunNodeItem] = []
+        for child in children:
+            snapshot = _workflow_child_snapshot_from_row(child)
+            if snapshot is None:
+                continue
+            fallback_items.append(
+                WorkflowRunNodeItem(
+                    node_id=snapshot.node_id,
+                    job_kind=str(child["kind"]),
+                    status=snapshot.status.value,
+                    job_id=snapshot.job_id,
+                    attempts=snapshot.retry_count,
+                    error=snapshot.error,
+                    outputs=_workflow_child_response_outputs(snapshot),
+                )
             )
-            for child in children
-            if isinstance(child["payload"], dict)
-        ]
+        return fallback_items
     snapshots = _workflow_child_snapshots_from_rows(children)
     now = datetime.now(UTC)
     # 与 worker 推进器共用同一纯函数 + 同一份触发时冻结的 when 变量快照,
@@ -5796,6 +5803,7 @@ def _workflow_run_node_items(
                 job_id=state.job_id,
                 attempts=state.attempts,
                 error=state.error,
+                outputs=state.outputs,
             )
         )
     return items
@@ -5806,20 +5814,49 @@ def _workflow_child_snapshots_from_rows(
 ) -> dict[str, WorkflowChildJob]:
     snapshots: dict[str, WorkflowChildJob] = {}
     for child in children:
-        child_payload = child["payload"] if isinstance(child["payload"], dict) else {}
-        node_id = child_payload.get("workflow_node_id")
-        if not isinstance(node_id, str) or not node_id:
+        snapshot = _workflow_child_snapshot_from_row(child)
+        if snapshot is None:
             continue
-        finished_at = child["finished_at"]
-        snapshots[node_id] = WorkflowChildJob(
-            node_id=node_id,
-            job_id=str(child["id"]),
-            status=JobStatus(str(child["status"])),
-            retry_count=int(child["retry_count"] or 0),
-            finished_at=finished_at if isinstance(finished_at, datetime) else None,
-            error=_optional_str(child["error"]),
-        )
+        snapshots[snapshot.node_id] = snapshot
     return snapshots
+
+
+def _workflow_child_snapshot_from_row(child: RowMapping) -> WorkflowChildJob | None:
+    child_payload = child["payload"] if isinstance(child["payload"], dict) else {}
+    node_id = child_payload.get("workflow_node_id")
+    if not isinstance(node_id, str) or not node_id:
+        return None
+    result_ref: ResultRef | None = None
+    raw_result_ref = child["result_ref"] if "result_ref" in child else None
+    if raw_result_ref is not None:
+        try:
+            result_ref = ResultRef.model_validate(raw_result_ref)
+        except ValidationError:
+            result_ref = None
+    finished_at = child["finished_at"]
+    job_kind = str(child["kind"])
+    return WorkflowChildJob(
+        node_id=node_id,
+        job_id=str(child["id"]),
+        status=JobStatus(str(child["status"])),
+        retry_count=int(child["retry_count"] or 0),
+        finished_at=finished_at if isinstance(finished_at, datetime) else None,
+        error=_optional_str(child["error"]),
+        error_code=_optional_str(child["error_code"] if "error_code" in child else None),
+        outputs=extract_workflow_node_outputs(job_kind, result_ref),
+    )
+
+
+def _workflow_child_response_outputs(
+    snapshot: WorkflowChildJob,
+) -> dict[str, NodeOutputValue]:
+    outputs = cast(dict[str, NodeOutputValue], dict(snapshot.outputs))
+    outputs.update(
+        status=snapshot.status.value,
+        job_id=snapshot.job_id,
+        error_code=snapshot.error_code,
+    )
+    return outputs
 
 
 def _row_value_or_none(row: RowMapping, key: str) -> datetime | None:
