@@ -146,6 +146,25 @@ test('metadata probe failure shows error without blanking the tree', async ({ pa
   expectNoConsoleErrors()
 })
 
+test('AI SQL metadata failure shows actionable localized guidance', async ({ page }) => {
+  await mockBase(page)
+  await page.route('**/api/datasources/ds-1/ai/sql-generate', (r) =>
+    json(r, 503, {
+      error: 'metadata_probe_failed',
+      message: 'Datasource metadata probe failed',
+    }),
+  )
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'AI Generate' }).first().click()
+  await page.getByRole('textbox', { name: 'What do you want to query?' }).fill('list customers')
+  await page.getByRole('button', { name: 'AI Generate', exact: true }).last().click()
+
+  await expect(page.getByText(/test the datasource connection and refresh metadata/i)).toBeVisible()
+  await expect(page.getByText('Datasource metadata probe failed')).toHaveCount(0)
+  expectNoConsoleErrors()
+})
+
 test('format and expand-star rewrite the editor SQL', async ({ page }) => {
   await mockBase(page)
   await page.route('**/api/sql/format', (r) =>

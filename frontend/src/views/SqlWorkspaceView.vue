@@ -1058,6 +1058,8 @@ async function onGenerateSql(): Promise<void> {
     // AI 未启用 → 后端结构化 409 ai_disabled;给友好禁用提示,不当普通报错。
     if (e instanceof ApiError && e.code === 'ai_disabled') {
       aiDisabled.value = true
+    } else if (e instanceof ApiError && e.code === 'metadata_probe_failed') {
+      aiError.value = t('sql.ai_metadata_unavailable')
     } else {
       aiError.value = errorMessage(e)
     }

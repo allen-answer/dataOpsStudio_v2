@@ -392,6 +392,15 @@ function sourceColumnDetail(index: number, name: string): CompareProjectionDetai
   )
 }
 
+function targetColumnDetail(index: number, name: string): CompareProjectionDetail | null {
+  const details = activeTask.value?.target_projection_details
+  return (
+    detailByName(details, name) ??
+    details?.find((item) => item.generated && item.projection_index === index + 1) ??
+    null
+  )
+}
+
 function resultColumnDetail(name: string): CompareProjectionDetail | null {
   return detailByName(activeTask.value?.source_projection_details, name)
 }
@@ -2734,6 +2743,15 @@ const missingTarget = computed(
                       :title="t('compare.col_target_hint')"
                       @input="onTargetColInput(ci, $event)"
                     />
+                    <div
+                      v-if="targetColumnDetail(ci, targetColName(col.name))?.generated"
+                      class="mt-1 text-[10px]"
+                    >
+                      <CompareExpressionLabel
+                        :name="targetColumnDetail(ci, targetColName(col.name))?.name ?? targetColName(col.name)"
+                        :detail="targetColumnDetail(ci, targetColName(col.name))"
+                      />
+                    </div>
                   </td>
                   <td class="px-2 py-1.5">
                     <select v-model="col.type" class="chrome-input w-full text-xs">
