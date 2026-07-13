@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 from sqlalchemy.exc import IntegrityError
+from structlog.testing import capture_logs
 
 from app.dbclients.factory import UnsupportedDbTypeError
 from app.dbclients.protocol import AdapterConnectionError
@@ -25,7 +26,7 @@ from app.domain.compare_result import (
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.lineage import LineageReport, schema_from_metadata_cache_rows
-from app.domain.notify import NotifyResult
+from app.domain.notify import NotifyResult, NotifyTarget, RunNotification
 from app.domain.plan import PlanNode
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
@@ -1029,6 +1030,8 @@ class _FakeBackend:
         self.retried_nodes: list[str] = []
         self.cancel_requested_ids: list[str] = []
         self.cancelled_pending: list[tuple[str, str]] = []
+        self.jobs_by_id: dict[str, Job] = {job.id: job for job in jobs}
+        self.get_job_calls: list[str] = []
 
     def claim_next(self, worker_id: str) -> Job | None:
         if not self._jobs:
@@ -1064,6 +1067,10 @@ class _FakeBackend:
 
     def list_jobs_by_parent(self, parent_workflow_run_id: str) -> list[Job]:
         return list(self.children_by_parent.get(parent_workflow_run_id, []))
+
+    def get_job(self, job_id: str) -> Job | None:
+        self.get_job_calls.append(job_id)
+        return self.jobs_by_id.get(job_id)
 
     def requeue_workflow_run(self, job_id: str) -> None:
         self.requeued_workflow_runs.append(job_id)
@@ -2277,6 +2284,338 @@ def test_workflow_run_node_interpolation_failure_fails_run_via_on_failure() -> N
 
 
 # ── workflow_run 终态通知(C-9 worker 接入)────────────────────────────────────
+
+
+class _DagNotifyChannel:
+    channel = "webhook"
+
+    def __init__(self, *, failed_call_numbers: set[int] | None = None) -> None:
+        self.calls: list[tuple[NotifyTarget, RunNotification]] = []
+        self.failed_call_numbers = failed_call_numbers or set()
+
+    def send(
+        self,
+        target: NotifyTarget,
+        payload: RunNotification,
+        *,
+        reveal: object,
+    ) -> NotifyResult:
+        del reveal
+        self.calls.append((target, payload))
+        if len(self.calls) in self.failed_call_numbers:
+            return NotifyResult(
+                channel=self.channel,
+                target_id=target.id,
+                ok=False,
+                error="http_error status=500",
+            )
+        return NotifyResult(channel=self.channel, target_id=target.id, ok=True)
+
+
+def _notify_parent_run_job(
+    *,
+    notifications: list[dict[str, object]],
+    target_ids: list[str],
+    message: str | None = None,
+) -> Job:
+    node_payload: dict[str, object] = {"target_ids": target_ids}
+    if message is not None:
+        node_payload["message"] = message
+    parent = _workflow_run_job(
+        {
+            "nodes": [
+                {
+                    "id": "notify-node",
+                    "job_kind": "notify",
+                    "payload": node_payload,
+                    "timeout_seconds": 60,
+                }
+            ],
+            "edges": [],
+            "notifications": notifications,
+        }
+    )
+    return parent.model_copy(
+        update={
+            "id": "parent-run",
+            "payload": {
+                **parent.payload,
+                "workflow_name": "frozen-workflow",
+                "trigger": "manual",
+            },
+        }
+    )
+
+
+def _notify_child_job(
+    target_ids: list[str],
+    *,
+    message: str | None = None,
+) -> Job:
+    payload: dict[str, object] = {
+        "workflow_node_id": "notify-node",
+        "target_ids": target_ids,
+    }
+    if message is not None:
+        payload["message"] = message
+    return _make_job(kind=JobKind.NOTIFY, payload=payload).model_copy(
+        update={"id": "notify-child", "parent_workflow_run_id": "parent-run"}
+    )
+
+
+def test_worker_notify_loads_frozen_parent_and_completes_sent_count() -> None:
+    message = "dag-message-sentinel"
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+                "events": ["failed"],
+            }
+        ],
+        target_ids=["frozen-target"],
+        message=message,
+    )
+    child = _notify_child_job(["frozen-target"], message=message)
+    backend = _FakeBackend([child])
+    backend.jobs_by_id[parent.id] = parent
+    channel = _DagNotifyChannel()
+    runner = _workflow_runner(backend)
+    runner._notify_service = WorkflowNotifyService(
+        lambda ref: "unused",
+        {"webhook": channel},
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.get_job_calls == ["parent-run"]
+    assert child.payload == {
+        "workflow_node_id": "notify-node",
+        "target_ids": ["frozen-target"],
+        "message": message,
+    }
+    assert "frozen-ref" not in repr(child.payload)
+    assert len(channel.calls) == 1
+    target, payload = channel.calls[0]
+    assert target.id == "frozen-target"
+    assert payload.workflow_id == "wf-1"
+    assert payload.workflow_name == "frozen-workflow"
+    assert payload.project == parent.project_id
+    assert payload.run_job_id == "parent-run"
+    assert payload.trigger == "manual"
+    assert payload.status == "running"
+    assert payload.message == message
+    assert backend.failed == []
+    assert backend.completed == [
+        (
+            "notify-child",
+            ResultRef(
+                backend="notify",
+                uri="notify/notify-child",
+                metadata={"sent_count": 1},
+            ),
+        )
+    ]
+
+
+def test_build_notify_child_payload_excludes_target_config_and_secret_refs() -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["frozen-target"],
+        message="hello",
+    )
+    node = WorkflowNode(
+        id="notify-node",
+        job_kind="notify",
+        payload={"target_ids": ["frozen-target"], "message": "hello"},
+        timeout_seconds=60,
+    )
+
+    child = _build_workflow_child_job(parent, node, {"today": "2026-07-13"})
+
+    assert child.payload == {
+        "workflow_node_id": "notify-node",
+        "target_ids": ["frozen-target"],
+        "message": "hello",
+    }
+    assert "frozen-ref" not in repr(child.payload)
+
+
+def test_worker_notify_all_disabled_completes_with_zero_sent_count() -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "disabled",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+                "enabled": False,
+            }
+        ],
+        target_ids=["disabled"],
+    )
+    child = _notify_child_job(["disabled"])
+    backend = _FakeBackend([child])
+    backend.jobs_by_id[parent.id] = parent
+    channel = _DagNotifyChannel()
+    runner = _workflow_runner(backend)
+    runner._notify_service = WorkflowNotifyService(
+        lambda ref: "unused",
+        {"webhook": channel},
+    )
+
+    assert runner.run_once() is True
+
+    assert channel.calls == []
+    assert backend.failed == []
+    assert backend.completed == [
+        (
+            "notify-child",
+            ResultRef(
+                backend="notify",
+                uri="notify/notify-child",
+                metadata={"sent_count": 0},
+            ),
+        )
+    ]
+
+
+def test_worker_notify_partial_failure_retries_at_least_once() -> None:
+    message = "dag-message-sentinel"
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "first",
+                "channel": "webhook",
+                "url_secret_ref": "first-ref",
+                "events": ["failed"],
+            },
+            {
+                "id": "second",
+                "channel": "webhook",
+                "url_secret_ref": "second-ref",
+                "events": ["failed"],
+            },
+        ],
+        target_ids=["first", "second"],
+        message=message,
+    )
+    child = _notify_child_job(["first", "second"], message=message)
+    backend = _FakeBackend([child, child])
+    backend.jobs_by_id[parent.id] = parent
+    channel = _DagNotifyChannel(failed_call_numbers={2})
+    runner = _workflow_runner(backend)
+    runner._notify_service = WorkflowNotifyService(
+        lambda ref: "unused",
+        {"webhook": channel},
+    )
+
+    with capture_logs() as logs:
+        assert runner.run_once() is True
+        assert runner.run_once() is True
+
+    assert [target.id for target, _ in channel.calls] == [
+        "first",
+        "second",
+        "first",
+        "second",
+    ]
+    assert backend.failed == [("notify-child", "notify_delivery_failed")]
+    assert backend.completed == [
+        (
+            "notify-child",
+            ResultRef(
+                backend="notify",
+                uri="notify/notify-child",
+                metadata={"sent_count": 2},
+            ),
+        )
+    ]
+    rendered = repr(logs) + repr([result.model_dump() for _, result in backend.completed])
+    for sensitive in (
+        message,
+        "first-ref",
+        "second-ref",
+        "http_error status=500",
+    ):
+        assert sensitive not in rendered
+
+
+def test_worker_notify_missing_service_fails_safely() -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["target"],
+    )
+    child = _notify_child_job(["target"])
+    backend = _FakeBackend([child])
+    backend.jobs_by_id[parent.id] = parent
+    runner = _workflow_runner(backend)
+
+    assert runner._notify_service is None
+    assert runner.run_once() is True
+
+    assert backend.failed == [("notify-child", "notify_service_unavailable")]
+    assert backend.completed == []
+
+
+def test_worker_notify_missing_parent_fails_safely() -> None:
+    child = _notify_child_job(["target"])
+    backend = _FakeBackend([child])
+    channel = _DagNotifyChannel()
+    runner = _workflow_runner(backend)
+    runner._notify_service = WorkflowNotifyService(
+        lambda ref: "unused",
+        {"webhook": channel},
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.get_job_calls == ["parent-run"]
+    assert backend.failed == [("notify-child", "notify_parent_unavailable")]
+    assert backend.completed == []
+    assert channel.calls == []
+
+
+def test_worker_notify_cancellation_before_dispatch_does_not_send() -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["target"],
+    )
+    child = _notify_child_job(["target"])
+    backend = _FakeBackend([child])
+    backend.jobs_by_id[parent.id] = parent
+    backend.cancel_after_checks = 1
+    channel = _DagNotifyChannel()
+    runner = _workflow_runner(backend)
+    runner._notify_service = WorkflowNotifyService(
+        lambda ref: "unused",
+        {"webhook": channel},
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.cancelled == [("notify-child", "cancel requested")]
+    assert backend.get_job_calls == []
+    assert channel.calls == []
+    assert backend.completed == []
 
 
 class _RecordingNotifyService:

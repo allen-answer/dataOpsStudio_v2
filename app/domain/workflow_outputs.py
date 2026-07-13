@@ -66,6 +66,8 @@ def extract_workflow_node_outputs(
         _copy_string(metadata, "selected_target", outputs)
     elif job_kind == "sleep":
         _copy_int(metadata, "duration_seconds", outputs)
+    elif job_kind == "notify":
+        _copy_int(metadata, "sent_count", outputs)
     return outputs
 
 

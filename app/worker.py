@@ -212,6 +212,14 @@ class WorkflowRunFailedError(RuntimeError):
     """WorkflowRun 终态失败(节点失败 / abort);message 为公开错误串。"""
 
 
+class NotifyDeliveryError(RuntimeError):
+    """DAG Notify failed with a stable non-sensitive public code."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
 class BackendLike(Protocol):
     def claim_next(self, worker_id: str) -> Job | None: ...
 
@@ -238,6 +246,8 @@ class BackendLike(Protocol):
     def request_cancel(self, job_id: str) -> None: ...
 
     def list_jobs_by_parent(self, parent_workflow_run_id: str) -> list[Job]: ...
+
+    def get_job(self, job_id: str) -> Job | None: ...
 
     def requeue_workflow_run(self, job_id: str) -> None: ...
 
@@ -537,6 +547,8 @@ class WorkerRunner:
                 outcome = self._execute_branch(job)
             elif job.kind is JobKind.SLEEP:
                 outcome = self._execute_sleep(job)
+            elif job.kind is JobKind.NOTIFY:
+                outcome = self._execute_notify(job)
             elif job.kind is JobKind.WORKFLOW_SENSOR_CHECK:
                 outcome = self._execute_sensor_check(job)
             else:
@@ -1587,6 +1599,62 @@ class WorkerRunner:
                 backend="sleep",
                 uri=f"sleep/{job.id}",
                 metadata={"duration_seconds": duration_seconds},
+            )
+        )
+
+    def _execute_notify(self, job: Job) -> _ExecutionOutcome:
+        if self._notify_service is None:
+            raise NotifyDeliveryError("notify_service_unavailable")
+        parent_id = job.parent_workflow_run_id
+        if not isinstance(parent_id, str) or not parent_id:
+            raise NotifyDeliveryError("notify_parent_unavailable")
+        try:
+            parent = self._backend.get_job(parent_id)
+        except Exception:
+            raise NotifyDeliveryError("notify_parent_unavailable") from None
+        if parent is None or parent.kind is not JobKind.WORKFLOW_RUN:
+            raise NotifyDeliveryError("notify_parent_unavailable")
+        try:
+            spec = _workflow_spec_from_payload(parent.payload)
+            target_ids_value = job.payload.get("target_ids")
+            if (
+                not isinstance(target_ids_value, list)
+                or not target_ids_value
+                or not all(
+                    isinstance(target_id, str) and target_id for target_id in target_ids_value
+                )
+            ):
+                raise NotifyDeliveryError("notify_invalid_payload")
+            target_ids = cast(list[str], target_ids_value)
+            message_value = job.payload.get("message")
+            if message_value is not None and (
+                not isinstance(message_value, str) or len(message_value) > 512
+            ):
+                raise NotifyDeliveryError("notify_invalid_payload")
+            message = message_value
+            payload = RunNotification(
+                workflow_id=_payload_optional_str(parent.payload, "workflow_id") or parent.id,
+                workflow_name=_payload_optional_str(parent.payload, "workflow_name"),
+                project=parent.project_id,
+                run_job_id=parent.id,
+                trigger=_payload_optional_str(parent.payload, "trigger"),
+                status=JobStatus.RUNNING.value,
+                started_at=parent.started_at,
+                message=message,
+            )
+            results = self._notify_service.notify_node(spec, target_ids, payload)
+        except NotifyDeliveryError:
+            raise
+        except Exception:
+            raise NotifyDeliveryError("notify_delivery_failed") from None
+        if any(not result.ok for result in results):
+            raise NotifyDeliveryError("notify_delivery_failed")
+        sent_count = sum(1 for result in results if result.ok)
+        return _ExecutionOutcome(
+            ResultRef(
+                backend="notify",
+                uri=f"notify/{job.id}",
+                metadata={"sent_count": sent_count},
             )
         )
 
@@ -3418,6 +3486,8 @@ def _optional_int(value: object) -> int | None:
 
 
 def _public_error_message(exc: Exception, kind: JobKind) -> str:
+    if isinstance(exc, NotifyDeliveryError):
+        return exc.code
     if isinstance(exc, DatasourceConnectionTestError):
         return exc.error_code
     if isinstance(exc, OperationPolicyDeniedError):

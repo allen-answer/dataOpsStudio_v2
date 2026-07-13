@@ -347,6 +347,17 @@ SUPPORTED_WORKFLOW_NODE_KINDS = {
 - 节点 payload / `when` 可读取 `${nodes.<ancestor>.<field>}`,但仅限构造期验证过的
   拓扑上游和按节点 kind 声明的标量白名单。禁止结果行、ResultRef URI、SecretRef
   与任意 metadata 进入输出上下文。
+- DAG Notify 的公开 payload 仅含 1..10 个唯一非空 target_ids 与可选
+  message(最长 512 字符);RunNotification.message 与
+  WorkflowNotifyService.notify_node 均为向后兼容的纯追加接口。
+- Worker 必须通过 parent_workflow_run_id 读取冻结的父 workflow_run payload.spec
+  解析 NotifyTarget,不得把目标配置或 SecretRef 复制进子 Job payload。DAG Notify
+  尊重 target.enabled,但忽略 target.events(events 仅过滤 run 终态通知)。
+- DAG Notify 按 target_ids 声明顺序尝试全部启用目标;仅当全部成功时子 Job 才成功,
+  任一失败走既有节点 retry。投递发生在 backend.complete 之前,语义为 at-least-once,
+  retry / stale worker 可重复投递;不承诺 exactly-once。
+- DAG Notify 成功输出仅允许当前尝试的整数 sent_count;不得输出 ResultRef URI 或其它
+  metadata。run 终态通知与 DAG Notify 隔离:终态通知失败不得改变 workflow_run 状态。
 - `notify` 只引用 Workflow 已配置的通知 target id;`sleep` 只接受
   `duration_seconds`;`branch` payload 为空。Scenario 两种节点留待 2.6.0。
 

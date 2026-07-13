@@ -89,6 +89,16 @@ _NOW = datetime(2026, 7, 2, 8, 0, 0, tzinfo=UTC)
             {"duration_seconds": 30, "debug": ["secret"]},
             {"duration_seconds": 30},
         ),
+        (
+            "notify",
+            {
+                "sent_count": 2,
+                "message": "dag-message-sentinel",
+                "url": "https://sensitive.invalid/hook",
+                "secret_ref": "ref-abc",
+            },
+            {"sent_count": 2},
+        ),
         ("export_excel", {"source_result_set_id": "rs-secret"}, {}),
     ],
 )
