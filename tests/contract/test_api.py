@@ -1595,7 +1595,8 @@ def test_compare_sql_task_response_includes_projection_details() -> None:
 
     assert response.status_code == 201
     payload = response.json()
-    assert payload["source_ref"]["sql"] == task_row["source_ref"]["sql"]
+    source_ref = cast(dict[str, object], task_row["source_ref"])
+    assert payload["source_ref"]["sql"] == source_ref["sql"]
     assert payload["source_projection_details"][-1]["name"] == "RESULT_1"
     assert payload["target_projection_details"][-1]["generated"] is True
 
