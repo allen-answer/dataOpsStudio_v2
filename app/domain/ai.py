@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -26,6 +26,11 @@ class EgressLevel(IntEnum):
     L5 = 5
 
 
+class ReasoningMode(StrEnum):
+    DISABLED = "disabled"
+    ENABLED = "enabled"
+
+
 class ContextItem(BaseModel):
     """AI Context 单条(设计稿 §2.7.2)。"""
 
@@ -47,6 +52,7 @@ class AiOptions(BaseModel):
     model: str | None = None
     max_tokens: int | None = None
     temperature: float | None = None
+    reasoning_mode: ReasoningMode | None = None
     purpose: str = "unspecified"  # 落 ai_usage.purpose 审计字段
 
 
@@ -54,8 +60,12 @@ class AiResponse(BaseModel):
     content: str
     tokens_in: int = 0
     tokens_out: int = 0
+    tokens_total: int = 0
     provider: str = "unknown"
     model: str = "unknown"
+    finish_reason: str | None = None
+    reasoning_chars: int = 0
+    duration_ms: int = 0
 
 
 class AiChunk(BaseModel):

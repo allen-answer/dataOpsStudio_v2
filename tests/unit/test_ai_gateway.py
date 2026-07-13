@@ -12,10 +12,13 @@
 
 from __future__ import annotations
 
+import urllib.error
+import urllib.request
+
 import pytest
 
 from app.config import AiGatewayConfig
-from app.domain.ai import AiContext, AiOptions, ContextItem, EgressLevel
+from app.domain.ai import AiContext, AiOptions, ContextItem, EgressLevel, ReasoningMode
 from app.services.ai import (
     AiDisabledError,
     AiGatewayRuntimeConfig,
@@ -23,6 +26,7 @@ from app.services.ai import (
     MockProvider,
     OpenAICompatibleProvider,
     ProviderError,
+    UrllibTransport,
     build_gateway,
     build_gateway_from_runtime_config,
 )
@@ -102,18 +106,136 @@ def test_openai_compatible_bad_response_raises_provider_error() -> None:
         provider.complete("hi", AiContext(), AiOptions())
 
 
-def test_openai_compatible_empty_content_raises_provider_error() -> None:
+def test_openai_compatible_empty_content_is_preserved_for_caller_diagnostics() -> None:
     response: dict[str, object] = {
         "model": "test-model",
-        "choices": [{"message": {"role": "assistant", "content": "   "}}],
+        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "   "}}],
     }
-    transport = _FakeTransport(response)
     provider = OpenAICompatibleProvider(
-        api_key="k", endpoint="https://x.invalid", model="m", transport=transport
+        api_key="not-a-real-key",
+        endpoint="https://example.invalid",
+        model="test-model",
+        transport=_FakeTransport(response),
     )
 
-    with pytest.raises(ProviderError, match="empty"):
-        provider.complete("hi", AiContext(), AiOptions())
+    result = provider.complete("hi", AiContext(), AiOptions())
+
+    assert result.content == ""
+    assert result.reasoning_chars == 0
+
+
+def test_openai_compatible_normalizes_reasoning_finish_and_usage() -> None:
+    transport = _FakeTransport(
+        {
+            "model": "deepseek-v4-pro",
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {
+                        "role": "assistant",
+                        "reasoning_content": "private chain that must not escape",
+                        "content": "",
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 90, "total_tokens": 100},
+        }
+    )
+    provider = OpenAICompatibleProvider(
+        api_key="not-a-real-key",
+        endpoint="https://example.invalid/v1",
+        model="deepseek-v4-pro",
+        transport=transport,
+    )
+
+    response = provider.complete("query", AiContext(), AiOptions(max_tokens=100))
+
+    assert response.content == ""
+    assert response.finish_reason == "length"
+    assert response.reasoning_chars == len("private chain that must not escape")
+    assert response.tokens_total == 100
+    assert "private chain" not in response.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (ReasoningMode.ENABLED, {"type": "enabled"}),
+        (ReasoningMode.DISABLED, {"type": "disabled"}),
+    ],
+)
+def test_deepseek_model_maps_reasoning_mode_to_thinking(
+    mode: ReasoningMode, expected: dict[str, str]
+) -> None:
+    transport = _FakeTransport(_OPENAI_RESPONSE)
+    provider = OpenAICompatibleProvider(
+        api_key="not-a-real-key",
+        endpoint="https://example.invalid/v1",
+        model="deepseek-v4-pro",
+        transport=transport,
+    )
+
+    provider.complete("query", AiContext(), AiOptions(reasoning_mode=mode))
+
+    assert transport.last_body["thinking"] == expected
+
+
+def test_generic_model_does_not_receive_vendor_thinking_field() -> None:
+    transport = _FakeTransport(_OPENAI_RESPONSE)
+    provider = OpenAICompatibleProvider(
+        api_key="not-a-real-key",
+        endpoint="https://example.invalid/v1",
+        model="generic-model",
+        transport=transport,
+    )
+
+    provider.complete("query", AiContext(), AiOptions(reasoning_mode=ReasoningMode.DISABLED))
+
+    assert "thinking" not in transport.last_body
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(401, "provider_auth_failed"), (403, "provider_auth_failed"), (429, "provider_rate_limited")],
+)
+def test_urllib_transport_classifies_http_without_exposing_body(
+    monkeypatch: pytest.MonkeyPatch, status: int, code: str
+) -> None:
+    error = urllib.error.HTTPError(
+        "https://example.invalid", status, "provider secret body", {}, None
+    )
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(ProviderError) as caught:
+        UrllibTransport().post_json("https://example.invalid", {}, {})
+
+    assert caught.value.diagnostic_code == code
+    assert caught.value.status_code == status
+    assert "provider secret body" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("reason", "code"),
+    [(TimeoutError(), "provider_timeout"), (OSError("offline"), "provider_unreachable")],
+)
+def test_urllib_transport_classifies_network_failure(
+    monkeypatch: pytest.MonkeyPatch, reason: Exception, code: str
+) -> None:
+    error = urllib.error.URLError(reason)
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(ProviderError) as caught:
+        UrllibTransport().post_json("https://example.invalid", {}, {})
+
+    assert caught.value.diagnostic_code == code
 
 
 def test_redactor_hook_is_called() -> None:
