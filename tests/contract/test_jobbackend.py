@@ -9,7 +9,7 @@ Codex T1 实现 PostgresJobBackend / ThreadPoolJobBackend 后:
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -27,8 +27,13 @@ from app.infrastructure.jobbackend.protocol import JobBackend
 pytestmark = pytest.mark.contract
 
 
-def _make_job(job_id: str = "j_1", priority: int = 0) -> Job:
-    return Job(
+def _make_job(
+    job_id: str = "j_1",
+    priority: int = 0,
+    *,
+    available_at: datetime | None = None,
+) -> Job:
+    job = Job(
         id=job_id,
         kind=JobKind.SQL_QUERY,
         status=JobStatus.PENDING,
@@ -41,6 +46,9 @@ def _make_job(job_id: str = "j_1", priority: int = 0) -> Job:
         audit_id="a_1",
         payload={"sql": "SELECT 1"},
     )
+    if available_at is None:
+        return job
+    return job.model_copy(update={"available_at": available_at})
 
 
 @pytest.fixture
@@ -76,6 +84,25 @@ def test_claim_respects_priority_then_fifo(jobbackend: JobBackend) -> None:
     jobbackend.enqueue(high)
     claimed = jobbackend.claim_next("worker-1")
     assert claimed is not None and claimed.id == "j_high"
+
+
+def test_claim_skips_future_high_priority_job_for_due_job(
+    jobbackend: JobBackend,
+) -> None:
+    future = _make_job(
+        "j_future",
+        priority=100,
+        available_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    due = _make_job("j_due", priority=1)
+    jobbackend.enqueue(future)
+    jobbackend.enqueue(due)
+
+    claimed = jobbackend.claim_next("worker-1")
+
+    assert claimed is not None
+    assert claimed.id == "j_due"
+    assert jobbackend.claim_next("worker-2") is None
 
 
 def test_complete_marks_success_and_attaches_result_ref(jobbackend: JobBackend) -> None:
@@ -150,11 +177,20 @@ def test_workflow_run_requeue_yields_running_back_to_pending(
     job = _make_job("j_wf")
     jobbackend.enqueue(job)
     jobbackend.claim_next("worker-1")
+    future = datetime.now(UTC) + timedelta(hours=1)
+    with _pg_engine_or_skip().begin() as conn:
+        conn.execute(
+            text("UPDATE jobs SET available_at = :available_at WHERE id = :job_id"),
+            {"available_at": future, "job_id": job.id},
+        )
     jobbackend.requeue_workflow_run("j_wf")
     requeued = jobbackend.get_job("j_wf")
     assert requeued is not None
     assert requeued.status == JobStatus.PENDING
     assert requeued.worker_id is None
+    # PostgreSQL writes and evaluates due times with its own clock.  Compare
+    # against the previous future value, then let claim_next prove it is due.
+    assert requeued.available_at < future
     reclaimed = jobbackend.claim_next("worker-1")
     assert reclaimed is not None and reclaimed.id == "j_wf"
 
@@ -167,14 +203,22 @@ def test_retry_workflow_node_requeues_failed_and_increments_retry_count(
     jobbackend.enqueue(job)
     jobbackend.claim_next("worker-1")
     jobbackend.fail("j_node", "boom")
+    future = datetime.now(UTC) + timedelta(hours=1)
+    with _pg_engine_or_skip().begin() as conn:
+        conn.execute(
+            text("UPDATE jobs SET available_at = :available_at WHERE id = :job_id"),
+            {"available_at": future, "job_id": job.id},
+        )
     jobbackend.retry_workflow_node("j_node")
     retried = jobbackend.get_job("j_node")
     assert retried is not None
     assert retried.status == JobStatus.PENDING
     assert retried.retry_count == 1
     assert retried.error is None
+    assert retried.available_at < future
     # 非 failed/timeout 状态不重排(幂等防护)
-    jobbackend.claim_next("worker-1")
+    reclaimed = jobbackend.claim_next("worker-1")
+    assert reclaimed is not None and reclaimed.id == "j_node"
     jobbackend.retry_workflow_node("j_node")
     running = jobbackend.get_job("j_node")
     assert running is not None
@@ -186,13 +230,15 @@ def test_cancel_pending_job_marks_terminal_without_claim(
     jobbackend: JobBackend,
 ) -> None:
     assert isinstance(jobbackend, PostgresJobBackend)
-    job = _make_job("j_pending")
+    available_at = datetime.now(UTC) + timedelta(hours=1)
+    job = _make_job("j_pending", available_at=available_at)
     jobbackend.enqueue(job)
     jobbackend.cancel_pending_job("j_pending", "workflow aborted")
     cancelled = jobbackend.get_job("j_pending")
     assert cancelled is not None
     assert cancelled.status == JobStatus.CANCELLED
     assert cancelled.cancel_reason == "workflow aborted"
+    assert cancelled.available_at == available_at
     assert jobbackend.claim_next("worker-1") is None
 
 

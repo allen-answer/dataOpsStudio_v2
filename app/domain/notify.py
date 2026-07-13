@@ -130,6 +130,7 @@ class RunNotification(BaseModel):
     elapsed_seconds: float | None = None
     error: str | None = None
     node_status_counts: dict[str, int] = Field(default_factory=dict)
+    message: str | None = Field(default=None, max_length=512)
 
     @field_validator("error")
     @classmethod

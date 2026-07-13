@@ -6,15 +6,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
+from pydantic import ValidationError
 
+import app.config as config_module
 from app.config import (
     ApiConfig,
     BootstrapPaths,
     Form,
     JobBackendKind,
     MetadataDbConfig,
+    SchedulerConfig,
     Settings,
     load_settings,
 )
@@ -93,3 +97,38 @@ def test_api_config_defaults_avoid_v1_ports() -> None:
     forbidden = {80, 443, 3307, 5432, 8000, 8010, 8080}
     assert api.port not in forbidden
     assert api.metrics_port not in forbidden
+
+
+def test_scheduler_timezone_accepts_explicit_iana_key() -> None:
+    scheduler = SchedulerConfig.model_validate({"timezone": "Asia/Shanghai"})
+
+    assert isinstance(scheduler.timezone, ZoneInfo)
+    assert scheduler.timezone.key == "Asia/Shanghai"
+
+
+def test_scheduler_timezone_reads_iana_key_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATAOPS_SCHEDULER_TIMEZONE", "Asia/Shanghai")
+
+    scheduler = SchedulerConfig()
+
+    assert isinstance(scheduler.timezone, ZoneInfo)
+    assert scheduler.timezone.key == "Asia/Shanghai"
+
+
+def test_scheduler_timezone_rejects_invalid_key_even_when_disabled() -> None:
+    with pytest.raises(ValidationError, match="invalid_scheduler_timezone"):
+        SchedulerConfig.model_validate({"enabled": False, "timezone": "not/a-real-zone"})
+
+
+def test_scheduler_timezone_defaults_to_local_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_zone = ZoneInfo("Pacific/Auckland")
+    monkeypatch.delenv("DATAOPS_SCHEDULER_TIMEZONE", raising=False)
+    monkeypatch.setattr(config_module, "get_localzone", lambda: local_zone)
+
+    scheduler = SchedulerConfig()
+
+    assert scheduler.timezone is local_zone

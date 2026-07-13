@@ -19,7 +19,6 @@ import { useI18n } from 'vue-i18n'
 import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import type { Query } from '@tanstack/vue-query'
 import {
-  AlertTriangle,
   Bell,
   GitBranch,
   History,
@@ -43,17 +42,27 @@ import {
   triggerWorkflowRun,
   updateNotifyTarget,
   updateWorkflow,
-  SUPPORTED_WORKFLOW_NODE_KINDS,
   type NotifyChannel,
+  type NotifyEvent,
   type NotifyTargetInSpec,
+  type WorkflowSpec,
   type WorkflowNodeStatus,
   type WorkflowRunStatusResponse,
   type WorkflowVariableValue,
 } from '../api/workflow'
+import { listDatasources } from '../api/datasources'
+import { listCompareTasks } from '../api/compare'
 import { ApiError, type JobStatus } from '../api/types'
 import Modal from '../components/Modal.vue'
 import JobStatusBadge from '../components/JobStatusBadge.vue'
 import LoadingDots from '../components/LoadingDots.vue'
+import WorkflowEditor from '../components/workflow/WorkflowEditor.vue'
+import {
+  emptyWorkflowSpec,
+  safeOutputEntries,
+  specForAdvancedJson,
+  type WorkflowEditorValue,
+} from '../components/workflow/workflowEditor'
 import { useToast } from '../composables/useToast'
 
 type DetailTab = 'detail' | 'runs' | 'notify'
@@ -87,13 +96,16 @@ watch(workflows, (list) => {
   if (!selectedId.value && list.length > 0) selectedId.value = list[0].id
   if (selectedId.value && !list.some((w) => w.id === selectedId.value)) {
     selectedId.value = list.length > 0 ? list[0].id : null
+    resetRunSelection()
   }
 })
 
 function selectWorkflow(id: string): void {
+  closeEditor()
   selectedId.value = id
   tab.value = 'detail'
   selectedRunId.value = null
+  runOffset.value = 0
 }
 
 // ── 详情 ─────────────────────────────────────────────────────────────
@@ -113,109 +125,69 @@ function invalidateDetail(): void {
   void queryClient.invalidateQueries({ queryKey: ['workflows', projectId.value] })
 }
 
-// ── 创建 ─────────────────────────────────────────────────────────────
-const CREATE_TEMPLATE = JSON.stringify(
-  {
-    nodes: [
-      { id: 'n1', job_kind: 'sql_query', payload: {}, timeout_seconds: 60, on_failure: 'abort' },
-    ],
-    edges: [],
-    variables: {},
-  },
-  null,
-  2,
-)
-const createOpen = ref(false)
-const createName = ref('')
-const createSpec = ref(CREATE_TEMPLATE)
-const createError = ref<string | null>(null)
-const createBusy = ref(false)
+// ── 结构化创建 / 编辑 ───────────────────────────────────────────────
+type EditorIntent = 'create' | 'edit'
+const editorIntent = ref<EditorIntent | null>(null)
+const editorBusy = ref(false)
+const editorKey = ref(0)
+
+const datasourceQuery = useQuery({
+  queryKey: computed(() => ['datasources', projectId.value]),
+  queryFn: () => listDatasources(projectId.value),
+  enabled: computed(() => Boolean(projectId.value && editorIntent.value)),
+})
+const compareTasksQuery = useQuery({
+  queryKey: computed(() => ['compare-tasks', projectId.value]),
+  queryFn: () => listCompareTasks(projectId.value),
+  enabled: computed(() => Boolean(projectId.value && editorIntent.value)),
+})
 
 function openCreate(): void {
-  createName.value = ''
-  createSpec.value = CREATE_TEMPLATE
-  createError.value = null
-  createOpen.value = true
+  editorIntent.value = 'create'
+  editorKey.value += 1
 }
 
-async function submitCreate(): Promise<void> {
-  createError.value = null
-  if (!createName.value.trim()) {
-    createError.value = t('workflow.err.name_required')
-    return
-  }
-  let spec: Record<string, unknown>
+function openEdit(): void {
+  if (!detail.value) return
+  editorIntent.value = 'edit'
+  editorKey.value += 1
+}
+
+function closeEditor(): void {
+  editorIntent.value = null
+}
+
+async function saveEditor(value: WorkflowEditorValue): Promise<void> {
+  editorBusy.value = true
   try {
-    spec = JSON.parse(createSpec.value) as Record<string, unknown>
-  } catch {
-    createError.value = t('workflow.err.invalid_json')
-    return
-  }
-  createBusy.value = true
-  try {
-    const created = await createWorkflow(projectId.value, { name: createName.value.trim(), spec })
-    createOpen.value = false
-    toast.success(t('workflow.toast_created'))
-    await queryClient.invalidateQueries({ queryKey: ['workflows', projectId.value] })
-    selectedId.value = created.id
+    // Notification targets are a dedicated subresource. Never send the editor's
+    // potentially stale, write-only SecretRefs back through the Workflow PUT.
+    const requestSpec = specForAdvancedJson(value.spec)
+    if (editorIntent.value === 'create') {
+      const created = await createWorkflow(projectId.value, {
+        name: value.name,
+        enabled: value.enabled,
+        spec: requestSpec,
+      })
+      toast.success(t('workflow.toast_created'))
+      await queryClient.invalidateQueries({ queryKey: ['workflows', projectId.value] })
+      selectedId.value = created.id
+      resetRunSelection()
+    } else if (selectedId.value) {
+      await updateWorkflow(projectId.value, selectedId.value, {
+        name: value.name,
+        enabled: value.enabled,
+        spec: requestSpec,
+      })
+      toast.success(t('workflow.toast_saved'))
+      invalidateDetail()
+    }
+    editorIntent.value = null
     tab.value = 'detail'
   } catch (e) {
-    createError.value = workflowErrorMessage(e)
+    toast.error(workflowErrorMessage(e))
   } finally {
-    createBusy.value = false
-  }
-}
-
-// ── 高级编辑(危险区:整份 spec 覆盖)────────────────────────────────
-const editOpen = ref(false)
-const editName = ref('')
-const editSpec = ref('')
-const editError = ref<string | null>(null)
-const editConfirmed = ref(false)
-const editBusy = ref(false)
-
-function openAdvancedEdit(): void {
-  const wf = detail.value
-  if (!wf) return
-  editName.value = wf.name
-  // 回填完整 spec(含 notifications/variables),整份提交语义最清晰;
-  // 即便漏带,后端 #152 也会 preserve-on-omit,但这里照直保留最稳。
-  editSpec.value = JSON.stringify(wf.spec, null, 2)
-  editError.value = null
-  editConfirmed.value = false
-  editOpen.value = true
-}
-
-async function submitAdvancedEdit(): Promise<void> {
-  editError.value = null
-  if (!editConfirmed.value) {
-    editError.value = t('workflow.err.confirm_required')
-    return
-  }
-  if (!editName.value.trim()) {
-    editError.value = t('workflow.err.name_required')
-    return
-  }
-  let spec: Record<string, unknown>
-  try {
-    spec = JSON.parse(editSpec.value) as Record<string, unknown>
-  } catch {
-    editError.value = t('workflow.err.invalid_json')
-    return
-  }
-  editBusy.value = true
-  try {
-    await updateWorkflow(projectId.value, selectedId.value as string, {
-      name: editName.value.trim(),
-      spec,
-    })
-    editOpen.value = false
-    toast.success(t('workflow.toast_saved'))
-    invalidateDetail()
-  } catch (e) {
-    editError.value = workflowErrorMessage(e)
-  } finally {
-    editBusy.value = false
+    editorBusy.value = false
   }
 }
 
@@ -231,6 +203,7 @@ async function confirmDelete(): Promise<void> {
     deleteOpen.value = false
     toast.success(t('workflow.toast_deleted'))
     selectedId.value = null
+    resetRunSelection()
     await queryClient.invalidateQueries({ queryKey: ['workflows', projectId.value] })
   } catch (e) {
     toast.error(workflowErrorMessage(e))
@@ -298,6 +271,7 @@ async function submitTrigger(): Promise<void> {
     )
     triggerOpen.value = false
     toast.success(t('workflow.toast_triggered'))
+    runOffset.value = 0
     selectedRunId.value = res.run_id
     tab.value = 'runs'
     void queryClient.invalidateQueries({
@@ -311,14 +285,32 @@ async function submitTrigger(): Promise<void> {
 }
 
 // ── run 历史 + 单 run 状态 ───────────────────────────────────────────
+const RUN_PAGE_SIZE = 20
+const runOffset = ref(0)
 const runsQuery = useQuery({
-  queryKey: computed(() => ['workflow-runs', projectId.value, selectedId.value]),
-  queryFn: () => listWorkflowRuns(projectId.value, selectedId.value as string),
+  queryKey: computed(() => [
+    'workflow-runs',
+    projectId.value,
+    selectedId.value,
+    runOffset.value,
+  ]),
+  queryFn: () =>
+    listWorkflowRuns(
+      projectId.value,
+      selectedId.value as string,
+      RUN_PAGE_SIZE,
+      runOffset.value,
+    ),
   enabled: computed(() => Boolean(projectId.value && selectedId.value && tab.value === 'runs')),
 })
 const runs = computed(() => runsQuery.data.value?.runs ?? [])
 
 const selectedRunId = ref<string | null>(null)
+
+function resetRunSelection(): void {
+  runOffset.value = 0
+  selectedRunId.value = null
+}
 
 const runStatusQuery = useQuery({
   queryKey: computed(() => ['workflow-run', projectId.value, selectedRunId.value]),
@@ -349,6 +341,17 @@ function openRun(runId: string): void {
   selectedRunId.value = runId
 }
 
+function previousRunPage(): void {
+  runOffset.value = Math.max(0, runOffset.value - RUN_PAGE_SIZE)
+  selectedRunId.value = null
+}
+
+function nextRunPage(): void {
+  if (!runsQuery.data.value?.has_more) return
+  runOffset.value += RUN_PAGE_SIZE
+  selectedRunId.value = null
+}
+
 const cancelBusy = ref(false)
 async function cancelRun(): Promise<void> {
   if (!selectedRunId.value) return
@@ -376,10 +379,17 @@ interface NotifyForm {
   targetId: string | null // null = 新建
   channel: NotifyChannel
   url: string
+  smtp_host: string
+  smtp_port: number
+  smtp_from: string
+  smtp_to: string
+  smtp_user: string
+  smtp_password: string
   enabled: boolean
   timeout_seconds: number
-  events: string // 逗号分隔,空 = 默认(failed)
+  events: NotifyEvent[]
 }
+const NOTIFY_EVENTS: NotifyEvent[] = ['success', 'failed', 'timeout', 'cancelled', 'all']
 const notifyOpen = ref(false)
 const notifyBusy = ref(false)
 const notifyError = ref<string | null>(null)
@@ -387,18 +397,39 @@ const notifyForm = reactive<NotifyForm>({
   targetId: null,
   channel: 'webhook',
   url: '',
+  smtp_host: '',
+  smtp_port: 587,
+  smtp_from: '',
+  smtp_to: '',
+  smtp_user: '',
+  smtp_password: '',
   enabled: true,
   timeout_seconds: 5,
-  events: '',
+  events: ['failed'],
 })
+
+function clearNotifyPlaintext(): void {
+  notifyForm.url = ''
+  notifyForm.smtp_password = ''
+}
+
+function closeNotify(): void {
+  clearNotifyPlaintext()
+  notifyOpen.value = false
+}
 
 function openNotifyCreate(): void {
   notifyForm.targetId = null
   notifyForm.channel = 'webhook'
-  notifyForm.url = ''
+  clearNotifyPlaintext()
+  notifyForm.smtp_host = ''
+  notifyForm.smtp_port = 587
+  notifyForm.smtp_from = ''
+  notifyForm.smtp_to = ''
+  notifyForm.smtp_user = ''
   notifyForm.enabled = true
   notifyForm.timeout_seconds = 5
-  notifyForm.events = ''
+  notifyForm.events = ['failed']
   notifyError.value = null
   notifyOpen.value = true
 }
@@ -406,57 +437,92 @@ function openNotifyCreate(): void {
 function openNotifyEdit(target: NotifyTargetInSpec): void {
   notifyForm.targetId = target.id
   notifyForm.channel = target.channel
-  notifyForm.url = '' // ★ R5:url 只写不回读,编辑时留空 = 不改地址
+  clearNotifyPlaintext()
+  notifyForm.smtp_host = target.smtp_host ?? ''
+  notifyForm.smtp_port = target.smtp_port ?? 587
+  notifyForm.smtp_from = target.smtp_from ?? ''
+  notifyForm.smtp_to = (target.smtp_to ?? []).join(', ')
+  notifyForm.smtp_user = target.smtp_user ?? ''
   notifyForm.enabled = target.enabled
   notifyForm.timeout_seconds = target.timeout_seconds
-  notifyForm.events = (target.events ?? []).join(',')
+  notifyForm.events = (target.events ?? ['failed']).filter(
+    (event): event is NotifyEvent => NOTIFY_EVENTS.includes(event as NotifyEvent),
+  )
   notifyError.value = null
   notifyOpen.value = true
 }
 
-function parseEvents(raw: string): string[] | null {
-  const list = raw
+function smtpRecipients(): string[] {
+  return notifyForm.smtp_to
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean)
-  return list.length > 0 ? list : null
+}
+
+function toggleNotifyEvent(event: NotifyEvent, checked: boolean): void {
+  let next = notifyForm.events.filter((candidate) => candidate !== event)
+  if (checked) next.push(event)
+  if (event === 'all' && checked) next = ['all']
+  if (event !== 'all' && checked) next = next.filter((candidate) => candidate !== 'all')
+  notifyForm.events = next
 }
 
 async function submitNotify(): Promise<void> {
   notifyError.value = null
-  const events = parseEvents(notifyForm.events)
+  if (notifyForm.events.length === 0) {
+    notifyError.value = t('workflow.err.invalid_notify_events')
+    return
+  }
+  const email = notifyForm.channel === 'email'
+  const recipients = smtpRecipients()
+  if (
+    email &&
+    (!notifyForm.smtp_host.trim() || !notifyForm.smtp_from.trim() || recipients.length === 0)
+  ) {
+    notifyError.value = t('workflow.err.invalid_email_target')
+    return
+  }
   notifyBusy.value = true
   try {
     if (notifyForm.targetId === null) {
-      // 新建:webhook/wecom 必须带明文 url
-      if (!notifyForm.url.trim()) {
+      if (!email && !notifyForm.url.trim()) {
         notifyError.value = t('workflow.err.url_required')
-        notifyBusy.value = false
         return
       }
       await createNotifyTarget(projectId.value, selectedId.value as string, {
         channel: notifyForm.channel,
-        url: notifyForm.url.trim(),
+        url: email ? null : notifyForm.url.trim(),
+        smtp_host: email ? notifyForm.smtp_host.trim() : null,
+        smtp_port: email ? notifyForm.smtp_port : undefined,
+        smtp_from: email ? notifyForm.smtp_from.trim() : null,
+        smtp_to: email ? recipients : undefined,
+        smtp_user: email ? notifyForm.smtp_user.trim() || null : null,
+        smtp_password: email ? notifyForm.smtp_password || null : null,
         enabled: notifyForm.enabled,
         timeout_seconds: notifyForm.timeout_seconds,
-        events: events as never,
+        events: notifyForm.events,
       })
     } else {
-      // 更新:url 留空 = 不改地址(不重存 secret);只改 events/enabled/timeout
       await updateNotifyTarget(projectId.value, selectedId.value as string, notifyForm.targetId, {
-        url: notifyForm.url.trim() || null,
+        url: email ? null : notifyForm.url.trim() || null,
+        smtp_host: email ? notifyForm.smtp_host.trim() : null,
+        smtp_port: email ? notifyForm.smtp_port : null,
+        smtp_from: email ? notifyForm.smtp_from.trim() : null,
+        smtp_to: email ? recipients : null,
+        smtp_user: email ? notifyForm.smtp_user.trim() || null : null,
+        smtp_password: email ? notifyForm.smtp_password || null : null,
         enabled: notifyForm.enabled,
         timeout_seconds: notifyForm.timeout_seconds,
-        events: events as never,
+        events: notifyForm.events,
       })
     }
-    notifyForm.url = '' // 提交后立即清空明文(不缓存,R2)
     notifyOpen.value = false
     toast.success(t('workflow.toast_notify_saved'))
     invalidateDetail()
   } catch (e) {
     notifyError.value = workflowErrorMessage(e)
   } finally {
+    clearNotifyPlaintext()
     notifyBusy.value = false
   }
 }
@@ -489,6 +555,22 @@ const KNOWN_CODES = new Set([
   'invalid_cron',
   'invalid_node_id',
   'invalid_when',
+  'invalid_branch_payload',
+  'invalid_sleep_payload',
+  'invalid_notify_payload',
+  'invalid_edge_when',
+  'duplicate_edge',
+  'invalid_branch_routes',
+  'conditional_edge_requires_branch',
+  'missing_failure_route',
+  'invalid_failure_routes',
+  'failure_edge_requires_branch',
+  'unknown_notify_target',
+  'invalid_node_output_reference',
+  'unknown_node_output',
+  'forbidden_node_output_field',
+  'non_upstream_node_output',
+  'invalid_sensor_datasource',
   'invalid_workflow_spec',
   'workflow_name_conflict',
   'workflow_disabled',
@@ -499,7 +581,10 @@ const KNOWN_CODES = new Set([
   'unsafe_variable_value',
   'variable_value_too_long',
   'invalid_variable_value',
+  'variable_list_too_long',
   'duplicate_notify_target_id',
+  'workflow_notify_target_in_use',
+  'workflow_notify_target_active_run',
   'invalid_url_secret_ref',
   'invalid_email_target',
   'invalid_notify_events',
@@ -545,12 +630,16 @@ function fmtTime(iso: string | null): string {
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString()
 }
 
+function outputValue(value: string | number | boolean | null): string {
+  if (value === null) return '—'
+  return String(value)
+}
+
 function payloadPreview(payload: Record<string, unknown>): string {
   const json = JSON.stringify(payload ?? {})
   return json.length > 80 ? `${json.slice(0, 79)}…` : json
 }
 
-const supportedKinds = SUPPORTED_WORKFLOW_NODE_KINDS
 </script>
 
 <template>
@@ -631,9 +720,9 @@ const supportedKinds = SUPPORTED_WORKFLOW_NODE_KINDS
               type="button"
               class="chrome-btn-secondary text-sm"
               :disabled="!detail"
-              @click="openAdvancedEdit"
+              @click="openEdit"
             >
-              {{ t('workflow.advanced_edit') }}
+              {{ t('workflow.editor.edit_definition') }}
             </button>
             <button
               type="button"
@@ -675,6 +764,21 @@ const supportedKinds = SUPPORTED_WORKFLOW_NODE_KINDS
         </div>
 
         <div class="flex-1 min-h-0 overflow-auto p-4">
+          <WorkflowEditor
+            v-if="editorIntent"
+            :key="editorKey"
+            :initial-name="editorIntent === 'edit' ? detail?.name : ''"
+            :initial-enabled="editorIntent === 'edit' ? detail?.enabled : true"
+            :initial-spec="editorIntent === 'edit' ? detail?.spec : emptyWorkflowSpec()"
+            :create-mode="editorIntent === 'create'"
+            :datasources="datasourceQuery.data.value ?? []"
+            :compare-tasks="compareTasksQuery.data.value ?? []"
+            :notifications="editorIntent === 'edit' ? detail?.spec.notifications ?? [] : []"
+            :busy="editorBusy"
+            @save="saveEditor"
+            @cancel="closeEditor"
+          />
+          <template v-else>
           <div v-if="detailQuery.isPending.value"><LoadingDots /></div>
           <div v-else-if="detailQuery.isError.value" class="text-sm text-red-600 dark:text-red-400">
             {{ workflowErrorMessage(detailQuery.error.value) }}
@@ -794,6 +898,7 @@ const supportedKinds = SUPPORTED_WORKFLOW_NODE_KINDS
                   v-for="r in runs"
                   :key="r.run_id"
                   type="button"
+                  :data-testid="`workflow-run-${r.run_id}`"
                   class="w-full text-left rounded-card border px-2 py-1.5 transition-colors"
                   :class="
                     r.run_id === selectedRunId
@@ -810,6 +915,29 @@ const supportedKinds = SUPPORTED_WORKFLOW_NODE_KINDS
                   </div>
                   <div class="mt-1 text-[11px] chrome-text-muted">{{ fmtTime(r.created_at) }}</div>
                 </button>
+                <div class="flex items-center justify-between gap-2 pt-2">
+                  <button
+                    type="button"
+                    class="chrome-btn-secondary text-xs"
+                    :disabled="runOffset === 0"
+                    :aria-label="t('workflow.previous_page')"
+                    @click="previousRunPage"
+                  >
+                    {{ t('workflow.previous_page') }}
+                  </button>
+                  <span class="text-[10px] chrome-text-muted">
+                    {{ Math.floor(runOffset / RUN_PAGE_SIZE) + 1 }}
+                  </span>
+                  <button
+                    type="button"
+                    class="chrome-btn-secondary text-xs"
+                    :disabled="!runsQuery.data.value?.has_more"
+                    :aria-label="t('workflow.next_page')"
+                    @click="nextRunPage"
+                  >
+                    {{ t('workflow.next_page') }}
+                  </button>
+                </div>
               </div>
 
               <!-- 单 run 状态 -->
@@ -847,6 +975,7 @@ const supportedKinds = SUPPORTED_WORKFLOW_NODE_KINDS
                             <th class="text-left px-3 py-1.5 font-medium">{{ t('workflow.col_kind') }}</th>
                             <th class="text-left px-3 py-1.5 font-medium">{{ t('workflow.col_status') }}</th>
                             <th class="text-left px-3 py-1.5 font-medium">{{ t('workflow.col_attempts') }}</th>
+                            <th class="text-left px-3 py-1.5 font-medium">{{ t('workflow.col_outputs') }}</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -869,6 +998,22 @@ const supportedKinds = SUPPORTED_WORKFLOW_NODE_KINDS
                               </div>
                             </td>
                             <td class="px-3 py-1.5 tabular-nums chrome-text-muted">{{ node.attempts }}</td>
+                            <td class="px-3 py-1.5">
+                              <div
+                                v-for="[key, value] in safeOutputEntries(node.outputs)"
+                                :key="key"
+                                class="flex items-center gap-2 text-[10px]"
+                              >
+                                <span class="font-mono chrome-text-muted">{{ key }}</span>
+                                <span class="font-mono chrome-text-normal">{{ outputValue(value) }}</span>
+                              </div>
+                              <span
+                                v-if="safeOutputEntries(node.outputs).length === 0"
+                                class="text-[10px] chrome-text-muted"
+                              >
+                                —
+                              </span>
+                            </td>
                           </tr>
                         </tbody>
                       </table>
@@ -926,80 +1071,10 @@ const supportedKinds = SUPPORTED_WORKFLOW_NODE_KINDS
               </div>
             </div>
           </template>
+          </template>
         </div>
       </template>
     </div>
-
-    <!-- ============ 创建 modal ============ -->
-    <Modal :open="createOpen" :title="t('workflow.create_title')" @close="createOpen = false">
-      <div class="space-y-3">
-        <label class="block">
-          <span class="block text-xs chrome-text-muted mb-1">{{ t('workflow.field_name') }}</span>
-          <input v-model="createName" class="chrome-input w-full text-sm" :placeholder="t('workflow.name_ph')" />
-        </label>
-        <label class="block">
-          <span class="block text-xs chrome-text-muted mb-1">{{ t('workflow.field_spec') }}</span>
-          <textarea
-            v-model="createSpec"
-            rows="12"
-            spellcheck="false"
-            class="chrome-input w-full text-xs font-mono"
-          />
-        </label>
-        <p class="text-[11px] chrome-text-muted">
-          {{ t('workflow.supported_kinds') }}: {{ supportedKinds.join(', ') }}
-        </p>
-        <div v-if="createError" class="text-xs text-red-600 dark:text-red-400">{{ createError }}</div>
-        <div class="flex justify-end gap-2">
-          <button type="button" class="chrome-btn-secondary text-sm" @click="createOpen = false">
-            {{ t('common.cancel') }}
-          </button>
-          <button type="button" class="chrome-btn-primary text-sm" :disabled="createBusy" @click="submitCreate">
-            {{ t('workflow.create_submit') }}
-          </button>
-        </div>
-      </div>
-    </Modal>
-
-    <!-- ============ 高级编辑 modal(危险区)============ -->
-    <Modal :open="editOpen" :title="t('workflow.advanced_edit_title')" @close="editOpen = false">
-      <div class="space-y-3">
-        <div class="flex items-start gap-2 rounded-card border border-amber-300 dark:border-amber-500/40 bg-amber-50 dark:bg-amber-500/10 p-2 text-xs text-amber-800 dark:text-amber-200">
-          <AlertTriangle class="w-4 h-4 shrink-0 mt-0.5" /> {{ t('workflow.advanced_edit_warn') }}
-        </div>
-        <label class="block">
-          <span class="block text-xs chrome-text-muted mb-1">{{ t('workflow.field_name') }}</span>
-          <input v-model="editName" class="chrome-input w-full text-sm" />
-        </label>
-        <label class="block">
-          <span class="block text-xs chrome-text-muted mb-1">{{ t('workflow.field_spec') }}</span>
-          <textarea
-            v-model="editSpec"
-            rows="14"
-            spellcheck="false"
-            class="chrome-input w-full text-xs font-mono"
-          />
-        </label>
-        <label class="flex items-center gap-2 text-xs chrome-text-normal">
-          <input v-model="editConfirmed" type="checkbox" />
-          {{ t('workflow.advanced_edit_confirm') }}
-        </label>
-        <div v-if="editError" class="text-xs text-red-600 dark:text-red-400">{{ editError }}</div>
-        <div class="flex justify-end gap-2">
-          <button type="button" class="chrome-btn-secondary text-sm" @click="editOpen = false">
-            {{ t('common.cancel') }}
-          </button>
-          <button
-            type="button"
-            class="chrome-btn-danger text-sm"
-            :disabled="editBusy || !editConfirmed"
-            @click="submitAdvancedEdit"
-          >
-            {{ t('workflow.advanced_edit_submit') }}
-          </button>
-        </div>
-      </div>
-    </Modal>
 
     <!-- ============ 删除确认 modal ============ -->
     <Modal :open="deleteOpen" :title="t('workflow.delete_title')" @close="deleteOpen = false">
@@ -1064,7 +1139,7 @@ const supportedKinds = SUPPORTED_WORKFLOW_NODE_KINDS
     <Modal
       :open="notifyOpen"
       :title="notifyForm.targetId ? t('workflow.notify_edit_title') : t('workflow.notify_add_title')"
-      @close="notifyOpen = false"
+      @close="closeNotify"
     >
       <div class="space-y-3">
         <label class="block" v-if="!notifyForm.targetId">
@@ -1072,9 +1147,10 @@ const supportedKinds = SUPPORTED_WORKFLOW_NODE_KINDS
           <select v-model="notifyForm.channel" class="chrome-input w-full text-sm">
             <option value="webhook">webhook</option>
             <option value="wecom">wecom</option>
+            <option value="email">email</option>
           </select>
         </label>
-        <label class="block">
+        <label v-if="notifyForm.channel !== 'email'" class="block">
           <span class="block text-xs chrome-text-muted mb-1">
             {{ t('workflow.notify_url') }}
             <span v-if="notifyForm.targetId" class="chrome-text-muted">({{ t('workflow.notify_url_edit_hint') }})</span>
@@ -1087,14 +1163,67 @@ const supportedKinds = SUPPORTED_WORKFLOW_NODE_KINDS
             :placeholder="notifyForm.targetId ? t('workflow.notify_url_keep_ph') : t('workflow.notify_url_ph')"
           />
         </label>
-        <label class="block">
-          <span class="block text-xs chrome-text-muted mb-1">{{ t('workflow.notify_events') }}</span>
-          <input
-            v-model="notifyForm.events"
-            class="chrome-input w-full text-sm font-mono"
-            :placeholder="t('workflow.notify_events_ph')"
-          />
-        </label>
+        <div v-else class="grid gap-3 sm:grid-cols-2">
+          <label class="block">
+            <span class="block text-xs chrome-text-muted mb-1">{{ t('workflow.notify_smtp_host') }}</span>
+            <input v-model="notifyForm.smtp_host" class="chrome-input w-full text-sm" />
+          </label>
+          <label class="block">
+            <span class="block text-xs chrome-text-muted mb-1">{{ t('workflow.notify_smtp_port') }}</span>
+            <input
+              v-model.number="notifyForm.smtp_port"
+              type="number"
+              min="1"
+              max="65535"
+              class="chrome-input w-full text-sm"
+            />
+          </label>
+          <label class="block">
+            <span class="block text-xs chrome-text-muted mb-1">{{ t('workflow.notify_smtp_from') }}</span>
+            <input v-model="notifyForm.smtp_from" type="email" class="chrome-input w-full text-sm" />
+          </label>
+          <label class="block">
+            <span class="block text-xs chrome-text-muted mb-1">{{ t('workflow.notify_smtp_to') }}</span>
+            <input
+              v-model="notifyForm.smtp_to"
+              class="chrome-input w-full text-sm"
+              :placeholder="t('workflow.notify_smtp_to_ph')"
+            />
+          </label>
+          <label class="block">
+            <span class="block text-xs chrome-text-muted mb-1">{{ t('workflow.notify_smtp_user') }}</span>
+            <input v-model="notifyForm.smtp_user" autocomplete="off" class="chrome-input w-full text-sm" />
+          </label>
+          <label class="block">
+            <span class="block text-xs chrome-text-muted mb-1">
+              {{ t('workflow.notify_smtp_password') }}
+              <span v-if="notifyForm.targetId">({{ t('workflow.notify_password_edit_hint') }})</span>
+            </span>
+            <input
+              v-model="notifyForm.smtp_password"
+              type="password"
+              autocomplete="new-password"
+              class="chrome-input w-full text-sm"
+            />
+          </label>
+        </div>
+        <fieldset>
+          <legend class="block text-xs chrome-text-muted mb-1">{{ t('workflow.notify_events') }}</legend>
+          <div class="flex flex-wrap gap-2">
+            <label
+              v-for="event in NOTIFY_EVENTS"
+              :key="event"
+              class="flex items-center gap-1.5 rounded-input border chrome-border-subtle px-2 py-1 text-xs chrome-text-normal"
+            >
+              <input
+                type="checkbox"
+                :checked="notifyForm.events.includes(event)"
+                @change="toggleNotifyEvent(event, ($event.target as HTMLInputElement).checked)"
+              />
+              {{ event }}
+            </label>
+          </div>
+        </fieldset>
         <div class="flex items-center gap-4">
           <label class="flex items-center gap-2 text-xs chrome-text-normal">
             <input v-model="notifyForm.enabled" type="checkbox" /> {{ t('workflow.notify_enabled') }}
@@ -1112,7 +1241,7 @@ const supportedKinds = SUPPORTED_WORKFLOW_NODE_KINDS
         </div>
         <div v-if="notifyError" class="text-xs text-red-600 dark:text-red-400">{{ notifyError }}</div>
         <div class="flex justify-end gap-2">
-          <button type="button" class="chrome-btn-secondary text-sm" @click="notifyOpen = false">
+          <button type="button" class="chrome-btn-secondary text-sm" @click="closeNotify">
             {{ t('common.cancel') }}
           </button>
           <button type="button" class="chrome-btn-primary text-sm" :disabled="notifyBusy" @click="submitNotify">

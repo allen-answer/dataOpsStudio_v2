@@ -8,10 +8,10 @@ Workflow = Job DAG:只编排 DataOpsStudio 内置 Job,不是低配 Airflow。
 - ``forbidden_node_kind`` —— kind 不在 ``ALLOWED_WORKFLOW_NODE_KINDS``(R7 红线,
   永不开放:shell / python / 任意 HTTP 等);
 - ``unsupported_node_kind`` —— kind 在 R7 白名单内但不在
-  ``SUPPORTED_WORKFLOW_NODE_KINDS_V1``(首版暂不支持,后续版本开放)。
+  ``SUPPORTED_WORKFLOW_NODE_KINDS_V1``(当前仅 Scenario 两种等待 2.6.0)。
 
-``on_failure`` 类型层对齐设计稿 ``Literal["abort", "continue", "branch"]``,
-但首版校验拒绝 ``"branch"``(``unsupported_on_failure``,暂不支持)。
+``on_failure`` 支持 ``abort/continue/branch``;branch 的 failure 边在
+``WorkflowSpec`` 构造期校验 first-match + 唯一 default。
 节点级 ``when`` 条件首版只做存储 + 非空校验,表达式求值语义属执行器(PR-4)。
 Cron 校验两道关(PR-4b 落地精确解析):先 5 段 + 字符集,再 croniter 语义解析,
 拒绝越界 / 不可解析表达式(如 ``99 * * * *``)。运行期"上一触发点"计算属调度器
@@ -29,9 +29,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from app.domain.job import ALLOWED_WORKFLOW_NODE_KINDS
 from app.domain.notify import NotifyTarget
+from app.domain.workflow_outputs import (
+    NODE_OUTPUT_FIELDS_BY_KIND,
+    iter_placeholder_expressions,
+    parse_node_output_reference,
+)
 
-# 首版(2.4.0 PR-1)支持的节点集:R7 白名单的真子集。
-# notify / sleep / branch / scenario_* 在白名单内但首版执行器不实现。
+# 2.4.x 支持的节点集:R7 白名单中除 Scenario Lab(2.6.0)外的节点。
 SUPPORTED_WORKFLOW_NODE_KINDS_V1: frozenset[str] = frozenset(
     {
         "sql_query",
@@ -39,6 +43,9 @@ SUPPORTED_WORKFLOW_NODE_KINDS_V1: frozenset[str] = frozenset(
         "compare_run",
         "lineage_analyze",
         "export_excel",
+        "notify",
+        "sleep",
+        "branch",
     }
 )
 
@@ -240,16 +247,6 @@ class WorkflowNode(BaseModel):
             )
         return value
 
-    @field_validator("on_failure")
-    @classmethod
-    def _validate_on_failure(cls, value: str) -> str:
-        if value == "branch":
-            raise ValueError(
-                "unsupported_on_failure: on_failure='branch' 首版暂不支持"
-                "(类型层对齐设计稿保留,执行语义后续版本开放)"
-            )
-        return value
-
     @field_validator("when")
     @classmethod
     def _validate_when(cls, value: str | None) -> str | None:
@@ -257,14 +254,60 @@ class WorkflowNode(BaseModel):
             raise ValueError("invalid_when: when 条件不能为空白字符串(不写请传 null)")
         return value
 
+    @model_validator(mode="after")
+    def _validate_intrinsic_payload(self) -> WorkflowNode:
+        if self.job_kind == "branch":
+            if self.payload:
+                raise ValueError("invalid_branch_payload: branch 节点 payload 必须为空")
+            return self
+        if self.job_kind == "sleep":
+            duration = self.payload.get("duration_seconds")
+            if (
+                set(self.payload) != {"duration_seconds"}
+                or isinstance(duration, bool)
+                or not isinstance(duration, int)
+                or not 1 <= duration <= 86_400
+            ):
+                raise ValueError(
+                    "invalid_sleep_payload: sleep 节点只接受 1..86400 的 duration_seconds"
+                )
+            return self
+        if self.job_kind == "notify":
+            if not set(self.payload) <= {"target_ids", "message"}:
+                raise ValueError("invalid_notify_payload: notify 节点含未知字段")
+            target_ids = self.payload.get("target_ids")
+            if (
+                not isinstance(target_ids, list)
+                or not 1 <= len(target_ids) <= 10
+                or not all(
+                    isinstance(target_id, str) and target_id.strip() for target_id in target_ids
+                )
+                or len(set(target_ids)) != len(target_ids)
+            ):
+                raise ValueError("invalid_notify_payload: target_ids 必须是 1..10 个唯一非空字符串")
+            message = self.payload.get("message")
+            if message is not None and (not isinstance(message, str) or len(message) > 512):
+                raise ValueError("invalid_notify_payload: message 最长 512 字符")
+        return self
+
 
 class WorkflowEdge(BaseModel):
-    """DAG 有向边:source 成功后 target 才可调度(执行语义属 PR-4)。"""
+    """DAG 有向边;旧边默认保持 source 成功后调度 target。"""
 
     model_config = ConfigDict(frozen=True)
 
     source: str
     target: str
+    trigger: Literal["success", "failure"] = "success"
+    when: str | None = Field(default=None, max_length=MAX_WHEN_LENGTH)
+    is_default: bool = False
+
+    @field_validator("when")
+    @classmethod
+    def _validate_when(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("invalid_edge_when: 边条件不能为空白字符串(不写请传 null)")
+        return value
 
 
 class WorkflowSpec(BaseModel):
@@ -274,7 +317,7 @@ class WorkflowSpec(BaseModel):
     id 唯一、边引用存在、无自环、无环;孤立节点合法(单节点 workflow)。
     """
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, hide_input_in_errors=True)
 
     nodes: list[WorkflowNode] = Field(min_length=1, max_length=MAX_WORKFLOW_NODES)
     edges: list[WorkflowEdge] = Field(default_factory=list)
@@ -303,6 +346,9 @@ class WorkflowSpec(BaseModel):
             node_ids.add(node.id)
 
         adjacency: dict[str, list[str]] = {node_id: [] for node_id in node_ids}
+        incoming: dict[str, list[str]] = {node_id: [] for node_id in node_ids}
+        outgoing: dict[str, list[WorkflowEdge]] = {node_id: [] for node_id in node_ids}
+        edge_keys: set[tuple[str, str, str]] = set()
         for edge in self.edges:
             if edge.source not in node_ids:
                 raise ValueError(f"unknown_edge_node: 边 source {edge.source!r} 不是已声明节点")
@@ -310,18 +356,154 @@ class WorkflowSpec(BaseModel):
                 raise ValueError(f"unknown_edge_node: 边 target {edge.target!r} 不是已声明节点")
             if edge.source == edge.target:
                 raise ValueError(f"self_loop: 节点 {edge.source!r} 不允许自环")
+            edge_key = (edge.source, edge.target, edge.trigger)
+            if edge_key in edge_keys:
+                raise ValueError(
+                    "duplicate_edge: "
+                    f"{edge.source!r}->{edge.target!r} trigger={edge.trigger!r} 重复"
+                )
+            edge_keys.add(edge_key)
             adjacency[edge.source].append(edge.target)
+            incoming[edge.target].append(edge.source)
+            outgoing[edge.source].append(edge)
 
         cycle = _find_cycle(self.nodes, adjacency)
         if cycle is not None:
             raise ValueError(f"cycle_detected: DAG 存在环,环上节点: {' -> '.join(cycle)}")
+
+        ancestors = _workflow_ancestors(self.nodes, incoming)
+        nodes_by_id = {node.id: node for node in self.nodes}
+        for node in self.nodes:
+            _validate_output_references(
+                node.payload,
+                allowed_nodes=ancestors[node.id],
+                nodes_by_id=nodes_by_id,
+            )
+            _validate_output_references(
+                node.when,
+                allowed_nodes=ancestors[node.id],
+                nodes_by_id=nodes_by_id,
+            )
+        for edge in self.edges:
+            _validate_output_references(
+                edge.when,
+                allowed_nodes=ancestors[edge.source] | {edge.source},
+                nodes_by_id=nodes_by_id,
+            )
+
+        for node in self.nodes:
+            _validate_node_routes(node, outgoing[node.id])
 
         notify_ids: set[str] = set()
         for target in self.notifications:
             if target.id in notify_ids:
                 raise ValueError(f"duplicate_notify_target_id: 通知目标 id {target.id!r} 重复")
             notify_ids.add(target.id)
+        for node in self.nodes:
+            if node.job_kind != "notify":
+                continue
+            target_ids = node.payload["target_ids"]
+            for target_id in target_ids:
+                if target_id not in notify_ids:
+                    raise ValueError(
+                        f"unknown_notify_target: notify 节点 {node.id!r} 引用未知目标 {target_id!r}"
+                    )
         return self
+
+
+def _validate_node_routes(node: WorkflowNode, outgoing: list[WorkflowEdge]) -> None:
+    success_edges = [edge for edge in outgoing if edge.trigger == "success"]
+    failure_edges = [edge for edge in outgoing if edge.trigger == "failure"]
+
+    if node.job_kind == "branch":
+        _validate_first_match_routes(
+            node_id=node.id,
+            edges=success_edges,
+            minimum_edges=2,
+            error_code="invalid_branch_routes",
+        )
+    elif any(edge.when is not None or edge.is_default for edge in success_edges):
+        raise ValueError(
+            "conditional_edge_requires_branch: "
+            f"普通节点 {node.id!r} 的 success 边不能设置 when/is_default"
+        )
+
+    if node.on_failure == "branch":
+        if not failure_edges:
+            raise ValueError(
+                f"missing_failure_route: 节点 {node.id!r} on_failure='branch' 但无 failure 边"
+            )
+        _validate_first_match_routes(
+            node_id=node.id,
+            edges=failure_edges,
+            minimum_edges=1,
+            error_code="invalid_failure_routes",
+        )
+    elif failure_edges:
+        raise ValueError(
+            "failure_edge_requires_branch: "
+            f"节点 {node.id!r} 只有 on_failure='branch' 才能声明 failure 边"
+        )
+
+
+def _validate_first_match_routes(
+    *,
+    node_id: str,
+    edges: list[WorkflowEdge],
+    minimum_edges: int,
+    error_code: str,
+) -> None:
+    defaults = [edge for edge in edges if edge.is_default]
+    conditions_valid = all(
+        edge.when is None if edge.is_default else edge.when is not None for edge in edges
+    )
+    if len(edges) < minimum_edges or len(defaults) != 1 or not conditions_valid:
+        raise ValueError(f"{error_code}: 节点 {node_id!r} 路由边数量/条件/default 配置非法")
+
+
+def _workflow_ancestors(
+    nodes: list[WorkflowNode],
+    incoming: Mapping[str, list[str]],
+) -> dict[str, set[str]]:
+    ancestors: dict[str, set[str]] = {}
+
+    def collect(node_id: str) -> set[str]:
+        cached = ancestors.get(node_id)
+        if cached is not None:
+            return cached
+        found: set[str] = set()
+        for parent in incoming[node_id]:
+            found.add(parent)
+            found.update(collect(parent))
+        ancestors[node_id] = found
+        return found
+
+    for node in nodes:
+        collect(node.id)
+    return ancestors
+
+
+def _validate_output_references(
+    value: object,
+    *,
+    allowed_nodes: set[str],
+    nodes_by_id: Mapping[str, WorkflowNode],
+) -> None:
+    for expression in iter_placeholder_expressions(value):
+        if not expression.startswith("nodes."):
+            continue
+        reference = parse_node_output_reference(expression)
+        if reference is None:
+            raise ValueError("invalid_node_output_reference")
+        node_id, field = reference
+        referenced_node = nodes_by_id.get(node_id)
+        if referenced_node is None:
+            raise ValueError("unknown_node_output")
+        allowed_fields = NODE_OUTPUT_FIELDS_BY_KIND[referenced_node.job_kind]
+        if field not in allowed_fields:
+            raise ValueError("forbidden_node_output_field")
+        if node_id not in allowed_nodes:
+            raise ValueError("non_upstream_node_output")
 
 
 def _find_cycle(nodes: list[WorkflowNode], adjacency: dict[str, list[str]]) -> list[str] | None:

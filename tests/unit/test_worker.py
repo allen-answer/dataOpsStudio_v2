@@ -7,9 +7,13 @@ import threading
 import time
 import zipfile
 from collections.abc import Callable, Iterable
+from datetime import UTC, datetime, timedelta
 from typing import Any, BinaryIO, Protocol
+from unittest.mock import patch
 
+import pytest
 from sqlalchemy.exc import IntegrityError
+from structlog.testing import capture_logs
 
 from app.dbclients.factory import UnsupportedDbTypeError
 from app.dbclients.protocol import AdapterConnectionError
@@ -22,7 +26,7 @@ from app.domain.compare_result import (
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.lineage import LineageReport, schema_from_metadata_cache_rows
-from app.domain.notify import NotifyResult
+from app.domain.notify import NotifyResult, NotifyTarget, RunNotification
 from app.domain.plan import PlanNode
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
@@ -36,6 +40,7 @@ from app.worker import (
     WorkerRunnerConfig,
     _build_workflow_child_job,
     _compare_export_row_cap,
+    _workflow_children_snapshots,
 )
 
 
@@ -170,6 +175,68 @@ def test_worker_runs_sql_explain_to_spool_and_completes() -> None:
     assert backend.completed == [("job-1", ResultRef(backend="local_fs", uri="spool/rs-1"))]
     assert catalog.completed[-1]["loaded_rows"] == 1
     assert catalog.completed[-1]["console_id"] == "console-1"
+
+
+def test_workflow_sql_query_completion_persists_safe_output_metadata() -> None:
+    job = _make_job(payload={"sql": "SELECT 1", "result_set_id": "rs-workflow"}).model_copy(
+        update={
+            "parent_workflow_run_id": "run-1",
+            "payload": {
+                "sql": "SELECT 1",
+                "result_set_id": "rs-workflow",
+                "workflow_node_id": "query",
+            },
+        }
+    )
+    backend = _FakeBackend([job])
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([Row(values=[1]), Row(values=[2])])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.completed[0][1].metadata == {
+        "result_set_id": "rs-workflow",
+        "loaded_rows": 2,
+    }
+
+
+def test_workflow_sql_explain_completion_persists_safe_output_metadata() -> None:
+    job = _make_job(
+        kind=JobKind.SQL_EXPLAIN,
+        payload={"sql": "SELECT 1", "result_set_id": "rs-workflow-plan"},
+    ).model_copy(
+        update={
+            "parent_workflow_run_id": "run-1",
+            "payload": {
+                "sql": "SELECT 1",
+                "result_set_id": "rs-workflow-plan",
+                "workflow_node_id": "plan",
+            },
+        }
+    )
+    backend = _FakeBackend([job])
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(
+            datasource_id,
+            operation_policy=OperationPolicy(allow_explain=True),
+        ),
+        _adapter_factory(_FakeAdapter([], explain_rows=[{"id": 1}])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.completed[0][1].metadata == {
+        "result_set_id": "rs-workflow-plan",
+        "loaded_rows": 1,
+    }
 
 
 def test_worker_updates_catalog_while_streaming_batches() -> None:
@@ -960,9 +1027,12 @@ class _FakeBackend:
         self.enqueued: list[Job] = []
         self.children_by_parent: dict[str, list[Job]] = {}
         self.requeued_workflow_runs: list[str] = []
+        self.requeued_workflow_run_times: list[datetime | None] = []
         self.retried_nodes: list[str] = []
         self.cancel_requested_ids: list[str] = []
         self.cancelled_pending: list[tuple[str, str]] = []
+        self.jobs_by_id: dict[str, Job] = {job.id: job for job in jobs}
+        self.get_job_calls: list[str] = []
 
     def claim_next(self, worker_id: str) -> Job | None:
         if not self._jobs:
@@ -999,8 +1069,18 @@ class _FakeBackend:
     def list_jobs_by_parent(self, parent_workflow_run_id: str) -> list[Job]:
         return list(self.children_by_parent.get(parent_workflow_run_id, []))
 
-    def requeue_workflow_run(self, job_id: str) -> None:
+    def get_job(self, job_id: str) -> Job | None:
+        self.get_job_calls.append(job_id)
+        return self.jobs_by_id.get(job_id)
+
+    def requeue_workflow_run(
+        self,
+        job_id: str,
+        *,
+        available_at: datetime | None = None,
+    ) -> None:
         self.requeued_workflow_runs.append(job_id)
+        self.requeued_workflow_run_times.append(available_at)
 
     def retry_workflow_node(self, job_id: str) -> None:
         self.retried_nodes.append(job_id)
@@ -1431,7 +1511,7 @@ class _FakeCompareRunCatalog:
 
 def _workflow_spec_payload(
     nodes: list[dict[str, object]] | None = None,
-    edges: list[dict[str, str]] | None = None,
+    edges: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
         "nodes": nodes
@@ -1494,6 +1574,32 @@ def _workflow_child(
         retry_count=retry_count,
         error=error,
     )
+
+
+def test_workflow_child_snapshot_maps_error_code_and_only_safe_result_outputs() -> None:
+    child = _workflow_child("job-1", "n1", JobStatus.FAILED, error="timed out").model_copy(
+        update={
+            "error_code": JobErrorCode.TIMEOUT,
+            "result_ref": ResultRef(
+                backend="local_fs",
+                uri="spool/internal-sensitive-location",
+                metadata={
+                    "result_set_id": "rs-1",
+                    "loaded_rows": 7,
+                    "sql": "SELECT sensitive_value",
+                    "rows": [["secret-row"]],
+                    "arbitrary": {"secret": "value"},
+                },
+            ),
+        }
+    )
+
+    snapshot = _workflow_children_snapshots([child])["n1"]
+
+    assert snapshot.error_code == "timeout"
+    assert snapshot.outputs == {"result_set_id": "rs-1", "loaded_rows": 7}
+    assert "internal-sensitive-location" not in repr(snapshot.outputs)
+    assert "secret-row" not in repr(snapshot.outputs)
 
 
 def test_workflow_run_first_step_enqueues_root_child_and_yields() -> None:
@@ -1705,6 +1811,308 @@ def test_build_workflow_child_job_expands_list_variable_via_sql_in() -> None:
 
     assert child.payload["source_ref"]["sql"] == "SELECT * FROM t WHERE id IN (1, 2, 3)"
     assert child.kind is JobKind.COMPARE_RUN
+
+
+def test_build_workflow_sql_children_default_result_set_id_to_child_id() -> None:
+    run_job = _workflow_run_job()
+    variables = {"today": "2026-07-07"}
+
+    for job_kind in ("sql_query", "sql_explain"):
+        node = WorkflowNode(
+            id=job_kind,
+            job_kind=job_kind,
+            payload={"sql": "SELECT 1", "datasource_id": "ds-9"},
+            timeout_seconds=60,
+        )
+
+        child = _build_workflow_child_job(run_job, node, variables)
+
+        assert child.payload["result_set_id"] == child.id
+
+
+def test_workflow_sql_to_export_child_receives_safe_upstream_output_context() -> None:
+    spec = _workflow_spec_payload(
+        nodes=[
+            {
+                "id": "query",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 1", "datasource_id": "ds-9"},
+                "timeout_seconds": 60,
+            },
+            {
+                "id": "export",
+                "job_kind": "export_excel",
+                "payload": {
+                    "source_result_set_id": "${nodes.query.result_set_id}",
+                    "loaded_rows": "${nodes.query.loaded_rows}",
+                    "filename": "result.xlsx",
+                },
+                "timeout_seconds": 60,
+            },
+        ],
+        edges=[{"source": "query", "target": "export"}],
+    )
+    query_child = _workflow_child("job-1", "query", JobStatus.SUCCESS).model_copy(
+        update={
+            "result_ref": ResultRef(
+                backend="local_fs",
+                uri="spool/private-location",
+                metadata={
+                    "result_set_id": "rs-query",
+                    "loaded_rows": 7,
+                    "rows": [["secret-row"]],
+                },
+            )
+        }
+    )
+    backend = _FakeBackend([_workflow_run_job(spec)])
+    backend.children_by_parent["job-1"] = [query_child]
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert len(backend.enqueued) == 1
+    export_child = backend.enqueued[0]
+    assert export_child.kind is JobKind.EXPORT_EXCEL
+    assert export_child.payload["source_result_set_id"] == "rs-query"
+    assert export_child.payload["loaded_rows"] == 7
+    assert isinstance(export_child.payload["loaded_rows"], int)
+    assert "secret-row" not in repr(export_child.payload)
+
+
+def test_workflow_branch_child_is_enqueued_with_frozen_selected_target() -> None:
+    spec = _workflow_spec_payload(
+        nodes=[
+            {
+                "id": "query",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 1", "datasource_id": "ds-9"},
+                "timeout_seconds": 60,
+            },
+            {
+                "id": "route",
+                "job_kind": "branch",
+                "payload": {},
+                "timeout_seconds": 60,
+            },
+            {
+                "id": "has_rows",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 1", "datasource_id": "ds-9"},
+                "timeout_seconds": 60,
+            },
+            {
+                "id": "empty",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 0", "datasource_id": "ds-9"},
+                "timeout_seconds": 60,
+            },
+        ],
+        edges=[
+            {"source": "query", "target": "route"},
+            {
+                "source": "route",
+                "target": "has_rows",
+                "when": "${nodes.query.loaded_rows} > 0",
+            },
+            {"source": "route", "target": "empty", "is_default": True},
+        ],
+    )
+    query_child = _workflow_child("job-1", "query", JobStatus.SUCCESS).model_copy(
+        update={
+            "result_ref": ResultRef(
+                backend="local_fs",
+                uri="spool/private-location",
+                metadata={"result_set_id": "rs-query", "loaded_rows": 2},
+            )
+        }
+    )
+    backend = _FakeBackend([_workflow_run_job(spec)])
+    backend.children_by_parent["job-1"] = [query_child]
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert len(backend.enqueued) == 1
+    branch_child = backend.enqueued[0]
+    assert branch_child.kind is JobKind.BRANCH
+    assert branch_child.payload == {
+        "workflow_node_id": "route",
+        "selected_target": "has_rows",
+    }
+
+
+def test_worker_executes_branch_immediately_with_safe_result_ref() -> None:
+    job = _make_job(
+        kind=JobKind.BRANCH,
+        payload={"workflow_node_id": "route", "selected_target": "has_rows"},
+    ).model_copy(update={"parent_workflow_run_id": "run-1"})
+    backend = _FakeBackend([job])
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert backend.failed == []
+    assert backend.completed == [
+        (
+            "job-1",
+            ResultRef(
+                backend="branch",
+                uri="branch/job-1",
+                metadata={"selected_target": "has_rows"},
+            ),
+        )
+    ]
+
+
+@pytest.mark.parametrize("duration_seconds", [1, 86_400])
+def test_build_workflow_sleep_child_accepts_duration_boundaries(
+    duration_seconds: int,
+) -> None:
+    now = datetime(2026, 7, 12, 4, 0, tzinfo=UTC)
+    node = WorkflowNode(
+        id="pause",
+        job_kind="sleep",
+        payload={"duration_seconds": duration_seconds},
+        timeout_seconds=60,
+    )
+
+    child = _build_workflow_child_job(
+        _workflow_run_job(),
+        node,
+        {"today": "2026-07-12"},
+        now=now,
+    )
+
+    assert child.available_at == now + timedelta(seconds=duration_seconds)
+    assert child.payload == {
+        "workflow_node_id": "pause",
+        "duration_seconds": duration_seconds,
+    }
+
+
+@pytest.mark.parametrize("duration_seconds", [1, 86_400])
+def test_worker_completes_due_sleep_at_duration_boundaries_without_sleep_call(
+    duration_seconds: int,
+) -> None:
+    job = _make_job(
+        kind=JobKind.SLEEP,
+        payload={"workflow_node_id": "pause", "duration_seconds": duration_seconds},
+    ).model_copy(
+        update={
+            "parent_workflow_run_id": "run-1",
+            "available_at": datetime(2026, 7, 12, 4, 0, tzinfo=UTC),
+        }
+    )
+    backend = _FakeBackend([job])
+    runner = _workflow_runner(backend)
+
+    with patch("app.worker.time.sleep") as duration_sleep:
+        assert runner.run_once() is True
+
+    duration_sleep.assert_not_called()
+    assert backend.failed == []
+    assert backend.completed == [
+        (
+            "job-1",
+            ResultRef(
+                backend="sleep",
+                uri="sleep/job-1",
+                metadata={"duration_seconds": duration_seconds},
+            ),
+        )
+    ]
+
+
+def test_workflow_run_waiting_for_future_sleep_requeues_without_blocking_worker() -> None:
+    run_job = _workflow_run_job(
+        _workflow_spec_payload(
+            nodes=[
+                {
+                    "id": "pause",
+                    "job_kind": "sleep",
+                    "payload": {"duration_seconds": 60},
+                    "timeout_seconds": 60,
+                }
+            ]
+        )
+    )
+    future_sleep = _make_job(
+        kind=JobKind.SLEEP,
+        payload={"workflow_node_id": "pause", "duration_seconds": 60},
+    ).model_copy(
+        update={
+            "id": "child-pause",
+            "status": JobStatus.PENDING,
+            "parent_workflow_run_id": run_job.id,
+            "available_at": datetime.now(UTC) + timedelta(seconds=60),
+        }
+    )
+    backend = _FakeBackend([run_job])
+    backend.children_by_parent[run_job.id] = [future_sleep]
+    runner = _workflow_runner(backend)
+    before = datetime.now(UTC)
+
+    with patch("app.worker.time.sleep") as blocking_sleep:
+        assert runner.run_once() is True
+
+    blocking_sleep.assert_not_called()
+    assert backend.requeued_workflow_runs == [run_job.id]
+    assert len(backend.requeued_workflow_run_times) == 1
+    available_at = backend.requeued_workflow_run_times[0]
+    assert available_at is not None
+    assert before < available_at <= datetime.now(UTC) + timedelta(seconds=2)
+
+
+@pytest.mark.parametrize("duration_seconds", [0, 86_401])
+def test_worker_rejects_sleep_duration_outside_public_range(duration_seconds: int) -> None:
+    job = _make_job(
+        kind=JobKind.SLEEP,
+        payload={"workflow_node_id": "pause", "duration_seconds": duration_seconds},
+    ).model_copy(update={"parent_workflow_run_id": "run-1"})
+    backend = _FakeBackend([job])
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert backend.completed == []
+    assert backend.failed == [("job-1", "internal")]
+
+
+def test_workflow_run_cancel_cancels_future_pending_sleep() -> None:
+    run_job = _workflow_run_job(
+        _workflow_spec_payload(
+            nodes=[
+                {
+                    "id": "pause",
+                    "job_kind": "sleep",
+                    "payload": {"duration_seconds": 3600},
+                    "timeout_seconds": 60,
+                }
+            ]
+        )
+    )
+    future_sleep = _make_job(
+        kind=JobKind.SLEEP,
+        payload={"workflow_node_id": "pause", "duration_seconds": 3600},
+    ).model_copy(
+        update={
+            "id": "child-pause",
+            "status": JobStatus.PENDING,
+            "parent_workflow_run_id": "job-1",
+            "available_at": datetime.now(UTC) + timedelta(hours=1),
+        }
+    )
+    backend = _FakeBackend([run_job])
+    backend.children_by_parent["job-1"] = [future_sleep]
+    backend.cancel_after_checks = 1
+    runner = _workflow_runner(backend)
+
+    assert runner.run_once() is True
+
+    assert "child-pause" in backend.cancel_requested_ids
+    assert ("child-pause", "workflow run cancelled") in backend.cancelled_pending
+    assert backend.cancelled == [("job-1", "cancel requested")]
 
 
 def _compare_run_node_payload() -> dict[str, object]:
@@ -1923,6 +2331,537 @@ def test_workflow_run_node_interpolation_failure_fails_run_via_on_failure() -> N
 
 
 # ── workflow_run 终态通知(C-9 worker 接入)────────────────────────────────────
+
+
+class _DagNotifyChannel:
+    channel = "webhook"
+
+    def __init__(self, *, failed_call_numbers: set[int] | None = None) -> None:
+        self.calls: list[tuple[NotifyTarget, RunNotification]] = []
+        self.failed_call_numbers = failed_call_numbers or set()
+
+    def send(
+        self,
+        target: NotifyTarget,
+        payload: RunNotification,
+        *,
+        reveal: object,
+    ) -> NotifyResult:
+        del reveal
+        self.calls.append((target, payload))
+        if len(self.calls) in self.failed_call_numbers:
+            return NotifyResult(
+                channel=self.channel,
+                target_id=target.id,
+                ok=False,
+                error="http_error status=500",
+            )
+        return NotifyResult(channel=self.channel, target_id=target.id, ok=True)
+
+
+def _notify_parent_run_job(
+    *,
+    notifications: list[dict[str, object]],
+    target_ids: list[str],
+    message: str | None = None,
+    extra_nodes: list[dict[str, object]] | None = None,
+) -> Job:
+    node_payload: dict[str, object] = {"target_ids": target_ids}
+    if message is not None:
+        node_payload["message"] = message
+    parent = _workflow_run_job(
+        {
+            "nodes": [
+                {
+                    "id": "notify-node",
+                    "job_kind": "notify",
+                    "payload": node_payload,
+                    "timeout_seconds": 60,
+                },
+                *(extra_nodes or []),
+            ],
+            "edges": [],
+            "notifications": notifications,
+        }
+    )
+    return parent.model_copy(
+        update={
+            "id": "parent-run",
+            "payload": {
+                **parent.payload,
+                "workflow_name": "frozen-workflow",
+                "trigger": "manual",
+            },
+        }
+    )
+
+
+def _notify_child_job(
+    target_ids: list[str],
+    *,
+    message: str | None = None,
+    node_id: str | None = "notify-node",
+    extra_payload: dict[str, object] | None = None,
+) -> Job:
+    payload: dict[str, object] = {"target_ids": target_ids}
+    if node_id is not None:
+        payload["workflow_node_id"] = node_id
+    if message is not None:
+        payload["message"] = message
+    if extra_payload is not None:
+        payload.update(extra_payload)
+    return _make_job(kind=JobKind.NOTIFY, payload=payload).model_copy(
+        update={"id": "notify-child", "parent_workflow_run_id": "parent-run"}
+    )
+
+
+def _run_notify_child(
+    parent: Job,
+    child: Job,
+) -> tuple[_FakeBackend, _DagNotifyChannel]:
+    backend = _FakeBackend([child])
+    backend.jobs_by_id[parent.id] = parent
+    channel = _DagNotifyChannel()
+    runner = _workflow_runner(backend)
+    runner._notify_service = WorkflowNotifyService(
+        lambda ref: "unused",
+        {"webhook": channel},
+    )
+    assert runner.run_once() is True
+    return backend, channel
+
+
+def test_worker_notify_loads_frozen_parent_and_completes_sent_count() -> None:
+    message = "dag-message-sentinel"
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+                "events": ["failed"],
+            }
+        ],
+        target_ids=["frozen-target"],
+        message=message,
+    )
+    child = _notify_child_job(["frozen-target"], message=message)
+    backend = _FakeBackend([child])
+    backend.jobs_by_id[parent.id] = parent
+    channel = _DagNotifyChannel()
+    runner = _workflow_runner(backend)
+    runner._notify_service = WorkflowNotifyService(
+        lambda ref: "unused",
+        {"webhook": channel},
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.get_job_calls == ["parent-run"]
+    assert child.payload == {
+        "workflow_node_id": "notify-node",
+        "target_ids": ["frozen-target"],
+        "message": message,
+    }
+    assert "frozen-ref" not in repr(child.payload)
+    assert len(channel.calls) == 1
+    target, payload = channel.calls[0]
+    assert target.id == "frozen-target"
+    assert payload.workflow_id == "wf-1"
+    assert payload.workflow_name == "frozen-workflow"
+    assert payload.project == parent.project_id
+    assert payload.run_job_id == "parent-run"
+    assert payload.trigger == "manual"
+    assert payload.status == "running"
+    assert payload.message == message
+    assert backend.failed == []
+    assert backend.completed == [
+        (
+            "notify-child",
+            ResultRef(
+                backend="notify",
+                uri="notify/notify-child",
+                metadata={"sent_count": 1},
+            ),
+        )
+    ]
+
+
+def test_build_notify_child_payload_excludes_target_config_and_secret_refs() -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["frozen-target"],
+        message="hello",
+    )
+    node = WorkflowNode(
+        id="notify-node",
+        job_kind="notify",
+        payload={"target_ids": ["frozen-target"], "message": "hello"},
+        timeout_seconds=60,
+    )
+
+    child = _build_workflow_child_job(parent, node, {"today": "2026-07-13"})
+
+    assert child.payload == {
+        "workflow_node_id": "notify-node",
+        "target_ids": ["frozen-target"],
+        "message": "hello",
+    }
+    assert "frozen-ref" not in repr(child.payload)
+
+
+def test_worker_notify_rejects_redirected_target_in_same_frozen_spec() -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            },
+            {
+                "id": "redirect-target",
+                "channel": "webhook",
+                "url_secret_ref": "redirect-ref",
+            },
+        ],
+        target_ids=["frozen-target"],
+    )
+    child = _notify_child_job(["redirect-target"])
+
+    backend, channel = _run_notify_child(parent, child)
+
+    assert backend.failed == [("notify-child", "notify_invalid_payload")]
+    assert backend.completed == []
+    assert channel.calls == []
+
+
+@pytest.mark.parametrize(
+    ("frozen_message", "child_payload_update"),
+    [
+        (None, {"unexpected": "value"}),
+        (None, {"message": "injected"}),
+        ("run ${today}", {}),
+    ],
+    ids=["extra_key", "message_not_declared", "declared_message_missing"],
+)
+def test_worker_notify_rejects_child_payload_key_mismatch(
+    frozen_message: str | None,
+    child_payload_update: dict[str, object],
+) -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["frozen-target"],
+        message=frozen_message,
+    )
+    child = _notify_child_job(
+        ["frozen-target"],
+        extra_payload=child_payload_update,
+    )
+
+    backend, channel = _run_notify_child(parent, child)
+
+    assert backend.failed == [("notify-child", "notify_invalid_payload")]
+    assert backend.completed == []
+    assert channel.calls == []
+
+
+@pytest.mark.parametrize(
+    "target_ids",
+    [
+        [],
+        [f"target-{index}" for index in range(11)],
+        ["frozen-target", "frozen-target"],
+        ["   "],
+    ],
+    ids=["empty", "too_many", "duplicate", "whitespace"],
+)
+def test_worker_notify_rejects_invalid_target_id_list(target_ids: list[str]) -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["frozen-target"],
+    )
+    child = _notify_child_job(target_ids)
+
+    backend, channel = _run_notify_child(parent, child)
+
+    assert backend.failed == [("notify-child", "notify_invalid_payload")]
+    assert backend.completed == []
+    assert channel.calls == []
+
+
+@pytest.mark.parametrize(
+    "node_id",
+    [None, "   ", "missing-node", "query-node"],
+    ids=["missing", "blank", "unknown", "non_notify"],
+)
+def test_worker_notify_rejects_invalid_frozen_node_binding(node_id: str | None) -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["frozen-target"],
+        extra_nodes=[
+            {
+                "id": "query-node",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 1"},
+                "timeout_seconds": 60,
+            }
+        ],
+    )
+    child = _notify_child_job(["frozen-target"], node_id=node_id)
+
+    backend, channel = _run_notify_child(parent, child)
+
+    assert backend.failed == [("notify-child", "notify_invalid_payload")]
+    assert backend.completed == []
+    assert channel.calls == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [42, "m" * 513],
+    ids=["wrong_type", "too_long"],
+)
+def test_worker_notify_rejects_invalid_message(message: object) -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["frozen-target"],
+        message="run ${today}",
+    )
+    child = _notify_child_job(
+        ["frozen-target"],
+        extra_payload={"message": message},
+    )
+
+    backend, channel = _run_notify_child(parent, child)
+
+    assert backend.failed == [("notify-child", "notify_invalid_payload")]
+    assert backend.completed == []
+    assert channel.calls == []
+
+
+def test_worker_notify_accepts_interpolated_message_different_from_frozen_text() -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["frozen-target"],
+        message="run ${today}",
+    )
+    child = _notify_child_job(
+        ["frozen-target"],
+        message="run 2026-07-13",
+    )
+
+    backend, channel = _run_notify_child(parent, child)
+
+    assert backend.failed == []
+    assert len(channel.calls) == 1
+    assert channel.calls[0][1].message == "run 2026-07-13"
+    assert backend.completed[0][1].metadata == {"sent_count": 1}
+
+
+def test_worker_notify_all_disabled_completes_with_zero_sent_count() -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "disabled",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+                "enabled": False,
+            }
+        ],
+        target_ids=["disabled"],
+    )
+    child = _notify_child_job(["disabled"])
+    backend = _FakeBackend([child])
+    backend.jobs_by_id[parent.id] = parent
+    channel = _DagNotifyChannel()
+    runner = _workflow_runner(backend)
+    runner._notify_service = WorkflowNotifyService(
+        lambda ref: "unused",
+        {"webhook": channel},
+    )
+
+    assert runner.run_once() is True
+
+    assert channel.calls == []
+    assert backend.failed == []
+    assert backend.completed == [
+        (
+            "notify-child",
+            ResultRef(
+                backend="notify",
+                uri="notify/notify-child",
+                metadata={"sent_count": 0},
+            ),
+        )
+    ]
+
+
+def test_worker_notify_partial_failure_retries_at_least_once() -> None:
+    message = "dag-message-sentinel"
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "first",
+                "channel": "webhook",
+                "url_secret_ref": "first-ref",
+                "events": ["failed"],
+            },
+            {
+                "id": "second",
+                "channel": "webhook",
+                "url_secret_ref": "second-ref",
+                "events": ["failed"],
+            },
+        ],
+        target_ids=["first", "second"],
+        message=message,
+    )
+    child = _notify_child_job(["first", "second"], message=message)
+    backend = _FakeBackend([child, child])
+    backend.jobs_by_id[parent.id] = parent
+    channel = _DagNotifyChannel(failed_call_numbers={2})
+    runner = _workflow_runner(backend)
+    runner._notify_service = WorkflowNotifyService(
+        lambda ref: "unused",
+        {"webhook": channel},
+    )
+
+    with capture_logs() as logs:
+        assert runner.run_once() is True
+        assert runner.run_once() is True
+
+    assert [target.id for target, _ in channel.calls] == [
+        "first",
+        "second",
+        "first",
+        "second",
+    ]
+    assert backend.failed == [("notify-child", "notify_delivery_failed")]
+    assert backend.completed == [
+        (
+            "notify-child",
+            ResultRef(
+                backend="notify",
+                uri="notify/notify-child",
+                metadata={"sent_count": 2},
+            ),
+        )
+    ]
+    rendered = repr(logs) + repr([result.model_dump() for _, result in backend.completed])
+    for sensitive in (
+        message,
+        "first-ref",
+        "second-ref",
+        "http_error status=500",
+    ):
+        assert sensitive not in rendered
+
+
+def test_worker_notify_missing_service_fails_safely() -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["target"],
+    )
+    child = _notify_child_job(["target"])
+    backend = _FakeBackend([child])
+    backend.jobs_by_id[parent.id] = parent
+    runner = _workflow_runner(backend)
+
+    assert runner._notify_service is None
+    assert runner.run_once() is True
+
+    assert backend.failed == [("notify-child", "notify_service_unavailable")]
+    assert backend.completed == []
+
+
+def test_worker_notify_missing_parent_fails_safely() -> None:
+    child = _notify_child_job(["target"])
+    backend = _FakeBackend([child])
+    channel = _DagNotifyChannel()
+    runner = _workflow_runner(backend)
+    runner._notify_service = WorkflowNotifyService(
+        lambda ref: "unused",
+        {"webhook": channel},
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.get_job_calls == ["parent-run"]
+    assert backend.failed == [("notify-child", "notify_parent_unavailable")]
+    assert backend.completed == []
+    assert channel.calls == []
+
+
+def test_worker_notify_cancellation_before_dispatch_does_not_send() -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["target"],
+    )
+    child = _notify_child_job(["target"])
+    backend = _FakeBackend([child])
+    backend.jobs_by_id[parent.id] = parent
+    backend.cancel_after_checks = 1
+    channel = _DagNotifyChannel()
+    runner = _workflow_runner(backend)
+    runner._notify_service = WorkflowNotifyService(
+        lambda ref: "unused",
+        {"webhook": channel},
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.cancelled == [("notify-child", "cancel requested")]
+    assert backend.get_job_calls == []
+    assert channel.calls == []
+    assert backend.completed == []
 
 
 class _RecordingNotifyService:

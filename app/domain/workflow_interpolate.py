@@ -12,8 +12,8 @@
   数字裸出、字符串单引号 + ``'``→``''`` 转义、**空 list → ``NULL``**(避免 ``IN ()``
   语法错);
 - ``${var | csv}`` —— 逗号拼接、无引号(数字 ID 用;元素已在入口过安全字符集校验);
-- **不支持节点输出引用** ``${nodes.*}`` / 含 ``.`` 的引用(2.0 首版子 job 产物是
-  ResultRef 不是自由 dict,与 ``when`` 口径一致);
+- ``${nodes.<id>.<field>}`` —— 仅消费调用方提供的标量白名单输出;完整占位符
+  保留类型,嵌入字符串时转字符串;不开放任意 ResultRef metadata;
 - **未知过滤器**(除 sql_in / csv 外)→ 显式报错,不静默放行;
 - **裸 ``${var}`` 解析到 list → 报错**(``list_variable_requires_filter``):list 只能
   经 sql_in / csv 消费,绝不被误 stringify 成 ``['a','b']`` 拼进 SQL。
@@ -31,6 +31,13 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from typing import Any
+
+from app.domain.workflow_outputs import (
+    NodeOutputMap,
+    NodeOutputReferenceError,
+    parse_node_output_reference,
+    resolve_node_output,
+)
 
 __all__ = [
     "ParamInterpolationError",
@@ -53,31 +60,40 @@ class ParamInterpolationError(ValueError):
 def interpolate_payload(
     payload: Mapping[str, Any],
     variables: Mapping[str, str | list[str]],
+    *,
+    node_outputs: NodeOutputMap | None = None,
 ) -> dict[str, Any]:
     """递归渲染 payload 里所有字符串中的 ``${var}`` / ``${var | filter}`` 占位符。
 
     - dict / list 递归下钻;str 做替换;其余类型(int/float/bool/None 等)原样透传;
     - ``${name}`` 中 ``name`` 不在 ``variables`` → :class:`ParamInterpolationError`
       (消息只含变量名);
-    - ``${nodes.*}`` / 含 ``.`` 的引用 → 不支持(不开放节点输出取值);
+    - ``${nodes.<id>.<field>}`` 从 ``node_outputs`` 读取受控标量;
     - ``${x | sql_in}`` / ``${x | csv}`` → 过滤器展开;未知过滤器 → 报错;
     - 裸 ``${listvar}``(无过滤器)解析到 list → 报错(list 必须经过滤器消费)。
 
     返回全新 dict(不原地修改入参)。
     """
+    outputs = node_outputs or {}
     rendered: dict[str, Any] = {
-        key: _interpolate_value(value, variables) for key, value in payload.items()
+        key: _interpolate_value(value, variables, outputs) for key, value in payload.items()
     }
     return rendered
 
 
-def _interpolate_value(value: Any, variables: Mapping[str, str | list[str]]) -> Any:
+def _interpolate_value(
+    value: Any,
+    variables: Mapping[str, str | list[str]],
+    node_outputs: NodeOutputMap,
+) -> Any:
     if isinstance(value, str):
-        return _interpolate_str(value, variables)
+        return _interpolate_str(value, variables, node_outputs)
     if isinstance(value, Mapping):
-        return {key: _interpolate_value(item, variables) for key, item in value.items()}
+        return {
+            key: _interpolate_value(item, variables, node_outputs) for key, item in value.items()
+        }
     if isinstance(value, list):
-        return [_interpolate_value(item, variables) for item in value]
+        return [_interpolate_value(item, variables, node_outputs) for item in value]
     # 非字符串标量 / 非容器:原样透传(占位符只在字符串里生效)
     return value
 
@@ -119,13 +135,35 @@ def _format_csv(value: str | list[str]) -> str:
     return ",".join(elements)
 
 
-def _interpolate_str(text: str, variables: Mapping[str, str | list[str]]) -> str:
+def _interpolate_str(
+    text: str,
+    variables: Mapping[str, str | list[str]],
+    node_outputs: NodeOutputMap,
+) -> Any:
+    exact = _PLACEHOLDER_RE.fullmatch(text)
+    if exact is not None:
+        exact_expr = exact.group(1).strip()
+        if parse_node_output_reference(exact_expr) is not None:
+            try:
+                return resolve_node_output(exact_expr, node_outputs)
+            except NodeOutputReferenceError as exc:
+                raise ParamInterpolationError(str(exc)) from exc
+
     def replace(match: re.Match[str]) -> str:
         expr = match.group(1).strip()
+        if parse_node_output_reference(expr) is not None:
+            try:
+                return str(resolve_node_output(expr, node_outputs))
+            except NodeOutputReferenceError as exc:
+                raise ParamInterpolationError(str(exc)) from exc
         if "|" in expr:
-            raw_name, _, raw_filter = expr.partition("|")
+            raw_name, _, raw_filter = expr.rpartition("|")
             name = raw_name.strip()
             filter_name = raw_filter.strip()
+            if parse_node_output_reference(name) is not None:
+                raise ParamInterpolationError("unsupported_node_output_filter")
+            if name.startswith("nodes."):
+                raise ParamInterpolationError("invalid_node_output_reference")
             value = _resolve_variable(name, variables, expr)
             if filter_name == "sql_in":
                 return _format_sql_in(value)
@@ -133,6 +171,8 @@ def _interpolate_str(text: str, variables: Mapping[str, str | list[str]]) -> str
                 return _format_csv(value)
             # 未知过滤器:显式报错,消息带原始表达式(无取值)
             raise ParamInterpolationError(f"unsupported_param_filter: {expr}")
+        if expr.startswith("nodes."):
+            raise ParamInterpolationError("invalid_node_output_reference")
         value = _resolve_variable(expr, variables, expr)
         # ★ 裸 ${listvar}(无过滤器)禁止:list 只能经 sql_in / csv 消费,
         # 绝不被误 stringify 成 "['a','b']" 拼进 SQL(消息只含变量名,R5)

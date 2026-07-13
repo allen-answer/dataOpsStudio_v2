@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from email.message import EmailMessage
 
 import pytest
+from structlog.testing import capture_logs
 
 from app.domain.notify import NotifyResult, NotifyTarget, RunNotification
 from app.domain.secret import SecretKind, SecretRef
@@ -29,6 +30,7 @@ from app.services.notify.service import WorkflowNotifyService
 
 # ★ 含 token 的整条 url —— 断言它绝不出现在返回 / 日志里(R5)。
 SECRET_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=SUPERSECRETTOKEN123"
+MESSAGE_SENTINEL = "dag-message-sentinel"
 
 
 def make_target(**overrides: object) -> NotifyTarget:
@@ -124,6 +126,37 @@ def test_webhook_posts_raw_payload(fake_urlopen: _FakeUrlopen) -> None:
     assert body["run_job_id"] == "job-9"
 
 
+def test_webhook_without_message_preserves_pre_message_json_shape(
+    fake_urlopen: _FakeUrlopen,
+) -> None:
+    WebhookChannel().send(make_target(), make_payload(), reveal=_RecordingReveal())
+
+    body = fake_urlopen.recorded[0].body
+    assert body == {
+        "workflow_id": "w1",
+        "workflow_name": "nightly",
+        "project": None,
+        "run_job_id": "job-9",
+        "trigger": None,
+        "status": "failed",
+        "started_at": None,
+        "finished_at": None,
+        "elapsed_seconds": None,
+        "error": "boom",
+        "node_status_counts": {},
+    }
+    assert "message" not in body
+
+
+def test_webhook_json_includes_provided_message(fake_urlopen: _FakeUrlopen) -> None:
+    WebhookChannel().send(
+        make_target(),
+        make_payload(message=MESSAGE_SENTINEL),
+        reveal=_RecordingReveal(),
+    )
+    assert fake_urlopen.recorded[0].body["message"] == MESSAGE_SENTINEL
+
+
 def test_webhook_timeout_passed_through(fake_urlopen: _FakeUrlopen) -> None:
     WebhookChannel().send(make_target(timeout_seconds=7), make_payload(), reveal=_RecordingReveal())
     assert fake_urlopen.recorded[0].timeout == 7
@@ -149,6 +182,16 @@ def test_wecom_markdown_template(fake_urlopen: _FakeUrlopen) -> None:
     assert "Workflow failed: nightly" in content
     assert "run: job-9" in content
     assert "error: boom" in content
+
+
+def test_wecom_markdown_includes_provided_message(fake_urlopen: _FakeUrlopen) -> None:
+    WecomChannel().send(
+        make_target(channel="wecom"),
+        make_payload(message=MESSAGE_SENTINEL),
+        reveal=_RecordingReveal(),
+    )
+    content = fake_urlopen.recorded[0].body["markdown"]["content"]  # type: ignore[index]
+    assert MESSAGE_SENTINEL in content
 
 
 # ------------------------------------------------------------ 失败隔离(R5:不泄 url)
@@ -291,6 +334,15 @@ def test_email_sends_message(fake_smtp: _SMTPRecorder) -> None:
     assert "error: boom" in body
 
 
+def test_email_body_includes_provided_message(fake_smtp: _SMTPRecorder) -> None:
+    EmailChannel().send(
+        make_email_target(),
+        make_payload(message=MESSAGE_SENTINEL),
+        reveal=_RecordingRevealPassword(),
+    )
+    assert MESSAGE_SENTINEL in fake_smtp.sent[0].get_content()
+
+
 def test_email_timeout_passed_through(fake_smtp: _SMTPRecorder) -> None:
     EmailChannel().send(
         make_email_target(timeout_seconds=9), make_payload(), reveal=_RecordingRevealPassword()
@@ -403,6 +455,187 @@ def test_service_unknown_channel_recorded(fake_urlopen: _FakeUrlopen) -> None:
     assert len(results) == 1
     assert results[0].ok is False
     assert results[0].error == "unknown_channel"
+
+
+class _NodeRecordingChannel:
+    channel = "webhook"
+
+    def __init__(
+        self,
+        *,
+        failed_ids: set[str] | None = None,
+        raise_ids: set[str] | None = None,
+    ) -> None:
+        self.failed_ids = failed_ids or set()
+        self.raise_ids = raise_ids or set()
+        self.calls: list[str] = []
+
+    def send(
+        self,
+        target: NotifyTarget,
+        payload: RunNotification,
+        *,
+        reveal: object,
+    ) -> NotifyResult:
+        del payload, reveal
+        self.calls.append(target.id)
+        if target.id in self.raise_ids:
+            raise RuntimeError(
+                "raw-exception message=dag-message-sentinel "
+                "url=https://sensitive.invalid/hook password=smtp-password ref=ref-abc"
+            )
+        if target.id in self.failed_ids:
+            return NotifyResult(
+                channel=self.channel,
+                target_id=target.id,
+                ok=False,
+                error="http_error status=500",
+            )
+        return NotifyResult(channel=self.channel, target_id=target.id, ok=True)
+
+
+def test_notify_node_selects_only_target_ids_in_declared_order() -> None:
+    spec = _spec_with(
+        make_target(id="t1", events=["failed"]),
+        make_target(id="t2", events=["failed"]),
+        make_target(id="t3", events=["failed"]),
+    )
+    channel = _NodeRecordingChannel()
+
+    results = WorkflowNotifyService(
+        _RecordingReveal(),
+        channels={"webhook": channel},
+    ).notify_node(spec, ["t3", "t1"], make_payload(status="running"))
+
+    assert channel.calls == ["t3", "t1"]
+    assert [result.target_id for result in results] == ["t3", "t1"]
+
+
+def test_notify_node_skips_disabled_but_ignores_terminal_events() -> None:
+    spec = _spec_with(
+        make_target(id="disabled", enabled=False, events=["all"]),
+        make_target(id="event-mismatch", events=["failed"]),
+    )
+    channel = _NodeRecordingChannel()
+
+    results = WorkflowNotifyService(
+        _RecordingReveal(),
+        channels={"webhook": channel},
+    ).notify_node(
+        spec,
+        ["disabled", "event-mismatch"],
+        make_payload(status="running"),
+    )
+
+    assert channel.calls == ["event-mismatch"]
+    assert [result.target_id for result in results] == ["event-mismatch"]
+
+
+def test_notify_node_attempts_later_targets_after_failure() -> None:
+    spec = _spec_with(
+        make_target(id="first", events=["all"]),
+        make_target(id="second", events=["all"]),
+    )
+    channel = _NodeRecordingChannel(failed_ids={"first"})
+
+    results = WorkflowNotifyService(
+        _RecordingReveal(),
+        channels={"webhook": channel},
+    ).notify_node(spec, ["first", "second"], make_payload(status="running"))
+
+    assert channel.calls == ["first", "second"]
+    assert [result.ok for result in results] == [False, True]
+
+
+def test_notify_node_unknown_target_and_channel_are_safe_failures() -> None:
+    spec = _spec_with(make_target(id="known"))
+
+    results = WorkflowNotifyService(
+        _RecordingReveal(),
+        channels={},
+    ).notify_node(spec, ["missing", "known"], make_payload(status="running"))
+
+    assert [(result.target_id, result.error) for result in results] == [
+        ("missing", "unknown_target"),
+        ("known", "unknown_channel"),
+    ]
+
+
+def test_notify_node_logs_and_results_exclude_sensitive_failure_details() -> None:
+    spec = _spec_with(make_target(id="bad"))
+    channel = _NodeRecordingChannel(raise_ids={"bad"})
+    with capture_logs() as logs:
+        results = WorkflowNotifyService(
+            _RecordingReveal(),
+            channels={"webhook": channel},
+        ).notify_node(
+            spec,
+            ["bad"],
+            make_payload(status="running", message=MESSAGE_SENTINEL),
+        )
+
+    rendered = repr([result.model_dump() for result in results]) + repr(logs)
+    assert results[0].error == "channel_error"
+    for sensitive in (
+        MESSAGE_SENTINEL,
+        "sensitive.invalid",
+        "smtp-password",
+        "ref-abc",
+        "raw-exception",
+    ):
+        assert sensitive not in rendered
+
+
+def test_notify_node_normalizes_sensitive_channel_failure_result() -> None:
+    class _RawFailureChannel:
+        channel = "webhook"
+
+        def send(
+            self,
+            target: NotifyTarget,
+            payload: RunNotification,
+            *,
+            reveal: object,
+        ) -> NotifyResult:
+            del payload, reveal
+            return NotifyResult(
+                channel="https://sensitive.invalid/hook",
+                target_id="ref-abc",
+                ok=False,
+                error=(
+                    "response-body raw-exception dag-message-sentinel "
+                    "https://sensitive.invalid/hook smtp-password ref-abc"
+                ),
+            )
+
+    spec = _spec_with(make_target(id="bad"))
+    results = WorkflowNotifyService(
+        _RecordingReveal(),
+        channels={"webhook": _RawFailureChannel()},
+    ).notify_node(
+        spec,
+        ["bad"],
+        make_payload(status="running", message=MESSAGE_SENTINEL),
+    )
+
+    assert results == [
+        NotifyResult(
+            channel="webhook",
+            target_id="bad",
+            ok=False,
+            error="delivery_failed",
+        )
+    ]
+    rendered = repr([result.model_dump() for result in results])
+    for sensitive in (
+        MESSAGE_SENTINEL,
+        "sensitive.invalid",
+        "smtp-password",
+        "ref-abc",
+        "response-body",
+        "raw-exception",
+    ):
+        assert sensitive not in rendered
 
 
 def test_default_channels_registry() -> None:

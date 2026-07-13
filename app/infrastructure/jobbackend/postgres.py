@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, TypeVar
 
 from sqlalchemy import RowMapping, delete, insert, select, text, update
@@ -53,6 +54,7 @@ class PostgresJobBackend(JobBackend):
                     project_id=job.project_id,
                     datasource_ids=job.datasource_ids,
                     priority=job.priority,
+                    available_at=job.available_at,
                     timeout_seconds=job.timeout_seconds,
                     resource_profile=job.resource_profile.model_dump(),
                     result_ref=_result_ref_to_json(job.result_ref),
@@ -85,6 +87,7 @@ class PostgresJobBackend(JobBackend):
                 SELECT id
                 FROM jobs
                 WHERE status = 'pending'
+                  AND available_at <= now()
                 ORDER BY priority DESC, created_at ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
@@ -208,9 +211,15 @@ class PostgresJobBackend(JobBackend):
 
         return self._read(op)
 
-    def requeue_workflow_run(self, job_id: str) -> None:
-        """workflow_run 推进一步后让位:running → pending(高频,不写事件)。"""
+    def requeue_workflow_run(
+        self,
+        job_id: str,
+        *,
+        available_at: datetime | None = None,
+    ) -> None:
+        """workflow_run 推进一步后让位,并可在队列中延后下一次领取。"""
         worker_id = self._require_worker_id("requeue_workflow_run")
+        next_available_at = available_at if available_at is not None else text("now()")
 
         def op(conn: Connection) -> None:
             conn.execute(
@@ -223,6 +232,7 @@ class PostgresJobBackend(JobBackend):
                     worker_id=None,
                     started_at=None,
                     last_heartbeat=None,
+                    available_at=next_available_at,
                 )
             )
 
@@ -244,6 +254,7 @@ class PostgresJobBackend(JobBackend):
                     finished_at=None,
                     error=None,
                     error_code=None,
+                    available_at=text("now()"),
                     retry_count=jobs.c.retry_count + 1,
                 )
             )
@@ -476,6 +487,7 @@ def _job_from_row(row: RowMapping) -> Job:
         project_id=str(row["project_id"]),
         datasource_ids=list(row["datasource_ids"] or []),
         priority=int(row["priority"]),
+        available_at=row["available_at"],
         timeout_seconds=int(row["timeout_seconds"]),
         resource_profile=ResourceProfile.model_validate(row["resource_profile"] or {}),
         result_ref=ResultRef.model_validate(result_ref_payload) if result_ref_payload else None,
@@ -487,6 +499,7 @@ def _job_from_row(row: RowMapping) -> Job:
         cancel_requested=bool(row["cancel_requested"]),
         cancel_reason=str(row["cancel_reason"]) if row["cancel_reason"] is not None else None,
         error=str(row["error"]) if row["error"] is not None else None,
+        error_code=row["error_code"],
         retry_count=int(row["retry_count"]),
         payload=dict(row["payload"] or {}),
         parent_workflow_run_id=_optional_str(row["parent_workflow_run_id"]),

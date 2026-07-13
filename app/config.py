@@ -18,6 +18,8 @@
   DATAOPS_API_DOWNLOAD_URL_TTL_SECONDS
 - DATAOPS_FRONTEND_DIST(前端 dist 目录;设置即 API 进程伺服 SPA,默认 API-only)
 - DATAOPS_WORKER_WORKER_ID / DATAOPS_WORKER_MAX_CONCURRENT_JOBS / ...
+- DATAOPS_SCHEDULER_ENABLED / DATAOPS_SCHEDULER_TICK_INTERVAL_SECONDS /
+  DATAOPS_SCHEDULER_TIMEZONE
 - DATAOPS_RESULT_BACKEND / DATAOPS_RESULT_LOCAL_ROOT / DATAOPS_RESULT_SQL_EXPORT_TTL_HOURS /
   DATAOPS_RESULT_EXPORT_LIMIT_MB / ...
 - DATAOPS_AI_ENABLED / DATAOPS_AI_PROVIDER / DATAOPS_AI_MAX_AUTO_EGRESS_LEVEL / ...
@@ -28,9 +30,11 @@ from __future__ import annotations
 
 from enum import StrEnum
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from tzlocal import get_localzone
 
 
 class Form(StrEnum):
@@ -125,6 +129,10 @@ class WorkerConfig(BaseSettings):
     workflow_node_default_max_retries: int = 0
 
 
+def _local_scheduler_timezone() -> ZoneInfo:
+    return get_localzone()
+
+
 class SchedulerConfig(BaseSettings):
     """Workflow cron 调度 tick 配置(PR-4b / ADR-0009 §1)。
 
@@ -133,10 +141,27 @@ class SchedulerConfig(BaseSettings):
     单 API 实例是受支持拓扑;HA 多实例去重后置(ADR-0009 Non-Goals)。
     """
 
-    model_config = SettingsConfigDict(env_prefix="DATAOPS_SCHEDULER_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="DATAOPS_SCHEDULER_",
+        extra="ignore",
+        arbitrary_types_allowed=True,
+    )
 
     enabled: bool = True
     tick_interval_seconds: float = Field(default=30.0, ge=1.0, le=3600.0)
+    timezone: ZoneInfo = Field(default_factory=_local_scheduler_timezone)
+
+    @field_validator("timezone", mode="before")
+    @classmethod
+    def _validate_timezone(cls, value: object) -> ZoneInfo:
+        if isinstance(value, ZoneInfo):
+            return value
+        if isinstance(value, str):
+            try:
+                return ZoneInfo(value)
+            except (ValueError, ZoneInfoNotFoundError):
+                pass
+        raise ValueError("invalid_scheduler_timezone")
 
 
 class ResultStoreConfig(BaseSettings):

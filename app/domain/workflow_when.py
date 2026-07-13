@@ -5,9 +5,8 @@
 - ``${var}`` 占位符 + JS 风格糖(``&&`` / ``||`` / ``!`` / ``null/true/false``);
 - 仅允许字面量、比较、布尔运算(AST 白名单同 1.x:无函数调用 / 属性访问 /
   下标 / 推导式 / 赋值 / 裸标识符);
-- 变量只开放内置确定性集合 ``today / now / year / month / day``
-  (1.x 的 ``${nodes.<id>.<path>}`` 节点输出引用不移植:2.0 子 job 产物是
-  ResultRef 不是自由 dict,首版不开放跨节点取值)。
+- 变量开放冻结快照;2.4.x 另允许调用方传入的
+  ``${nodes.<id>.<whitelisted-field>}`` 标量输出,不读取自由 ResultRef。
 
 ★ 安全:1.x 白名单校验后仍走 ``eval(compile(...))``;2.0 **禁止 eval/exec**,
 改为对白名单 AST 直接递归解释执行,不存在代码执行面。
@@ -21,6 +20,12 @@ from collections.abc import Mapping
 from datetime import datetime
 
 from app.domain.workflow import MAX_WHEN_LENGTH
+from app.domain.workflow_outputs import (
+    NodeOutputMap,
+    NodeOutputReferenceError,
+    parse_node_output_reference,
+    resolve_node_output,
+)
 
 __all__ = [
     "WhenEvaluationError",
@@ -104,7 +109,12 @@ def when_variables_from_payload(
     return dict(raw)
 
 
-def evaluate_when(expression: str | None, variables: Mapping[str, str | list[str]]) -> bool:
+def evaluate_when(
+    expression: str | None,
+    variables: Mapping[str, str | list[str]],
+    *,
+    node_outputs: NodeOutputMap | None = None,
+) -> bool:
     """求值 ``when`` 表达式;空 / 空白 = True(总是执行)。
 
     任何非法构造 / 未知变量 / 类型不可比 → :class:`WhenEvaluationError`。
@@ -122,7 +132,7 @@ def evaluate_when(expression: str | None, variables: Mapping[str, str | list[str
     sugared = re.sub(r"\bnull\b", "None", sugared)
     sugared = re.sub(r"\btrue\b", "True", sugared)
     sugared = re.sub(r"\bfalse\b", "False", sugared)
-    rendered = _interpolate(sugared, variables)
+    rendered = _interpolate(sugared, variables, node_outputs or {})
     # 行首 `!` 替换成 ` not ` 会留出前导空格,eval 模式会当缩进错误,strip 掉
     rendered = rendered.strip()
     try:
@@ -138,13 +148,20 @@ def evaluate_when(expression: str | None, variables: Mapping[str, str | list[str
     return bool(_eval_node(tree.body))
 
 
-def _interpolate(expression: str, variables: Mapping[str, str | list[str]]) -> str:
+def _interpolate(
+    expression: str,
+    variables: Mapping[str, str | list[str]],
+    node_outputs: NodeOutputMap,
+) -> str:
     def replace(match: re.Match[str]) -> str:
         name = match.group(1).strip()
+        if parse_node_output_reference(name) is not None:
+            try:
+                return repr(resolve_node_output(name, node_outputs))
+            except NodeOutputReferenceError as exc:
+                raise WhenEvaluationError(str(exc)) from exc
         if name.startswith("nodes."):
-            raise WhenEvaluationError(
-                "unsupported_when_reference: 2.0 首版 when 不支持节点输出引用 ${nodes.*}"
-            )
+            raise WhenEvaluationError("invalid_node_output_reference")
         if name not in variables:
             raise WhenEvaluationError(f"unknown_when_variable: 未知变量 {name!r}")
         value = variables[name]

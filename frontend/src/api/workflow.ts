@@ -47,7 +47,11 @@ export const SUPPORTED_WORKFLOW_NODE_KINDS = [
   'compare_run',
   'lineage_analyze',
   'export_excel',
+  'notify',
+  'sleep',
+  'branch',
 ] as const
+export type WorkflowNodeKind = (typeof SUPPORTED_WORKFLOW_NODE_KINDS)[number]
 
 // ── 通知渠道 / 事件(notify.py Literal)──────────────────────────────
 export type NotifyChannel = 'webhook' | 'wecom' | 'email'
@@ -67,19 +71,30 @@ export interface CronSchedule {
 export interface WorkflowEdge {
   source: string
   target: string
+  trigger: 'success' | 'failure'
+  when: string | null
+  is_default: boolean
 }
 
 export type WorkflowOnFailure = 'abort' | 'continue' | 'branch'
 
 export interface WorkflowNode {
   id: string
-  job_kind: string
+  job_kind: WorkflowNodeKind
   // 节点参数(形状按 kind 而异;v1 只读展示,不做按 kind 表单)。
   payload: Record<string, unknown>
   retry_policy: RetryPolicy | null
   timeout_seconds: number
   on_failure: WorkflowOnFailure
   when: string | null
+}
+
+export interface WorkflowSensor {
+  sql: string
+  datasource_id: string
+  check_interval_seconds: number
+  cooldown_seconds: number
+  enabled: boolean
 }
 
 /**
@@ -108,6 +123,7 @@ export interface WorkflowSpec {
   nodes: WorkflowNode[]
   edges: WorkflowEdge[]
   schedule: CronSchedule | null
+  sensor: WorkflowSensor | null
   notifications: NotifyTargetInSpec[]
   variables: Record<string, WorkflowVariableValue>
 }
@@ -143,11 +159,13 @@ export interface WorkflowResponse {
 export interface WorkflowCreateRequest {
   name: string
   spec: Record<string, unknown>
+  enabled?: boolean
 }
 
 export interface WorkflowUpdateRequest {
   name: string
   spec: Record<string, unknown>
+  enabled?: boolean
 }
 
 // ── Run 触发 / 状态 / 历史(schemas.py)────────────────────────────────
@@ -179,6 +197,7 @@ export interface WorkflowRunNodeItem {
   job_id: string | null
   attempts: number
   error: string | null
+  outputs: Record<string, string | number | boolean | null>
 }
 
 export interface WorkflowRunStatusResponse {

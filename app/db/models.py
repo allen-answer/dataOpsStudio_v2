@@ -257,6 +257,12 @@ jobs = Table(
         server_default=text("'{}'::varchar[]"),
     ),
     Column("priority", Integer(), nullable=False, server_default="0"),
+    Column(
+        "available_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    ),
     Column("timeout_seconds", Integer(), nullable=False),
     # resource_profile —— Step 0 补,与设计稿 §2.5 对齐
     Column(
@@ -283,6 +289,7 @@ jobs = Table(
     # ★ 关键:status='pending' 偏序索引;FOR UPDATE SKIP LOCKED 走这条极小索引
     Index(
         "ix_jobs_queue_pending",
+        "available_at",
         "priority",
         "created_at",
         postgresql_where=text("status = 'pending'"),

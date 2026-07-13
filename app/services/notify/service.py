@@ -71,3 +71,82 @@ class WorkflowNotifyService:
                     )
                 )
         return results
+
+    def notify_node(
+        self,
+        spec: WorkflowSpec,
+        target_ids: list[str],
+        payload: RunNotification,
+    ) -> list[NotifyResult]:
+        """Deliver a DAG Notify node without applying terminal-event filters.
+
+        Targets are resolved from the frozen parent WorkflowSpec and processed
+        in the node-declared order. Disabled targets are successful no-ops.
+        Per-target failures are returned so the worker can fail/retry the child
+        after every enabled target has been attempted.
+        """
+        targets_by_id = {target.id: target for target in spec.notifications}
+        results: list[NotifyResult] = []
+        for target_id in target_ids:
+            target = targets_by_id.get(target_id)
+            if target is None:
+                _log.warning(
+                    "notify target unknown",
+                    channel="unknown",
+                    target_id=target_id,
+                    reason="unknown_target",
+                )
+                results.append(
+                    NotifyResult(
+                        channel="unknown",
+                        target_id=target_id,
+                        ok=False,
+                        error="unknown_target",
+                    )
+                )
+                continue
+            if not target.enabled:
+                continue
+            channel = self._channels.get(target.channel)
+            if channel is None:
+                _log.warning(
+                    "notify channel unknown",
+                    channel=target.channel,
+                    target_id=target.id,
+                    reason="unknown_channel",
+                )
+                results.append(
+                    NotifyResult(
+                        channel=target.channel,
+                        target_id=target.id,
+                        ok=False,
+                        error="unknown_channel",
+                    )
+                )
+                continue
+            try:
+                channel_result = channel.send(target, payload, reveal=self._reveal)
+                results.append(
+                    NotifyResult(
+                        channel=target.channel,
+                        target_id=target.id,
+                        ok=channel_result.ok,
+                        error=None if channel_result.ok else "delivery_failed",
+                    )
+                )
+            except Exception:
+                _log.warning(
+                    "notify target failed",
+                    channel=target.channel,
+                    target_id=target.id,
+                    reason="channel_error",
+                )
+                results.append(
+                    NotifyResult(
+                        channel=target.channel,
+                        target_id=target.id,
+                        ok=False,
+                        error="channel_error",
+                    )
+                )
+        return results

@@ -33,6 +33,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import structlog
 from croniter import croniter
@@ -50,6 +51,7 @@ if TYPE_CHECKING:
     from app.api.services import ApiServices
 
 logger = structlog.get_logger(__name__)
+_UTC_TIMEZONE = ZoneInfo("UTC")
 
 
 def _new_id() -> str:
@@ -57,8 +59,13 @@ def _new_id() -> str:
     return str(uuid4())
 
 
-def most_recent_fire(cron_expr: str, now: datetime) -> datetime | None:
-    """<= ``now`` 的最近 cron 触发点(时区随 ``now``,建议传 aware UTC)。
+def most_recent_fire(
+    cron_expr: str,
+    now: datetime,
+    *,
+    timezone: ZoneInfo = _UTC_TIMEZONE,
+) -> datetime | None:
+    """<= ``now`` 的最近 cron 触发点(按 ``timezone`` 求值,返回 aware UTC)。
 
     表达式不可解析返回 ``None``(创建期已 croniter 校验,运行期这里再兜一道)。
     croniter ``get_prev`` 取严格早于基点的触发点;传入 ``now`` 时,秒级精度下
@@ -67,11 +74,14 @@ def most_recent_fire(cron_expr: str, now: datetime) -> datetime | None:
     """
     if not croniter.is_valid(cron_expr):
         return None
-    itr = croniter(cron_expr, now)
+    now_utc = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
+    itr = croniter(cron_expr, now_utc.astimezone(timezone))
     prev = itr.get_prev(datetime)
     if not isinstance(prev, datetime):  # 防御:croniter 类型宽松
         return None
-    return prev
+    if prev.tzinfo is None:
+        prev = prev.replace(tzinfo=timezone)
+    return prev.astimezone(UTC)
 
 
 class ScheduleAction(Enum):
@@ -93,6 +103,7 @@ def evaluate_schedule(
     cron: str | None,
     now: datetime,
     last_fired: datetime | None,
+    timezone: ZoneInfo = _UTC_TIMEZONE,
 ) -> ScheduleDecision:
     """纯决策(无 IO,单测核心):给定调度状态 → SKIP / SEED / FIRE。
 
@@ -101,13 +112,15 @@ def evaluate_schedule(
     """
     if not enabled or not schedule_enabled or not cron:
         return ScheduleDecision(ScheduleAction.SKIP, None)
-    fire_at = most_recent_fire(cron, now)
+    fire_at = most_recent_fire(cron, now, timezone=timezone)
     if fire_at is None:
         return ScheduleDecision(ScheduleAction.SKIP, None)
     if last_fired is None:
         return ScheduleDecision(ScheduleAction.SEED, fire_at)
     if last_fired.tzinfo is None:
         last_fired = last_fired.replace(tzinfo=UTC)
+    else:
+        last_fired = last_fired.astimezone(UTC)
     if fire_at > last_fired:
         return ScheduleDecision(ScheduleAction.FIRE, fire_at)
     return ScheduleDecision(ScheduleAction.SKIP, None)
@@ -261,12 +274,41 @@ def _enqueue_in_txn(conn: Connection, job: Job) -> None:
     PostgresJobBackend(conn).enqueue(job)
 
 
+def _locked_workflow_execution_row(
+    conn: Connection,
+    workflow_id: str,
+) -> dict[str, object] | None:
+    row = (
+        conn.execute(
+            select(
+                workflows.c.id,
+                workflows.c.project_id,
+                workflows.c.name,
+                workflows.c.created_by,
+                workflows.c.dag_jsonb,
+            )
+            .where(workflows.c.id == workflow_id)
+            .with_for_update()
+        )
+        .mappings()
+        .one_or_none()
+    )
+    return None if row is None else dict(row)
+
+
 class WorkflowScheduler:
     """进程内 cron tick 后台线程。start() 于 API 启动,stop() 于关闭。"""
 
-    def __init__(self, services: ApiServices, *, tick_interval_seconds: float) -> None:
+    def __init__(
+        self,
+        services: ApiServices,
+        *,
+        tick_interval_seconds: float,
+        timezone: ZoneInfo = _UTC_TIMEZONE,
+    ) -> None:
         self._services = services
         self._interval = tick_interval_seconds
+        self._timezone = timezone
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -356,6 +398,7 @@ class WorkflowScheduler:
             cron=cron if isinstance(cron, str) else None,
             now=now,
             last_fired=last_fired if isinstance(last_fired, datetime) else None,
+            timezone=self._timezone,
         )
         if decision.action is ScheduleAction.SKIP or decision.fire_at is None:
             return
@@ -366,6 +409,7 @@ class WorkflowScheduler:
         # SEED 与 FIRE 都在此认领(SEED 只推进锚点不入队),同一事务里连带入队 job。
         run_id: str | None = None
         owner_id: str | None = None
+        current_project_id: str | None = None
         with self._services.engine.begin() as conn:
             claimed = conn.execute(
                 update(workflows)
@@ -390,7 +434,10 @@ class WorkflowScheduler:
                     fire_at=fire_at.isoformat(),
                 )
                 return
-            created_by = row["created_by"]
+            current = _locked_workflow_execution_row(conn, workflow_id)
+            if current is None:
+                return
+            created_by = current["created_by"]
             if not isinstance(created_by, str) or not created_by:
                 # 创建者被删(created_by SET NULL):无法归属 owner(jobs.owner NOT NULL)。
                 # 锚点已推进 → 只告警一次(不逐 tick 刷屏),调度暂停至有人重存该 workflow。
@@ -400,23 +447,27 @@ class WorkflowScheduler:
                 )
                 return
             owner_id = created_by
-            spec = WorkflowSpec.model_validate(row["dag_jsonb"] or {})
+            current_project_id = str(current["project_id"])
+            spec = WorkflowSpec.model_validate(current["dag_jsonb"] or {})
             job = build_workflow_run_job(
                 workflow_id=workflow_id,
-                workflow_name=str(row["name"]),
-                project_id=str(row["project_id"]),
+                workflow_name=str(current["name"]),
+                project_id=current_project_id,
                 owner_user_id=owner_id,
                 spec=spec,
                 trigger="schedule",
-                now=now,
+                # Freeze built-ins at the nominal UTC fire point, not at a
+                # potentially delayed tick scan (ADR-0009 2.4.x addendum).
+                now=fire_at,
             )
             _enqueue_in_txn(conn, job)
             run_id = job.id
 
         # 到此只可能是 FIRE 已成功入队(其余分支均在事务内 return)。
+        assert current_project_id is not None
         self._services.write_audit(
             user_id=owner_id,
-            project_id=str(row["project_id"]),
+            project_id=current_project_id,
             action="workflow_run_trigger",
             resource_type="workflow",
             resource_id=workflow_id,
@@ -474,7 +525,6 @@ class WorkflowScheduler:
         if decision.action is SensorAction.SKIP:
             return
 
-        created_by = row["created_by"]
         prev_checked = last_checked if isinstance(last_checked, datetime) else None
         # 原子认领 sensor_last_checked_at(compare-and-swap 读到的旧值):单 API 实例本
         # 无竞争,此守卫顺带兜住 HA 多实例误重复(HA 去重仍属后置,ADR-0009 Non-Goals)。
@@ -492,6 +542,14 @@ class WorkflowScheduler:
             claimed = conn.execute(claim.values(sensor_last_checked_at=now)).rowcount
             if claimed != 1:
                 return
+            current = _locked_workflow_execution_row(conn, workflow_id)
+            if current is None:
+                return
+            spec = WorkflowSpec.model_validate(current["dag_jsonb"] or {})
+            sensor = spec.sensor
+            if sensor is None or not sensor.enabled:
+                return
+            created_by = current["created_by"]
             if not isinstance(created_by, str) or not created_by:
                 # 创建者被删(created_by SET NULL):无法归属 owner(jobs.owner NOT NULL)。
                 # 锚点已推进 → 只告警一次(不逐 tick 刷屏),sensor 暂停至有人重存该 workflow。
@@ -502,8 +560,8 @@ class WorkflowScheduler:
                 return
             job = build_sensor_check_job(
                 workflow_id=workflow_id,
-                workflow_name=str(row["name"]),
-                project_id=str(row["project_id"]),
+                workflow_name=str(current["name"]),
+                project_id=str(current["project_id"]),
                 owner_user_id=created_by,
                 datasource_id=sensor.datasource_id,
                 sensor_sql=sensor.sql,

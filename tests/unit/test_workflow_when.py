@@ -75,11 +75,32 @@ def test_forbidden_constructs_rejected(expression: str) -> None:
         evaluate_when(expression, _VARS)
 
 
-def test_unknown_variable_and_nodes_reference_rejected() -> None:
+def test_unknown_variable_and_unknown_node_output_rejected() -> None:
     with pytest.raises(WhenEvaluationError, match="unknown_when_variable"):
         evaluate_when("${no_such_var} == '1'", _VARS)
-    with pytest.raises(WhenEvaluationError, match="unsupported_when_reference"):
-        evaluate_when("${nodes.n1.rows} > 0", _VARS)
+    with pytest.raises(WhenEvaluationError, match="unresolved_node_output"):
+        evaluate_when(
+            "${nodes.n1.loaded_rows} > 0",
+            _VARS,
+            node_outputs={"n1": {}},
+        )
+
+
+def test_when_compares_scalar_node_outputs_without_string_coercion() -> None:
+    outputs: dict[str, dict[str, object]] = {
+        "compare": {"diff_count": 2, "status": "success"},
+        "lineage": {"cached": False},
+    }
+    assert evaluate_when(
+        "${nodes.compare.diff_count} > 0 && ${nodes.compare.status} == 'success'",
+        _VARS,
+        node_outputs=outputs,
+    )
+    assert not evaluate_when(
+        "${nodes.lineage.cached} == true",
+        _VARS,
+        node_outputs=outputs,
+    )
 
 
 def test_syntax_error_rejected() -> None:

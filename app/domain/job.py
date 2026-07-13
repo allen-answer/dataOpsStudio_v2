@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field
 
 from app.domain.resource import ResourceProfile
 from app.domain.result import ResultRef
@@ -29,6 +29,9 @@ class JobKind(StrEnum):
     SCENARIO_MATERIALIZE = "scenario_materialize"
     SCENARIO_RUN_ALL = "scenario_run_all"
     WORKFLOW_RUN = "workflow_run"
+    NOTIFY = "notify"
+    SLEEP = "sleep"
+    BRANCH = "branch"
     # C-10:sensor 数据到达检查(调度线程派发,worker 在 datasource 上跑只读 SQL,
     # 结果 truthy 则入队 workflow_run)。非 workflow 节点 kind(不在 ALLOWED_ 白名单)。
     WORKFLOW_SENSOR_CHECK = "workflow_sensor_check"
@@ -93,6 +96,7 @@ class Job(BaseModel):
     project_id: str
     datasource_ids: list[str] = Field(default_factory=list)
     priority: int
+    available_at: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC))
     timeout_seconds: int
     resource_profile: ResourceProfile  # 2.0.0 字段最小集,见 app/domain/resource.py
     result_ref: ResultRef | None = None

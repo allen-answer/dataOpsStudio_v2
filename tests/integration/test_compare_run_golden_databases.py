@@ -9,6 +9,7 @@ import importlib
 import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, cast
 
 import pytest
@@ -433,6 +434,10 @@ class _FakeBackend:
             update={"status": JobStatus.RUNNING, "worker_id": worker_id}
         )
 
+    def get_job(self, job_id: str) -> Job | None:
+        del job_id
+        return None
+
     def complete(self, job_id: str, result_ref: ResultRef) -> None:
         self.completed.append((job_id, result_ref))
 
@@ -469,8 +474,13 @@ class _FakeBackend:
         del parent_workflow_run_id
         return []
 
-    def requeue_workflow_run(self, job_id: str) -> None:
-        del job_id
+    def requeue_workflow_run(
+        self,
+        job_id: str,
+        *,
+        available_at: datetime | None = None,
+    ) -> None:
+        del job_id, available_at
 
     def retry_workflow_node(self, job_id: str) -> None:
         del job_id

@@ -20,6 +20,7 @@ from app.domain.job import Job, JobKind
 from app.domain.license import LicenseMode
 from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Index, Row, Schema, Table
+from app.domain.workflow import WorkflowSpec
 from tests._asgi_client import AsgiClient
 
 pytestmark = pytest.mark.contract
@@ -4363,6 +4364,32 @@ def test_workflow_create_contract_persists_spec_and_schedule_redundant_columns()
     assert any(audit["action"] == "workflow_create" for audit in services.audits)
 
 
+def test_workflow_create_explicit_false_persists_disabled() -> None:
+    disabled_row = _workflow_row()
+    disabled_row["enabled"] = False
+    engine = _FakeEngine([{"id": "project-1"}, None, disabled_row])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows",
+        headers=_auth_headers(),
+        json_body={
+            "name": "disabled-report",
+            "spec": _workflow_spec_payload(),
+            "enabled": False,
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["enabled"] is False
+    insert_statement = next(
+        statement
+        for statement in engine.executed
+        if str(statement).lstrip().upper().startswith("INSERT INTO WORKFLOWS")
+    )
+    assert insert_statement.compile().params["enabled"] is False
+
+
 def test_workflow_create_rejects_forbidden_node_kind_before_any_db_write() -> None:
     engine = _FakeEngine([])
     app = create_app(services=cast(ApiServices, _Services(engine)))
@@ -4385,11 +4412,52 @@ def test_workflow_create_rejects_unsupported_node_kind_distinct_from_forbidden()
     response = AsgiClient(app).post(
         "/api/projects/project-1/workflows",
         headers=_auth_headers(),
-        json_body={"name": "bad", "spec": _workflow_spec_payload(job_kind="notify")},
+        json_body={
+            "name": "bad",
+            "spec": _workflow_spec_payload(job_kind="scenario_materialize"),
+        },
     )
 
     assert response.status_code == 400
     assert response.json()["error"] == "unsupported_node_kind"
+    assert engine.statements == []
+
+
+def test_workflow_create_returns_unknown_notify_target_error_code() -> None:
+    spec = _workflow_spec_payload(job_kind="notify")
+    nodes = cast(list[dict[str, object]], spec["nodes"])
+    nodes[0]["payload"] = {"target_ids": ["missing-target"]}
+    engine = _FakeEngine([])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows",
+        headers=_auth_headers(),
+        json_body={"name": "bad-notify", "spec": spec},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "unknown_notify_target"
+    assert engine.statements == []
+
+
+def test_workflow_create_returns_code_only_node_output_reference_error() -> None:
+    raw_expression = "nodes.query.bad-field"
+    spec = _workflow_spec_payload()
+    nodes = cast(list[dict[str, object]], spec["nodes"])
+    nodes[0]["payload"] = {"sql": f"SELECT '${{{raw_expression}}}'"}
+    engine = _FakeEngine([])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/workflows",
+        headers=_auth_headers(),
+        json_body={"name": "bad-output-ref", "spec": spec},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_node_output_reference"
+    assert raw_expression not in response.body.decode("utf-8")
     assert engine.statements == []
 
 
@@ -4531,6 +4599,62 @@ def test_workflow_update_contract_revalidates_spec_and_syncs_schedule_columns() 
     assert any(audit["action"] == "workflow_update" for audit in services.audits)
 
 
+def test_workflow_update_omitted_enabled_preserves_disabled() -> None:
+    disabled_row = _workflow_row()
+    disabled_row["enabled"] = False
+    engine = _FakeEngine([{"id": "project-1"}, disabled_row, None, disabled_row])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={"name": "nightly-report", "spec": _workflow_spec_payload()},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["enabled"] is False
+    update_statement = next(
+        statement
+        for statement in engine.executed
+        if str(statement).lstrip().upper().startswith("UPDATE WORKFLOWS")
+    )
+    assert "enabled" not in update_statement.compile().params
+
+
+@pytest.mark.parametrize(("existing", "requested"), [(False, True), (True, False)])
+def test_workflow_update_explicit_enabled_toggles(
+    existing: bool,
+    requested: bool,
+) -> None:
+    existing_row = _workflow_row()
+    existing_row["enabled"] = existing
+    updated_row = _workflow_row()
+    updated_row["enabled"] = requested
+    engine = _FakeEngine([{"id": "project-1"}, existing_row, None, updated_row])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={
+            "name": "nightly-report",
+            "spec": _workflow_spec_payload(),
+            "enabled": requested,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["enabled"] is requested
+    update_statement = next(
+        statement
+        for statement in engine.executed
+        if str(statement).lstrip().upper().startswith("UPDATE WORKFLOWS")
+    )
+    assert update_statement.compile().params["enabled"] is requested
+
+
 def test_workflow_update_rejects_forbidden_node_kind_before_any_db_write() -> None:
     engine = _FakeEngine([])
     app = create_app(services=cast(ApiServices, _Services(engine)))
@@ -4581,6 +4705,44 @@ def test_workflow_update_omitting_notifications_preserves_existing_targets() -> 
     assert len(dag["notifications"]) == 1
     assert dag["notifications"][0]["id"] == "nt-1"
     assert dag["notifications"][0]["url_secret_ref"] == "secret-existing"
+    # PUT 必须与通知子资源写入串行化,否则两边从同一旧 dag_jsonb 回写会丢目标。
+    _assert_workflow_row_read_uses_for_update(engine)
+
+
+def test_workflow_update_omitting_notifications_validates_after_preserving_notify_refs() -> None:
+    existing = _workflow_row_with_notify_node()
+    request_spec = dict(cast(dict[str, Any], existing["dag_jsonb"]))
+    request_spec.pop("notifications")
+    engine = _FakeEngine([{"id": "project-1"}, existing, None, existing])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={"name": "nightly-report", "spec": request_spec},
+    )
+
+    assert response.status_code == 200
+    dag = _persisted_workflow_dag(engine)
+    assert dag["nodes"][0]["payload"]["target_ids"] == ["nt-1"]
+    assert dag["notifications"][0]["id"] == "nt-1"
+
+
+def test_workflow_update_explicit_empty_notifications_rejects_remaining_notify_refs() -> None:
+    request_spec = dict(cast(dict[str, Any], _workflow_row_with_notify_node()["dag_jsonb"]))
+    request_spec["notifications"] = []
+    engine = _FakeEngine([])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1",
+        headers=_auth_headers(),
+        json_body={"name": "nightly-report", "spec": request_spec},
+    )
+
+    assert response.status_code == 400
 
 
 def test_workflow_update_explicit_empty_notifications_clears_targets() -> None:
@@ -4714,6 +4876,52 @@ def _workflow_row_with_notification(
     return row
 
 
+def _workflow_row_with_notify_node() -> dict[str, object]:
+    row = _workflow_row_with_notification()
+    dag = dict(cast(dict[str, Any], row["dag_jsonb"]))
+    dag["nodes"] = [
+        {
+            "id": "notify-1",
+            "job_kind": "notify",
+            "payload": {"target_ids": ["nt-1"]},
+            "timeout_seconds": 60,
+        }
+    ]
+    row["dag_jsonb"] = dag
+    return row
+
+
+def _workflow_run_referencing_notification(
+    *,
+    target_id: str = "nt-1",
+    status: str = "running",
+) -> dict[str, object]:
+    return {
+        "status": status,
+        "payload": {
+            "workflow_id": "wf-1",
+            "spec": {
+                "nodes": [
+                    {
+                        "id": "notify-1",
+                        "job_kind": "notify",
+                        "payload": {"target_ids": [target_id]},
+                        "timeout_seconds": 60,
+                    }
+                ],
+                "edges": [],
+                "notifications": [
+                    {
+                        "id": target_id,
+                        "channel": "wecom",
+                        "url_secret_ref": "secret-frozen",
+                    }
+                ],
+            },
+        },
+    }
+
+
 def _persisted_workflow_dag(engine: _FakeEngine) -> dict[str, Any]:
     """从最近一条 UPDATE workflows 语句里 compile 出持久化的 dag_jsonb。"""
     statement = next(
@@ -4722,6 +4930,17 @@ def _persisted_workflow_dag(engine: _FakeEngine) -> dict[str, Any]:
         if str(stmt).lstrip().upper().startswith("UPDATE WORKFLOWS")
     )
     return dict(statement.compile().params["dag_jsonb"])
+
+
+def _assert_workflow_row_read_uses_for_update(engine: _FakeEngine) -> None:
+    workflow_reads = [
+        str(statement).upper()
+        for statement in engine.executed
+        if str(statement).lstrip().upper().startswith("SELECT")
+        and "FROM WORKFLOWS" in str(statement).upper()
+    ]
+    assert workflow_reads
+    assert any("FOR UPDATE" in statement for statement in workflow_reads)
 
 
 def test_workflow_notify_create_stores_ref_and_hides_url() -> None:
@@ -4756,6 +4975,8 @@ def test_workflow_notify_create_stores_ref_and_hides_url() -> None:
     assert "url" not in target
     assert _NOTIFY_URL not in json.dumps(dag)
     assert any(audit["action"] == "workflow_notify_add" for audit in services.audits)
+    # 先锁 workflow 行再读取 spec,避免并发 PUT 用旧快照覆盖新 target、孤儿化 ref。
+    _assert_workflow_row_read_uses_for_update(engine)
 
 
 def test_workflow_notify_create_unknown_workflow_returns_404_without_orphan_secret() -> None:
@@ -4822,7 +5043,7 @@ def test_workflow_notify_create_email_stores_password_ref_and_hides_it() -> None
 
 
 def test_workflow_notify_update_replaces_ref_and_deletes_old() -> None:
-    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification()])
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification(), []])
     secret_store = _SecretStore()
     services = _Services(engine, secret_store=secret_store)
     app = create_app(services=cast(ApiServices, services))
@@ -4847,10 +5068,11 @@ def test_workflow_notify_update_replaces_ref_and_deletes_old() -> None:
     assert dag["notifications"][0]["url_secret_ref"] == "secret-new"
     assert _NOTIFY_URL_ROTATED not in json.dumps(dag)
     assert any(audit["action"] == "workflow_notify_update" for audit in services.audits)
+    _assert_workflow_row_read_uses_for_update(engine)
 
 
 def test_workflow_notify_update_without_url_keeps_ref_and_stores_nothing() -> None:
-    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification()])
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification(), []])
     secret_store = _SecretStore()
     services = _Services(engine, secret_store=secret_store)
     app = create_app(services=cast(ApiServices, services))
@@ -4888,8 +5110,72 @@ def test_workflow_notify_update_unknown_target_returns_404() -> None:
     assert secret_store.stored == []
 
 
+def test_workflow_notify_update_rejects_target_referenced_by_active_frozen_run() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_row_with_notification(),
+            [_workflow_run_referencing_notification()],
+        ]
+    )
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1/notifications/nt-1",
+        headers=_auth_headers(),
+        json_body={"url": _NOTIFY_URL_ROTATED},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "workflow_notify_target_active_run"
+    assert secret_store.stored == []
+    assert secret_store.deleted == []
+    assert not any(
+        str(statement).lstrip().upper().startswith("UPDATE WORKFLOWS")
+        for statement in engine.executed
+    )
+
+
+def test_workflow_notify_update_rejects_target_referenced_by_pending_sensor_check() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_row_with_notification(),
+            [_workflow_run_referencing_notification(status="pending")],
+        ]
+    )
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/projects/project-1/workflows/wf-1/notifications/nt-1",
+        headers=_auth_headers(),
+        json_body={"url": _NOTIFY_URL_ROTATED},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "workflow_notify_target_active_run"
+    job_read = next(
+        statement
+        for statement in engine.executed
+        if str(statement).lstrip().upper().startswith("SELECT")
+        and "FROM JOBS" in str(statement).upper()
+    )
+    kind_values = [
+        value for key, value in job_read.compile().params.items() if key.startswith("kind_")
+    ]
+    assert kind_values == [["workflow_run", "workflow_sensor_check"]]
+    assert secret_store.stored == []
+    assert secret_store.deleted == []
+
+
 def test_workflow_notify_delete_removes_target_and_secret() -> None:
-    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification()])
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notification(), []])
     secret_store = _SecretStore()
     services = _Services(engine, secret_store=secret_store)
     app = create_app(services=cast(ApiServices, services))
@@ -4904,6 +5190,55 @@ def test_workflow_notify_delete_removes_target_and_secret() -> None:
     assert secret_store.deleted == ["secret-existing"]
     assert _persisted_workflow_dag(engine)["notifications"] == []
     assert any(audit["action"] == "workflow_notify_remove" for audit in services.audits)
+    _assert_workflow_row_read_uses_for_update(engine)
+
+
+def test_workflow_notify_delete_rejects_target_referenced_by_current_dag() -> None:
+    engine = _FakeEngine([{"id": "project-1"}, _workflow_row_with_notify_node()])
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "DELETE",
+        "/api/projects/project-1/workflows/wf-1/notifications/nt-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "workflow_notify_target_in_use"
+    assert secret_store.deleted == []
+    assert not any(
+        str(statement).lstrip().upper().startswith("UPDATE WORKFLOWS")
+        for statement in engine.executed
+    )
+
+
+def test_workflow_notify_delete_rejects_target_referenced_by_active_frozen_run() -> None:
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_row_with_notification(),
+            [_workflow_run_referencing_notification()],
+        ]
+    )
+    secret_store = _SecretStore()
+    services = _Services(engine, secret_store=secret_store)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "DELETE",
+        "/api/projects/project-1/workflows/wf-1/notifications/nt-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "workflow_notify_target_active_run"
+    assert secret_store.deleted == []
+    assert not any(
+        str(statement).lstrip().upper().startswith("UPDATE WORKFLOWS")
+        for statement in engine.executed
+    )
 
 
 def test_workflow_notify_delete_unknown_target_returns_404() -> None:
@@ -4955,6 +5290,7 @@ def test_workflow_run_trigger_contract_enqueues_workflow_run_job() -> None:
     assert set(frozen) == {"today", "now", "year", "month", "day"}
     assert all(isinstance(value, str) for value in frozen.values())
     assert any(audit["action"] == "workflow_run_trigger" for audit in services.audits)
+    _assert_workflow_row_read_uses_for_update(engine)
 
 
 def test_workflow_run_trigger_disabled_workflow_returns_409() -> None:
@@ -5121,6 +5457,213 @@ def test_workflow_run_status_contract_returns_run_and_node_states() -> None:
     assert node["attempts"] == 0
 
 
+@pytest.mark.parametrize(
+    ("job_kind", "metadata", "expected_kind_outputs"),
+    [
+        (
+            "sql_query",
+            {"result_set_id": "rs-1", "loaded_rows": 7},
+            {"result_set_id": "rs-1", "loaded_rows": 7},
+        ),
+        (
+            "sql_explain",
+            {"result_set_id": "rs-plan", "loaded_rows": 1},
+            {"result_set_id": "rs-plan", "loaded_rows": 1},
+        ),
+        (
+            "compare_run",
+            {
+                "run_id": "compare-1",
+                "bucket_counts": {"same": 11, "only_source": 2, "only_target": 3, "diff": 4},
+            },
+            {
+                "run_id": "compare-1",
+                "same_count": 11,
+                "only_source_count": 2,
+                "only_target_count": 3,
+                "diff_count": 4,
+            },
+        ),
+        (
+            "lineage_analyze",
+            {
+                "lineage_run_id": "lineage-1",
+                "cached": False,
+                "table_edge_count": 5,
+                "column_edge_count": 6,
+                "parse_error_count": 1,
+            },
+            {
+                "run_id": "lineage-1",
+                "cached": False,
+                "table_edge_count": 5,
+                "column_edge_count": 6,
+                "parse_error_count": 1,
+            },
+        ),
+        ("export_excel", {}, {}),
+        ("notify", {"sent_count": 2}, {"sent_count": 2}),
+        ("sleep", {"duration_seconds": 30}, {"duration_seconds": 30}),
+        ("branch", {"selected_target": "n2"}, {"selected_target": "n2"}),
+    ],
+)
+def test_workflow_run_status_returns_only_safe_scalar_node_outputs(
+    job_kind: str,
+    metadata: dict[str, object],
+    expected_kind_outputs: dict[str, object],
+) -> None:
+    sentinels = {
+        "rows": ["rows-sentinel"],
+        "password": "password-sentinel",
+        "token": "token-sentinel",
+        "message": "message-sentinel",
+        "nested": {"secret": "nested-sentinel"},
+        "unknown": "unknown-sentinel",
+    }
+    status_spec = _workflow_status_spec(job_kind)
+    WorkflowSpec.model_validate(status_spec)
+    run_row = _workflow_run_job_row(status="running")
+    cast(dict[str, Any], run_row["payload"])["spec"] = status_spec
+    child = _workflow_child_job_row(
+        "n1",
+        status="success",
+        job_kind=job_kind,
+        result_ref={
+            "backend": "test",
+            "uri": "uri-sentinel",
+            "metadata": {**metadata, **sentinels},
+        },
+    )
+    engine = _FakeEngine([{"id": "project-1"}, run_row, [child]])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflow-runs/run-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    node = response.json()["nodes"][0]
+    assert node["outputs"] == {
+        **expected_kind_outputs,
+        "status": "success",
+        "job_id": "child-1",
+        "error_code": None,
+    }
+    serialized = response.body.decode("utf-8")
+    for sentinel in (
+        "uri-sentinel",
+        "rows-sentinel",
+        "password-sentinel",
+        "token-sentinel",
+        "message-sentinel",
+        "nested-sentinel",
+        "unknown-sentinel",
+    ):
+        assert sentinel not in serialized
+
+
+def test_workflow_run_status_maps_child_error_code_into_common_outputs() -> None:
+    child = _workflow_child_job_row(
+        "n1",
+        status="failed",
+        error_code="sql_failed",
+    )
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_run_job_row(status="running"),
+            [child],
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflow-runs/run-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["nodes"][0]["outputs"] == {
+        "status": "failed",
+        "job_id": "child-1",
+        "error_code": "sql_failed",
+    }
+
+
+def test_workflow_run_status_malformed_result_ref_keeps_safe_common_outputs() -> None:
+    child = _workflow_child_job_row(
+        "n1",
+        status="success",
+        result_ref={
+            "backend": "test",
+            "uri": ["malformed-uri-sentinel"],
+            "metadata": {"result_set_id": "metadata-sentinel"},
+        },
+    )
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _workflow_run_job_row(status="running"),
+            [child],
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflow-runs/run-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["nodes"][0]["outputs"] == {
+        "status": "success",
+        "job_id": "child-1",
+        "error_code": None,
+    }
+    assert "malformed-uri-sentinel" not in response.body.decode("utf-8")
+    assert "metadata-sentinel" not in response.body.decode("utf-8")
+
+
+def test_workflow_run_status_invalid_spec_fallback_uses_safe_projection() -> None:
+    run_row = _workflow_run_job_row(status="running")
+    cast(dict[str, Any], run_row["payload"])["spec"] = {"nodes": "invalid-spec"}
+    child = _workflow_child_job_row(
+        "n1",
+        status="success",
+        result_ref={
+            "backend": "test",
+            "uri": "fallback-uri-sentinel",
+            "metadata": {
+                "result_set_id": "rs-fallback",
+                "loaded_rows": 3,
+                "rows": ["fallback-row-sentinel"],
+                "token": "fallback-token-sentinel",
+            },
+        },
+    )
+    engine = _FakeEngine([{"id": "project-1"}, run_row, [child]])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/workflow-runs/run-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["nodes"][0]["outputs"] == {
+        "result_set_id": "rs-fallback",
+        "loaded_rows": 3,
+        "status": "success",
+        "job_id": "child-1",
+        "error_code": None,
+    }
+    serialized = response.body.decode("utf-8")
+    assert "fallback-uri-sentinel" not in serialized
+    assert "fallback-row-sentinel" not in serialized
+    assert "fallback-token-sentinel" not in serialized
+
+
 def test_workflow_run_status_uses_configured_node_default_max_retries() -> None:
     # RetryPolicy=None 的失败节点:worker 若配 default_max_retries>=1 会重排(retry_wait)。
     # API 状态查询必须与 worker 同源读该配置,而非硬编码 0(否则展示为终态 failed,漂移)。
@@ -5211,6 +5754,7 @@ def test_workflow_runs_list_contract_returns_runs_desc() -> None:
     assert first["status"] == "success"
     # 节点明细不在列表项里(走单 run 状态端点)
     assert "nodes" not in first
+    assert "outputs" not in first
 
 
 def test_workflow_runs_list_has_more_when_over_limit() -> None:
@@ -5332,15 +5876,20 @@ def _workflow_child_job_row(
     *,
     status: str,
     job_id: str = "child-1",
+    job_kind: str = "sql_query",
+    error_code: str | None = None,
+    result_ref: object | None = None,
 ) -> dict[str, object]:
     return {
         "id": job_id,
-        "kind": "sql_query",
+        "kind": job_kind,
         "status": status,
         "owner_user_id": "user-1",
         "project_id": "project-1",
         "payload": {"sql": "SELECT 1", "workflow_node_id": node_id},
         "error": None,
+        "error_code": error_code,
+        "result_ref": result_ref,
         "retry_count": 0,
         "created_at": _dt(3),
         "started_at": _dt(4),
@@ -5359,6 +5908,44 @@ def _workflow_spec_payload(
         "edges": [],
         "schedule": schedule,
     }
+
+
+def _workflow_status_spec(job_kind: str) -> dict[str, object]:
+    payload_by_kind: dict[str, dict[str, object]] = {
+        "notify": {"target_ids": ["nt-1"]},
+        "sleep": {"duration_seconds": 30},
+    }
+    spec: dict[str, object] = {
+        "nodes": [
+            {
+                "id": "n1",
+                "job_kind": job_kind,
+                "payload": payload_by_kind.get(job_kind, {}),
+                "timeout_seconds": 60,
+            }
+        ],
+        "edges": [],
+    }
+    if job_kind == "branch":
+        cast(list[dict[str, object]], spec["nodes"]).extend(
+            [
+                {"id": "n2", "job_kind": "sql_query", "payload": {}, "timeout_seconds": 60},
+                {"id": "n3", "job_kind": "sql_query", "payload": {}, "timeout_seconds": 60},
+            ]
+        )
+        spec["edges"] = [
+            {"source": "n1", "target": "n2", "when": "1 == 1"},
+            {"source": "n1", "target": "n3", "is_default": True},
+        ]
+    if job_kind == "notify":
+        spec["notifications"] = [
+            {
+                "id": "nt-1",
+                "channel": "webhook",
+                "url_secret_ref": "secret-ref-1",
+            }
+        ]
+    return spec
 
 
 def _workflow_row() -> dict[str, object]:

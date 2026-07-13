@@ -12,7 +12,7 @@ The 2.0 job infrastructure already anticipates this: `Job.kind` includes `workfl
 Lessons from 1.x (`docs/legacy/V1_AS_IS.md` §5.2):
 
 - The 1.x engine (`services/workflow_engine.py`) had 5 node types: `params` / `compare` / `lineage` / `http` / `excel_export`. Topological execution by `depends_on`, single-node failure bypassed pure downstream as SKIPPED, `when:` expressions for conditional skip. These execution semantics proved useful in daily operation and are worth keeping.
-- The 1.x `http` node was removed in 2.0 and stays removed. An arbitrary-HTTP node holds secrets and calls arbitrary URLs from inside the data platform — an exfiltration and SSRF vector that contradicts R2/R7. Its one legitimate use (notifications) is replaced by a dedicated `notify` node restricted to a built-in webhook target whitelist.
+- The 1.x `http` node was removed in 2.0 and stays removed. An arbitrary-HTTP node holds secrets and calls arbitrary URLs from inside the data platform — an exfiltration and SSRF vector that contradicts R2/R7. Its one legitimate use (notifications) is replaced by a dedicated `notify` node restricted to existing configured Workflow notification targets (webhook, WeCom, or email).
 - 1.x scheduling used APScheduler with a polling-loop fallback. 2.0 does not want a new scheduler dependency or a new process.
 
 ## Decision
@@ -50,7 +50,7 @@ Workflow creation accepts only node kinds whose job implementations already exis
 sql_query / sql_explain / compare_run / lineage_analyze / export_excel
 ```
 
-`scenario_materialize` / `scenario_run_all` / `notify` / `sleep` / `branch` stay in `ALLOWED_WORKFLOW_NODE_KINDS` but are rejected at creation with `unsupported_node_kind`. This is deliberately distinct from the R7 *forbidden* semantics: forbidden kinds are never allowed on the 2.0 main line; unsupported kinds are whitelisted-but-not-yet-available and will be opened one by one as their dependencies land (scenario_* with Scenario Lab in 2.6.0; notify once the webhook target whitelist exists).
+`scenario_materialize` / `scenario_run_all` / `notify` / `sleep` / `branch` stay in `ALLOWED_WORKFLOW_NODE_KINDS` but are rejected at creation with `unsupported_node_kind`. This is deliberately distinct from the R7 *forbidden* semantics: forbidden kinds are never allowed on the 2.0 main line; unsupported kinds are whitelisted-but-not-yet-available and will be opened one by one as their dependencies land (scenario_* with Scenario Lab in 2.6.0; notify once configured Workflow notification targets exist for webhook, WeCom, or email).
 
 - Rationale: keeps the R7 whitelist (and its CI consistency tests) stable while gating actual availability at the API layer.
 
@@ -63,7 +63,7 @@ The full whitelist stays at 10 kinds (contract §4 R7):
  "scenario_run_all", "lineage_analyze", "export_excel", "notify", "sleep", "branch"}
 ```
 
-Forbidden — never on the 2.0 main line: shell / system command, Python script / arbitrary code execution, arbitrary HTTP request (secrets + arbitrary URLs; see the 1.x `http` lesson above), arbitrary direct DDL/DML execution, browser automation. `workflow_run` itself is also excluded from the whitelist: no workflow nesting. `notify` only targets a built-in webhook whitelist.
+Forbidden — never on the 2.0 main line: shell / system command, Python script / arbitrary code execution, arbitrary HTTP request (secrets + arbitrary URLs; see the 1.x `http` lesson above), arbitrary direct DDL/DML execution, browser automation. `workflow_run` itself is also excluded from the whitelist: no workflow nesting. `notify` only targets existing configured Workflow notification targets (webhook, WeCom, or email).
 
 ## Consequences
 
@@ -71,7 +71,42 @@ Forbidden — never on the 2.0 main line: shell / system command, Python script 
 - API restart delays scheduled triggers by at most one tick interval; missed windows are not backfilled in the first release.
 - Creating a workflow with a forbidden kind and with an unsupported kind must fail with distinguishable errors (R7 violation vs `unsupported_node_kind`).
 - R7 stops being dormant: 2.4.0 adds runtime validation (creation + enqueue) on top of the whitelist consistency tests already in CI.
-- 2.4.x roadmap inside the domain: `branch` semantics, `notify` (webhook whitelist), `sleep`; `scenario_*` opens with 2.6.0 Scenario Lab.
+- 2.4.x roadmap inside the domain: `branch` semantics, `notify` (configured webhook/WeCom/email targets), `sleep`; `scenario_*` opens with 2.6.0 Scenario Lab.
+
+## 2.4.x completion addendum (2026-07-11)
+
+The three intrinsic nodes deferred above are now opened without changing the R7 allowlist:
+`branch`, `notify`, and `sleep`. The supported set therefore contains eight kinds; the two
+`scenario_*` kinds remain unavailable until Scenario Lab.
+
+- Edges are additive and backward compatible: `trigger=success|failure`, optional `when`, and
+  `is_default`. Legacy edges remain ordinary success dependencies.
+- A join ignores only route paths proven inactive. Every active legacy success dependency must
+  still succeed; failed, cancelled, or node-level-skipped ordinary dependencies block the join.
+  Inactive branch paths propagate through skipped route nodes so selected success or compensation
+  paths can reconverge without weakening legacy fan-in semantics.
+- A branch uses edge declaration order, chooses the first true condition, and otherwise chooses
+  its single default. `on_failure=branch` uses the same rule on failure edges. Compensation never
+  rewrites the original failed run to success.
+- `${nodes.<node_id>.<field>}` exposes only scalar, kind-specific metadata from a topological
+  ancestor. Result rows, arbitrary ResultRef metadata/URI, SQL, and SecretRef values stay closed.
+- `notify` references existing configured Workflow notification targets (webhook/WeCom/email);
+  arbitrary HTTP remains forbidden.
+  `sleep` is a delayed queue job rather than a worker-blocking sleep.
+- Workflow definition updates, notification target create/update/delete, manual trigger, cron
+  dispatch, and sensor dispatch serialize on the Workflow row. Workflow updates that omit
+  `notifications` merge the locked current targets; the structured editor always omits this
+  dedicated subresource so a stale draft cannot restore rotated SecretRefs. Cron/sensor claims
+  re-read the locked current spec before freezing a job.
+  Target deletion is rejected while the current DAG references it; update/delete are also rejected
+  while a pending/running WorkflowRun or sensor check holds its frozen target. This keeps versioned
+  SecretRefs alive for every in-flight execution without exposing or logging their values.
+- Cron expressions use one process-wide IANA scheduler timezone. An explicit
+  `DATAOPS_SCHEDULER_TIMEZONE` value is validated at startup; otherwise the server local zone is
+  resolved. Fire points are converted back to UTC before comparison, persistence, audit, and Job
+  construction. Built-in run variables are frozen at that nominal UTC fire point rather than a
+  delayed scheduler tick. Configuration changes require restart; per-workflow timezones and
+  backfill remain out of scope.
 
 ## Non-Goals
 
