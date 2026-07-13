@@ -95,6 +95,13 @@ export interface CompareRunLimitsPayload {
 }
 
 // ── 任务 CRUD ───────────────────────────────────────────────────────
+export interface CompareProjectionDetail {
+  name: string
+  generated: boolean
+  projection_index: number
+  expression: string | null
+}
+
 export interface CompareTaskResponse {
   id: string
   project_id: string
@@ -104,6 +111,8 @@ export interface CompareTaskResponse {
   source_ref: CompareDataRef
   target_ref: CompareDataRef
   columns: Column[]
+  source_projection_details: CompareProjectionDetail[]
+  target_projection_details: CompareProjectionDetail[]
   compare_rules: CompareRulesPayload
   run_limits: CompareRunLimitsPayload
   created_by: string | null
@@ -281,6 +290,7 @@ export interface ComparePreviewRequest {
 
 export interface ComparePreviewResponse {
   columns: string[]
+  column_details?: CompareProjectionDetail[]
   rows: unknown[][]
   row_count: number
   truncated: boolean

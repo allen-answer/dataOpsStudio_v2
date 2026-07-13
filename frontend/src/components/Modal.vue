@@ -6,6 +6,7 @@ const props = defineProps<{
   open: boolean
   title?: string
   subtitle?: string
+  closeLabel?: string
 }>()
 
 const emit = defineEmits<{
@@ -64,7 +65,7 @@ onUnmounted(() => window.removeEventListener('keydown', onEsc))
               type="button"
               @click="$emit('close')"
               class="chrome-btn-ghost -mr-1 -mt-1"
-              aria-label="close"
+              :aria-label="closeLabel ?? 'close'"
             >
               <X class="w-4 h-4" />
             </button>
