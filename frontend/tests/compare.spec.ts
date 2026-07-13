@@ -315,6 +315,62 @@ test('generated expression preview shows summary and full expression', async ({ 
   expectNoConsoleErrors()
 })
 
+test('target generated aliases expose the target SQL expression', async ({ page }) => {
+  const task = compareTask({
+    columns: [{ name: 'RESULT_1', type: 'decimal' }],
+    source_projection_details: [
+      {
+        name: 'RESULT_1',
+        generated: true,
+        projection_index: 1,
+        expression: 'SUM(SOURCE_AMOUNT)',
+      },
+    ],
+    target_projection_details: [
+      {
+        name: 'RESULT_1',
+        generated: true,
+        projection_index: 1,
+        expression: 'SUM(TARGET_FARE)',
+      },
+    ],
+  })
+  await mockBase(page)
+  await page.route(/\/api\/compare\/tasks(\?|$)/, (r) => json(r, 200, [task]))
+
+  await page.goto('/projects/project-1/compare')
+  const buttons = page.getByRole('button', { name: 'Inspect expression for RESULT_1' })
+  await expect(buttons).toHaveCount(2)
+  await buttons.nth(1).click()
+  await expect(page.getByText('SUM(TARGET_FARE)', { exact: true })).toBeVisible()
+  await expect(page.getByText('SUM(SOURCE_AMOUNT)', { exact: true })).toHaveCount(0)
+  expectNoConsoleErrors()
+})
+
+test('missing target projection details keeps the compare editor stable', async ({ page }) => {
+  const task = compareTask({
+    columns: [{ name: 'RESULT_1', type: 'decimal' }],
+    source_projection_details: [
+      {
+        name: 'RESULT_1',
+        generated: true,
+        projection_index: 1,
+        expression: 'SUM(SOURCE_AMOUNT)',
+      },
+    ],
+    target_projection_details: [],
+  })
+  await mockBase(page)
+  await page.route(/\/api\/compare\/tasks(\?|$)/, (r) => json(r, 200, [task]))
+
+  await page.goto('/projects/project-1/compare')
+  await expect(
+    page.getByRole('button', { name: 'Inspect expression for RESULT_1' }),
+  ).toHaveCount(1)
+  await expect(page.locator('input[placeholder="Column"]').first()).toHaveValue('RESULT_1')
+  expectNoConsoleErrors()
+})
+
 test('legacy aliases can be repaired and saved through the task API', async ({ page }) => {
   const expressions = ['SUM(A)', 'SUM(B)', 'SUM(C)']
   const baseNames = ['OCCUR_DATE', 'CUST_NO', 'SEC_CODE', 'SEC_TYPE', 'BUSINESS_CODE']
