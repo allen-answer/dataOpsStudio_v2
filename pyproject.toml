@@ -41,6 +41,8 @@ dependencies = [
     # 纯 Python parser(非调度框架/进程),只解析 cron 求上/下一触发点;
     # ADR-0009 §1 拒绝的是 APScheduler(独立调度进程),进程内 tick 仍自写。
     "croniter>=3.0",
+    # Workflow cron 全局时区:跨 Windows/Unix 解析服务器本地 IANA ZoneInfo。
+    "tzlocal>=5.4",
 ]
 
 [project.optional-dependencies]

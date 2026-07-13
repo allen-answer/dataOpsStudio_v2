@@ -4,20 +4,30 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, cast
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
 
+import app.services.workflow_scheduler as scheduler_module
+from app.api.app import _build_scheduler
+from app.config import SchedulerConfig, Settings
 from app.domain.workflow import CronSchedule, WorkflowSpec
 from app.services.workflow_scheduler import (
     ScheduleAction,
+    ScheduleDecision,
     SensorAction,
+    WorkflowScheduler,
     build_sensor_check_job,
     build_workflow_run_job,
     evaluate_schedule,
     evaluate_sensor,
     most_recent_fire,
 )
+
+if TYPE_CHECKING:
+    from app.api.services import ApiServices
 
 
 def _spec(**overrides: object) -> WorkflowSpec:
@@ -48,6 +58,16 @@ def test_most_recent_fire_daily_cron() -> None:
     now = datetime(2026, 7, 8, 10, 7, 0, tzinfo=UTC)
     # 每天 03:00 → 最近触发点是今天 03:00
     assert most_recent_fire("0 3 * * *", now) == datetime(2026, 7, 8, 3, 0, tzinfo=UTC)
+
+
+def test_most_recent_fire_daily_cron_in_configured_timezone_returns_utc() -> None:
+    now = datetime(2026, 7, 8, 0, 7, tzinfo=UTC)
+
+    fire_at = most_recent_fire("0 3 * * *", now, timezone=ZoneInfo("Asia/Shanghai"))
+
+    assert fire_at == datetime(2026, 7, 7, 19, 0, tzinfo=UTC)
+    assert fire_at is not None
+    assert fire_at.tzinfo is UTC
 
 
 def test_most_recent_fire_unparseable_returns_none() -> None:
@@ -92,6 +112,47 @@ def test_evaluate_dedup_future_last_fired() -> None:
         enabled=True, schedule_enabled=True, cron="*/15 * * * *", now=_NOW, last_fired=future
     )
     assert d.action is ScheduleAction.SKIP
+
+
+def test_evaluate_non_utc_schedule_seeds_with_utc_fire_point() -> None:
+    decision = evaluate_schedule(
+        enabled=True,
+        schedule_enabled=True,
+        cron="0 3 * * *",
+        now=datetime(2026, 7, 8, 0, 7, tzinfo=UTC),
+        last_fired=None,
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+
+    assert decision.action is ScheduleAction.SEED
+    assert decision.fire_at == datetime(2026, 7, 7, 19, 0, tzinfo=UTC)
+
+
+def test_evaluate_non_utc_schedule_fires_at_new_utc_point() -> None:
+    decision = evaluate_schedule(
+        enabled=True,
+        schedule_enabled=True,
+        cron="0 3 * * *",
+        now=datetime(2026, 7, 8, 0, 7, tzinfo=UTC),
+        last_fired=datetime(2026, 7, 6, 19, 0, tzinfo=UTC),
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+
+    assert decision.action is ScheduleAction.FIRE
+    assert decision.fire_at == datetime(2026, 7, 7, 19, 0, tzinfo=UTC)
+
+
+def test_evaluate_non_utc_schedule_deduplicates_utc_fire_point() -> None:
+    decision = evaluate_schedule(
+        enabled=True,
+        schedule_enabled=True,
+        cron="0 3 * * *",
+        now=datetime(2026, 7, 8, 0, 7, tzinfo=UTC),
+        last_fired=datetime(2026, 7, 7, 19, 0, tzinfo=UTC),
+        timezone=ZoneInfo("Asia/Shanghai"),
+    )
+
+    assert decision.action is ScheduleAction.SKIP
 
 
 def test_evaluate_naive_last_fired_treated_as_utc() -> None:
@@ -194,6 +255,58 @@ def test_cron_schedule_rejects_out_of_range() -> None:
     # 字符集过关但字段越界 → croniter 语义关拦下
     with pytest.raises(ValidationError, match="invalid_cron"):
         CronSchedule(cron="99 * * * *")
+
+
+def test_scheduler_cron_path_uses_process_timezone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured_timezone = ZoneInfo("Asia/Shanghai")
+    captured_timezone = ZoneInfo("UTC")
+
+    def fake_evaluate_schedule(
+        *,
+        enabled: bool,
+        schedule_enabled: bool,
+        cron: str | None,
+        now: datetime,
+        last_fired: datetime | None,
+        timezone: ZoneInfo,
+    ) -> ScheduleDecision:
+        del enabled, schedule_enabled, cron, now, last_fired
+        nonlocal captured_timezone
+        captured_timezone = timezone
+        return ScheduleDecision(ScheduleAction.SKIP, None)
+
+    monkeypatch.setattr(scheduler_module, "evaluate_schedule", fake_evaluate_schedule)
+    scheduler = WorkflowScheduler(
+        cast("ApiServices", object()),
+        tick_interval_seconds=30.0,
+        timezone=configured_timezone,
+    )
+
+    scheduler._process_row(
+        {
+            "id": "wf-1",
+            "enabled": True,
+            "schedule_enabled": True,
+            "schedule_cron": "0 3 * * *",
+            "schedule_last_fired_at": None,
+        },
+        datetime(2026, 7, 8, 0, 7, tzinfo=UTC),
+    )
+
+    assert captured_timezone is configured_timezone
+
+
+def test_build_scheduler_passes_configured_timezone() -> None:
+    settings = Settings(
+        scheduler=SchedulerConfig.model_validate({"timezone": "Asia/Shanghai"}),
+    )
+
+    scheduler = _build_scheduler(cast("ApiServices", object()), settings)
+
+    assert scheduler is not None
+    assert scheduler._timezone is settings.scheduler.timezone
 
 
 # ── C-10 evaluate_sensor:检查间隔节流 / 冷却期 / 禁用 ────────────────────────

@@ -368,6 +368,10 @@ SUPPORTED_WORKFLOW_NODE_KINDS = {
   `status/job_id/error_code` 来自权威 job 行;禁止 URI、任意 metadata、SQL/rows、
   SecretRef、容器值或未知字段。损坏 ResultRef 与损坏/缺失 spec fallback 均不得 500,
   且使用同一安全投影。run 历史列表保持轻量,不含节点 `outputs`。
+- 接口追加: scheduler_timezone。全局 `DATAOPS_SCHEDULER_TIMEZONE` 只接受 IANA
+  ZoneInfo key;缺省用 `tzlocal.get_localzone()` 解析服务器本地时区,显式非法值即使
+  scheduler 禁用也必须拒绝启动。cron 按该进程级时区求值,fire point 转回 UTC 后
+  才比较、入库、审计与构造 Job。修改配置需重启;不支持 per-workflow 时区或 backfill。
 
 ---
 

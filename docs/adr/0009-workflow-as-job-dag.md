@@ -89,6 +89,11 @@ The three intrinsic nodes deferred above are now opened without changing the R7 
 - `notify` references existing configured Workflow notification targets (webhook/WeCom/email);
   arbitrary HTTP remains forbidden.
   `sleep` is a delayed queue job rather than a worker-blocking sleep.
+- Cron expressions use one process-wide IANA scheduler timezone. An explicit
+  `DATAOPS_SCHEDULER_TIMEZONE` value is validated at startup; otherwise the server local zone is
+  resolved. Fire points are converted back to UTC before comparison, persistence, audit, and Job
+  construction. Configuration changes require restart; per-workflow timezones and backfill remain
+  out of scope.
 
 ## Non-Goals
 
