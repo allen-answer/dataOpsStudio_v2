@@ -126,6 +126,28 @@ def test_webhook_posts_raw_payload(fake_urlopen: _FakeUrlopen) -> None:
     assert body["run_job_id"] == "job-9"
 
 
+def test_webhook_without_message_preserves_pre_message_json_shape(
+    fake_urlopen: _FakeUrlopen,
+) -> None:
+    WebhookChannel().send(make_target(), make_payload(), reveal=_RecordingReveal())
+
+    body = fake_urlopen.recorded[0].body
+    assert body == {
+        "workflow_id": "w1",
+        "workflow_name": "nightly",
+        "project": None,
+        "run_job_id": "job-9",
+        "trigger": None,
+        "status": "failed",
+        "started_at": None,
+        "finished_at": None,
+        "elapsed_seconds": None,
+        "error": "boom",
+        "node_status_counts": {},
+    }
+    assert "message" not in body
+
+
 def test_webhook_json_includes_provided_message(fake_urlopen: _FakeUrlopen) -> None:
     WebhookChannel().send(
         make_target(),

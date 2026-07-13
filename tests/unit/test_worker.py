@@ -2317,6 +2317,7 @@ def _notify_parent_run_job(
     notifications: list[dict[str, object]],
     target_ids: list[str],
     message: str | None = None,
+    extra_nodes: list[dict[str, object]] | None = None,
 ) -> Job:
     node_payload: dict[str, object] = {"target_ids": target_ids}
     if message is not None:
@@ -2329,7 +2330,8 @@ def _notify_parent_run_job(
                     "job_kind": "notify",
                     "payload": node_payload,
                     "timeout_seconds": 60,
-                }
+                },
+                *(extra_nodes or []),
             ],
             "edges": [],
             "notifications": notifications,
@@ -2351,16 +2353,35 @@ def _notify_child_job(
     target_ids: list[str],
     *,
     message: str | None = None,
+    node_id: str | None = "notify-node",
+    extra_payload: dict[str, object] | None = None,
 ) -> Job:
-    payload: dict[str, object] = {
-        "workflow_node_id": "notify-node",
-        "target_ids": target_ids,
-    }
+    payload: dict[str, object] = {"target_ids": target_ids}
+    if node_id is not None:
+        payload["workflow_node_id"] = node_id
     if message is not None:
         payload["message"] = message
+    if extra_payload is not None:
+        payload.update(extra_payload)
     return _make_job(kind=JobKind.NOTIFY, payload=payload).model_copy(
         update={"id": "notify-child", "parent_workflow_run_id": "parent-run"}
     )
+
+
+def _run_notify_child(
+    parent: Job,
+    child: Job,
+) -> tuple[_FakeBackend, _DagNotifyChannel]:
+    backend = _FakeBackend([child])
+    backend.jobs_by_id[parent.id] = parent
+    channel = _DagNotifyChannel()
+    runner = _workflow_runner(backend)
+    runner._notify_service = WorkflowNotifyService(
+        lambda ref: "unused",
+        {"webhook": channel},
+    )
+    assert runner.run_once() is True
+    return backend, channel
 
 
 def test_worker_notify_loads_frozen_parent_and_completes_sent_count() -> None:
@@ -2446,6 +2467,184 @@ def test_build_notify_child_payload_excludes_target_config_and_secret_refs() -> 
         "message": "hello",
     }
     assert "frozen-ref" not in repr(child.payload)
+
+
+def test_worker_notify_rejects_redirected_target_in_same_frozen_spec() -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            },
+            {
+                "id": "redirect-target",
+                "channel": "webhook",
+                "url_secret_ref": "redirect-ref",
+            },
+        ],
+        target_ids=["frozen-target"],
+    )
+    child = _notify_child_job(["redirect-target"])
+
+    backend, channel = _run_notify_child(parent, child)
+
+    assert backend.failed == [("notify-child", "notify_invalid_payload")]
+    assert backend.completed == []
+    assert channel.calls == []
+
+
+@pytest.mark.parametrize(
+    ("frozen_message", "child_payload_update"),
+    [
+        (None, {"unexpected": "value"}),
+        (None, {"message": "injected"}),
+        ("run ${today}", {}),
+    ],
+    ids=["extra_key", "message_not_declared", "declared_message_missing"],
+)
+def test_worker_notify_rejects_child_payload_key_mismatch(
+    frozen_message: str | None,
+    child_payload_update: dict[str, object],
+) -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["frozen-target"],
+        message=frozen_message,
+    )
+    child = _notify_child_job(
+        ["frozen-target"],
+        extra_payload=child_payload_update,
+    )
+
+    backend, channel = _run_notify_child(parent, child)
+
+    assert backend.failed == [("notify-child", "notify_invalid_payload")]
+    assert backend.completed == []
+    assert channel.calls == []
+
+
+@pytest.mark.parametrize(
+    "target_ids",
+    [
+        [],
+        [f"target-{index}" for index in range(11)],
+        ["frozen-target", "frozen-target"],
+        ["   "],
+    ],
+    ids=["empty", "too_many", "duplicate", "whitespace"],
+)
+def test_worker_notify_rejects_invalid_target_id_list(target_ids: list[str]) -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["frozen-target"],
+    )
+    child = _notify_child_job(target_ids)
+
+    backend, channel = _run_notify_child(parent, child)
+
+    assert backend.failed == [("notify-child", "notify_invalid_payload")]
+    assert backend.completed == []
+    assert channel.calls == []
+
+
+@pytest.mark.parametrize(
+    "node_id",
+    [None, "   ", "missing-node", "query-node"],
+    ids=["missing", "blank", "unknown", "non_notify"],
+)
+def test_worker_notify_rejects_invalid_frozen_node_binding(node_id: str | None) -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["frozen-target"],
+        extra_nodes=[
+            {
+                "id": "query-node",
+                "job_kind": "sql_query",
+                "payload": {"sql": "SELECT 1"},
+                "timeout_seconds": 60,
+            }
+        ],
+    )
+    child = _notify_child_job(["frozen-target"], node_id=node_id)
+
+    backend, channel = _run_notify_child(parent, child)
+
+    assert backend.failed == [("notify-child", "notify_invalid_payload")]
+    assert backend.completed == []
+    assert channel.calls == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [42, "m" * 513],
+    ids=["wrong_type", "too_long"],
+)
+def test_worker_notify_rejects_invalid_message(message: object) -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["frozen-target"],
+        message="run ${today}",
+    )
+    child = _notify_child_job(
+        ["frozen-target"],
+        extra_payload={"message": message},
+    )
+
+    backend, channel = _run_notify_child(parent, child)
+
+    assert backend.failed == [("notify-child", "notify_invalid_payload")]
+    assert backend.completed == []
+    assert channel.calls == []
+
+
+def test_worker_notify_accepts_interpolated_message_different_from_frozen_text() -> None:
+    parent = _notify_parent_run_job(
+        notifications=[
+            {
+                "id": "frozen-target",
+                "channel": "webhook",
+                "url_secret_ref": "frozen-ref",
+            }
+        ],
+        target_ids=["frozen-target"],
+        message="run ${today}",
+    )
+    child = _notify_child_job(
+        ["frozen-target"],
+        message="run 2026-07-13",
+    )
+
+    backend, channel = _run_notify_child(parent, child)
+
+    assert backend.failed == []
+    assert len(channel.calls) == 1
+    assert channel.calls[0][1].message == "run 2026-07-13"
+    assert backend.completed[0][1].metadata == {"sent_count": 1}
 
 
 def test_worker_notify_all_disabled_completes_with_zero_sent_count() -> None:

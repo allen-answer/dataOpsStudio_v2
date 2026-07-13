@@ -1616,16 +1616,35 @@ class WorkerRunner:
             raise NotifyDeliveryError("notify_parent_unavailable")
         try:
             spec = _workflow_spec_from_payload(parent.payload)
+            node_id_value = job.payload.get("workflow_node_id")
+            if not isinstance(node_id_value, str) or not node_id_value.strip():
+                raise NotifyDeliveryError("notify_invalid_payload")
+            frozen_node = next(
+                (node for node in spec.nodes if node.id == node_id_value),
+                None,
+            )
+            if frozen_node is None or frozen_node.job_kind != JobKind.NOTIFY.value:
+                raise NotifyDeliveryError("notify_invalid_payload")
+            expected_keys = {"workflow_node_id", "target_ids"}
+            if "message" in frozen_node.payload:
+                expected_keys.add("message")
+            if set(job.payload) != expected_keys:
+                raise NotifyDeliveryError("notify_invalid_payload")
             target_ids_value = job.payload.get("target_ids")
             if (
                 not isinstance(target_ids_value, list)
-                or not target_ids_value
+                or not 1 <= len(target_ids_value) <= 10
                 or not all(
-                    isinstance(target_id, str) and target_id for target_id in target_ids_value
+                    isinstance(target_id, str) and target_id.strip()
+                    for target_id in target_ids_value
                 )
             ):
                 raise NotifyDeliveryError("notify_invalid_payload")
             target_ids = cast(list[str], target_ids_value)
+            if len(set(target_ids)) != len(target_ids) or target_ids != frozen_node.payload.get(
+                "target_ids"
+            ):
+                raise NotifyDeliveryError("notify_invalid_payload")
             message_value = job.payload.get("message")
             if message_value is not None and (
                 not isinstance(message_value, str) or len(message_value) > 512
