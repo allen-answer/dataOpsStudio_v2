@@ -1985,6 +1985,38 @@ def test_ai_sql_generate_uses_l2_schema_context_and_audits() -> None:
     assert "password" not in body
 
 
+def test_ai_sql_generate_metadata_failure_is_audited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        core_routes,
+        "build_database_adapter",
+        lambda conn_info, secret_store, **kwargs: _FailingMetadataAdapter(),
+    )
+    engine = _FakeEngine(
+        [
+            _datasource_row(),
+            {"id": "project-1"},
+            _ai_config_row(),
+            None,
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={"natural_language": "list rows"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "metadata_probe_failed"
+    audit = next(a for a in services.audits if a["action"] == "ai_copilot_run")
+    assert audit["result"] == "failed"
+    assert audit["detail"] == {"error": "metadata_probe_failed"}
+
+
 def test_ai_sql_generate_disabled_returns_structured_409() -> None:
     engine = _FakeEngine(
         [

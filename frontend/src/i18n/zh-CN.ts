@@ -296,6 +296,7 @@ export default {
     ai_prompt_placeholder: '例如:最近 30 天每个客户的订单总额',
     ai_generating: '生成中…',
     ai_failed: 'AI 未能生成 SQL,请换种说法再试。',
+    ai_metadata_unavailable: '无法读取数据源结构，请先测试数据源连接并刷新元数据后重试。',
     ai_disabled: 'AI Copilot 未启用,请联系管理员配置 AI Gateway。',
     expand_needs_metadata: '请先在元数据浏览器刷新该表,再展开 *。',
     plan_running: '正在计算执行计划…',

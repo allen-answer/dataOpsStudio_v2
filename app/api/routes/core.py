@@ -1479,7 +1479,11 @@ def generate_sql_from_nl(
         audit("skipped", {"error": "ai_disabled"})
         raise ApiError(409, "ai_disabled", "AI copilot is not enabled")
 
-    tables, more_tables = _schema_tables_for_ai(services, row, body)
+    try:
+        tables, more_tables = _schema_tables_for_ai(services, row, body)
+    except ApiError as exc:
+        audit("failed", {"error": exc.code})
+        raise
     schema_payload, tables_used, column_truncated = build_schema_context(tables)
     truncated = more_tables or column_truncated
     prompt = build_nl2sql_prompt(body.natural_language, dialect=str(row["db_type"]))
