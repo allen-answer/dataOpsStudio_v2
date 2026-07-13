@@ -105,10 +105,10 @@ class UrllibTransport:
             raise ProviderError(code) from exc
         try:
             parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:  # pragma: no cover - 真网络分支
-            raise ProviderError("provider returned non-JSON body") from exc
+        except json.JSONDecodeError as exc:
+            raise ProviderError("provider_invalid_response") from exc
         if not isinstance(parsed, dict):
-            raise ProviderError("provider returned non-object JSON")
+            raise ProviderError("provider_invalid_response")
         return parsed
 
 

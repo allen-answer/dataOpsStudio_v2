@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import io
 import urllib.error
 import urllib.request
 
@@ -236,6 +237,30 @@ def test_urllib_transport_classifies_network_failure(
         UrllibTransport().post_json("https://example.invalid", {}, {})
 
     assert caught.value.diagnostic_code == code
+
+
+def test_urllib_transport_normalizes_non_json_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: io.BytesIO(b""))
+
+    with pytest.raises(ProviderError) as caught:
+        UrllibTransport().post_json("https://example.invalid", {}, {})
+
+    assert caught.value.diagnostic_code == "provider_invalid_response"
+    assert str(caught.value) == "provider_invalid_response"
+
+
+def test_urllib_transport_normalizes_non_object_json_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: io.BytesIO(b"[]"))
+
+    with pytest.raises(ProviderError) as caught:
+        UrllibTransport().post_json("https://example.invalid", {}, {})
+
+    assert caught.value.diagnostic_code == "provider_invalid_response"
+    assert str(caught.value) == "provider_invalid_response"
 
 
 def test_redactor_hook_is_called() -> None:
