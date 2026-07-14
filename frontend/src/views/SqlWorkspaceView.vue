@@ -88,7 +88,7 @@ import {
   type MetadataTableItem,
 } from '../api/metadata'
 import { explainSql, preflightSql, type SqlPreflightFinding } from '../api/sql'
-import { generateSql, diagnoseSlowSql } from '../api/ai'
+import { diagnoseSlowSql } from '../api/ai'
 import { ApiError, type DatasourceListItem, type ExportFormat, type JobStatus } from '../api/types'
 import { useThemeStore } from '../stores/theme'
 import { useAuthStore } from '../stores/auth'
@@ -96,6 +96,7 @@ import JobStatusBadge from '../components/JobStatusBadge.vue'
 import ResultTable from '../components/ResultTable.vue'
 import LoadingDots from '../components/LoadingDots.vue'
 import Modal from '../components/Modal.vue'
+import AiSqlAssistantPanel from '../components/AiSqlAssistantPanel.vue'
 
 const g = self as unknown as { MonacoEnvironment?: { getWorker: () => Worker } }
 if (!g.MonacoEnvironment) {
@@ -248,13 +249,8 @@ const toolBusy = ref<'' | 'format' | 'expand' | 'explain' | 'preflight'>('')
 // SQL 体检(C-11):文本级 advisory finding;卡片展示,可关闭。行数估算复用 EXPLAIN。
 const preflightFindings = ref<SqlPreflightFinding[] | null>(null)
 
-// ── AI 生成(C1:自然语言 → 真实 schema 生成只读 SQL)────────────────
-const aiModalOpen = ref(false)
-const aiPrompt = ref('')
-const aiBusy = ref(false)
-const aiError = ref<string | null>(null)
-const aiDisabled = ref(false)
-const aiExplanation = ref<string | null>(null)
+// ── AI 生成(C1:候选表确认 → 预览 → 用户应用到编辑器)──────────────
+const aiPanelOpen = ref(false)
 
 // ── AI 慢 SQL 根因诊断(C4:EXPLAIN + 结构 + 历史基线 → 根因排序,egress L3)──
 const aiDiagnoseBusy = ref(false)
@@ -411,7 +407,8 @@ watch(activeConsoleId, () => {
   preflightFindings.value = null
 })
 
-watch(selectedDsId, (value) => {
+watch(selectedDsId, (value, previous) => {
+  if (value !== previous) aiPanelOpen.value = false
   execError.value = null
   if (suppressConsoleSave.value || !activeConsole.value || editorReadOnly.value) return
   const datasourceId = value || null
@@ -1031,41 +1028,8 @@ async function onExplain(): Promise<void> {
   }
 }
 
-function openAiModal(): void {
-  aiError.value = null
-  aiDisabled.value = false
-  aiExplanation.value = null
-  aiModalOpen.value = true
-}
-
-async function onGenerateSql(): Promise<void> {
-  if (!aiPrompt.value.trim() || !selectedDsId.value) return
-  aiError.value = null
-  aiDisabled.value = false
-  aiExplanation.value = null
-  aiBusy.value = true
-  try {
-    const res = await generateSql(selectedDsId.value, { natural_language: aiPrompt.value })
-    if (!res.ok || !res.sql) {
-      aiError.value = t('sql.ai_failed')
-      return
-    }
-    // 只插入编辑器,绝不自动执行(执行仍走用户手动 + SqlGuard)。
-    editorSql.value = res.sql
-    aiExplanation.value = res.explanation
-    aiModalOpen.value = false
-  } catch (e) {
-    // AI 未启用 → 后端结构化 409 ai_disabled;给友好禁用提示,不当普通报错。
-    if (e instanceof ApiError && e.code === 'ai_disabled') {
-      aiDisabled.value = true
-    } else if (e instanceof ApiError && e.code === 'metadata_probe_failed') {
-      aiError.value = t('sql.ai_metadata_unavailable')
-    } else {
-      aiError.value = errorMessage(e)
-    }
-  } finally {
-    aiBusy.value = false
-  }
+function applyGeneratedSql(sql: string): void {
+  editorSql.value = sql
 }
 
 // SQL 体检(C-11):文本级 advisory findings 卡;若数据源支持 EXPLAIN,顺带触发一次
@@ -1282,7 +1246,7 @@ function parseVariables(value: string): string[] {
 </script>
 
 <template>
-  <div class="flex h-full min-h-0 chrome-bg-main">
+  <div class="flex h-full min-h-0 min-w-0 max-w-full overflow-hidden chrome-bg-main">
     <aside class="w-[21rem] shrink-0 border-r chrome-border chrome-bg-panel flex flex-col min-h-0">
       <div class="px-4 py-3 border-b chrome-border-subtle">
         <div class="text-xs uppercase tracking-wider chrome-text-muted font-medium">
@@ -1641,7 +1605,7 @@ function parseVariables(value: string): string[] {
       </div>
     </aside>
 
-    <main class="flex-1 min-w-0 flex flex-col h-full">
+    <main class="flex-1 min-w-0 max-w-full overflow-hidden flex flex-col h-full">
       <div class="flex items-center gap-3 px-5 py-3 border-b chrome-border chrome-bg-panel">
         <div class="min-w-0">
           <div class="text-sm font-medium chrome-text-heading truncate">
@@ -1697,7 +1661,7 @@ function parseVariables(value: string): string[] {
         </button>
       </div>
       <template v-else>
-        <div class="flex-1 min-h-[35vh] border-b chrome-border relative">
+        <div class="flex-1 min-h-[35vh] min-w-0 max-w-full overflow-hidden border-b chrome-border relative">
           <VueMonacoEditor
             v-model:value="editorSql"
             language="sql"
@@ -1759,7 +1723,7 @@ function parseVariables(value: string): string[] {
             class="chrome-btn-secondary"
             :disabled="!selectedDsId || editorReadOnly"
             :title="t('sql.ai_generate_hint')"
-            @click="openAiModal"
+            @click="aiPanelOpen = true"
           >
             <Sparkles class="w-3.5 h-3.5" />
             {{ t('sql.ai_generate') }}
@@ -1775,14 +1739,6 @@ function parseVariables(value: string): string[] {
             {{ toolBusy === 'preflight' ? t('common.submitting') : t('sql.tool_preflight') }}
           </button>
           <div class="flex-1" />
-          <span
-            v-if="aiExplanation"
-            class="text-xs chrome-text-muted truncate max-w-[24rem] flex items-center gap-1"
-            :title="aiExplanation"
-          >
-            <Sparkles class="w-3 h-3 shrink-0" />
-            {{ aiExplanation }}
-          </span>
           <span v-if="toolError" class="text-xs text-red-600 dark:text-red-400 truncate max-w-[24rem]" :title="toolError">
             {{ toolError }}
           </span>
@@ -2022,6 +1978,14 @@ function parseVariables(value: string): string[] {
       </template>
     </main>
 
+    <AiSqlAssistantPanel
+      :open="aiPanelOpen"
+      :datasource-id="selectedDsId"
+      :editor-sql="editorSql"
+      @apply="applyGeneratedSql"
+      @close="aiPanelOpen = false"
+    />
+
     <Modal
       :open="templateModalOpen"
       :title="templateForm.id ? t('sql.template_edit') : t('sql.template_new')"
@@ -2061,42 +2025,5 @@ function parseVariables(value: string): string[] {
       </form>
     </Modal>
 
-    <Modal :open="aiModalOpen" :title="t('sql.ai_generate_title')" @close="aiModalOpen = false">
-      <form class="space-y-3" @submit.prevent="onGenerateSql">
-        <p class="text-xs chrome-text-muted">{{ t('sql.ai_generate_desc') }}</p>
-        <label class="block">
-          <span class="block text-xs chrome-text-muted mb-1">{{ t('sql.ai_prompt_label') }}</span>
-          <textarea
-            v-model="aiPrompt"
-            class="chrome-input w-full min-h-28"
-            :placeholder="t('sql.ai_prompt_placeholder')"
-            required
-          />
-        </label>
-        <div
-          v-if="aiDisabled"
-          class="flex items-center gap-2 px-3 py-2 text-xs rounded"
-          style="background-color: rgb(180 83 9 / 0.1); color: rgb(180 83 9)"
-        >
-          <AlertTriangle class="w-3.5 h-3.5 shrink-0" />
-          <span>{{ t('sql.ai_disabled') }}</span>
-        </div>
-        <p v-if="aiError" class="text-xs text-red-600 dark:text-red-400">{{ aiError }}</p>
-        <div class="flex justify-end gap-2 pt-2">
-          <button type="button" class="chrome-btn-secondary" @click="aiModalOpen = false">
-            <X class="w-3.5 h-3.5" />
-            {{ t('common.cancel') }}
-          </button>
-          <button
-            type="submit"
-            class="chrome-btn-primary"
-            :disabled="aiBusy || !aiPrompt.trim() || !selectedDsId"
-          >
-            <Sparkles class="w-3.5 h-3.5" />
-            {{ aiBusy ? t('sql.ai_generating') : t('sql.ai_generate') }}
-          </button>
-        </div>
-      </form>
-    </Modal>
   </div>
 </template>

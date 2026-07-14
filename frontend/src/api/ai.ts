@@ -17,6 +17,42 @@ export interface SqlGenerateRequest {
   natural_language: string
   schema_name?: string | null
   table_names?: string[]
+  candidate_sql?: string | null
+  revision_instruction?: string | null
+}
+
+export type SqlValidationState = 'passed' | 'failed' | 'partial'
+export type SqlDiagnosticCode =
+  | 'provider_auth_failed'
+  | 'provider_rate_limited'
+  | 'provider_timeout'
+  | 'provider_unreachable'
+  | 'provider_reasoning_only'
+  | 'provider_output_truncated'
+  | 'provider_invalid_response'
+  | 'metadata_probe_failed'
+  | 'ai_egress_blocked'
+  | 'sql_parse_failed'
+  | 'sql_not_readonly'
+  | 'sql_unknown_table'
+  | 'sql_unknown_column'
+
+export interface SqlTableCandidate {
+  schema_name: string | null
+  table_name: string
+  matched_by: Array<'editor_reference' | 'table_name' | 'column_name'>
+}
+
+export interface SqlTableCandidatesResponse {
+  candidates: SqlTableCandidate[]
+  truncated: boolean
+}
+
+export interface SqlGenerateValidation {
+  readonly: SqlValidationState
+  tables: SqlValidationState
+  columns: SqlValidationState
+  warnings: string[]
 }
 
 export interface SqlGenerateResponse {
@@ -29,6 +65,26 @@ export interface SqlGenerateResponse {
   egress_level: number
   tables_used: string[]
   truncated: boolean
+  stage: 'failed' | 'validated'
+  diagnostic_code: SqlDiagnosticCode | null
+  attempts: number
+  reasoning_mode: 'disabled' | 'enabled' | null
+  validation: SqlGenerateValidation | null
+  request_id: string | null
+}
+
+export function suggestSqlTables(
+  datasourceId: string,
+  req: { natural_language: string; schema_name?: string | null; editor_sql?: string | null },
+): Promise<SqlTableCandidatesResponse> {
+  return apiClient.post<SqlTableCandidatesResponse>(
+    `/datasources/${encodeURIComponent(datasourceId)}/ai/sql-table-candidates`,
+    {
+      natural_language: req.natural_language,
+      schema_name: req.schema_name ?? null,
+      editor_sql: req.editor_sql ?? null,
+    },
+  )
 }
 
 /** POST /datasources/{id}/ai/sql-generate —— 自然语言 → 真实 schema 生成只读 SQL。 */
@@ -42,6 +98,8 @@ export function generateSql(
       natural_language: req.natural_language,
       schema_name: req.schema_name ?? null,
       table_names: req.table_names ?? [],
+      candidate_sql: req.candidate_sql ?? null,
+      revision_instruction: req.revision_instruction ?? null,
     },
   )
 }

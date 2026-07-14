@@ -148,7 +148,7 @@ test('metadata probe failure shows error without blanking the tree', async ({ pa
 
 test('AI SQL metadata failure shows actionable localized guidance', async ({ page }) => {
   await mockBase(page)
-  await page.route('**/api/datasources/ds-1/ai/sql-generate', (r) =>
+  await page.route('**/api/datasources/ds-1/ai/sql-table-candidates', (r) =>
     json(r, 503, {
       error: 'metadata_probe_failed',
       message: 'Datasource metadata probe failed',
@@ -157,11 +157,127 @@ test('AI SQL metadata failure shows actionable localized guidance', async ({ pag
 
   await page.goto('/projects/project-1/sql')
   await page.getByRole('button', { name: 'AI Generate' }).first().click()
-  await page.getByRole('textbox', { name: 'What do you want to query?' }).fill('list customers')
-  await page.getByRole('button', { name: 'AI Generate', exact: true }).last().click()
+  await page.getByRole('textbox', { name: 'Query request' }).fill('list customers')
+  await page.getByRole('button', { name: 'Recommend tables' }).click()
 
-  await expect(page.getByText(/test the datasource connection and refresh metadata/i)).toBeVisible()
+  await expect(page.getByText(/test the connection and refresh metadata/i)).toBeVisible()
   await expect(page.getByText('Datasource metadata probe failed')).toHaveCount(0)
+  expectNoConsoleErrors()
+})
+
+test('AI assistant confirms tables, previews, and applies without executing', async ({ page }) => {
+  const { patches } = await mockBase(page)
+  let executeCalls = 0
+  await page.route('**/api/sql/execute', (r) => {
+    executeCalls += 1
+    return json(r, 500, { error: 'must_not_execute' })
+  })
+  await page.route('**/api/datasources/ds-1/ai/sql-table-candidates', (r) =>
+    json(r, 200, {
+      candidates: [
+        { schema_name: 'app', table_name: 'users', matched_by: ['table_name'] },
+        { schema_name: 'app', table_name: 'orders', matched_by: ['column_name'] },
+      ],
+      truncated: false,
+    }),
+  )
+  await page.route('**/api/datasources/ds-1/ai/sql-generate', (r) =>
+    json(r, 200, {
+      ok: true,
+      sql: 'SELECT id, name FROM app.users',
+      explanation: null,
+      provider: 'mock',
+      model: 'mock-model',
+      error: null,
+      egress_level: 2,
+      tables_used: ['app.users'],
+      truncated: false,
+      stage: 'validated',
+      diagnostic_code: null,
+      attempts: 1,
+      reasoning_mode: 'disabled',
+      validation: { readonly: 'passed', tables: 'passed', columns: 'passed', warnings: [] },
+      request_id: 'request-1',
+    }),
+  )
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'AI Generate' }).click()
+  await expect(page.getByRole('complementary', { name: 'AI SQL Assistant' })).toBeVisible()
+  await page.getByLabel('Query request').fill('list user names')
+  await page.getByRole('button', { name: 'Recommend tables' }).click()
+  await expect(page.getByRole('checkbox', { name: 'app.users' })).toBeChecked()
+  await page.getByRole('button', { name: 'Generate preview' }).click()
+  await expect(page.getByText('SELECT id, name FROM app.users', { exact: true })).toBeVisible()
+  expect(await page.locator('.monaco-editor').innerText()).not.toContain('id, name')
+  await page.getByRole('button', { name: 'Apply to editor' }).click()
+  await expect.poll(() => patches.some((p) => JSON.stringify(p).includes('id, name'))).toBeTruthy()
+  expect(executeCalls).toBe(0)
+  expectNoConsoleErrors()
+})
+
+test('AI assistant revises only the current draft and shows diagnostic guidance', async ({ page }) => {
+  await mockBase(page)
+  const requests: Record<string, unknown>[] = []
+  await page.route('**/api/datasources/ds-1/ai/sql-table-candidates', (r) =>
+    json(r, 200, {
+      candidates: [{ schema_name: 'app', table_name: 'users', matched_by: ['table_name'] }],
+      truncated: false,
+    }),
+  )
+  await page.route('**/api/datasources/ds-1/ai/sql-generate', (r) => {
+    requests.push(r.request().postDataJSON())
+    if (requests.length === 1) {
+      return json(r, 200, {
+        ok: true, sql: 'SELECT id FROM app.users', explanation: null, provider: 'mock', model: 'm',
+        error: null, egress_level: 2, tables_used: ['app.users'], truncated: false,
+        stage: 'validated', diagnostic_code: null, attempts: 1, reasoning_mode: 'disabled',
+        validation: { readonly: 'passed', tables: 'passed', columns: 'passed', warnings: [] },
+        request_id: 'r1',
+      })
+    }
+    return json(r, 200, {
+      ok: false, sql: null, explanation: null, provider: 'mock', model: 'm',
+      error: 'provider_output_truncated', egress_level: 3, tables_used: [], truncated: true,
+      stage: 'failed', diagnostic_code: 'provider_output_truncated', attempts: 2,
+      reasoning_mode: 'enabled', validation: null, request_id: 'diag-1',
+    })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'AI Generate' }).click()
+  await page.getByLabel('Query request').fill('list users')
+  await page.getByRole('button', { name: 'Recommend tables' }).click()
+  await page.getByRole('button', { name: 'Generate preview' }).click()
+  await page.getByLabel('Revision request').fill('add a date filter')
+  await page.getByRole('button', { name: 'Revise preview' }).click()
+
+  expect(requests[1]).toMatchObject({
+    candidate_sql: 'SELECT id FROM app.users',
+    revision_instruction: 'add a date filter',
+  })
+  await expect(page.getByText(/output was truncated/i)).toBeVisible()
+  await expect(page.getByText('diag-1')).toBeVisible()
+  await expect(page.getByText('SELECT id FROM app.users', { exact: true })).toBeVisible()
+  expectNoConsoleErrors()
+})
+
+test('long SQL stays inside Monaco without widening the document', async ({ page }) => {
+  const longExpression = Array.from({ length: 120 }, (_, i) => `column_${i}`).join(' + ')
+  await mockLicense(page)
+  await page.route(/\/api\/datasources\?/, (r) => json(r, 200, [datasource()]))
+  await page.route('**/api/sql/consoles', (r) =>
+    json(r, 200, [consoleRow({ sql: `SELECT ${longExpression} FROM users` })]),
+  )
+
+  await page.goto('/projects/project-1/sql')
+  await expect(page.getByRole('button', { name: 'Run' })).toBeVisible()
+  await expect(page.getByRole('combobox').first()).toBeVisible()
+  const widths = await page.evaluate(() => ({
+    scroll: document.documentElement.scrollWidth,
+    client: document.documentElement.clientWidth,
+  }))
+  expect(widths.scroll).toBeLessThanOrEqual(widths.client + 1)
   expectNoConsoleErrors()
 })
 

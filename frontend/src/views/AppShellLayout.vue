@@ -47,7 +47,7 @@ const { t } = useI18n()
 
       <LicenseBanner />
 
-      <main class="flex-1 overflow-y-auto">
+      <main class="flex-1 min-w-0 max-w-full overflow-y-auto overflow-x-hidden">
         <RouterView />
       </main>
     </div>
