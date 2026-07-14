@@ -11,6 +11,7 @@ from fastapi.routing import APIRoute
 
 from app.api.app import create_app
 from app.api.routes import core as core_routes
+from app.api.schemas import SqlGenerateResponse
 from app.api.security import create_access_token, decode_access_token
 from app.api.services import ApiServices
 from app.dbclients.protocol import AdapterConnectionError
@@ -1985,6 +1986,78 @@ def test_ai_sql_generate_uses_l2_schema_context_and_audits() -> None:
     assert "password" not in body
 
 
+def test_ai_sql_table_candidates_rank_without_calling_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    calls = {"gateway": 0}
+
+    def fail_gateway(*args: object, **kwargs: object) -> None:
+        calls["gateway"] += 1
+        raise AssertionError("candidate ranking must not call AI")
+
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", fail_gateway)
+    monkeypatch.setattr(
+        core_routes,
+        "_metadata_all_tables",
+        lambda services, row, refresh: [
+            SimpleNamespace(schema_name="app", name="orders"),
+            SimpleNamespace(schema_name="app", name="users"),
+        ],
+    )
+    monkeypatch.setattr(
+        core_routes,
+        "_metadata_columns_for_table",
+        lambda services, row, schema_name, table_name, refresh: [
+            Column(name="customer_id", type=ColumnType.INTEGER),
+            Column(
+                name="amount" if table_name == "orders" else "name",
+                type=ColumnType.STRING,
+            ),
+        ],
+    )
+    engine = _FakeEngine([_datasource_row(), {"id": "project-1"}])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/ai/sql-table-candidates",
+        headers=_auth_headers(),
+        json_body={
+            "natural_language": "customer order amount",
+            "schema_name": None,
+            "editor_sql": "SELECT * FROM app.users",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["candidates"][0]["table_name"] == "users"
+    assert calls["gateway"] == 0
+
+
+def test_ai_sql_generate_rejects_empty_confirmed_table_scope() -> None:
+    engine = _FakeEngine([_datasource_row(), {"id": "project-1"}, _ai_config_row()])
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={"natural_language": "list rows", "schema_name": "app", "table_names": []},
+    )
+
+    assert response.status_code == 422
+
+
+def test_sql_generate_response_additive_defaults_preserve_old_construction() -> None:
+    payload = SqlGenerateResponse(ok=False, error="ProviderError").model_dump(mode="json")
+    assert payload["stage"] == "failed"
+    assert payload["diagnostic_code"] is None
+    assert payload["attempts"] == 0
+    assert payload["validation"] is None
+
+
 def test_ai_sql_generate_metadata_failure_is_audited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2007,7 +2080,11 @@ def test_ai_sql_generate_metadata_failure_is_audited(
     response = AsgiClient(app).post(
         "/api/datasources/ds-1/ai/sql-generate",
         headers=_auth_headers(),
-        json_body={"natural_language": "list rows"},
+        json_body={
+            "natural_language": "list rows",
+            "schema_name": "app",
+            "table_names": ["users"],
+        },
     )
 
     assert response.status_code == 503
@@ -2031,7 +2108,11 @@ def test_ai_sql_generate_disabled_returns_structured_409() -> None:
     response = AsgiClient(app).post(
         "/api/datasources/ds-1/ai/sql-generate",
         headers=_auth_headers(),
-        json_body={"natural_language": "list rows"},
+        json_body={
+            "natural_language": "list rows",
+            "schema_name": "app",
+            "table_names": ["users"],
+        },
     )
 
     assert response.status_code == 409
@@ -5787,6 +5868,10 @@ class _MetadataAdapter:
 
 class _FailingMetadataAdapter:
     def list_schemas(self) -> list[Schema]:
+        raise AdapterConnectionError("adapter connection failed")
+
+    def list_columns(self, schema: str, table: str) -> list[Column]:
+        del schema, table
         raise AdapterConnectionError("adapter connection failed")
 
 

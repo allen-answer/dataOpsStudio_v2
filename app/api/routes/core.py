@@ -128,6 +128,9 @@ from app.api.schemas import (
     SqlPreflightFinding,
     SqlPreflightRequest,
     SqlPreflightResponse,
+    SqlTableCandidateItem,
+    SqlTableCandidatesRequest,
+    SqlTableCandidatesResponse,
     SqlTemplateCreateRequest,
     SqlTemplateRenderRequest,
     SqlTemplateRenderResponse,
@@ -282,6 +285,7 @@ from app.services.ai.default_gateway import (
     build_gateway_from_runtime_config,
 )
 from app.services.ai.errors import AiDisabledError, AiGatewayError, EgressBlockedError
+from app.services.ai.sql_assistant import TableSchema, rank_table_candidates
 from app.services.lineage_batch_export import batch_export_sheets
 from app.services.sql_preflight import run_sql_preflight
 from app.services.workflow_scheduler import build_workflow_run_job
@@ -1439,6 +1443,61 @@ def list_datasource_metadata_indexes(
 
 
 @router.post(
+    "/datasources/{datasource_id}/ai/sql-table-candidates",
+    response_model=SqlTableCandidatesResponse,
+)
+def suggest_ai_sql_tables(
+    datasource_id: str,
+    body: SqlTableCandidatesRequest,
+    request: Request,
+) -> SqlTableCandidatesResponse:
+    services = services_from(request)
+    row = _datasource_for_current_user(request, datasource_id)
+    all_tables = _metadata_all_tables(services, row, refresh=False)
+    filtered = [
+        item
+        for item in all_tables
+        if body.schema_name is None or item.schema_name == body.schema_name
+    ]
+    table_schemas = [
+        TableSchema(
+            schema_name=item.schema_name,
+            table_name=item.name,
+            columns=tuple(
+                _metadata_columns_for_table(
+                    services,
+                    row,
+                    schema_name=item.schema_name,
+                    table_name=item.name,
+                    refresh=False,
+                )
+            ),
+        )
+        for item in filtered[:MAX_TABLES]
+    ]
+    ranked = rank_table_candidates(
+        body.natural_language,
+        body.editor_sql or "",
+        table_schemas,
+        limit=8,
+    )
+    return SqlTableCandidatesResponse(
+        candidates=[
+            SqlTableCandidateItem(
+                schema_name=item.schema_name,
+                table_name=item.table_name,
+                matched_by=cast(
+                    list[Literal["editor_reference", "table_name", "column_name"]],
+                    list(item.matched_by),
+                ),
+            )
+            for item in ranked
+        ],
+        truncated=len(filtered) > MAX_TABLES,
+    )
+
+
+@router.post(
     "/datasources/{datasource_id}/ai/sql-generate",
     response_model=SqlGenerateResponse,
 )
@@ -1454,6 +1513,9 @@ def generate_sql_from_nl(
     组 prompt → AiGateway.complete(purpose=ai_copilot_run)→ 拆 SQL + 解释。
     详见 docs/design/C1-copilot-nl2sql.md。
     """
+    if not body.table_names:
+        raise ApiError(422, "ai_table_scope_required", "Confirm at least one table")
+
     services = services_from(request)
     user = current_user_from(request)
     row = _datasource_for_current_user(request, datasource_id)
