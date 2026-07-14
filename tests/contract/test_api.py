@@ -16,6 +16,7 @@ from app.api.security import create_access_token, decode_access_token
 from app.api.services import ApiServices
 from app.dbclients.protocol import AdapterConnectionError
 from app.domain.ai import AiContext, AiOptions, AiResponse, EgressLevel
+from app.domain.ai_copilot import MAX_TABLES
 from app.domain.compare_result import encode_compare_result_row
 from app.domain.job import Job, JobKind
 from app.domain.license import LicenseMode
@@ -2100,7 +2101,11 @@ def test_ai_sql_generate_repairs_truncated_output_once(
     assert response.json()["ok"] is True
     assert response.json()["attempts"] == 2
     assert len(gateway.calls) == 2
-    assert gateway.calls[1][2].max_tokens > gateway.calls[0][2].max_tokens
+    first_max_tokens = gateway.calls[0][2].max_tokens
+    second_max_tokens = gateway.calls[1][2].max_tokens
+    assert first_max_tokens is not None
+    assert second_max_tokens is not None
+    assert second_max_tokens > first_max_tokens
     audits = [audit for audit in services.audits if audit["action"] == "ai_copilot_run"]
     assert len(audits) == 1
     detail = audits[0]["detail"]
@@ -2544,7 +2549,7 @@ def test_ai_sql_table_candidates_reports_truncated_schema_scope(
                 "name": f"table_{index}",
                 "table_type": "BASE TABLE",
             }
-            for index in range(core_routes.MAX_TABLES + 1)
+            for index in range(MAX_TABLES + 1)
         ],
     )
 
@@ -2572,7 +2577,7 @@ def test_ai_sql_table_candidates_reports_truncated_schema_scope(
     assert response.status_code == 200
     assert response.json()["truncated"] is True
     assert len(response.json()["candidates"]) == 8
-    assert len(column_calls) == core_routes.MAX_TABLES
+    assert len(column_calls) == MAX_TABLES
 
 
 def test_ai_sql_table_candidates_rejects_unauthorized_datasource_before_metadata(

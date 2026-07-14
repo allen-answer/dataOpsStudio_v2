@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import urllib.error
 import urllib.request
+from email.message import Message
 
 import pytest
 
@@ -203,7 +204,7 @@ def test_urllib_transport_classifies_http_without_exposing_body(
     monkeypatch: pytest.MonkeyPatch, status: int, code: str
 ) -> None:
     error = urllib.error.HTTPError(
-        "https://example.invalid", status, "provider secret body", {}, None
+        "https://example.invalid", status, "provider secret body", Message(), None
     )
     monkeypatch.setattr(
         urllib.request,
