@@ -1311,11 +1311,13 @@ class WorkflowCreateRequest(BaseModel):
     # 以便把 R7 门禁等构造期校验错误映射为结构化错误码
     # (直接类型化会走 FastAPI 默认 422 detail,丢失 forbidden/unsupported 区分)
     spec: dict[str, Any]
+    enabled: bool = True
 
 
 class WorkflowUpdateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     spec: dict[str, Any]
+    enabled: bool | None = None
 
 
 class WorkflowResponse(BaseModel):
@@ -1445,6 +1447,7 @@ class WorkflowRunNodeItem(BaseModel):
     job_id: str | None = None
     attempts: int = 0
     error: str | None = None
+    outputs: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
 
 
 class WorkflowRunStatusResponse(BaseModel):

@@ -10,9 +10,12 @@ from typing import Any, cast
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, func, insert, select, update
+from sqlalchemy import create_engine, func, insert, select, text, update
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import DBAPIError
 
+from app.api.errors import ApiError
+from app.api.routes import core as core_routes
 from app.api.services import ApiServices
 from app.db.models import jobs, metadata, projects, users, workflows
 from app.domain.workflow import WorkflowSpec
@@ -207,6 +210,173 @@ def test_sensor_cooldown_claim_prevents_double_trigger() -> None:
         assert _sensor_last_triggered(engine, workflow_id) == t1
     finally:
         _clear_metadata(engine)
+
+
+_NOTIFY_TARGET_ID = "notify-target-1"
+_NOTIFY_SPEC = {
+    "nodes": [
+        {
+            "id": "extract",
+            "job_kind": "sql_query",
+            "payload": {"sql": "SELECT 1"},
+            "timeout_seconds": 60,
+        }
+    ],
+    "edges": [],
+    "notifications": [
+        {
+            "id": _NOTIFY_TARGET_ID,
+            "channel": "wecom",
+            "url_secret_ref": "secret-ref-before",
+        }
+    ],
+}
+
+
+def test_workflow_notify_target_lock_serializes_mutation_and_manual_freeze() -> None:
+    """Two PG connections cannot freeze/delete across the workflow row lock."""
+    engine = _pg_engine_or_skip()
+    metadata.create_all(engine)
+    _clear_metadata(engine)
+    try:
+        user_id, project_id = _seed_user_and_project(engine)
+        workflow_id = _seed_notify_workflow(
+            engine,
+            project_id=project_id,
+            created_by=user_id,
+        )
+
+        # Mutation wins the workflow row lock: a concurrent trigger cannot read
+        # the old spec. After commit it observes only the replacement ref.
+        mutation_conn = engine.connect()
+        mutation_txn = mutation_conn.begin()
+        try:
+            before = core_routes._workflow_row_for_project(
+                mutation_conn,
+                project_id=project_id,
+                workflow_id=workflow_id,
+                for_update=True,
+            )
+            assert before["dag_jsonb"]["notifications"][0]["url_secret_ref"] == (
+                "secret-ref-before"
+            )
+            _assert_workflow_row_lock_held(
+                engine,
+                project_id=project_id,
+                workflow_id=workflow_id,
+            )
+            after_spec = WorkflowSpec.model_validate(_NOTIFY_SPEC).model_dump(mode="json")
+            after_spec["notifications"][0]["url_secret_ref"] = "secret-ref-after"
+            mutation_conn.execute(
+                update(workflows).where(workflows.c.id == workflow_id).values(dag_jsonb=after_spec)
+            )
+            mutation_txn.commit()
+        finally:
+            if mutation_txn.is_active:
+                mutation_txn.rollback()
+            mutation_conn.close()
+
+        with engine.begin() as trigger_after_mutation:
+            current = core_routes._workflow_row_for_project(
+                trigger_after_mutation,
+                project_id=project_id,
+                workflow_id=workflow_id,
+                for_update=True,
+            )
+            assert current["dag_jsonb"]["notifications"][0]["url_secret_ref"] == (
+                "secret-ref-after"
+            )
+
+        # Trigger wins the same lock: it freezes and inserts its job before a
+        # mutation can inspect active executions. Once released, the mutation
+        # sees the pending frozen run and must reject removal of the ref.
+        trigger_conn = engine.connect()
+        trigger_txn = trigger_conn.begin()
+        try:
+            current = core_routes._workflow_row_for_project(
+                trigger_conn,
+                project_id=project_id,
+                workflow_id=workflow_id,
+                for_update=True,
+            )
+            spec = WorkflowSpec.model_validate(current["dag_jsonb"])
+            run_job = build_workflow_run_job(
+                workflow_id=workflow_id,
+                workflow_name=str(current["name"]),
+                project_id=project_id,
+                owner_user_id=user_id,
+                spec=spec,
+                trigger="manual",
+                now=datetime(2026, 7, 8, 10, 0, tzinfo=UTC),
+            )
+            _assert_workflow_row_lock_held(
+                engine,
+                project_id=project_id,
+                workflow_id=workflow_id,
+            )
+            PostgresJobBackend(trigger_conn).enqueue(run_job)
+            trigger_txn.commit()
+        finally:
+            if trigger_txn.is_active:
+                trigger_txn.rollback()
+            trigger_conn.close()
+
+        with engine.begin() as mutation_after_trigger:
+            core_routes._workflow_row_for_project(
+                mutation_after_trigger,
+                project_id=project_id,
+                workflow_id=workflow_id,
+                for_update=True,
+            )
+            with pytest.raises(ApiError) as exc_info:
+                core_routes._require_no_active_workflow_run_notify_target(
+                    mutation_after_trigger,
+                    project_id=project_id,
+                    workflow_id=workflow_id,
+                    target_id=_NOTIFY_TARGET_ID,
+                )
+            assert exc_info.value.code == "workflow_notify_target_active_run"
+    finally:
+        _clear_metadata(engine)
+
+
+def _assert_workflow_row_lock_held(
+    engine: Engine,
+    *,
+    project_id: str,
+    workflow_id: str,
+) -> None:
+    contender = engine.connect()
+    contender_txn = contender.begin()
+    try:
+        contender.execute(text("SET LOCAL lock_timeout = '100ms'"))
+        with pytest.raises(DBAPIError):
+            core_routes._workflow_row_for_project(
+                contender,
+                project_id=project_id,
+                workflow_id=workflow_id,
+                for_update=True,
+            )
+    finally:
+        contender_txn.rollback()
+        contender.close()
+
+
+def _seed_notify_workflow(engine: Engine, *, project_id: str, created_by: str) -> str:
+    workflow_id = str(uuid4())
+    spec = WorkflowSpec.model_validate(_NOTIFY_SPEC)
+    with engine.begin() as conn:
+        conn.execute(
+            insert(workflows).values(
+                id=workflow_id,
+                project_id=project_id,
+                name="notify-" + workflow_id,
+                dag_jsonb=spec.model_dump(mode="json"),
+                enabled=True,
+                created_by=created_by,
+            )
+        )
+    return workflow_id
 
 
 def _seed_sensor_workflow(engine: Engine, *, project_id: str, created_by: str) -> str:

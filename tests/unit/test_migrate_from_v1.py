@@ -327,8 +327,20 @@ def test_migrate_workflows_maps_supported_nodes_edges_and_when() -> None:
         "export_excel",
     ]
     assert dag["edges"] == [
-        {"source": "compare", "target": "lineage"},
-        {"source": "lineage", "target": "excel"},
+        {
+            "source": "compare",
+            "target": "lineage",
+            "trigger": "success",
+            "when": None,
+            "is_default": False,
+        },
+        {
+            "source": "lineage",
+            "target": "excel",
+            "trigger": "success",
+            "when": None,
+            "is_default": False,
+        },
     ]
     assert dag["nodes"][1]["when"] == "nodes.compare.summary.diff_rows == 0"
     assert dag["nodes"][0]["payload"]["task_id"] == "task-1"
