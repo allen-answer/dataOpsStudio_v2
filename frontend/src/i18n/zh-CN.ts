@@ -871,7 +871,7 @@ export default {
     title: '编排',
     new: '新建',
     empty_title: '还没有编排',
-    empty_hint: '点击"新建"用 JSON 定义一个 Job DAG 编排',
+    empty_hint: '点击"新建"用结构化表单创建 Job DAG 编排',
     select_hint: '从左侧选择一个编排查看详情',
     node_count: '{count} 个节点',
     schedule_off: '已停用',

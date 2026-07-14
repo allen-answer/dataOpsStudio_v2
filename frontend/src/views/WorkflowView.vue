@@ -692,8 +692,23 @@ function payloadPreview(payload: Record<string, unknown>): string {
 
     <!-- ============ 右栏:详情 ============ -->
     <div class="flex-1 min-h-0 flex flex-col">
+      <div v-if="editorIntent === 'create'" class="flex-1 min-h-0 overflow-auto p-4">
+        <WorkflowEditor
+          :key="editorKey"
+          initial-name=""
+          :initial-enabled="true"
+          :initial-spec="emptyWorkflowSpec()"
+          :create-mode="true"
+          :datasources="datasourceQuery.data.value ?? []"
+          :compare-tasks="compareTasksQuery.data.value ?? []"
+          :notifications="[]"
+          :busy="editorBusy"
+          @save="saveEditor"
+          @cancel="closeEditor"
+        />
+      </div>
       <div
-        v-if="!selectedId"
+        v-else-if="!selectedId"
         class="flex-1 grid place-items-center text-sm chrome-text-muted"
       >
         {{ t('workflow.select_hint') }}
@@ -765,15 +780,15 @@ function payloadPreview(payload: Record<string, unknown>): string {
 
         <div class="flex-1 min-h-0 overflow-auto p-4">
           <WorkflowEditor
-            v-if="editorIntent"
+            v-if="editorIntent === 'edit'"
             :key="editorKey"
-            :initial-name="editorIntent === 'edit' ? detail?.name : ''"
-            :initial-enabled="editorIntent === 'edit' ? detail?.enabled : true"
-            :initial-spec="editorIntent === 'edit' ? detail?.spec : emptyWorkflowSpec()"
-            :create-mode="editorIntent === 'create'"
+            :initial-name="detail?.name"
+            :initial-enabled="detail?.enabled"
+            :initial-spec="detail?.spec"
+            :create-mode="false"
             :datasources="datasourceQuery.data.value ?? []"
             :compare-tasks="compareTasksQuery.data.value ?? []"
-            :notifications="editorIntent === 'edit' ? detail?.spec.notifications ?? [] : []"
+            :notifications="detail?.spec.notifications ?? []"
             :busy="editorBusy"
             @save="saveEditor"
             @cancel="closeEditor"
