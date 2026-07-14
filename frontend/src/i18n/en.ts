@@ -903,7 +903,7 @@ export default {
     title: 'Workflows',
     new: 'New',
     empty_title: 'No workflows yet',
-    empty_hint: 'Click "New" to define a Job DAG workflow as JSON',
+    empty_hint: 'Click "New" to create a Job DAG workflow with the structured form',
     select_hint: 'Select a workflow on the left to view details',
     node_count: '{count} nodes',
     schedule_off: 'disabled',
