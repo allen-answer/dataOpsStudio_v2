@@ -188,7 +188,7 @@ test('SQL workspace tabs, history, templates, and progressive result render', as
   await page.getByRole('button', { name: 'Run' }).click()
   await expect(page.getByText(/loaded 2 rows/)).toBeVisible()
   await expect(page.getByText('Ada')).toBeVisible()
-  await expect(page.getByText('Lin')).toBeVisible()
+  await expect(page.getByRole('cell', { name: 'Lin', exact: true })).toBeVisible()
   expectNoConsoleErrors()
 })
 
