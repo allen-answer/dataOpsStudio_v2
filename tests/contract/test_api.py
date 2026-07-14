@@ -15,12 +15,13 @@ from app.api.schemas import SqlGenerateResponse
 from app.api.security import create_access_token, decode_access_token
 from app.api.services import ApiServices
 from app.dbclients.protocol import AdapterConnectionError
-from app.domain.ai import AiResponse
+from app.domain.ai import AiContext, AiOptions, AiResponse, EgressLevel
 from app.domain.compare_result import encode_compare_result_row
 from app.domain.job import Job, JobKind
 from app.domain.license import LicenseMode
 from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Index, Row, Schema, Table
+from app.services.ai.errors import EgressBlockedError, ProviderError
 from tests._asgi_client import AsgiClient
 
 pytestmark = pytest.mark.contract
@@ -1930,7 +1931,26 @@ def test_compare_ai_map_suggest_samples_without_optin_rejected_403() -> None:
     assert audit["result"] == "skipped"
 
 
-def test_ai_sql_generate_uses_l2_schema_context_and_audits() -> None:
+class _SequenceGateway:
+    def __init__(
+        self,
+        responses: list[AiResponse] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.responses = list(responses or [])
+        self.error = error
+        self.calls: list[tuple[str, AiContext, AiOptions]] = []
+
+    def complete(self, prompt: str, context: AiContext, options: AiOptions) -> AiResponse:
+        self.calls.append((prompt, context, options))
+        if self.error is not None:
+            raise self.error
+        return self.responses.pop(0)
+
+
+def test_ai_sql_generate_uses_l2_schema_context_and_audits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     columns_cache = _metadata_cache(
         [
             {
@@ -1960,6 +1980,10 @@ def test_ai_sql_generate_uses_l2_schema_context_and_audits() -> None:
         ]
     )
     services = _Services(engine)
+    gateway = _SequenceGateway(
+        [AiResponse(content="SELECT id, amount FROM app.users", provider="mock", model="m")]
+    )
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
     app = create_app(services=cast(ApiServices, services))
 
     response = AsgiClient(app).post(
@@ -1975,8 +1999,7 @@ def test_ai_sql_generate_uses_l2_schema_context_and_audits() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
-    # MockProvider echoes "ok"; no fenced block -> whole content is the SQL.
-    assert payload["sql"] == "ok"
+    assert payload["sql"] == "SELECT id, amount FROM app.users"
     assert payload["egress_level"] == 2
     assert payload["tables_used"] == ["app.users"]
     assert payload["truncated"] is False
@@ -1984,6 +2007,248 @@ def test_ai_sql_generate_uses_l2_schema_context_and_audits() -> None:
     # No datasource adapter was built (metadata came from cache) and no row values leaked.
     body = response.body.decode("utf-8")
     assert "password" not in body
+
+
+def test_ai_sql_generate_validates_preview_without_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _SequenceGateway(
+        [AiResponse(content="SELECT id, name FROM app.users", provider="mock", model="m")]
+    )
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
+    services = _Services(_ai_sql_engine())
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={
+            "natural_language": "list user names",
+            "schema_name": "app",
+            "table_names": ["users"],
+        },
+    )
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["stage"] == "validated"
+    assert payload["attempts"] == 1
+    assert payload["reasoning_mode"] == "disabled"
+    assert payload["validation"] == {
+        "readonly": "passed",
+        "tables": "passed",
+        "columns": "passed",
+        "warnings": [],
+    }
+    assert gateway.calls[0][1].items[0].egress_level is EgressLevel.L2
+    assert gateway.calls[0][2].max_tokens == 1200
+    assert not any(audit["action"] == "sql_execute" for audit in services.audits)
+    assert not any("INSERT INTO jobs" in statement for statement in services.engine.statements)
+
+
+def test_ai_sql_generate_repairs_truncated_output_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _SequenceGateway(
+        [
+            AiResponse(content="", finish_reason="length", reasoning_chars=100),
+            AiResponse(content="SELECT id FROM app.users", finish_reason="stop"),
+        ]
+    )
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
+    services = _Services(_ai_sql_engine())
+    response = AsgiClient(create_app(services=cast(ApiServices, services))).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={
+            "natural_language": "list users",
+            "schema_name": "app",
+            "table_names": ["users"],
+        },
+    )
+
+    assert response.json()["ok"] is True
+    assert response.json()["attempts"] == 2
+    assert len(gateway.calls) == 2
+    assert gateway.calls[1][2].max_tokens > gateway.calls[0][2].max_tokens
+
+
+def test_ai_sql_generate_stops_after_one_failed_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _SequenceGateway(
+        [
+            AiResponse(content="", finish_reason="length"),
+            AiResponse(content="", finish_reason="length"),
+        ]
+    )
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
+    services = _Services(_ai_sql_engine())
+
+    response = AsgiClient(create_app(services=cast(ApiServices, services))).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={
+            "natural_language": "list users",
+            "schema_name": "app",
+            "table_names": ["users"],
+        },
+    )
+
+    assert response.json()["ok"] is False
+    assert response.json()["diagnostic_code"] == "provider_output_truncated"
+    assert response.json()["attempts"] == 2
+    assert len(gateway.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "provider_auth_failed",
+        "provider_rate_limited",
+        "provider_timeout",
+        "provider_unreachable",
+    ],
+)
+def test_ai_sql_generate_does_not_retry_deterministic_provider_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    code: str,
+) -> None:
+    gateway = _SequenceGateway(error=ProviderError(code))
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
+    services = _Services(_ai_sql_engine())
+    response = AsgiClient(create_app(services=cast(ApiServices, services))).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={
+            "natural_language": "list users",
+            "schema_name": "app",
+            "table_names": ["users"],
+        },
+    )
+
+    assert response.json()["diagnostic_code"] == code
+    assert response.json()["attempts"] == 1
+    assert len(gateway.calls) == 1
+
+
+def test_ai_sql_generate_repairs_invalid_provider_response_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _SequenceGateway(error=ProviderError("provider_invalid_response"))
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
+    services = _Services(_ai_sql_engine())
+
+    response = AsgiClient(create_app(services=cast(ApiServices, services))).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={
+            "natural_language": "list users",
+            "schema_name": "app",
+            "table_names": ["users"],
+        },
+    )
+
+    assert response.json()["diagnostic_code"] == "provider_invalid_response"
+    assert response.json()["attempts"] == 2
+    assert len(gateway.calls) == 2
+
+
+def test_ai_sql_generate_does_not_retry_egress_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _SequenceGateway(error=EgressBlockedError(EgressLevel.L3, EgressLevel.L2))
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
+    services = _Services(_ai_sql_engine())
+
+    response = AsgiClient(create_app(services=cast(ApiServices, services))).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={
+            "natural_language": "list users",
+            "schema_name": "app",
+            "table_names": ["users"],
+        },
+    )
+
+    assert response.json()["diagnostic_code"] == "ai_egress_blocked"
+    assert response.json()["attempts"] == 1
+    assert len(gateway.calls) == 1
+
+
+def test_ai_sql_generate_revision_uses_separate_l3_candidate_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = "SELECT id FROM app.users"
+    gateway = _SequenceGateway(
+        [AiResponse(content="SELECT id, name FROM app.users", provider="mock", model="m")]
+    )
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
+    services = _Services(_ai_sql_engine())
+
+    response = AsgiClient(create_app(services=cast(ApiServices, services))).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={
+            "natural_language": "list users",
+            "schema_name": "app",
+            "table_names": ["users"],
+            "candidate_sql": candidate,
+            "revision_instruction": "include names",
+        },
+    )
+
+    assert response.json()["ok"] is True
+    assert response.json()["egress_level"] == 3
+    assert [item.egress_level for item in gateway.calls[0][1].items] == [
+        EgressLevel.L2,
+        EgressLevel.L3,
+    ]
+    assert gateway.calls[0][1].items[1].content == candidate
+    assert candidate not in gateway.calls[0][0]
+
+
+def test_ai_sql_audit_contains_only_allowlisted_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _SequenceGateway(
+        [AiResponse(content="SELECT id FROM app.users", provider="mock", model="m")]
+    )
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
+    services = _Services(_ai_sql_engine())
+    AsgiClient(create_app(services=cast(ApiServices, services))).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={
+            "natural_language": "private prompt marker",
+            "schema_name": "app",
+            "table_names": ["users"],
+        },
+    )
+
+    detail = next(
+        audit["detail"] for audit in services.audits if audit["action"] == "ai_copilot_run"
+    )
+    assert isinstance(detail, dict)
+    assert set(detail) <= {
+        "diagnostic_code",
+        "stage",
+        "duration_ms",
+        "provider_duration_ms",
+        "attempts",
+        "provider",
+        "model",
+        "reasoning_mode",
+        "table_count",
+        "tokens_in",
+        "tokens_out",
+        "tokens_total",
+        "egress_level",
+    }
+    assert "private prompt marker" not in str(detail)
+    assert "users" not in str(detail)
+    assert "SELECT" not in str(detail)
 
 
 def test_ai_sql_table_candidates_rank_without_calling_gateway(
@@ -2178,6 +2443,8 @@ def test_ai_sql_generate_without_schema_uses_only_unique_confirmed_table(
         return [Column(name="id", type=ColumnType.INTEGER)]
 
     monkeypatch.setattr(core_routes, "_metadata_columns_for_table", columns)
+    gateway = _SequenceGateway([AiResponse(content="SELECT id FROM app.users")])
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
     engine = _FakeEngine([_datasource_row(), {"id": "project-1"}, _ai_config_row()])
     app = create_app(services=cast(ApiServices, _Services(engine)))
 
@@ -2260,6 +2527,10 @@ def test_sql_generate_response_additive_defaults_preserve_old_construction() -> 
 def test_ai_sql_generate_metadata_failure_is_audited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    def fail_gateway(*args: object, **kwargs: object) -> None:
+        raise AssertionError("metadata failure must stop before provider access")
+
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", fail_gateway)
     monkeypatch.setattr(
         core_routes,
         "build_database_adapter",
@@ -2290,7 +2561,10 @@ def test_ai_sql_generate_metadata_failure_is_audited(
     assert response.json()["error"] == "metadata_probe_failed"
     audit = next(a for a in services.audits if a["action"] == "ai_copilot_run")
     assert audit["result"] == "failed"
-    assert audit["detail"] == {"error": "metadata_probe_failed"}
+    assert audit["detail"] == {
+        "diagnostic_code": "metadata_probe_failed",
+        "stage": "failed",
+    }
 
 
 def test_ai_sql_generate_disabled_returns_structured_409() -> None:
@@ -2316,10 +2590,9 @@ def test_ai_sql_generate_disabled_returns_structured_409() -> None:
 
     assert response.status_code == 409
     assert response.json()["error"] == "ai_disabled"
-    assert any(
-        audit["action"] == "ai_copilot_run" and audit["result"] == "skipped"
-        for audit in services.audits
-    )
+    audit = next(audit for audit in services.audits if audit["action"] == "ai_copilot_run")
+    assert audit["result"] == "skipped"
+    assert audit["detail"] == {"diagnostic_code": "ai_disabled", "stage": "failed"}
 
 
 def _ai_config_row_l3() -> dict[str, object]:
@@ -4137,6 +4410,36 @@ def _ai_config_row() -> dict[str, object]:
         "l4_requires_optin": True,
         "enable_inference": True,
     }
+
+
+def _ai_sql_engine() -> _FakeEngine:
+    return _FakeEngine(
+        [
+            _datasource_row(),
+            {"id": "project-1"},
+            _ai_config_row(),
+            _metadata_cache(
+                [
+                    {
+                        "name": "id",
+                        "type": "integer",
+                        "driver_type": "INT",
+                        "nullable": False,
+                        "primary_key": True,
+                        "comment": None,
+                    },
+                    {
+                        "name": "name",
+                        "type": "string",
+                        "driver_type": "VARCHAR(64)",
+                        "nullable": True,
+                        "primary_key": False,
+                        "comment": None,
+                    },
+                ]
+            ),
+        ]
+    )
 
 
 def test_lineage_analyze_ai_fallback_writes_inferred_edges_via_gateway(

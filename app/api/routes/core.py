@@ -124,6 +124,7 @@ from app.api.schemas import (
     SqlFormatResponse,
     SqlGenerateRequest,
     SqlGenerateResponse,
+    SqlGenerateValidation,
     SqlHistoryItem,
     SqlPreflightFinding,
     SqlPreflightRequest,
@@ -181,7 +182,7 @@ from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.sql_build import limit_clause, quote_identifier
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
-from app.domain.ai import AiContext, AiOptions, ContextItem, EgressLevel
+from app.domain.ai import AiContext, AiOptions, ContextItem, EgressLevel, ReasoningMode
 from app.domain.ai_compare_map import (
     MAX_SAMPLE_ROWS,
     aggregate_mapping_history,
@@ -193,9 +194,7 @@ from app.domain.ai_compare_map import (
 )
 from app.domain.ai_copilot import (
     MAX_TABLES,  # C1 与 C4 共用同一"送 AI 表数上限"(均为 12,语义一致)
-    build_nl2sql_prompt,
     build_schema_context,
-    split_sql_and_explanation,
 )
 from app.domain.ai_slowsql import (
     MAX_PLAN_ROWS,
@@ -284,8 +283,23 @@ from app.services.ai.default_gateway import (
     AiGatewayRuntimeConfig,
     build_gateway_from_runtime_config,
 )
-from app.services.ai.errors import AiDisabledError, AiGatewayError, EgressBlockedError
-from app.services.ai.sql_assistant import TableSchema, rank_table_candidates
+from app.services.ai.errors import (
+    AiDisabledError,
+    AiGatewayError,
+    EgressBlockedError,
+    ProviderError,
+)
+from app.services.ai.sql_assistant import (
+    TableSchema,
+    build_generation_prompt,
+    build_repair_prompt,
+    classify_reasoning_mode,
+    diagnose_empty_response,
+    extract_sql,
+    rank_table_candidates,
+    should_repair,
+    validate_generated_sql,
+)
 from app.services.lineage_batch_export import batch_export_sheets
 from app.services.sql_preflight import run_sql_preflight
 from app.services.workflow_scheduler import build_workflow_run_job
@@ -1528,16 +1542,11 @@ def generate_sql_from_nl(
     body: SqlGenerateRequest,
     request: Request,
 ) -> SqlGenerateResponse:
-    """AI Copilot C1 —— 自然语言 → 用真实 schema 生成只读 SQL(设计稿 §2.7.4,egress L2)。
-
-    流程:取 datasource(校验 project 访问)→ 取 AI 运行配置(未启用 → 结构化 409)→
-    从 metadata 缓存组装 schema 上下文(仅表/列/类型,**绝不带样本数据/行值**)→
-    组 prompt → AiGateway.complete(purpose=ai_copilot_run)→ 拆 SQL + 解释。
-    详见 docs/design/C1-copilot-nl2sql.md。
-    """
+    """Generate a validated SQL preview from confirmed trusted metadata."""
     if not body.table_names:
         raise ApiError(422, "ai_table_scope_required", "Confirm at least one table")
 
+    started_at = time.monotonic()
     services = services_from(request)
     user = current_user_from(request)
     row = _datasource_for_current_user(request, datasource_id)
@@ -1556,63 +1565,227 @@ def generate_sql_from_nl(
             detail=detail,
         )
 
+    def audit_detail(
+        *,
+        diagnostic_code: str | None,
+        stage: str,
+        duration_ms: int,
+        provider_duration_ms: int,
+        attempts: int,
+        provider: str | None,
+        model: str | None,
+        reasoning_mode: str,
+        table_count: int,
+        tokens_in: int,
+        tokens_out: int,
+        tokens_total: int,
+        egress_level: int,
+    ) -> dict[str, object]:
+        return {
+            "diagnostic_code": diagnostic_code,
+            "stage": stage,
+            "duration_ms": duration_ms,
+            "provider_duration_ms": provider_duration_ms,
+            "attempts": attempts,
+            "provider": provider,
+            "model": model,
+            "reasoning_mode": reasoning_mode,
+            "table_count": table_count,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "tokens_total": tokens_total,
+            "egress_level": egress_level,
+        }
+
     with services.engine.connect() as conn:
         ai_row = _ai_config_row_or_none(conn)
     runtime = _ai_runtime_config(services, ai_row)
     if not runtime.enabled or runtime.provider in {None, "off"}:
-        audit("skipped", {"error": "ai_disabled"})
+        audit("skipped", {"diagnostic_code": "ai_disabled", "stage": "failed"})
         raise ApiError(409, "ai_disabled", "AI copilot is not enabled")
 
     try:
         tables, more_tables = _schema_tables_for_ai(services, row, body)
     except ApiError as exc:
-        audit("failed", {"error": exc.code})
+        audit("failed", {"diagnostic_code": exc.code, "stage": "failed"})
         raise
+
     schema_payload, tables_used, column_truncated = build_schema_context(tables)
     truncated = more_tables or column_truncated
-    prompt = build_nl2sql_prompt(body.natural_language, dialect=str(row["db_type"]))
-    context = AiContext(
-        items=[
-            ContextItem(
-                content=json.dumps(
-                    schema_payload,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                # ★ egress L2:仅结构信息(表名/列名/类型),永不含行值(§2.7.5)。
-                egress_level=EgressLevel.L2,
-            )
-        ]
-    )
-    try:
-        response = build_gateway_from_runtime_config(runtime).complete(
-            prompt,
-            context,
-            AiOptions(purpose="ai_copilot_run", max_tokens=800),
+    table_schemas = [
+        TableSchema(schema_name=schema_name, table_name=table_name, columns=tuple(columns))
+        for schema_name, table_name, columns in tables
+    ]
+    db_dialect = str(row["db_type"])
+    parser_dialect = _sqlglot_dialect(db_dialect)
+    reasoning_mode = classify_reasoning_mode(body.natural_language, table_schemas)
+    first_budget = 1200 if reasoning_mode is ReasoningMode.DISABLED else 3200
+    repair_budget = 1800 if reasoning_mode is ReasoningMode.DISABLED else 4800
+    egress_level = EgressLevel.L3 if body.candidate_sql is not None else EgressLevel.L2
+    context_items = [
+        ContextItem(
+            content=json.dumps(
+                schema_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            # ★ trusted schema only; never includes sample rows or values.
+            egress_level=EgressLevel.L2,
         )
-    except AiDisabledError:
-        audit("skipped", {"error": "ai_disabled"})
-        raise ApiError(409, "ai_disabled", "AI copilot is not enabled") from None
-    except AiGatewayError as exc:
-        error = type(exc).__name__
-        audit("failed", {"error": error})
-        return SqlGenerateResponse(ok=False, error=error)
-
-    sql, explanation = split_sql_and_explanation(response.content)
-    audit(
-        "success",
-        {"provider": response.provider, "tables": len(tables_used), "truncated": truncated},
+    ]
+    if body.candidate_sql is not None:
+        context_items.append(ContextItem(content=body.candidate_sql, egress_level=EgressLevel.L3))
+    context = AiContext(items=context_items)
+    generation_prompt = build_generation_prompt(
+        body.natural_language,
+        dialect=db_dialect,
+        revision_instruction=body.revision_instruction,
     )
+    gateway = build_gateway_from_runtime_config(runtime)
+
+    attempts = 0
+    provider_duration_ms = 0
+    tokens_in = 0
+    tokens_out = 0
+    tokens_total = 0
+    provider = runtime.provider
+    model = runtime.model
+    diagnostic_code = "provider_invalid_response"
+    repair_candidate = body.candidate_sql or ""
+
+    while attempts < 2:
+        attempts += 1
+        if attempts == 1:
+            prompt = generation_prompt
+            max_tokens = first_budget
+        else:
+            prompt = build_repair_prompt(
+                repair_candidate,
+                diagnostic_code,
+                dialect=db_dialect,
+            )
+            max_tokens = repair_budget
+
+        provider_started_at = time.monotonic()
+        try:
+            response = gateway.complete(
+                prompt,
+                context,
+                AiOptions(
+                    purpose="ai_copilot_run",
+                    max_tokens=max_tokens,
+                    reasoning_mode=reasoning_mode,
+                ),
+            )
+        except AiDisabledError:
+            audit("skipped", {"diagnostic_code": "ai_disabled", "stage": "failed"})
+            raise ApiError(409, "ai_disabled", "AI copilot is not enabled") from None
+        except ProviderError as exc:
+            provider_duration_ms += round((time.monotonic() - provider_started_at) * 1000)
+            diagnostic_code = exc.diagnostic_code
+            if should_repair(diagnostic_code, attempts=attempts):
+                continue
+            break
+        except EgressBlockedError:
+            provider_duration_ms += round((time.monotonic() - provider_started_at) * 1000)
+            diagnostic_code = "ai_egress_blocked"
+            break
+        except AiGatewayError:
+            provider_duration_ms += round((time.monotonic() - provider_started_at) * 1000)
+            diagnostic_code = "provider_invalid_response"
+            if should_repair(diagnostic_code, attempts=attempts):
+                continue
+            break
+
+        provider_duration_ms += response.duration_ms
+        tokens_in += response.tokens_in
+        tokens_out += response.tokens_out
+        tokens_total += response.tokens_total
+        provider = response.provider
+        model = response.model
+
+        diagnostic_code = diagnose_empty_response(response) or ""
+        sql: str | None = None
+        if not diagnostic_code:
+            sql = extract_sql(response.content)
+            if sql is None:
+                diagnostic_code = "sql_parse_failed"
+            else:
+                validation = validate_generated_sql(
+                    sql,
+                    dialect=parser_dialect,
+                    tables=table_schemas,
+                )
+                if validation.ok:
+                    detail = audit_detail(
+                        diagnostic_code=None,
+                        stage="validated",
+                        duration_ms=round((time.monotonic() - started_at) * 1000),
+                        provider_duration_ms=provider_duration_ms,
+                        attempts=attempts,
+                        provider=provider,
+                        model=model,
+                        reasoning_mode=reasoning_mode.value,
+                        table_count=len(tables_used),
+                        tokens_in=tokens_in,
+                        tokens_out=tokens_out,
+                        tokens_total=tokens_total,
+                        egress_level=int(egress_level),
+                    )
+                    audit("success", detail)
+                    return SqlGenerateResponse(
+                        ok=True,
+                        sql=sql,
+                        explanation=None,
+                        provider=provider,
+                        model=model,
+                        egress_level=int(egress_level),
+                        tables_used=tables_used,
+                        truncated=truncated,
+                        stage="validated",
+                        diagnostic_code=None,
+                        attempts=attempts,
+                        reasoning_mode=reasoning_mode.value,
+                        validation=SqlGenerateValidation(
+                            readonly=validation.readonly,
+                            tables=validation.tables,
+                            columns=validation.columns,
+                            warnings=list(validation.warnings),
+                        ),
+                        request_id=request_id_from(request),
+                    )
+                diagnostic_code = validation.diagnostic_code or "provider_invalid_response"
+
+        repair_candidate = sql if sql is not None else response.content
+        if should_repair(diagnostic_code, attempts=attempts):
+            continue
+        break
+
+    detail = audit_detail(
+        diagnostic_code=diagnostic_code,
+        stage="failed",
+        duration_ms=round((time.monotonic() - started_at) * 1000),
+        provider_duration_ms=provider_duration_ms,
+        attempts=attempts,
+        provider=provider,
+        model=model,
+        reasoning_mode=reasoning_mode.value,
+        table_count=len(tables_used),
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        tokens_total=tokens_total,
+        egress_level=int(egress_level),
+    )
+    audit("failed", detail)
     return SqlGenerateResponse(
-        ok=True,
-        sql=sql,
-        explanation=explanation,
-        provider=response.provider,
-        model=response.model,
-        egress_level=int(EgressLevel.L2),
-        tables_used=tables_used,
-        truncated=truncated,
+        ok=False,
+        error=diagnostic_code,
+        stage="failed",
+        diagnostic_code=diagnostic_code,
+        attempts=attempts,
+        reasoning_mode=reasoning_mode.value,
+        request_id=request_id_from(request),
     )
 
 
