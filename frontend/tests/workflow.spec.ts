@@ -194,6 +194,7 @@ interface MockState {
 }
 
 interface MockWorkflowOptions {
+  emptyWorkflows?: boolean
   updateError?: { status?: number; error: string; message: string }
 }
 
@@ -241,7 +242,13 @@ async function mockWorkflowPage(
     const url = new URL(request.url())
     const path = url.pathname
     if (path === '/api/projects/project-1/workflows' && request.method() === 'GET') {
-      return json(route, 200, [workflowListItem(), workflowListItem(secondaryWorkflow)])
+      return json(
+        route,
+        200,
+        options.emptyWorkflows
+          ? []
+          : [workflowListItem(), workflowListItem(secondaryWorkflow)],
+      )
     }
     if (path === '/api/projects/project-1/workflows' && request.method() === 'POST') {
       state.workflowWrites.push(request.postDataJSON())
@@ -432,6 +439,18 @@ test('create form lists all eight kinds and keeps Notify unavailable until first
   await page.getByRole('button', { name: 'Save changes' }).click()
   expect(state.workflowWrites).toHaveLength(1)
   expect(state.workflowWrites[0]).toMatchObject({ name: 'Created from form', enabled: false })
+  expect(consoleErrors).toEqual([])
+})
+
+test('empty workflow list opens the structured create form', async ({ page }) => {
+  const consoleErrors = trackConsoleErrors(page)
+  await mockWorkflowPage(page, { emptyWorkflows: true })
+  await page.goto('/projects/project-1/workflows')
+
+  await expect(page.getByText('No workflows yet')).toBeVisible()
+  await page.getByRole('button', { name: 'New' }).click()
+
+  await expect(page.getByTestId('workflow-editor')).toBeVisible()
   expect(consoleErrors).toEqual([])
 })
 
