@@ -1068,6 +1068,30 @@ def preflight_sql(body: SqlPreflightRequest, request: Request) -> SqlPreflightRe
     )
 
 
+def _metadata_tables_for_schema(
+    services: ApiServices,
+    datasource_row: RowMapping,
+    schema_name: str,
+) -> list[Table]:
+    payload = _metadata_payload(
+        services,
+        datasource_row,
+        _METADATA_LEVEL_TABLES,
+        schema_name=schema_name,
+        table_name="",
+        refresh=False,
+        load=lambda: [
+            MetadataTableItem(
+                schema_name=item.schema_name,
+                name=item.name,
+                table_type=item.table_type,
+            ).model_dump(mode="json")
+            for item in _metadata_adapter(services, datasource_row).list_tables(schema_name)
+        ],
+    )
+    return [Table.model_validate(item) for item in payload]
+
+
 @router.post(
     "/datasources/{datasource_id}/ai/slow-sql-diagnose",
     response_model=SlowSqlDiagnoseResponse,
@@ -1453,12 +1477,10 @@ def suggest_ai_sql_tables(
 ) -> SqlTableCandidatesResponse:
     services = services_from(request)
     row = _datasource_for_current_user(request, datasource_id)
-    all_tables = _metadata_all_tables(services, row, refresh=False)
-    filtered = [
-        item
-        for item in all_tables
-        if body.schema_name is None or item.schema_name == body.schema_name
-    ]
+    if body.schema_name is None:
+        filtered = _metadata_all_tables(services, row, refresh=False)
+    else:
+        filtered = _metadata_tables_for_schema(services, row, body.schema_name)
     table_schemas = [
         TableSchema(
             schema_name=item.schema_name,
@@ -1608,34 +1630,28 @@ def _schema_tables_for_ai(
     if body.schema_name and body.table_names:
         table_refs = [(body.schema_name, name) for name in body.table_names]
     elif body.schema_name:
-        table_payload = _metadata_payload(
-            services,
-            datasource_row,
-            _METADATA_LEVEL_TABLES,
-            schema_name=body.schema_name,
-            table_name="",
-            refresh=False,
-            load=lambda: [
-                MetadataTableItem(
-                    schema_name=item.schema_name,
-                    name=item.name,
-                    table_type=item.table_type,
-                ).model_dump(mode="json")
-                for item in _metadata_adapter(services, datasource_row).list_tables(
-                    body.schema_name or ""
+        table_refs = [
+            (item.schema_name, item.name)
+            for item in _metadata_tables_for_schema(services, datasource_row, body.schema_name)
+        ]
+    elif body.table_names:
+        all_tables = _metadata_all_tables(services, datasource_row, refresh=False)
+        schemas_by_name: dict[str, set[str]] = {}
+        for item in all_tables:
+            schemas_by_name.setdefault(item.name, set()).add(item.schema_name)
+        table_refs = []
+        for table_name in dict.fromkeys(body.table_names):
+            schema_names = schemas_by_name.get(table_name, set())
+            if len(schema_names) > 1:
+                raise ApiError(
+                    422,
+                    "ai_table_scope_ambiguous",
+                    "Confirmed table name matches multiple schemas",
                 )
-            ],
-        )
-        table_refs = [
-            (str(item["schema_name"]), str(item["name"]))
-            for item in table_payload
-            if item.get("name")
-        ]
+            if schema_names:
+                table_refs.append((next(iter(schema_names)), table_name))
     else:
-        table_refs = [
-            (table.schema_name, table.name)
-            for table in _metadata_all_tables(services, datasource_row, refresh=False)
-        ]
+        table_refs = []
 
     more_tables = len(table_refs) > MAX_TABLES
     result: list[tuple[str, str, list[Column]]] = []

@@ -2036,9 +2036,205 @@ def test_ai_sql_table_candidates_rank_without_calling_gateway(
     assert calls["gateway"] == 0
 
 
-def test_ai_sql_generate_rejects_empty_confirmed_table_scope() -> None:
+def test_ai_sql_table_candidates_schema_scope_avoids_all_schema_enumeration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_calls: list[tuple[str, str]] = []
+    column_calls: list[tuple[str, str]] = []
+
+    def fail_all_tables(*args: object, **kwargs: object) -> None:
+        raise AssertionError("schema-scoped candidates must not enumerate all schemas")
+
+    def schema_tables(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        metadata_calls.append((str(args[2]), str(kwargs["schema_name"])))
+        return [
+            {"schema_name": "app", "name": "users", "table_type": "BASE TABLE"},
+            {"schema_name": "app", "name": "orders", "table_type": "BASE TABLE"},
+        ]
+
+    def columns(
+        services: object,
+        row: object,
+        schema_name: str,
+        table_name: str,
+        refresh: bool,
+    ) -> list[Column]:
+        del services, row, refresh
+        column_calls.append((schema_name, table_name))
+        return [Column(name="id", type=ColumnType.INTEGER)]
+
+    monkeypatch.setattr(core_routes, "_metadata_all_tables", fail_all_tables)
+    monkeypatch.setattr(core_routes, "_metadata_payload", schema_tables)
+    monkeypatch.setattr(core_routes, "_metadata_columns_for_table", columns)
+    engine = _FakeEngine([_datasource_row(), {"id": "project-1"}])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/ai/sql-table-candidates",
+        headers=_auth_headers(),
+        json_body={"natural_language": "users", "schema_name": "app"},
+    )
+
+    assert response.status_code == 200
+    assert metadata_calls == [("tables", "app")]
+    assert all(item["schema_name"] == "app" for item in response.json()["candidates"])
+    assert column_calls == [("app", "users"), ("app", "orders")]
+
+
+def test_ai_sql_table_candidates_reports_truncated_schema_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    column_calls: list[str] = []
+
+    def fail_all_tables(*args: object, **kwargs: object) -> None:
+        raise AssertionError("schema-scoped candidates must not enumerate all schemas")
+
+    monkeypatch.setattr(core_routes, "_metadata_all_tables", fail_all_tables)
+    monkeypatch.setattr(
+        core_routes,
+        "_metadata_payload",
+        lambda *args, **kwargs: [
+            {
+                "schema_name": "app",
+                "name": f"table_{index}",
+                "table_type": "BASE TABLE",
+            }
+            for index in range(core_routes.MAX_TABLES + 1)
+        ],
+    )
+
+    def columns(
+        services: object,
+        row: object,
+        schema_name: str,
+        table_name: str,
+        refresh: bool,
+    ) -> list[Column]:
+        del services, row, schema_name, refresh
+        column_calls.append(table_name)
+        return [Column(name="id", type=ColumnType.INTEGER)]
+
+    monkeypatch.setattr(core_routes, "_metadata_columns_for_table", columns)
+    engine = _FakeEngine([_datasource_row(), {"id": "project-1"}])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/ai/sql-table-candidates",
+        headers=_auth_headers(),
+        json_body={"natural_language": "table", "schema_name": "app"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["truncated"] is True
+    assert len(response.json()["candidates"]) == 8
+    assert len(column_calls) == core_routes.MAX_TABLES
+
+
+def test_ai_sql_table_candidates_rejects_unauthorized_datasource_before_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_metadata(*args: object, **kwargs: object) -> None:
+        raise AssertionError("unauthorized datasource must not read metadata")
+
+    monkeypatch.setattr(core_routes, "_metadata_all_tables", fail_metadata)
+    monkeypatch.setattr(core_routes, "_metadata_payload", fail_metadata)
+    engine = _FakeEngine([_datasource_row(), None])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/ai/sql-table-candidates",
+        headers=_auth_headers(),
+        json_body={"natural_language": "users"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "not_found"
+
+
+def test_ai_sql_generate_without_schema_uses_only_unique_confirmed_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    column_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        core_routes,
+        "_metadata_all_tables",
+        lambda services, row, refresh: [
+            SimpleNamespace(schema_name="audit", name="events"),
+            SimpleNamespace(schema_name="app", name="users"),
+        ],
+    )
+
+    def columns(
+        services: object,
+        row: object,
+        schema_name: str,
+        table_name: str,
+        refresh: bool,
+    ) -> list[Column]:
+        del services, row, refresh
+        column_calls.append((schema_name, table_name))
+        return [Column(name="id", type=ColumnType.INTEGER)]
+
+    monkeypatch.setattr(core_routes, "_metadata_columns_for_table", columns)
+    engine = _FakeEngine([_datasource_row(), {"id": "project-1"}, _ai_config_row()])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={"natural_language": "list users", "table_names": ["users"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["tables_used"] == ["app.users"]
+    assert column_calls == [("app", "users")]
+
+
+def test_ai_sql_generate_without_schema_rejects_ambiguous_confirmed_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    def fail_after_scope(*args: object, **kwargs: object) -> None:
+        raise AssertionError("ambiguous table scope must stop before columns or gateway")
+
+    monkeypatch.setattr(
+        core_routes,
+        "_metadata_all_tables",
+        lambda services, row, refresh: [
+            SimpleNamespace(schema_name="app", name="users"),
+            SimpleNamespace(schema_name="audit", name="users"),
+        ],
+    )
+    monkeypatch.setattr(core_routes, "_metadata_columns_for_table", fail_after_scope)
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", fail_after_scope)
+    engine = _FakeEngine([_datasource_row(), {"id": "project-1"}, _ai_config_row()])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={"natural_language": "list users", "table_names": ["users"]},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"] == "ai_table_scope_ambiguous"
+
+
+def test_ai_sql_generate_rejects_empty_confirmed_table_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_after_scope(*args: object, **kwargs: object) -> None:
+        raise AssertionError("empty table scope must stop before all downstream work")
+
     engine = _FakeEngine([_datasource_row(), {"id": "project-1"}, _ai_config_row()])
     services = _Services(engine)
+    monkeypatch.setattr(core_routes, "_ai_config_row_or_none", fail_after_scope)
+    monkeypatch.setattr(core_routes, "_metadata_all_tables", fail_after_scope)
+    monkeypatch.setattr(core_routes, "_metadata_columns_for_table", fail_after_scope)
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", fail_after_scope)
     app = create_app(services=cast(ApiServices, services))
 
     response = AsgiClient(app).post(
@@ -2048,6 +2244,9 @@ def test_ai_sql_generate_rejects_empty_confirmed_table_scope() -> None:
     )
 
     assert response.status_code == 422
+    assert response.json()["error"] == "ai_table_scope_required"
+    assert len(engine.results) == 3
+    assert not any(audit["action"] == "ai_copilot_run" for audit in services.audits)
 
 
 def test_sql_generate_response_additive_defaults_preserve_old_construction() -> None:
