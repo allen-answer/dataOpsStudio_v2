@@ -1661,9 +1661,14 @@ def generate_sql_from_nl(
             max_tokens = first_budget
             attempt_context = AiContext(items=list(context_items))
         else:
-            prompt = build_repair_prompt(
+            repair_prompt = build_repair_prompt(
                 diagnostic_code,
                 dialect=db_dialect,
+            )
+            prompt = (
+                repair_prompt
+                if repair_candidate
+                else f"{generation_prompt}\nRetry instruction: {repair_prompt}"
             )
             max_tokens = repair_budget
             repair_items = list(context_items)

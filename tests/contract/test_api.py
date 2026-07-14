@@ -2113,6 +2113,53 @@ def test_ai_sql_generate_repairs_truncated_output_once(
     assert detail["attempts"] == 2
 
 
+@pytest.mark.parametrize(
+    ("first_response", "diagnostic_code"),
+    [
+        (
+            AiResponse(content="", finish_reason="length"),
+            "provider_output_truncated",
+        ),
+        (
+            AiResponse(content="", finish_reason="stop", reasoning_chars=10),
+            "provider_reasoning_only",
+        ),
+        (
+            AiResponse(content="", finish_reason="stop"),
+            "provider_invalid_response",
+        ),
+    ],
+)
+def test_ai_sql_generate_empty_repair_retains_original_intent_without_l3_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    first_response: AiResponse,
+    diagnostic_code: str,
+) -> None:
+    original_intent = "retain customer intent marker"
+    gateway = _SequenceGateway([first_response, AiResponse(content="SELECT id FROM app.users")])
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
+    services = _Services(_ai_sql_engine())
+
+    response = AsgiClient(create_app(services=cast(ApiServices, services))).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={
+            "natural_language": original_intent,
+            "schema_name": "app",
+            "table_names": ["users"],
+        },
+    )
+
+    assert response.json()["ok"] is True
+    assert response.json()["attempts"] == 2
+    assert len(gateway.calls) == 2
+    repair_prompt, repair_context, _ = gateway.calls[1]
+    assert original_intent in repair_prompt
+    assert diagnostic_code in repair_prompt
+    assert len(repair_context.items) == 1
+    assert repair_context.items[0].egress_level is EgressLevel.L2
+
+
 def test_ai_sql_generate_stops_after_one_failed_repair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
