@@ -132,6 +132,35 @@ class SqlExecuteResponse(BaseModel):
     result_set_id: str
 
 
+SqlValidationState = Literal["passed", "failed", "partial"]
+SqlGenerateStage = Literal["failed", "validated"]
+ReasoningModeValue = Literal["disabled", "enabled"]
+
+
+class SqlTableCandidatesRequest(BaseModel):
+    natural_language: str = Field(min_length=1, max_length=2000)
+    schema_name: str | None = None
+    editor_sql: str | None = Field(default=None, max_length=20000)
+
+
+class SqlTableCandidateItem(BaseModel):
+    schema_name: str | None
+    table_name: str
+    matched_by: list[Literal["editor_reference", "table_name", "column_name"]]
+
+
+class SqlTableCandidatesResponse(BaseModel):
+    candidates: list[SqlTableCandidateItem] = Field(default_factory=list)
+    truncated: bool = False
+
+
+class SqlGenerateValidation(BaseModel):
+    readonly: SqlValidationState
+    tables: SqlValidationState
+    columns: SqlValidationState
+    warnings: list[str] = Field(default_factory=list)
+
+
 class SqlGenerateRequest(BaseModel):
     """AI Copilot C1 —— 自然语言 → SQL 生成入参(设计稿 §2.7.4)。
 
@@ -140,7 +169,15 @@ class SqlGenerateRequest(BaseModel):
 
     natural_language: str = Field(min_length=1, max_length=2000)
     schema_name: str | None = None
-    table_names: list[str] = Field(default_factory=list)
+    table_names: list[str] = Field(default_factory=list, max_length=12)
+    candidate_sql: str | None = Field(default=None, max_length=20000)
+    revision_instruction: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def _validate_revision_pair(self) -> SqlGenerateRequest:
+        if (self.candidate_sql is None) != (self.revision_instruction is None):
+            raise ValueError("candidate_sql and revision_instruction must be supplied together")
+        return self
 
 
 class SqlGenerateResponse(BaseModel):
@@ -155,6 +192,12 @@ class SqlGenerateResponse(BaseModel):
     egress_level: int = 2
     tables_used: list[str] = Field(default_factory=list)
     truncated: bool = False
+    stage: SqlGenerateStage = "failed"
+    diagnostic_code: str | None = None
+    attempts: int = Field(default=0, ge=0, le=2)
+    reasoning_mode: ReasoningModeValue | None = None
+    validation: SqlGenerateValidation | None = None
+    request_id: str | None = None
 
 
 class SqlPreflightRequest(BaseModel):

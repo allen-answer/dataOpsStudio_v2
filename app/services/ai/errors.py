@@ -38,7 +38,14 @@ class BudgetExceededError(AiGatewayError):
 
 
 class ProviderError(AiGatewayError):
-    """provider 调用失败(网络 / HTTP / 解析)。
+    """Safe provider failure; never contains a response body or credential."""
 
-    ★ 是 AiGatewayError 子类,调用方按"AI 不可用"降级即可,不需区分网络细节。
-    """
+    def __init__(
+        self,
+        diagnostic_code: str = "provider_invalid_response",
+        *,
+        status_code: int | None = None,
+    ) -> None:
+        self.diagnostic_code = diagnostic_code
+        self.status_code = status_code
+        super().__init__(diagnostic_code)

@@ -17,12 +17,13 @@ completions——它是最薄的真协议(单个 POST /chat/completions,JSON 进
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Protocol
 
-from app.domain.ai import AiContext, AiOptions, AiResponse
+from app.domain.ai import AiContext, AiOptions, AiResponse, ReasoningMode
 from app.services.ai.errors import ProviderError
 
 
@@ -90,17 +91,24 @@ class UrllibTransport:
             # url 来自受信配置(endpoint),非用户输入。
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 raw = resp.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:  # pragma: no cover - 真网络分支
+        except urllib.error.HTTPError as exc:
             # ★ R5:不回显响应体(可能含 provider 侧 echo);只记状态码。
-            raise ProviderError(f"provider HTTP {exc.code}") from exc
-        except urllib.error.URLError as exc:  # pragma: no cover - 真网络分支
-            raise ProviderError("provider unreachable") from exc
+            raise ProviderError(_http_diagnostic(exc.code), status_code=exc.code) from exc
+        except TimeoutError as exc:
+            raise ProviderError("provider_timeout") from exc
+        except urllib.error.URLError as exc:
+            code = (
+                "provider_timeout"
+                if isinstance(exc.reason, TimeoutError)
+                else "provider_unreachable"
+            )
+            raise ProviderError(code) from exc
         try:
             parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:  # pragma: no cover - 真网络分支
-            raise ProviderError("provider returned non-JSON body") from exc
+        except json.JSONDecodeError as exc:
+            raise ProviderError("provider_invalid_response") from exc
         if not isinstance(parsed, dict):
-            raise ProviderError("provider returned non-object JSON")
+            raise ProviderError("provider_invalid_response")
         return parsed
 
 
@@ -140,11 +148,32 @@ class OpenAICompatibleProvider:
             body["max_tokens"] = options.max_tokens
         if options.temperature is not None:
             body["temperature"] = options.temperature
+        reasoning_mode: ReasoningMode | None = options.reasoning_mode
+        if reasoning_mode is not None and _supports_deepseek_thinking(model):
+            body["thinking"] = {"type": reasoning_mode.value}
 
         headers = {"authorization": f"Bearer {self.api_key}"}
         assert self.transport is not None  # __post_init__ 保证
+        started = time.perf_counter()
         payload = self.transport.post_json(self._url(), headers, body)
-        return _parse_chat_completion(payload, fallback_provider=self.name, fallback_model=model)
+        duration_ms = max(0, round((time.perf_counter() - started) * 1000))
+        response = _parse_chat_completion(
+            payload, fallback_provider=self.name, fallback_model=model
+        )
+        return response.model_copy(update={"duration_ms": duration_ms})
+
+
+def _supports_deepseek_thinking(model: str) -> bool:
+    lowered = model.lower()
+    return lowered.startswith("deepseek-v4") or lowered == "deepseek-reasoner"
+
+
+def _http_diagnostic(status: int) -> str:
+    if status in {401, 403}:
+        return "provider_auth_failed"
+    if status == 429:
+        return "provider_rate_limited"
+    return "provider_invalid_response"
 
 
 def _parse_chat_completion(
@@ -156,27 +185,40 @@ def _parse_chat_completion(
     """
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
-        raise ProviderError("provider response missing choices")
+        raise ProviderError("provider_invalid_response")
     first = choices[0]
-    message = first.get("message") if isinstance(first, dict) else None
-    content = message.get("content") if isinstance(message, dict) else None
-    if not isinstance(content, str):
-        raise ProviderError("provider response content not a string")
-    if not content.strip():
-        raise ProviderError("provider response content is empty")
-
+    if not isinstance(first, dict):
+        raise ProviderError("provider_invalid_response")
+    message = first.get("message")
+    if not isinstance(message, dict):
+        raise ProviderError("provider_invalid_response")
+    content_raw = message.get("content")
+    if content_raw is None:
+        content = ""
+    elif isinstance(content_raw, str):
+        content = content_raw.strip()
+    else:
+        raise ProviderError("provider_invalid_response")
+    reasoning_raw = message.get("reasoning_content")
+    reasoning_chars = len(reasoning_raw) if isinstance(reasoning_raw, str) else 0
+    finish_raw = first.get("finish_reason")
+    finish_reason = finish_raw if isinstance(finish_raw, str) else None
     usage_raw = payload.get("usage")
     usage = usage_raw if isinstance(usage_raw, dict) else {}
     tokens_in = _as_int(usage.get("prompt_tokens"))
     tokens_out = _as_int(usage.get("completion_tokens"))
+    tokens_total = _as_int(usage.get("total_tokens")) or tokens_in + tokens_out
     model_raw = payload.get("model")
     model = model_raw if isinstance(model_raw, str) else fallback_model
     return AiResponse(
         content=content,
         tokens_in=tokens_in,
         tokens_out=tokens_out,
+        tokens_total=tokens_total,
         provider=fallback_provider,
         model=model,
+        finish_reason=finish_reason,
+        reasoning_chars=reasoning_chars,
     )
 
 
