@@ -164,11 +164,11 @@ def build_generation_prompt(
     )
 
 
-def build_repair_prompt(candidate_sql: str, diagnostic_code: str, *, dialect: str) -> str:
+def build_repair_prompt(diagnostic_code: str, *, dialect: str) -> str:
     return (
         f"Repair this candidate into one read-only {dialect} SELECT "
         "using only the supplied schema. "
-        f"Validation code: {diagnostic_code}. Return SQL only.\nCandidate SQL:\n{candidate_sql}"
+        f"Validation code: {diagnostic_code}. Return SQL only."
     )
 
 

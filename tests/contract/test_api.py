@@ -21,7 +21,13 @@ from app.domain.job import Job, JobKind
 from app.domain.license import LicenseMode
 from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Index, Row, Schema, Table
-from app.services.ai.errors import EgressBlockedError, ProviderError
+from app.services.ai.default_gateway import DefaultAiGateway
+from app.services.ai.errors import (
+    AiGatewayError,
+    BudgetExceededError,
+    EgressBlockedError,
+    ProviderError,
+)
 from tests._asgi_client import AsgiClient
 
 pytestmark = pytest.mark.contract
@@ -1932,6 +1938,8 @@ def test_compare_ai_map_suggest_samples_without_optin_rejected_403() -> None:
 
 
 class _SequenceGateway:
+    name = "sequence"
+
     def __init__(
         self,
         responses: list[AiResponse] | None = None,
@@ -1988,7 +1996,7 @@ def test_ai_sql_generate_uses_l2_schema_context_and_audits(
 
     response = AsgiClient(app).post(
         "/api/datasources/ds-1/ai/sql-generate",
-        headers=_auth_headers(),
+        headers={**_auth_headers(), "X-Request-ID": "req-ai-sql-1"},
         json_body={
             "natural_language": "sum of amount",
             "schema_name": "app",
@@ -2003,6 +2011,7 @@ def test_ai_sql_generate_uses_l2_schema_context_and_audits(
     assert payload["egress_level"] == 2
     assert payload["tables_used"] == ["app.users"]
     assert payload["truncated"] is False
+    assert payload["request_id"] == "req-ai-sql-1"
     assert any(audit["action"] == "ai_copilot_run" for audit in services.audits)
     # No datasource adapter was built (metadata came from cache) and no row values leaked.
     body = response.body.decode("utf-8")
@@ -2052,8 +2061,27 @@ def test_ai_sql_generate_repairs_truncated_output_once(
 ) -> None:
     gateway = _SequenceGateway(
         [
-            AiResponse(content="", finish_reason="length", reasoning_chars=100),
-            AiResponse(content="SELECT id FROM app.users", finish_reason="stop"),
+            AiResponse(
+                content="",
+                finish_reason="length",
+                reasoning_chars=100,
+                provider="first-provider",
+                model="first-model",
+                tokens_in=10,
+                tokens_out=20,
+                tokens_total=30,
+                duration_ms=12,
+            ),
+            AiResponse(
+                content="SELECT id FROM app.users",
+                finish_reason="stop",
+                provider="final-provider",
+                model="final-model",
+                tokens_in=2,
+                tokens_out=3,
+                tokens_total=5,
+                duration_ms=8,
+            ),
         ]
     )
     monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
@@ -2072,6 +2100,17 @@ def test_ai_sql_generate_repairs_truncated_output_once(
     assert response.json()["attempts"] == 2
     assert len(gateway.calls) == 2
     assert gateway.calls[1][2].max_tokens > gateway.calls[0][2].max_tokens
+    audits = [audit for audit in services.audits if audit["action"] == "ai_copilot_run"]
+    assert len(audits) == 1
+    detail = audits[0]["detail"]
+    assert isinstance(detail, dict)
+    assert detail["provider_duration_ms"] == 20
+    assert detail["tokens_in"] == 12
+    assert detail["tokens_out"] == 23
+    assert detail["tokens_total"] == 35
+    assert detail["provider"] == "final-provider"
+    assert detail["model"] == "final-model"
+    assert detail["attempts"] == 2
 
 
 def test_ai_sql_generate_stops_after_one_failed_repair(
@@ -2155,6 +2194,37 @@ def test_ai_sql_generate_repairs_invalid_provider_response_once(
     assert len(gateway.calls) == 2
 
 
+@pytest.mark.parametrize(
+    ("error", "diagnostic_code"),
+    [
+        (BudgetExceededError(), "ai_budget_exceeded"),
+        (AiGatewayError("opaque gateway failure"), "ai_gateway_failed"),
+    ],
+)
+def test_ai_sql_generate_does_not_retry_gateway_policy_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    error: AiGatewayError,
+    diagnostic_code: str,
+) -> None:
+    gateway = _SequenceGateway(error=error)
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
+    services = _Services(_ai_sql_engine())
+
+    response = AsgiClient(create_app(services=cast(ApiServices, services))).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={
+            "natural_language": "list users",
+            "schema_name": "app",
+            "table_names": ["users"],
+        },
+    )
+
+    assert response.json()["diagnostic_code"] == diagnostic_code
+    assert response.json()["attempts"] == 1
+    assert len(gateway.calls) == 1
+
+
 def test_ai_sql_generate_does_not_retry_egress_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2175,6 +2245,68 @@ def test_ai_sql_generate_does_not_retry_egress_failure(
     assert response.json()["diagnostic_code"] == "ai_egress_blocked"
     assert response.json()["attempts"] == 1
     assert len(gateway.calls) == 1
+
+
+def test_ai_sql_generate_repair_keeps_candidate_out_of_prompt_and_in_l3_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = "SELECT missing FROM app.users"
+    gateway = _SequenceGateway(
+        [
+            AiResponse(content=candidate),
+            AiResponse(content="SELECT id FROM app.users"),
+        ]
+    )
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
+    services = _Services(_ai_sql_engine())
+
+    response = AsgiClient(create_app(services=cast(ApiServices, services))).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={
+            "natural_language": "list users",
+            "schema_name": "app",
+            "table_names": ["users"],
+        },
+    )
+
+    assert response.json()["ok"] is True
+    assert len(gateway.calls) == 2
+    assert candidate not in gateway.calls[1][0]
+    assert [item.egress_level for item in gateway.calls[1][1].items] == [
+        EgressLevel.L2,
+        EgressLevel.L3,
+    ]
+    assert gateway.calls[1][1].items[1].content == candidate
+
+
+def test_ai_sql_generate_repair_l3_context_is_blocked_before_second_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = "SELECT missing FROM app.users"
+    provider = _SequenceGateway(
+        [
+            AiResponse(content=candidate),
+            AiResponse(content="SELECT id FROM app.users"),
+        ]
+    )
+    gateway = DefaultAiGateway(provider, max_auto_egress_level=EgressLevel.L2)
+    monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
+    services = _Services(_ai_sql_engine())
+
+    response = AsgiClient(create_app(services=cast(ApiServices, services))).post(
+        "/api/datasources/ds-1/ai/sql-generate",
+        headers=_auth_headers(),
+        json_body={
+            "natural_language": "list users",
+            "schema_name": "app",
+            "table_names": ["users"],
+        },
+    )
+
+    assert response.json()["diagnostic_code"] == "ai_egress_blocked"
+    assert response.json()["attempts"] == 2
+    assert len(provider.calls) == 1
 
 
 def test_ai_sql_generate_revision_uses_separate_l3_candidate_context(
@@ -2227,9 +2359,9 @@ def test_ai_sql_audit_contains_only_allowlisted_diagnostics(
         },
     )
 
-    detail = next(
-        audit["detail"] for audit in services.audits if audit["action"] == "ai_copilot_run"
-    )
+    audits = [audit for audit in services.audits if audit["action"] == "ai_copilot_run"]
+    assert len(audits) == 1
+    detail = audits[0]["detail"]
     assert isinstance(detail, dict)
     assert set(detail) <= {
         "diagnostic_code",

@@ -286,6 +286,7 @@ from app.services.ai.default_gateway import (
 from app.services.ai.errors import (
     AiDisabledError,
     AiGatewayError,
+    BudgetExceededError,
     EgressBlockedError,
     ProviderError,
 )
@@ -1636,7 +1637,6 @@ def generate_sql_from_nl(
     ]
     if body.candidate_sql is not None:
         context_items.append(ContextItem(content=body.candidate_sql, egress_level=EgressLevel.L3))
-    context = AiContext(items=context_items)
     generation_prompt = build_generation_prompt(
         body.natural_language,
         dialect=db_dialect,
@@ -1659,19 +1659,25 @@ def generate_sql_from_nl(
         if attempts == 1:
             prompt = generation_prompt
             max_tokens = first_budget
+            attempt_context = AiContext(items=list(context_items))
         else:
             prompt = build_repair_prompt(
-                repair_candidate,
                 diagnostic_code,
                 dialect=db_dialect,
             )
             max_tokens = repair_budget
+            repair_items = list(context_items)
+            if repair_candidate:
+                repair_items.append(
+                    ContextItem(content=repair_candidate, egress_level=EgressLevel.L3)
+                )
+            attempt_context = AiContext(items=repair_items)
 
         provider_started_at = time.monotonic()
         try:
             response = gateway.complete(
                 prompt,
-                context,
+                attempt_context,
                 AiOptions(
                     purpose="ai_copilot_run",
                     max_tokens=max_tokens,
@@ -1687,15 +1693,17 @@ def generate_sql_from_nl(
             if should_repair(diagnostic_code, attempts=attempts):
                 continue
             break
+        except BudgetExceededError:
+            provider_duration_ms += round((time.monotonic() - provider_started_at) * 1000)
+            diagnostic_code = "ai_budget_exceeded"
+            break
         except EgressBlockedError:
             provider_duration_ms += round((time.monotonic() - provider_started_at) * 1000)
             diagnostic_code = "ai_egress_blocked"
             break
         except AiGatewayError:
             provider_duration_ms += round((time.monotonic() - provider_started_at) * 1000)
-            diagnostic_code = "provider_invalid_response"
-            if should_repair(diagnostic_code, attempts=attempts):
-                continue
+            diagnostic_code = "ai_gateway_failed"
             break
 
         provider_duration_ms += response.duration_ms

@@ -2,6 +2,7 @@ from app.domain.ai import AiResponse, ReasoningMode
 from app.domain.schema import Column, ColumnType
 from app.services.ai.sql_assistant import (
     TableSchema,
+    build_repair_prompt,
     classify_reasoning_mode,
     diagnose_empty_response,
     extract_sql,
@@ -56,6 +57,13 @@ def test_candidate_ranking_prefers_editor_then_table_then_column_match() -> None
 def test_extract_sql_accepts_fence_and_rejects_multiple_statements() -> None:
     assert extract_sql("```sql\nSELECT id FROM app.users\n```") == "SELECT id FROM app.users"
     assert extract_sql("SELECT 1; SELECT 2") is None
+
+
+def test_repair_prompt_contains_only_instruction_and_diagnostic() -> None:
+    prompt = build_repair_prompt("sql_unknown_column", dialect="mysql")
+
+    assert "sql_unknown_column" in prompt
+    assert "Candidate SQL" not in prompt
 
 
 def test_validation_understands_alias_cte_and_unknown_identifiers() -> None:
