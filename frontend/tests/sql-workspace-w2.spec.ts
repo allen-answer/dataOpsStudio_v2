@@ -334,7 +334,7 @@ test('AI assistant maps stable gateway diagnostics and disabled configuration', 
   expectNoConsoleErrors()
 })
 
-test('AI assistant overlays a narrow viewport and contains long preview SQL', async ({ page }) => {
+test('AI assistant overlays compact viewports and contains long preview SQL', async ({ page }) => {
   await mockBase(page)
   const longSql = `SELECT ${'very_long_expression_'.repeat(120)} FROM app.users`
   await page.route('**/api/datasources/ds-1/ai/sql-table-candidates', (r) =>
@@ -358,27 +358,31 @@ test('AI assistant overlays a narrow viewport and contains long preview SQL', as
   await page.getByLabel('Query request').fill('show a long expression')
   await page.getByRole('button', { name: 'Recommend tables' }).click()
   await page.getByRole('button', { name: 'Generate preview' }).click()
-  await page.setViewportSize({ width: 700, height: 800 })
-
   const panel = page.getByRole('complementary', { name: 'AI SQL Assistant' })
-  const box = await panel.boundingBox()
-  expect(box).not.toBeNull()
-  expect(box!.x).toBeGreaterThanOrEqual(0)
-  expect(box!.x + box!.width).toBeLessThanOrEqual(701)
-  const widths = await page.evaluate(() => ({
-    scroll: document.documentElement.scrollWidth,
-    client: document.documentElement.clientWidth,
-    offenders: [...document.querySelectorAll<HTMLElement>('body *')]
-      .map((element) => ({
-        tag: element.tagName,
-        className: element.className,
-        right: element.getBoundingClientRect().right,
-        width: element.getBoundingClientRect().width,
-      }))
-      .filter((item) => item.right > document.documentElement.clientWidth + 1)
-      .slice(0, 8),
-  }))
-  expect(widths.scroll, JSON.stringify(widths.offenders)).toBeLessThanOrEqual(widths.client + 1)
+  for (const viewportWidth of [700, 800, 1024]) {
+    await page.setViewportSize({ width: viewportWidth, height: 800 })
+    const box = await panel.boundingBox()
+    const editorBox = await page.locator('.monaco-editor').boundingBox()
+    expect(box).not.toBeNull()
+    expect(box!.x).toBeGreaterThanOrEqual(0)
+    expect(box!.x + box!.width).toBeLessThanOrEqual(viewportWidth + 1)
+    expect(editorBox).not.toBeNull()
+    expect(editorBox!.width).toBeGreaterThanOrEqual(Math.max(300, viewportWidth - 410))
+    const widths = await page.evaluate(() => ({
+      scroll: document.documentElement.scrollWidth,
+      client: document.documentElement.clientWidth,
+      offenders: [...document.querySelectorAll<HTMLElement>('body *')]
+        .map((element) => ({
+          tag: element.tagName,
+          className: element.className,
+          right: element.getBoundingClientRect().right,
+          width: element.getBoundingClientRect().width,
+        }))
+        .filter((item) => item.right > document.documentElement.clientWidth + 1)
+        .slice(0, 8),
+    }))
+    expect(widths.scroll, JSON.stringify(widths.offenders)).toBeLessThanOrEqual(widths.client + 1)
+  }
   expectNoConsoleErrors()
 })
 

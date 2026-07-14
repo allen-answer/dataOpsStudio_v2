@@ -158,7 +158,7 @@ watch(() => props.datasourceId, reset)
     v-if="open"
     role="complementary"
     :aria-label="t('sql.ai_assistant_title')"
-    class="fixed inset-y-0 right-0 z-40 w-[min(410px,100vw)] md:static md:z-auto md:w-[410px]
+    class="fixed inset-y-0 right-0 z-40 w-[min(410px,100vw)] xl:static xl:z-auto xl:w-[410px]
            shrink-0 min-w-0 max-w-full border-l chrome-border chrome-bg-panel
            flex flex-col overflow-hidden"
   >
