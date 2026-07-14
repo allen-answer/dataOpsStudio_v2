@@ -23,6 +23,8 @@ const busy = ref<'candidates' | 'generate' | 'revise' | ''>('')
 const errorCode = ref<SqlDiagnosticCode | null>(null)
 const localErrorKey = ref<string | null>(null)
 const diagnosticId = ref<string | null>(null)
+const revisionUsed = ref(false)
+const requestVersion = ref(0)
 
 const selectedCandidates = computed(() =>
   candidates.value.filter((item) => selected.value.has(candidateKey(item))),
@@ -33,6 +35,7 @@ function candidateKey(item: SqlTableCandidate): string {
 }
 
 function reset(): void {
+  requestVersion.value += 1
   prompt.value = ''
   candidates.value = []
   selected.value = new Set()
@@ -42,6 +45,7 @@ function reset(): void {
   errorCode.value = null
   localErrorKey.value = null
   diagnosticId.value = null
+  revisionUsed.value = false
 }
 
 function clearError(): void {
@@ -63,24 +67,28 @@ function onCandidateChange(item: SqlTableCandidate, event: Event): void {
 
 async function recommend(): Promise<void> {
   if (!prompt.value.trim() || !props.datasourceId) return
+  const version = requestVersion.value
+  const datasourceId = props.datasourceId
   clearError()
   busy.value = 'candidates'
   try {
-    const response = await suggestSqlTables(props.datasourceId, {
+    const response = await suggestSqlTables(datasourceId, {
       natural_language: prompt.value.trim(),
       editor_sql: props.editorSql || null,
     })
+    if (version !== requestVersion.value || datasourceId !== props.datasourceId) return
     candidates.value = response.candidates
     selected.value = new Set(response.candidates.map(candidateKey))
     if (response.candidates.length === 0) localErrorKey.value = 'sql.ai_no_tables'
   } catch (error) {
+    if (version !== requestVersion.value || datasourceId !== props.datasourceId) return
     if (error instanceof ApiError && error.code === 'metadata_probe_failed') {
       errorCode.value = 'metadata_probe_failed'
     } else {
       localErrorKey.value = 'sql.ai_candidates_failed'
     }
   } finally {
-    busy.value = ''
+    if (version === requestVersion.value && datasourceId === props.datasourceId) busy.value = ''
   }
 }
 
@@ -96,16 +104,20 @@ async function requestPreview(isRevision: boolean): Promise<void> {
     localErrorKey.value = 'sql.ai_tables_one_schema'
     return
   }
-  if (isRevision && (!preview.value?.sql || !revision.value.trim())) return
+  if (isRevision && (revisionUsed.value || !preview.value?.sql || !revision.value.trim())) return
+  const version = requestVersion.value
+  const datasourceId = props.datasourceId
+  if (isRevision) revisionUsed.value = true
   busy.value = isRevision ? 'revise' : 'generate'
   try {
-    const response = await generateSql(props.datasourceId, {
+    const response = await generateSql(datasourceId, {
       natural_language: prompt.value.trim(),
       schema_name: schemas[0],
       table_names: chosen.map((item) => item.table_name),
       candidate_sql: isRevision ? preview.value?.sql : undefined,
       revision_instruction: isRevision ? revision.value.trim() : undefined,
     })
+    if (version !== requestVersion.value || datasourceId !== props.datasourceId) return
     diagnosticId.value = response.request_id
     if (!response.ok || !response.sql) {
       if (!isRevision) preview.value = null
@@ -113,14 +125,20 @@ async function requestPreview(isRevision: boolean): Promise<void> {
       return
     }
     preview.value = response
+    if (!isRevision) revisionUsed.value = false
     revision.value = ''
   } catch (error) {
-    errorCode.value =
-      error instanceof ApiError && error.code === 'metadata_probe_failed'
-        ? 'metadata_probe_failed'
-        : 'provider_invalid_response'
+    if (version !== requestVersion.value || datasourceId !== props.datasourceId) return
+    if (error instanceof ApiError && error.code === 'ai_disabled') {
+      localErrorKey.value = 'sql.ai_disabled'
+    } else {
+      errorCode.value =
+        error instanceof ApiError && error.code === 'metadata_probe_failed'
+          ? 'metadata_probe_failed'
+          : 'provider_invalid_response'
+    }
   } finally {
-    busy.value = ''
+    if (version === requestVersion.value && datasourceId === props.datasourceId) busy.value = ''
   }
 }
 
@@ -184,7 +202,7 @@ watch(() => props.datasourceId, reset)
           {{ t('sql.ai_revision_label') }}
           <textarea v-model="revision" :aria-label="t('sql.ai_revision_label')" :placeholder="t('sql.ai_revision_placeholder')" class="chrome-input mt-1 w-full min-h-16" />
         </label>
-        <button type="button" class="chrome-btn-secondary" :disabled="busy !== '' || !revision.trim()" @click="requestPreview(true)">
+        <button type="button" class="chrome-btn-secondary" :disabled="busy !== '' || revisionUsed || !revision.trim()" @click="requestPreview(true)">
           {{ busy === 'revise' ? t('sql.ai_generating') : t('sql.ai_revise_preview') }}
         </button>
       </section>

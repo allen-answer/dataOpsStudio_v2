@@ -328,6 +328,8 @@ export default {
       provider_invalid_response: 'The provider returned an unsupported response.',
       metadata_probe_failed: 'Unable to read the datasource schema. Test the connection and refresh metadata.',
       ai_egress_blocked: 'The configured AI egress policy blocked this request.',
+      ai_budget_exceeded: 'The AI request budget was exceeded. Reduce the request scope and try again.',
+      ai_gateway_failed: 'The AI gateway could not complete this request. Try again later.',
       sql_parse_failed: 'The generated SQL could not be parsed.',
       sql_not_readonly: 'The generated statement was not read-only and was rejected.',
       sql_unknown_table: 'The generated SQL referenced a table outside the confirmed scope.',

@@ -9,7 +9,7 @@ const { t } = useI18n()
 </script>
 
 <template>
-  <div class="min-h-screen flex flex-1 chrome-bg-main">
+  <div class="min-h-screen flex flex-1 min-w-0 w-full max-w-full overflow-hidden chrome-bg-main">
     <NavRail />
 
     <div class="flex-1 flex flex-col min-w-0">

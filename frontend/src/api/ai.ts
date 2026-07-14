@@ -32,6 +32,8 @@ export type SqlDiagnosticCode =
   | 'provider_invalid_response'
   | 'metadata_probe_failed'
   | 'ai_egress_blocked'
+  | 'ai_budget_exceeded'
+  | 'ai_gateway_failed'
   | 'sql_parse_failed'
   | 'sql_not_readonly'
   | 'sql_unknown_table'

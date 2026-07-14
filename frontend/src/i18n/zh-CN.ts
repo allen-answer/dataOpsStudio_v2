@@ -325,6 +325,8 @@ export default {
       provider_invalid_response: 'AI 服务返回了不支持的响应格式。',
       metadata_probe_failed: '无法读取数据源结构，请先测试连接并刷新元数据。',
       ai_egress_blocked: '当前 AI 出站策略阻止了本次请求。',
+      ai_budget_exceeded: '本次 AI 请求超出预算，请缩小查询范围后重试。',
+      ai_gateway_failed: 'AI 网关未能完成本次请求，请稍后重试。',
       sql_parse_failed: '生成的 SQL 无法解析。',
       sql_not_readonly: '生成结果不是只读语句，已拒绝使用。',
       sql_unknown_table: '生成的 SQL 引用了确认范围外的数据表。',

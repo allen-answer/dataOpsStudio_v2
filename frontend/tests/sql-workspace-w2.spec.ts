@@ -259,6 +259,126 @@ test('AI assistant revises only the current draft and shows diagnostic guidance'
   await expect(page.getByText(/output was truncated/i)).toBeVisible()
   await expect(page.getByText('diag-1')).toBeVisible()
   await expect(page.getByText('SELECT id FROM app.users', { exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Revise preview' })).toBeDisabled()
+  expect(requests).toHaveLength(2)
+  expectNoConsoleErrors()
+})
+
+test('AI assistant ignores a stale table response after datasource switch', async ({ page }) => {
+  await mockBase(page)
+  await page.route(/\/api\/datasources\?/, (r) =>
+    json(r, 200, [
+      datasource(),
+      datasource({ id: 'ds-2', name: 'analytics', database: 'analytics' }),
+    ]),
+  )
+  let releaseResponse: (() => void) | undefined
+  let finishResponse: (() => void) | undefined
+  const delayed = new Promise<void>((resolve) => { releaseResponse = resolve })
+  const finished = new Promise<void>((resolve) => { finishResponse = resolve })
+  await page.route('**/api/datasources/ds-1/ai/sql-table-candidates', async (r) => {
+    await delayed
+    await json(r, 200, {
+      candidates: [{ schema_name: 'old_schema', table_name: 'old_table', matched_by: ['table_name'] }],
+      truncated: false,
+    })
+    finishResponse?.()
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'AI Generate' }).click()
+  await page.getByLabel('Query request').fill('list old records')
+  await page.getByRole('button', { name: 'Recommend tables' }).click()
+  await expect.poll(() => Boolean(releaseResponse)).toBeTruthy()
+  await page.getByRole('combobox').first().selectOption('ds-2')
+  await expect(page.getByRole('complementary', { name: 'AI SQL Assistant' })).toHaveCount(0)
+  releaseResponse?.()
+  await finished
+  await page.getByRole('button', { name: 'AI Generate' }).click()
+  await expect(page.getByRole('checkbox', { name: 'old_schema.old_table' })).toHaveCount(0)
+  expectNoConsoleErrors()
+})
+
+test('AI assistant maps stable gateway diagnostics and disabled configuration', async ({ page }) => {
+  await mockBase(page)
+  await page.route('**/api/datasources/ds-1/ai/sql-table-candidates', (r) =>
+    json(r, 200, {
+      candidates: [{ schema_name: 'app', table_name: 'users', matched_by: ['table_name'] }],
+      truncated: false,
+    }),
+  )
+  let generation = 0
+  await page.route('**/api/datasources/ds-1/ai/sql-generate', (r) => {
+    generation += 1
+    if (generation === 1) {
+      return json(r, 200, {
+        ok: false, sql: null, explanation: null, provider: 'mock', model: 'm',
+        error: 'ai_budget_exceeded', egress_level: 2, tables_used: [], truncated: false,
+        stage: 'failed', diagnostic_code: 'ai_budget_exceeded', attempts: 1,
+        reasoning_mode: 'disabled', validation: null, request_id: 'budget-1',
+      })
+    }
+    return json(r, 409, { error: 'ai_disabled', message: 'AI copilot is not enabled' })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'AI Generate' }).click()
+  await page.getByLabel('Query request').fill('list users')
+  await page.getByRole('button', { name: 'Recommend tables' }).click()
+  await page.getByRole('button', { name: 'Generate preview' }).click()
+  await expect(page.getByText(/request budget was exceeded/i)).toBeVisible()
+  await expect(page.getByText('budget-1')).toBeVisible()
+  await page.getByRole('button', { name: 'Generate preview' }).click()
+  await expect(page.getByText(/not enabled/i)).toBeVisible()
+  await expect(page.getByText(/unsupported response/i)).toHaveCount(0)
+  expectNoConsoleErrors()
+})
+
+test('AI assistant overlays a narrow viewport and contains long preview SQL', async ({ page }) => {
+  await mockBase(page)
+  const longSql = `SELECT ${'very_long_expression_'.repeat(120)} FROM app.users`
+  await page.route('**/api/datasources/ds-1/ai/sql-table-candidates', (r) =>
+    json(r, 200, {
+      candidates: [{ schema_name: 'app', table_name: 'users', matched_by: ['table_name'] }],
+      truncated: false,
+    }),
+  )
+  await page.route('**/api/datasources/ds-1/ai/sql-generate', (r) =>
+    json(r, 200, {
+      ok: true, sql: longSql, explanation: null, provider: 'mock', model: 'm', error: null,
+      egress_level: 2, tables_used: ['app.users'], truncated: false, stage: 'validated',
+      diagnostic_code: null, attempts: 1, reasoning_mode: 'disabled',
+      validation: { readonly: 'passed', tables: 'passed', columns: 'passed', warnings: [] },
+      request_id: 'narrow-1',
+    }),
+  )
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'AI Generate' }).click()
+  await page.getByLabel('Query request').fill('show a long expression')
+  await page.getByRole('button', { name: 'Recommend tables' }).click()
+  await page.getByRole('button', { name: 'Generate preview' }).click()
+  await page.setViewportSize({ width: 700, height: 800 })
+
+  const panel = page.getByRole('complementary', { name: 'AI SQL Assistant' })
+  const box = await panel.boundingBox()
+  expect(box).not.toBeNull()
+  expect(box!.x).toBeGreaterThanOrEqual(0)
+  expect(box!.x + box!.width).toBeLessThanOrEqual(701)
+  const widths = await page.evaluate(() => ({
+    scroll: document.documentElement.scrollWidth,
+    client: document.documentElement.clientWidth,
+    offenders: [...document.querySelectorAll<HTMLElement>('body *')]
+      .map((element) => ({
+        tag: element.tagName,
+        className: element.className,
+        right: element.getBoundingClientRect().right,
+        width: element.getBoundingClientRect().width,
+      }))
+      .filter((item) => item.right > document.documentElement.clientWidth + 1)
+      .slice(0, 8),
+  }))
+  expect(widths.scroll, JSON.stringify(widths.offenders)).toBeLessThanOrEqual(widths.client + 1)
   expectNoConsoleErrors()
 })
 
