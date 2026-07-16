@@ -75,10 +75,17 @@ async function mockWorkspace(
     datasource?: Record<string, unknown>
     jobCreatedAt?: string
     jobFinishedAt?: string
+    progressiveRows?: number
   } = {},
-): Promise<{ patches: unknown[]; renders: unknown[] }> {
+): Promise<{
+  patches: unknown[]
+  renders: unknown[]
+  resultRequestUrls: string[]
+  getJobReads: () => number
+}> {
   const patches: unknown[] = []
   const renders: unknown[] = []
+  const resultRequestUrls: string[] = []
   let jobReads = 0
   const jobCreatedAt = options.jobCreatedAt ?? now
   const jobFinishedAt = options.jobFinishedAt ?? now
@@ -114,12 +121,30 @@ async function mockWorkspace(
   await page.route('**/api/sql/execute', (r) =>
     json(r, 200, { job_id: 'job-1', result_set_id: 'rs-1' }),
   )
-  await page.route(/\/api\/jobs\/job-1\/result\?/, (r) =>
-    json(r, 200, {
+  await page.route(/\/api\/jobs\/job-1\/result\?/, (r) => {
+    resultRequestUrls.push(r.request().url())
+    if (options.progressiveRows !== undefined) {
+      const rowCount = options.progressiveRows
+      return json(r, 200, {
+        job_id: 'job-1',
+        result_set_id: 'rs-1',
+        offset: 0,
+        limit: 100,
+        columns: [
+          { name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true },
+        ],
+        rows: Array.from({ length: rowCount }, (_, index) => ({ values: [index + 1] })),
+        loaded_rows: rowCount,
+        total_rows: null,
+        state: jobReads <= 1 ? 'running' : 'success',
+        truncated: false,
+      })
+    }
+    return json(r, 200, {
       job_id: 'job-1',
       result_set_id: 'rs-1',
       offset: 0,
-      limit: 1000,
+      limit: 100,
       columns: [
         { name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true },
         { name: 'name', type: 'string', driver_type: 'VARCHAR', nullable: true, primary_key: false },
@@ -129,8 +154,8 @@ async function mockWorkspace(
       total_rows: null,
       state: 'running',
       truncated: false,
-    }),
-  )
+    })
+  })
   await page.route('**/api/jobs/job-1', (r) => {
     jobReads += 1
     return json(r, 200, {
@@ -147,7 +172,7 @@ async function mockWorkspace(
     })
   })
 
-  return { patches, renders }
+  return { patches, renders, resultRequestUrls, getJobReads: () => jobReads }
 }
 
 let consoleErrors: string[] = []
@@ -189,6 +214,28 @@ test('SQL workspace tabs, history, templates, and progressive result render', as
   await expect(page.getByText(/loaded 2 rows/)).toBeVisible()
   await expect(page.getByText('Ada')).toBeVisible()
   await expect(page.getByRole('cell', { name: 'Lin', exact: true })).toBeVisible()
+  expectNoConsoleErrors()
+})
+
+test('progressive results use bounded pages and polling stops at success', async ({ page }) => {
+  const state = await mockWorkspace(page, { progressiveRows: 100 })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.getByText(/loaded 100 rows/)).toBeVisible()
+  await expect.poll(() => state.resultRequestUrls.length).toBeGreaterThan(0)
+
+  expect(
+    state.resultRequestUrls.every(
+      (url) => new URL(url).searchParams.get('limit') === '100',
+    ),
+  ).toBe(true)
+  await expect(page.locator('table.text-data tbody tr')).toHaveCount(100)
+
+  await expect.poll(() => state.getJobReads()).toBe(2)
+  const terminalJobReads = state.getJobReads()
+  await page.waitForTimeout(1_200)
+  expect(state.getJobReads()).toBe(terminalJobReads)
   expectNoConsoleErrors()
 })
 
