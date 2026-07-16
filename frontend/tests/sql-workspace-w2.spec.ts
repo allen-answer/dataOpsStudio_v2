@@ -134,6 +134,122 @@ test('metadata browser drills schema → table → columns and inserts SELECT', 
   expectNoConsoleErrors()
 })
 
+test('typing schema dot suggests tables from the selected datasource', async ({ page }) => {
+  await mockBase(page)
+  const tableRequests: string[] = []
+  await page.route(/\/api\/datasources\/ds-1\/metadata\/tables/, (route) => {
+    tableRequests.push(route.request().url())
+    return json(route, 200, [
+      { schema_name: 'app', name: 'customers', table_type: 'BASE TABLE' },
+      { schema_name: 'app', name: 'orders', table_type: 'BASE TABLE' },
+    ])
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await expect(page.locator('main select')).toHaveValue('ds-1')
+  const input = page.locator('.monaco-editor textarea.inputarea')
+  await input.press('Control+A')
+  await input.type('SELECT * FROM app')
+  await input.press('.')
+
+  const suggestions = page.locator('.suggest-widget')
+  await expect
+    .poll(async () => (await page.locator('.monaco-editor').innerText()).includes('app.'))
+    .toBe(true)
+  await expect.poll(() => tableRequests.length).toBe(1)
+  await expect(suggestions).toBeVisible()
+  await expect(suggestions.getByText('customers', { exact: true })).toBeVisible()
+  await expect(suggestions.getByText('orders', { exact: true })).toBeVisible()
+  expect(tableRequests).toHaveLength(1)
+  expect(new URL(tableRequests[0]).searchParams.get('schema')).toBe('app')
+
+  await input.press('Escape')
+  await input.press('Control+A')
+  await input.type('SELECT * FROM "app"')
+  await input.press('.')
+  await expect(suggestions.getByText('customers', { exact: true })).toBeVisible()
+  expect(tableRequests).toHaveLength(1)
+  expectNoConsoleErrors()
+})
+
+test('completion drops tables returned after the datasource changes', async ({ page }) => {
+  await mockLicense(page)
+  await page.route(/\/api\/datasources\?/, (route) =>
+    json(route, 200, [datasource(), datasource({ id: 'ds-2', name: 'reporting' })]),
+  )
+  await page.route('**/api/sql/consoles', (route) =>
+    json(route, 200, [consoleRow()]),
+  )
+  await page.route('**/api/sql/consoles/console-1', async (route) => {
+    if (route.request().method() === 'PATCH') {
+      return json(route, 200, consoleRow(route.request().postDataJSON()))
+    }
+    return route.fallback()
+  })
+
+  let markFirstStarted: () => void = () => undefined
+  let releaseFirst: () => void = () => undefined
+  const firstStarted = new Promise<void>((resolve) => {
+    markFirstStarted = resolve
+  })
+  const firstReleased = new Promise<void>((resolve) => {
+    releaseFirst = resolve
+  })
+  await page.route(/\/api\/datasources\/ds-1\/metadata\/tables/, async (route) => {
+    markFirstStarted()
+    await firstReleased
+    return json(route, 200, [
+      { schema_name: 'app', name: 'stale_table', table_type: 'BASE TABLE' },
+    ])
+  })
+  await page.route(/\/api\/datasources\/ds-2\/metadata\/tables/, (route) =>
+    json(route, 200, [
+      { schema_name: 'app', name: 'current_table', table_type: 'BASE TABLE' },
+    ]),
+  )
+
+  await page.goto('/projects/project-1/sql')
+  const datasourceSelect = page.locator('main select')
+  await expect(datasourceSelect).toHaveValue('ds-1')
+  const input = page.locator('.monaco-editor textarea.inputarea')
+  await input.press('Control+A')
+  await input.type('SELECT * FROM app')
+  await input.press('.')
+  await firstStarted
+
+  await datasourceSelect.selectOption('ds-2')
+  releaseFirst()
+  await input.press('Control+A')
+  await input.type('SELECT * FROM app')
+  await input.press('.')
+
+  const suggestions = page.locator('.suggest-widget')
+  await expect(suggestions.getByText('current_table', { exact: true })).toBeVisible()
+  await expect(suggestions.getByText('stale_table', { exact: true })).toHaveCount(0)
+  expectNoConsoleErrors()
+})
+
+test('Monaco tokenizes SQL keywords and identifiers with distinct styles', async ({ page }) => {
+  await mockLicense(page)
+  await page.route(/\/api\/datasources\?/, (route) => json(route, 200, [datasource()]))
+  await page.route('**/api/sql/consoles', (route) =>
+    json(route, 200, [consoleRow({ sql: 'SELECT customer_id FROM app.customers' })]),
+  )
+
+  await page.goto('/projects/project-1/sql')
+  const viewLines = page.locator('.monaco-editor .view-lines')
+  await expect(viewLines).toContainText('SELECT')
+  const tokens = await viewLines.evaluate((root) =>
+    Array.from(root.querySelectorAll('span[class*="mtk"]'))
+      .map((node) => ({ text: node.textContent ?? '', className: node.className }))
+      .filter((token) => token.text.trim().length > 0),
+  )
+
+  expect(tokens.some((token) => token.text.includes('SELECT'))).toBe(true)
+  expect(new Set(tokens.map((token) => token.className)).size).toBeGreaterThan(1)
+  expectNoConsoleErrors()
+})
+
 test('metadata probe failure shows error without blanking the tree', async ({ page }) => {
   await mockBase(page)
   await page.route(/\/api\/datasources\/ds-1\/metadata\/schemas/, (r) =>
