@@ -46,6 +46,7 @@ import {
 } from 'lucide-vue-next'
 import * as monaco from 'monaco-editor/esm/vs/editor/editor.api'
 import 'monaco-editor/esm/vs/basic-languages/sql/sql.contribution'
+import 'monaco-editor/esm/vs/editor/contrib/suggest/browser/suggestController.js'
 import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker'
 import { VueMonacoEditor, loader } from '@guolao/vue-monaco-editor'
 import { listDatasources } from '../api/datasources'
@@ -111,14 +112,17 @@ const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>([
   'timeout',
 ])
 const ACTIVE: ReadonlySet<JobStatus> = new Set<JobStatus>(['pending', 'running'])
-const PAGE_SIZE = 1000
-const POLL_MS = 500
+const PAGE_SIZE = 100
+const POLL_MS = 1000
 const SAVE_DEBOUNCE_MS = 650
 // db2 后端 adapter 已具备执行能力,但 GA 决策维持 Preview,放开执行需单独 PR 人拍板。
 const SUPPORTED_EXECUTION_DB_TYPES = new Set(['mysql', 'dm', 'postgresql', 'db2'])
 // EXPLAIN / expand-star 依赖 sqlglot 方言 + 元数据缓存,与执行同口径(mysql / dm / postgresql)。
 const SUPPORTED_TOOL_DB_TYPES = new Set(['mysql', 'dm', 'postgresql'])
 const EXPORT_FORMATS: ExportFormat[] = ['csv', 'excel', 'json', 'sql']
+const SIMPLE_SQL_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_$#]*$/
+const SCHEMA_COMPLETION_PREFIX =
+  /(?:"((?:[^"]|"")*)"|([A-Za-z_][A-Za-z0-9_$#]*))\.([A-Za-z_][A-Za-z0-9_$#]*)?$/
 
 type SidebarTab = 'consoles' | 'history' | 'templates' | 'metadata'
 type HistoryRange = 'all' | 'today' | '7d'
@@ -203,8 +207,10 @@ const runtimes = reactive<Record<string, ConsoleRuntime>>({})
 const pollTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const saveTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const pendingConsolePatches = new Map<string, SqlConsoleUpdateRequest>()
+const completionTableRequests = new Map<string, Promise<MetadataTableItem[]>>()
 const nowMs = ref(Date.now())
 let nowTimer: ReturnType<typeof setInterval> | null = null
+let sqlCompletionProvider: monaco.IDisposable | null = null
 
 const historyItems = ref<SqlHistoryItem[]>([])
 const historyLoading = ref(false)
@@ -444,6 +450,9 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  sqlCompletionProvider?.dispose()
+  sqlCompletionProvider = null
+  completionTableRequests.clear()
   for (const timer of pollTimers.values()) clearTimeout(timer)
   for (const timer of saveTimers.values()) clearTimeout(timer)
   for (const timer of exportPollTimers) clearTimeout(timer)
@@ -884,8 +893,38 @@ function applySqlToActiveConsole(sqlText: string, datasourceId: string | null): 
 }
 
 // ── 元数据浏览器 ────────────────────────────────────────────────
+function completionCacheKey(datasourceId: string, schemaName: string): string {
+  return `${datasourceId}\u0000${schemaName}`
+}
+
+function completionInsertText(tableName: string): string {
+  return SIMPLE_SQL_IDENTIFIER.test(tableName)
+    ? tableName
+    : `"${tableName.replaceAll('"', '""')}"`
+}
+
+function completionTables(
+  datasourceId: string,
+  schemaName: string,
+): Promise<MetadataTableItem[]> {
+  const key = completionCacheKey(datasourceId, schemaName)
+  const cached = completionTableRequests.get(key)
+  if (cached) return cached
+  const request = listMetadataTables(datasourceId, schemaName, false).catch(() => [])
+  completionTableRequests.set(key, request)
+  return request
+}
+
+function clearCompletionTables(datasourceId: string): void {
+  const prefix = `${datasourceId}\u0000`
+  for (const key of completionTableRequests.keys()) {
+    if (key.startsWith(prefix)) completionTableRequests.delete(key)
+  }
+}
+
 async function loadMetadataSchemas(refresh: boolean): Promise<void> {
   if (!metadataDsId.value) return
+  if (refresh) clearCompletionTables(metadataDsId.value)
   metadataLoading.value = true
   metadataError.value = null
   try {
@@ -1200,7 +1239,49 @@ function scrollResultIntoView(): void {
   })
 }
 
+function registerSqlCompletionProvider(): void {
+  sqlCompletionProvider?.dispose()
+  sqlCompletionProvider = monaco.languages.registerCompletionItemProvider('sql', {
+    triggerCharacters: ['.'],
+    async provideCompletionItems(model, position) {
+      const linePrefix = model
+        .getLineContent(position.lineNumber)
+        .slice(0, position.column - 1)
+      const match = SCHEMA_COMPLETION_PREFIX.exec(linePrefix)
+      const datasource = selectedDs.value
+      if (!match || !datasource || !SUPPORTED_TOOL_DB_TYPES.has(datasource.db_type)) {
+        return { suggestions: [] }
+      }
+
+      const datasourceId = datasource.id
+      const schemaName = (match[1] ?? match[2] ?? '').replaceAll('""', '"')
+      const fragment = match[3] ?? ''
+      const tables = await completionTables(datasourceId, schemaName)
+      if (selectedDsId.value !== datasourceId) return { suggestions: [] }
+
+      const range = new monaco.Range(
+        position.lineNumber,
+        position.column - fragment.length,
+        position.lineNumber,
+        position.column,
+      )
+      return {
+        suggestions: tables.map((table) => ({
+          label: table.name,
+          kind: monaco.languages.CompletionItemKind.Class,
+          insertText: completionInsertText(table.name),
+          filterText: table.name,
+          sortText: table.name.toLocaleLowerCase(),
+          detail: table.schema_name,
+          range,
+        })),
+      }
+    },
+  })
+}
+
 function onEditorMount(editor: monaco.editor.IStandaloneCodeEditor): void {
+  registerSqlCompletionProvider()
   editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
     void onExecute()
   })
