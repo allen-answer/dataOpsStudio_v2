@@ -134,6 +134,44 @@ test('metadata browser drills schema → table → columns and inserts SELECT', 
   expectNoConsoleErrors()
 })
 
+test('typing schema dot suggests tables from the selected datasource', async ({ page }) => {
+  await mockBase(page)
+  const tableRequests: string[] = []
+  await page.route(/\/api\/datasources\/ds-1\/metadata\/tables/, (route) => {
+    tableRequests.push(route.request().url())
+    return json(route, 200, [
+      { schema_name: 'app', name: 'customers', table_type: 'BASE TABLE' },
+      { schema_name: 'app', name: 'orders', table_type: 'BASE TABLE' },
+    ])
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await expect(page.locator('main select')).toHaveValue('ds-1')
+  const input = page.locator('.monaco-editor textarea.inputarea')
+  await input.press('Control+A')
+  await input.type('SELECT * FROM app')
+  await input.press('.')
+
+  const suggestions = page.locator('.suggest-widget')
+  await expect
+    .poll(async () => (await page.locator('.monaco-editor').innerText()).includes('app.'))
+    .toBe(true)
+  await expect.poll(() => tableRequests.length).toBe(1)
+  await expect(suggestions).toBeVisible()
+  await expect(suggestions.getByText('customers', { exact: true })).toBeVisible()
+  await expect(suggestions.getByText('orders', { exact: true })).toBeVisible()
+  expect(tableRequests).toHaveLength(1)
+  expect(new URL(tableRequests[0]).searchParams.get('schema')).toBe('app')
+
+  await input.press('Escape')
+  await input.press('Control+A')
+  await input.type('SELECT * FROM "app"')
+  await input.press('.')
+  await expect(suggestions.getByText('customers', { exact: true })).toBeVisible()
+  expect(tableRequests).toHaveLength(1)
+  expectNoConsoleErrors()
+})
+
 test('metadata probe failure shows error without blanking the tree', async ({ page }) => {
   await mockBase(page)
   await page.route(/\/api\/datasources\/ds-1\/metadata\/schemas/, (r) =>
