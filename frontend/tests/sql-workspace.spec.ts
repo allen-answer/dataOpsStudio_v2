@@ -219,9 +219,11 @@ test('SQL workspace tabs, history, templates, and progressive result render', as
 
 test('editor and result panels share the viewport without page scrolling', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 720 })
-  await mockWorkspace(page)
+  await mockWorkspace(page, { progressiveRows: 100 })
 
   await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.getByText(/loaded 100 rows/)).toBeVisible()
 
   const editorPanel = page.getByTestId('sql-editor-panel')
   const resultPanel = page.getByTestId('sql-result-panel')

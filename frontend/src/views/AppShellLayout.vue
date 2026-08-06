@@ -9,10 +9,10 @@ const { t } = useI18n()
 </script>
 
 <template>
-  <div class="min-h-screen flex flex-1 min-w-0 w-full max-w-full overflow-hidden chrome-bg-main">
+  <div class="h-full min-h-0 flex flex-1 min-w-0 w-full max-w-full overflow-hidden chrome-bg-main">
     <NavRail />
 
-    <div class="flex-1 flex flex-col min-w-0">
+    <div class="flex-1 min-h-0 flex flex-col min-w-0">
       <!-- 顶栏:slim,品牌 + 2.0 badge + 搜索 + 用户菜单 -->
       <header
         class="h-12 border-b chrome-border chrome-bg-panel flex items-center justify-between px-4 lg:px-6 sticky top-0 z-30 backdrop-blur-md"
@@ -47,7 +47,7 @@ const { t } = useI18n()
 
       <LicenseBanner />
 
-      <main class="flex-1 min-w-0 max-w-full overflow-y-auto overflow-x-hidden">
+      <main class="flex-1 min-h-0 min-w-0 max-w-full overflow-y-auto overflow-x-hidden">
         <RouterView />
       </main>
     </div>
