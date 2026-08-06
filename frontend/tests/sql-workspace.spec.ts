@@ -217,6 +217,28 @@ test('SQL workspace tabs, history, templates, and progressive result render', as
   expectNoConsoleErrors()
 })
 
+test('editor and result panels share the viewport without page scrolling', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 720 })
+  await mockWorkspace(page)
+
+  await page.goto('/projects/project-1/sql')
+
+  const editorPanel = page.getByTestId('sql-editor-panel')
+  const resultPanel = page.getByTestId('sql-result-panel')
+  await expect(editorPanel).toBeVisible()
+  await expect(resultPanel).toBeInViewport()
+
+  const editorBox = await editorPanel.boundingBox()
+  const resultBox = await resultPanel.boundingBox()
+  expect(editorBox).not.toBeNull()
+  expect(resultBox).not.toBeNull()
+  expect(editorBox!.height).toBeLessThan(page.viewportSize()!.height / 2)
+  expect(resultBox!.y).toBeGreaterThan(editorBox!.y + editorBox!.height)
+  expect(resultBox!.y + resultBox!.height).toBeLessThanOrEqual(page.viewportSize()!.height)
+  expect(await page.evaluate(() => window.scrollY)).toBe(0)
+  expectNoConsoleErrors()
+})
+
 test('progressive results use bounded pages and polling stops at success', async ({ page }) => {
   const state = await mockWorkspace(page, { progressiveRows: 100 })
 
