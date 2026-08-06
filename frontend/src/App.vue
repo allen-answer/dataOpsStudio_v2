@@ -37,7 +37,7 @@ function onUpdate(v: typeof variant.value): void {
   <div
     :data-variant="variant"
     :data-mode="mode"
-    class="min-h-screen flex flex-col chrome-bg-main"
+    class="h-screen min-h-0 overflow-hidden flex flex-col chrome-bg-main"
   >
     <VariantSwitcher
       v-if="showShowcaseBar"
