@@ -1742,7 +1742,10 @@ function parseVariables(value: string): string[] {
         </button>
       </div>
       <template v-else>
-        <div class="flex-1 min-h-[35vh] min-w-0 max-w-full overflow-hidden border-b chrome-border relative">
+        <div
+          data-testid="sql-editor-panel"
+          class="h-[38%] min-h-[10rem] shrink-0 min-w-0 max-w-full overflow-hidden border-b chrome-border relative"
+        >
           <VueMonacoEditor
             v-model:value="editorSql"
             language="sql"
@@ -1853,7 +1856,11 @@ function parseVariables(value: string): string[] {
           </div>
         </div>
 
-        <div ref="resultPanel" class="flex-1 min-h-[35vh] flex flex-col">
+        <div
+          ref="resultPanel"
+          data-testid="sql-result-panel"
+          class="flex-1 min-h-0 flex flex-col overflow-hidden"
+        >
           <div class="flex items-center justify-between gap-3 px-5 py-2 border-b chrome-border-subtle text-xs">
             <div class="flex items-center gap-1 shrink-0">
               <button
