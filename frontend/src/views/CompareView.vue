@@ -12,6 +12,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useQuery } from '@tanstack/vue-query'
+import { storeToRefs } from 'pinia'
 import {
   AlertTriangle,
   ArrowRight,
@@ -88,7 +89,9 @@ import { ApiError, type ColumnType, type DatasourceListItem, type JobStatus } fr
 import LoadingDots from '../components/LoadingDots.vue'
 import JobStatusBadge from '../components/JobStatusBadge.vue'
 import CompareExpressionLabel from '../components/CompareExpressionLabel.vue'
+import SqlEditor from '../components/SqlEditor.vue'
 import { useToast } from '../composables/useToast'
+import { useThemeStore } from '../stores/theme'
 
 const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>([
   'success',
@@ -140,6 +143,8 @@ const BUCKET_STYLE: Record<CompareBucket, BucketStyle> = {
 const { t } = useI18n()
 const toast = useToast()
 const route = useRoute()
+const themeStore = useThemeStore()
+const { variant } = storeToRefs(themeStore)
 const projectId = computed(() => (typeof route.params.id === 'string' ? route.params.id : ''))
 
 // ── datasources ─────────────────────────────────────────────────────
@@ -265,6 +270,11 @@ function emptyDraft(): EditorDraft {
 }
 
 const draft = reactive<EditorDraft>(emptyDraft())
+const sourceDatasource = computed(() => datasources.value.find((item) => item.id === draft.sourceId))
+const targetDatasource = computed(() => datasources.value.find((item) => item.id === draft.targetId))
+const sqlEditorTheme = computed(() =>
+  variant.value === 'spotify-dark' || variant.value === 'figma-dark' ? 'vs-dark' : 'vs',
+)
 const isNewTask = ref(false)
 const savingTask = ref(false)
 const editorError = ref<string | null>(null)
@@ -966,7 +976,7 @@ watch(datasources, (list) => {
   if (!draft.targetId && list.length > 0) draft.targetId = list[0].id
   if (!suggestSourceId.value && list.length > 0) suggestSourceId.value = list[0].id
   if (!suggestTargetId.value && list.length > 0) suggestTargetId.value = list[0].id
-})
+}, { immediate: true })
 
 // ── tasks loading ───────────────────────────────────────────────────
 async function loadTasks(): Promise<void> {
@@ -2227,13 +2237,26 @@ const missingTarget = computed(
                 <input v-model="draft.sourceSchema" class="chrome-input w-full text-sm" :placeholder="t('compare.schema')" />
                 <input v-model="draft.sourceTable" class="chrome-input w-full text-sm" :placeholder="t('compare.table')" />
               </template>
-              <textarea
+              <SqlEditor
+                :key="`${activeTaskId ?? 'new'}-source`"
                 v-else-if="!draft.singleSql && draft.sourceKind === 'sql'"
                 v-model="draft.sourceSql"
-                rows="5"
-                class="chrome-input w-full text-xs font-mono"
+                :datasource-id="draft.sourceId"
+                :db-type="sourceDatasource?.db_type"
+                :default-schema="draft.sourceSchema || sourceDatasource?.database"
+                :theme="sqlEditorTheme"
+                :path="`compare-${activeTaskId ?? 'new'}-source.sql`"
                 :placeholder="t('compare.sql_placeholder')"
+                height="9rem"
+                class="w-full rounded-card border chrome-border"
+                @execute="onPreview('source')"
               />
+              <p
+                v-if="!draft.singleSql && draft.sourceKind === 'sql'"
+                class="text-[10px] chrome-text-muted"
+              >
+                {{ t('sql.metadata_editor_hint') }}
+              </p>
               <!-- 文件源(源):上传 → 解析参数 -->
               <div v-else-if="!draft.singleSql && draft.sourceKind === 'file'" class="space-y-2">
                 <label class="chrome-btn-secondary text-xs cursor-pointer w-full justify-center" :class="previews.source.uploading && 'opacity-60 pointer-events-none'">
@@ -2378,13 +2401,26 @@ const missingTarget = computed(
                 <input v-model="draft.targetSchema" class="chrome-input w-full text-sm" :placeholder="t('compare.schema')" />
                 <input v-model="draft.targetTable" class="chrome-input w-full text-sm" :placeholder="t('compare.table')" />
               </template>
-              <textarea
+              <SqlEditor
+                :key="`${activeTaskId ?? 'new'}-target`"
                 v-else-if="!draft.singleSql && draft.targetKind === 'sql'"
                 v-model="draft.targetSql"
-                rows="5"
-                class="chrome-input w-full text-xs font-mono"
+                :datasource-id="draft.targetId"
+                :db-type="targetDatasource?.db_type"
+                :default-schema="draft.targetSchema || targetDatasource?.database"
+                :theme="sqlEditorTheme"
+                :path="`compare-${activeTaskId ?? 'new'}-target.sql`"
                 :placeholder="t('compare.sql_placeholder')"
+                height="9rem"
+                class="w-full rounded-card border chrome-border"
+                @execute="onPreview('target')"
               />
+              <p
+                v-if="!draft.singleSql && draft.targetKind === 'sql'"
+                class="text-[10px] chrome-text-muted"
+              >
+                {{ t('sql.metadata_editor_hint') }}
+              </p>
               <!-- 文件源(目标):上传 → 解析参数 -->
               <div v-else-if="!draft.singleSql && draft.targetKind === 'file'" class="space-y-2">
                 <label class="chrome-btn-secondary text-xs cursor-pointer w-full justify-center" :class="previews.target.uploading && 'opacity-60 pointer-events-none'">
@@ -2496,12 +2532,22 @@ const missingTarget = computed(
             <!-- 单 SQL 输入(两侧共用同一段) -->
             <label v-if="draft.singleSql" class="block col-span-2">
               <span class="block text-xs chrome-text-muted mb-1">{{ t('compare.ref_kind_sql') }}</span>
-              <textarea
+              <SqlEditor
+                :key="`${activeTaskId ?? 'new'}-shared`"
                 v-model="draft.sourceSql"
-                rows="6"
-                class="chrome-input w-full text-xs font-mono"
+                :datasource-id="draft.sourceId"
+                :db-type="sourceDatasource?.db_type"
+                :default-schema="draft.sourceSchema || sourceDatasource?.database"
+                :theme="sqlEditorTheme"
+                :path="`compare-${activeTaskId ?? 'new'}-shared.sql`"
                 :placeholder="t('compare.sql_placeholder')"
+                height="10rem"
+                class="w-full rounded-card border chrome-border"
+                @execute="onPreview('source')"
               />
+              <span class="block text-[10px] chrome-text-muted mt-1">
+                {{ t('sql.metadata_editor_hint') }}
+              </span>
             </label>
           </div>
 

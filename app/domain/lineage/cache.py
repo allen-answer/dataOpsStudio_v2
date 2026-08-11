@@ -4,9 +4,9 @@ import json
 from hashlib import sha256
 from typing import Any
 
-# v2: statement coverage widened to CTAS / MERGE / multi-table & correlated
-# UPDATE / CTE / UNION — bumping invalidates cached parses from the v1 parser.
-LINEAGE_PARSER_VERSION = "sqlglot-w1-v2"
+# v3: normalize ${...} template variables before sqlglot and persist structured
+# ParseError location details. Bumping invalidates cached failures from v2.
+LINEAGE_PARSER_VERSION = "sqlglot-w1-v3"
 
 
 def lineage_sql_hash(
