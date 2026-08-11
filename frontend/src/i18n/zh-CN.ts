@@ -254,6 +254,7 @@ export default {
   },
   sql: {
     workspace: 'SQL 工作区',
+    datasource: '数据源',
     tab_consoles: '控制台',
     tab_history: '历史',
     tab_templates: '模板',
@@ -368,6 +369,11 @@ export default {
     execute: '执行',
     cancel: '取消',
     cancelling: '取消中…',
+    max_rows: '最多行数',
+    max_rows_hint: '达到该行数后 worker 会停止读取,并将结果标记为已截断。',
+    max_rows_custom: '自定义…',
+    max_rows_custom_input: '自定义最大行数',
+    max_rows_invalid: '最大行数必须是 1 到 {max} 之间的整数。',
     result: '结果',
     statement_result: '结果 {index}',
     no_datasource: '此项目还没有数据源',
@@ -1145,7 +1151,7 @@ export default {
     },
   },
   results: {
-    truncated_hint: '结果被后端截断(超过 spool 上限),只展示已落盘部分',
+    truncated_hint: '结果达到查询行数或存储上限,只展示已落盘部分',
     too_many_rows: '为防止浏览器卡死,只渲染前 {max} 行',
     empty_title: '空结果集',
     empty_hint: 'SQL 返回 0 行',

@@ -6,6 +6,7 @@ export interface SqlExecuteRequest {
   sql: string
   params?: Record<string, unknown>
   console_id?: string | null
+  max_rows?: number
 }
 
 export interface SqlConsole {
@@ -102,6 +103,7 @@ export function executeSql(req: SqlExecuteRequest): Promise<SqlExecuteResponse> 
     sql: req.sql,
     params: req.params ?? {},
     console_id: req.console_id ?? null,
+    max_rows: req.max_rows,
   })
 }
 

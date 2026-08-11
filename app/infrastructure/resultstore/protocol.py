@@ -36,6 +36,10 @@ class ResultStore(Protocol):
         """流式追加 spool(配合 ResultSet 实现 streaming)。"""
         raise NotImplementedError
 
+    def mark_spool_truncated(self, result_set_id: str) -> None:
+        """幂等标记 spool 已截断,供查询主动限行后关闭数据库游标。"""
+        raise NotImplementedError
+
     def get_manifest(self, run_id: str) -> Manifest:
         raise NotImplementedError
 

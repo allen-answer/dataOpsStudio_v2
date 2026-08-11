@@ -182,6 +182,18 @@ def test_spool_row_limit_marks_truncated(tmp_path: Path) -> None:
     assert store.get_spool_manifest("rs-1")["truncated"] is True
 
 
+def test_spool_can_be_marked_truncated_idempotently(tmp_path: Path) -> None:
+    store = LocalFsResultStore(tmp_path)
+    store.append_spool("rs-1", [Row(values=[1])])
+
+    store.mark_spool_truncated("rs-1")
+    store.mark_spool_truncated("rs-1")
+
+    manifest = store.get_spool_manifest("rs-1")
+    assert manifest["loaded_rows"] == 1
+    assert manifest["truncated"] is True
+
+
 def test_spool_byte_limit_marks_truncated(tmp_path: Path) -> None:
     store = LocalFsResultStore(tmp_path, spool_max_bytes=1)
 

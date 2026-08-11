@@ -180,6 +180,14 @@ class LocalFsResultStore(ResultStore):
             manifest.truncated = True
         self._write_spool_manifest(manifest)
 
+    def mark_spool_truncated(self, result_set_id: str) -> None:
+        manifest = self._read_spool_manifest(result_set_id)
+        if manifest.truncated:
+            return
+        manifest.truncated = True
+        manifest.updated_at = time.time()
+        self._write_spool_manifest(manifest)
+
     def set_spool_columns(self, result_set_id: str, columns: list[Column]) -> None:
         manifest = self._read_spool_manifest(result_set_id)
         manifest.columns = [Column.model_validate(column.model_dump()) for column in columns]

@@ -80,11 +80,13 @@ async function mockWorkspace(
 ): Promise<{
   patches: unknown[]
   renders: unknown[]
+  executeRequests: Record<string, unknown>[]
   resultRequestUrls: string[]
   getJobReads: () => number
 }> {
   const patches: unknown[] = []
   const renders: unknown[] = []
+  const executeRequests: Record<string, unknown>[] = []
   const resultRequestUrls: string[] = []
   let jobReads = 0
   const jobCreatedAt = options.jobCreatedAt ?? now
@@ -94,6 +96,7 @@ async function mockWorkspace(
   await page.route(/\/api\/datasources\?/, (r) =>
     json(r, 200, [datasource(options.datasource)]),
   )
+  await page.route('**/api/datasources/ds-1/metadata/schemas', (r) => json(r, 200, []))
   await page.route('**/api/sql/consoles', async (r: Route) => {
     if (r.request().method() === 'GET') return json(r, 200, [consoleRow()])
     if (r.request().method() === 'POST') return json(r, 201, consoleRow({ id: 'console-2', name: 'query_2.sql' }))
@@ -118,9 +121,10 @@ async function mockWorkspace(
     renders.push(r.request().postDataJSON())
     return json(r, 200, { sql_text: 'SELECT * FROM users LIMIT 10' })
   })
-  await page.route('**/api/sql/execute', (r) =>
-    json(r, 200, { job_id: 'job-1', result_set_id: 'rs-1' }),
-  )
+  await page.route('**/api/sql/execute', (r) => {
+    executeRequests.push(r.request().postDataJSON())
+    return json(r, 200, { job_id: 'job-1', result_set_id: 'rs-1' })
+  })
   await page.route(/\/api\/jobs\/job-1\/result\?/, (r) => {
     resultRequestUrls.push(r.request().url())
     if (options.progressiveRows !== undefined) {
@@ -172,7 +176,7 @@ async function mockWorkspace(
     })
   })
 
-  return { patches, renders, resultRequestUrls, getJobReads: () => jobReads }
+  return { patches, renders, executeRequests, resultRequestUrls, getJobReads: () => jobReads }
 }
 
 let consoleErrors: string[] = []
@@ -185,13 +189,40 @@ function expectNoConsoleErrors(): void {
   expect(consoleErrors, consoleErrors.join('\n')).toEqual([])
 }
 
+test('SQL execution sends the default maximum row limit', async ({ page }) => {
+  const state = await mockWorkspace(page)
+
+  await page.goto('/projects/project-1/sql')
+  await expect(page.getByLabel('Max rows')).toHaveValue('1000')
+  await page.getByRole('button', { name: 'Run' }).click()
+
+  await expect.poll(() => state.executeRequests.length).toBe(1)
+  await expect.poll(() => state.getJobReads()).toBeGreaterThanOrEqual(2)
+  expect(state.executeRequests[0]).toMatchObject({ max_rows: 1000 })
+  expectNoConsoleErrors()
+})
+
+test('SQL execution accepts a custom maximum row limit', async ({ page }) => {
+  const state = await mockWorkspace(page)
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByLabel('Max rows').selectOption('custom')
+  await page.getByLabel('Custom maximum rows').fill('2500')
+  await page.getByRole('button', { name: 'Run' }).click()
+
+  await expect.poll(() => state.executeRequests.length).toBe(1)
+  await expect.poll(() => state.getJobReads()).toBeGreaterThanOrEqual(2)
+  expect(state.executeRequests[0]).toMatchObject({ max_rows: 2500 })
+  expectNoConsoleErrors()
+})
+
 test('SQL workspace tabs, history, templates, and progressive result render', async ({ page }) => {
   const state = await mockWorkspace(page)
 
   await page.goto('/projects/project-1/sql')
   await expect(page.getByText('SQL workspace')).toBeVisible()
   await expect(page.locator('aside').getByText('query_1.sql')).toBeVisible()
-  await expect(page.locator('main select')).toHaveValue('ds-1')
+  await expect(page.getByLabel('Datasource')).toHaveValue('ds-1')
 
   await page.locator('button[title="History"]').click()
   await expect(page.getByText('SELECT COUNT(*) AS total FROM users')).toBeVisible()
@@ -268,7 +299,7 @@ test('DM datasource remains executable', async ({ page }) => {
 
   await page.goto('/projects/project-1/sql')
   await expect(page.getByText('SQL workspace')).toBeVisible()
-  await expect(page.locator('main select')).toHaveValue('ds-1')
+  await expect(page.getByLabel('Datasource')).toHaveValue('ds-1')
   await expect(page.getByText(/Execution currently supports MySQL \/ DM/)).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Run' })).toBeEnabled()
   expectNoConsoleErrors()
