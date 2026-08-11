@@ -6,6 +6,8 @@
 对外入口:
 - :func:`script_variables` —— 抽 ``${name}`` / ``:name`` / ``@name`` 占位符 + PACKAGE
   BODY / DECLARE 节的 CONSTANT / 变量声明,供前端变量面板展示。
+- :func:`normalize_template_variables` —— 在交给 sqlglot 前把 ``${name}`` 规范为
+  ``:name``,避免被误解为 STRUCT;替换保持文本长度与换行不变,便于错误定位。
 - :func:`package_variables` —— 只抽 PACKAGE BODY 顶层与 DECLARE 块的变量/常量声明。
 - :func:`all_plsql_local_names` —— 扫所有声明区收集**所有局部变量名**(不进面板),
   专用于过滤 ``SELECT INTO v_row`` 被 sqlglot 重写成 ``CREATE TABLE v_row`` 后
@@ -15,6 +17,8 @@
 from __future__ import annotations
 
 import re
+
+_RE_TEMPLATE_VARIABLE = re.compile(r"\$\{\s*([A-Za-z_][\w$#]*)\s*\}")
 
 
 def _unique_strings(values: list[str]) -> list[str]:
@@ -27,6 +31,21 @@ def _unique_strings(values: list[str]) -> list[str]:
         seen.add(value)
         out.append(value)
     return out
+
+
+def normalize_template_variables(sql: str) -> str:
+    """把 ``${name}`` 规范为 sqlglot 能稳定识别的命名占位符 ``:name``。
+
+    这里只做静态血缘解析所需的语法规范化,不读取或猜测变量实际值。替换结果用
+    尾随空格补齐原占位符长度,因此总字符数与换行位置保持不变;后续 ParseError 的
+    line / col 仍可直接对应用户输入的原始 SQL。
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        placeholder = f":{match.group(1)}"
+        return placeholder.ljust(len(match.group(0)))
+
+    return _RE_TEMPLATE_VARIABLE.sub(_replace, sql)
 
 
 def script_variables(sql: str) -> list[dict[str, str]]:
@@ -57,12 +76,8 @@ def script_variables(sql: str) -> list[dict[str, str]]:
 
 def variable_names(sql: str) -> list[str]:
     names: list[str] = []
-    patterns = [
-        r"\$\{\s*([A-Za-z_][\w$#]*)\s*\}",
-        r"(?<!:):([A-Za-z_][\w$#]*)",
-        r"@([A-Za-z_][\w$#]*)",
-    ]
-    for pattern in patterns:
+    names.extend(match.group(1) for match in _RE_TEMPLATE_VARIABLE.finditer(sql))
+    for pattern in [r"(?<!:):([A-Za-z_][\w$#]*)", r"@([A-Za-z_][\w$#]*)"]:
         names.extend(match.group(1) for match in re.finditer(pattern, sql))
     return _unique_strings(names)
 

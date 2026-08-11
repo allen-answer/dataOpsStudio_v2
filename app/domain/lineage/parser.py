@@ -29,7 +29,11 @@ from app.domain.lineage.segments import (
     extract_procedure_segments,
 )
 from app.domain.lineage.supplemental_edges import build_supplemental_edges
-from app.domain.lineage.variables import all_plsql_local_names, script_variables
+from app.domain.lineage.variables import (
+    all_plsql_local_names,
+    normalize_template_variables,
+    script_variables,
+)
 
 LineageSchema = dict[str, dict[str, dict[str, str]]]
 
@@ -149,7 +153,7 @@ def _mark_segment_parse_status(procedure_segments: list[dict[str, Any]], dialect
     """每段单独试 sqlglot 解析,回填 parse_status='parsed' / 'unsupported'。"""
     for segment in procedure_segments:
         try:
-            sqlglot.parse_one(str(segment["sql"]), read=dialect)
+            sqlglot.parse_one(normalize_template_variables(str(segment["sql"])), read=dialect)
         except ParseError:
             segment["parse_status"] = "unsupported"
         else:
@@ -225,16 +229,17 @@ def schema_from_metadata_cache_rows(rows: Iterable[Mapping[str, Any]]) -> Lineag
 
 
 def _parse_or_split_plsql(sql_text: str, dialect: str) -> list[str]:
+    normalized_sql = normalize_template_variables(sql_text)
     try:
-        parsed = sqlglot.parse(sql_text, read=dialect)
+        parsed = sqlglot.parse(normalized_sql, read=dialect)
     except ParseError:
         parsed = []
-    if parsed and not _looks_like_plsql(sql_text):
+    if parsed and not _looks_like_plsql(normalized_sql):
         return [expression.sql(dialect=dialect) for expression in parsed if expression is not None]
-    split = split_plsql_statements(sql_text)
+    split = split_plsql_statements(normalized_sql)
     if split:
         return split
-    return [sql_text]
+    return [normalized_sql]
 
 
 def _analyze_statement(
@@ -242,6 +247,7 @@ def _analyze_statement(
     context: _StatementContext,
     report: LineageReport,
 ) -> None:
+    statement = normalize_template_variables(statement)
     try:
         expression = cast(exp.Expression, sqlglot.parse_one(statement, read=context.dialect))
     except ParseError as exc:
@@ -253,8 +259,8 @@ def _analyze_statement(
             return
         try:
             expression = cast(exp.Expression, sqlglot.parse_one(rewritten, read=context.dialect))
-        except ParseError:
-            _append_parse_error(report, context, "parse_error", exc, statement_type=None)
+        except ParseError as rewritten_exc:
+            _append_parse_error(report, context, "parse_error", rewritten_exc, statement_type=None)
             return
     statement_type = expression.key.upper()
     report.statements.append({"index": context.index, "type": statement_type})
@@ -1379,15 +1385,33 @@ def _append_parse_error(
     *,
     statement_type: str | None,
 ) -> None:
+    message = _parse_error_message(exc) if isinstance(exc, ParseError) else type(exc).__name__
     report.parse_errors.append(
         LineageParseError(
             statement_index=context.index,
             error_type=error_type,
-            message=type(exc).__name__,
+            message=message,
             unsupported=True,
             statement_type=statement_type,
         ).model_dump(mode="json")
     )
+
+
+def _parse_error_message(exc: ParseError) -> str:
+    """保留 sqlglot 的结构化位置,但不把整段 SQL/context 写进持久化诊断。"""
+    details: list[str] = []
+    for error in exc.errors[:3]:
+        description = " ".join(str(error.get("description") or "parse failed").split())[:300]
+        location: list[str] = []
+        if isinstance(error.get("line"), int):
+            location.append(f"line {error['line']}")
+        if isinstance(error.get("col"), int):
+            location.append(f"col {error['col']}")
+        highlight = " ".join(str(error.get("highlight") or "").split())[:80]
+        if highlight:
+            location.append(f"token={highlight!r}")
+        details.append(f"{description} ({', '.join(location)})" if location else description)
+    return ("ParseError: " + "; ".join(details))[:1000] if details else "ParseError"
 
 
 def _append_unsupported(
