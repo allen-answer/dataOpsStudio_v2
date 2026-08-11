@@ -135,6 +135,26 @@ def test_report_summary_includes_parse_error_details() -> None:
     assert "app.unknown_orders" in detail["message"]
 
 
+def test_parse_error_detail_includes_line_column_and_token() -> None:
+    # 模板变量发生在错误 token 之前;规范化必须保持原长度,否则 col 会向前偏移。
+    sql = "SELECT * FROM app.orders WHERE amount <= ${fv_qmrq_m} AND ("
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text=sql,
+            dialect="dm",
+            schema=_schema(),
+            default_schema="app",
+        )
+    )
+
+    assert len(report.parse_errors) == 1
+    message = report.parse_errors[0]["message"]
+    assert message.startswith("ParseError:")
+    assert "line 1" in message
+    assert f"col {len(sql)}" in message
+    assert "token='('" in message
+
+
 def test_report_summary_truncates_parse_error_details() -> None:
     statements = ";\n".join(
         f"INSERT INTO app.target_orders SELECT id FROM app.unknown_{index}"
@@ -220,6 +240,32 @@ def test_dm_dialect_parses_oracle_compatible_dml() -> None:
 
     assert report.parse_errors == []
     assert _mapping(report.insert_mappings, "ID", "APP.ORDERS", "ID")
+
+
+def test_dm_template_variable_is_normalized_before_sqlglot() -> None:
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text=(
+                "INSERT INTO APP.TARGET_ORDERS (ID) "
+                "SELECT ID FROM APP.ORDERS WHERE AMOUNT <= ${fv_qmrq_m}"
+            ),
+            dialect="dm",
+            schema=_schema(),
+            default_schema="app",
+        )
+    )
+
+    assert report.parse_errors == []
+    assert report.variables == [
+        {"name": "fv_qmrq_m", "placeholder": "fv_qmrq_m", "assigned_value": ""}
+    ]
+    assert {(edge["source_table"], edge["target_table"]) for edge in report.graph_edges} == {
+        ("APP.ORDERS", "APP.TARGET_ORDERS")
+    }
+    assert _mapping(report.insert_mappings, "ID", "APP.ORDERS", "ID")
+    amount_filter = _mapping(report.insert_mappings, "ID", "APP.ORDERS", "AMOUNT")
+    assert amount_filter["transformation"] == TransformationKind.INDIRECT
+    assert amount_filter["transformation_subtype"] == TransformationSubtype.FILTER
 
 
 def test_postgres_dialect_parses_pg_specific_syntax() -> None:

@@ -44,11 +44,7 @@ import {
   Trash2,
   X,
 } from 'lucide-vue-next'
-import * as monaco from 'monaco-editor/esm/vs/editor/editor.api'
-import 'monaco-editor/esm/vs/basic-languages/sql/sql.contribution'
-import 'monaco-editor/esm/vs/editor/contrib/suggest/browser/suggestController.js'
-import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker'
-import { VueMonacoEditor, loader } from '@guolao/vue-monaco-editor'
+import type * as monaco from 'monaco-editor/esm/vs/editor/editor.api'
 import { listDatasources } from '../api/datasources'
 import {
   createSqlConsole,
@@ -98,12 +94,9 @@ import ResultTable from '../components/ResultTable.vue'
 import LoadingDots from '../components/LoadingDots.vue'
 import Modal from '../components/Modal.vue'
 import AiSqlAssistantPanel from '../components/AiSqlAssistantPanel.vue'
-
-const g = self as unknown as { MonacoEnvironment?: { getWorker: () => Worker } }
-if (!g.MonacoEnvironment) {
-  g.MonacoEnvironment = { getWorker: () => new editorWorker() }
-}
-loader.config({ monaco })
+import SqlEditor from '../components/SqlEditor.vue'
+import { clearSqlMetadataCache } from '../utils/sqlIntelligence'
+import { splitSqlStatements, statementAtOffset } from '../utils/sqlStatements'
 
 const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>([
   'success',
@@ -120,15 +113,15 @@ const SUPPORTED_EXECUTION_DB_TYPES = new Set(['mysql', 'dm', 'postgresql', 'db2'
 // EXPLAIN / expand-star 依赖 sqlglot 方言 + 元数据缓存,与执行同口径(mysql / dm / postgresql)。
 const SUPPORTED_TOOL_DB_TYPES = new Set(['mysql', 'dm', 'postgresql'])
 const EXPORT_FORMATS: ExportFormat[] = ['csv', 'excel', 'json', 'sql']
-const SIMPLE_SQL_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_$#]*$/
-const SCHEMA_COMPLETION_PREFIX =
-  /(?:"((?:[^"]|"")*)"|([A-Za-z_][A-Za-z0-9_$#]*))\.([A-Za-z_][A-Za-z0-9_$#]*)?$/
 
 type SidebarTab = 'consoles' | 'history' | 'templates' | 'metadata'
 type HistoryRange = 'all' | 'today' | '7d'
 type ResultTab = 'result' | 'plan' | 'stats'
 
 interface ConsoleRuntime {
+  statement: string
+  statementIndex: number
+  statementCount: number
   jobId: string | null
   resultSetId: string | null
   status: JobStatus | null
@@ -203,14 +196,14 @@ const editorSql = ref('SELECT 1 AS hello;')
 const selectedDsId = ref('')
 const suppressConsoleSave = ref(false)
 
-const runtimes = reactive<Record<string, ConsoleRuntime>>({})
+const runtimes = reactive<Record<string, ConsoleRuntime[]>>({})
+const activeRuntimeIndexes = reactive<Record<string, number>>({})
 const pollTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const saveTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const pendingConsolePatches = new Map<string, SqlConsoleUpdateRequest>()
-const completionTableRequests = new Map<string, Promise<MetadataTableItem[]>>()
 const nowMs = ref(Date.now())
 let nowTimer: ReturnType<typeof setInterval> | null = null
-let sqlCompletionProvider: monaco.IDisposable | null = null
+let sqlEditor: monaco.editor.IStandaloneCodeEditor | null = null
 
 const historyItems = ref<SqlHistoryItem[]>([])
 const historyLoading = ref(false)
@@ -275,9 +268,14 @@ const exportPollTimers = new Set<ReturnType<typeof setTimeout>>()
 const activeConsole = computed<SqlConsole | null>(
   () => consoles.value.find((item) => item.id === activeConsoleId.value) ?? null,
 )
-const activeRuntime = computed<ConsoleRuntime | null>(() =>
-  activeConsoleId.value ? runtimeFor(activeConsoleId.value) : null,
+const activeRuntimes = computed<ConsoleRuntime[]>(() =>
+  activeConsoleId.value ? runtimesFor(activeConsoleId.value) : [],
 )
+const activeRuntime = computed<ConsoleRuntime | null>(() => {
+  if (!activeConsoleId.value) return null
+  const items = activeRuntimes.value
+  return items[activeRuntimeIndexes[activeConsoleId.value] ?? 0] ?? items[0] ?? null
+})
 const selectedDs = computed<DatasourceListItem | undefined>(() =>
   datasources.value.find((d) => d.id === selectedDsId.value),
 )
@@ -310,8 +308,7 @@ const editorTheme = computed(() => {
   return v === 'spotify-dark' || v === 'figma-dark' ? 'vs-dark' : 'vs'
 })
 const editorReadOnly = computed(() => {
-  const status = activeRuntime.value?.status
-  return status ? ACTIVE.has(status) : false
+  return activeRuntimes.value.some((runtime) => runtime.status && ACTIVE.has(runtime.status))
 })
 const sortedConsoles = computed(() =>
   [...consoles.value].sort((a, b) => {
@@ -393,7 +390,8 @@ watch(datasources, (list) => {
   if (!selectedDsId.value && list.length > 0) selectedDsId.value = list[0].id
 })
 
-watch(activeConsole, (consoleRow) => {
+watch(activeConsoleId, () => {
+  const consoleRow = activeConsole.value
   suppressConsoleSave.value = true
   editorSql.value = consoleRow?.sql ?? 'SELECT 1 AS hello;'
   selectedDsId.value = consoleRow?.datasource_id ?? datasources.value[0]?.id ?? ''
@@ -450,37 +448,45 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  sqlCompletionProvider?.dispose()
-  sqlCompletionProvider = null
-  completionTableRequests.clear()
+  sqlEditor = null
   for (const timer of pollTimers.values()) clearTimeout(timer)
   for (const timer of saveTimers.values()) clearTimeout(timer)
   for (const timer of exportPollTimers) clearTimeout(timer)
   if (nowTimer !== null) clearInterval(nowTimer)
 })
 
-function runtimeFor(consoleId: string): ConsoleRuntime {
-  if (!runtimes[consoleId]) {
-    runtimes[consoleId] = {
-      jobId: null,
-      resultSetId: null,
-      status: null,
-      error: null,
-      message: null,
-      cancelling: false,
-      result: null,
-      resultLoading: false,
-      pageOffset: 0,
-      startedAt: null,
-      finishedAt: null,
-      planJobId: null,
-      planStatus: null,
-      planResult: null,
-      planError: null,
-      resultTab: 'result',
-    }
+function createRuntime(statement = '', statementIndex = 0, statementCount = 1): ConsoleRuntime {
+  return {
+    statement,
+    statementIndex,
+    statementCount,
+    jobId: null,
+    resultSetId: null,
+    status: null,
+    error: null,
+    message: null,
+    cancelling: false,
+    result: null,
+    resultLoading: false,
+    pageOffset: 0,
+    startedAt: null,
+    finishedAt: null,
+    planJobId: null,
+    planStatus: null,
+    planResult: null,
+    planError: null,
+    resultTab: 'result',
   }
+}
+
+function runtimesFor(consoleId: string): ConsoleRuntime[] {
+  if (!runtimes[consoleId]) runtimes[consoleId] = [createRuntime()]
   return runtimes[consoleId]
+}
+
+function runtimeFor(consoleId: string): ConsoleRuntime {
+  const items = runtimesFor(consoleId)
+  return items[activeRuntimeIndexes[consoleId] ?? 0] ?? items[0]
 }
 
 async function loadConsoles(): Promise<void> {
@@ -522,6 +528,7 @@ async function deleteConsole(consoleId: string): Promise<void> {
     consoles.value = consoles.value.filter((item) => item.id !== consoleId)
     stopConsolePoll(consoleId)
     delete runtimes[consoleId]
+    delete activeRuntimeIndexes[consoleId]
     if (activeConsoleId.value === consoleId) {
       activeConsoleId.value = sortedConsoles.value[0]?.id ?? null
     }
@@ -604,13 +611,57 @@ function patchLocalConsole(consoleId: string, patch: SqlConsoleUpdateRequest): v
 }
 
 function mergeConsole(consoleRow: SqlConsole): void {
+  const pending = pendingConsolePatches.get(consoleRow.id)
+  const reconciled = pending ? { ...consoleRow, ...pending } : consoleRow
   const index = consoles.value.findIndex((item) => item.id === consoleRow.id)
-  if (index === -1) consoles.value = [consoleRow, ...consoles.value]
-  else consoles.value.splice(index, 1, consoleRow)
+  if (index === -1) consoles.value = [reconciled, ...consoles.value]
+  else consoles.value.splice(index, 1, reconciled)
 }
 
 function nextConsoleName(): string {
   return `query_${consoles.value.length + 1}.sql`
+}
+
+interface EditorSqlTarget {
+  sql: string
+  start: number
+  end: number
+}
+
+function selectedEditorSql(): string {
+  const selection = sqlEditor?.getSelection()
+  const model = sqlEditor?.getModel()
+  if (!selection || !model || selection.isEmpty()) return ''
+  return model.getValueInRange(selection)
+}
+
+function editorSqlTarget(): EditorSqlTarget | null {
+  const selection = sqlEditor?.getSelection()
+  const model = sqlEditor?.getModel()
+  if (selection && model && !selection.isEmpty()) {
+    return {
+      sql: model.getValueInRange(selection),
+      start: model.getOffsetAt(selection.getStartPosition()),
+      end: model.getOffsetAt(selection.getEndPosition()),
+    }
+  }
+
+  const statements = splitSqlStatements(editorSql.value)
+  if (statements.length === 0) return null
+  if (!model || statements.length === 1) return statements[0]
+  const position = sqlEditor?.getPosition()
+  const offset = position ? model.getOffsetAt(position) : 0
+  return statementAtOffset(editorSql.value, offset)
+}
+
+function replaceEditorSqlTarget(target: EditorSqlTarget, replacement: string): void {
+  editorSql.value = `${editorSql.value.slice(0, target.start)}${replacement}${editorSql.value.slice(target.end)}`
+}
+
+function selectRuntime(index: number): void {
+  if (!activeConsoleId.value || !activeRuntimes.value[index]) return
+  activeRuntimeIndexes[activeConsoleId.value] = index
+  resetExportState()
 }
 
 async function onExecute(): Promise<void> {
@@ -625,71 +676,101 @@ async function onExecute(): Promise<void> {
   }
   execError.value = null
   await flushConsolePatch(consoleRow.id)
-  const runtime = runtimeFor(consoleRow.id)
-  resetRuntime(runtime)
-  runtime.status = 'pending'
-  runtime.startedAt = Date.now()
-  runtime.finishedAt = null
-  try {
-    const response = await executeSql({
-      datasource_id: selectedDsId.value,
-      console_id: consoleRow.id,
-      sql: editorSql.value,
-    })
-    runtime.jobId = response.job_id
-    runtime.resultSetId = response.result_set_id
-    startConsolePoll(consoleRow.id)
-    scrollResultIntoView()
-  } catch (e) {
-    runtime.status = null
-    execError.value = errorMessage(e)
-    scrollResultIntoView()
+  const selectedSql = selectedEditorSql()
+  const statements = splitSqlStatements(selectedSql || editorSql.value)
+  if (statements.length === 0) {
+    execError.value = t('sql.error_pick_ds_or_sql')
+    return
   }
+
+  stopConsolePoll(consoleRow.id)
+  const nextRuntimes = statements.map((statement, index) => {
+    const runtime = createRuntime(statement.sql, index, statements.length)
+    runtime.status = 'pending'
+    runtime.startedAt = Date.now()
+    return runtime
+  })
+  runtimes[consoleRow.id] = nextRuntimes
+  activeRuntimeIndexes[consoleRow.id] = 0
+  // 从 reactive 容器重新取 proxy；后续异步轮询必须修改 proxy，才能即时刷新结果区。
+  const batchRuntimes = runtimesFor(consoleRow.id)
+  scrollResultIntoView()
+
+  await Promise.all(
+    batchRuntimes.map(async (runtime, index) => {
+      try {
+        const response = await executeSql({
+          datasource_id: selectedDsId.value,
+          // A console owns one latest result set. Earlier batch results stay independent
+          // so the server's existing console-result eviction cannot remove sibling results.
+          console_id: index === batchRuntimes.length - 1 ? consoleRow.id : null,
+          sql: runtime.statement,
+        })
+        runtime.jobId = response.job_id
+        runtime.resultSetId = response.result_set_id
+        startConsolePoll(consoleRow.id, runtime)
+      } catch (e) {
+        runtime.status = null
+        runtime.error = errorMessage(e)
+        runtime.finishedAt = Date.now()
+      }
+    }),
+  )
 }
 
 async function onCancel(): Promise<void> {
-  const runtime = activeRuntime.value
-  if (!runtime?.jobId || runtime.cancelling) return
-  runtime.cancelling = true
-  try {
-    await cancelJob(runtime.jobId)
-  } catch (e) {
-    runtime.cancelling = false
-    runtime.error = errorMessage(e)
-  }
+  const cancellable = activeRuntimes.value.filter(
+    (runtime) => runtime.jobId && runtime.status && ACTIVE.has(runtime.status) && !runtime.cancelling,
+  )
+  await Promise.all(
+    cancellable.map(async (runtime) => {
+      runtime.cancelling = true
+      try {
+        await cancelJob(runtime.jobId as string)
+      } catch (e) {
+        runtime.cancelling = false
+        runtime.error = errorMessage(e)
+      }
+    }),
+  )
 }
 
-function startConsolePoll(consoleId: string): void {
-  stopConsolePoll(consoleId)
-  void pollConsole(consoleId)
+function startConsolePoll(consoleId: string, runtime: ConsoleRuntime): void {
+  void pollConsole(consoleId, runtime)
 }
 
 function stopConsolePoll(consoleId: string): void {
-  const timer = pollTimers.get(consoleId)
-  if (timer) clearTimeout(timer)
-  pollTimers.delete(consoleId)
+  const prefix = `query:${consoleId}:`
+  for (const [key, timer] of pollTimers.entries()) {
+    if (!key.startsWith(prefix)) continue
+    clearTimeout(timer)
+    pollTimers.delete(key)
+  }
 }
 
-async function pollConsole(consoleId: string): Promise<void> {
-  const runtime = runtimeFor(consoleId)
+async function pollConsole(consoleId: string, runtime: ConsoleRuntime): Promise<void> {
   if (!runtime.jobId) return
+  if (!runtimes[consoleId]?.includes(runtime)) return
+  const pollKey = `query:${consoleId}:${runtime.jobId}`
   try {
     const job = await getJob(runtime.jobId)
     applyJob(runtime, job)
     if (job.status === 'pending' || job.status === 'running' || job.status === 'success') {
-      await fetchResult(consoleId, runtime.pageOffset, false)
+      await fetchResult(runtime, runtime.pageOffset, false)
     }
     if (TERMINAL.has(job.status)) {
-      stopConsolePoll(consoleId)
+      const timer = pollTimers.get(pollKey)
+      if (timer) clearTimeout(timer)
+      pollTimers.delete(pollKey)
       return
     }
   } catch (e) {
     runtime.error = errorMessage(e)
   }
   pollTimers.set(
-    consoleId,
+    pollKey,
     setTimeout(() => {
-      void pollConsole(consoleId)
+      void pollConsole(consoleId, runtime)
     }, POLL_MS),
   )
 }
@@ -711,11 +792,10 @@ function applyJob(runtime: ConsoleRuntime, job: JobResponse): void {
 }
 
 async function fetchResult(
-  consoleId: string,
+  runtime: ConsoleRuntime,
   offset: number,
   showLoading: boolean = true,
 ): Promise<void> {
-  const runtime = runtimeFor(consoleId)
   if (!runtime.jobId) return
   if (showLoading) runtime.resultLoading = true
   try {
@@ -732,22 +812,9 @@ async function fetchResult(
 }
 
 function onChangePage(offset: number): void {
-  if (!activeConsoleId.value) return
-  void fetchResult(activeConsoleId.value, offset)
-}
-
-function resetRuntime(runtime: ConsoleRuntime): void {
-  runtime.jobId = null
-  runtime.resultSetId = null
-  runtime.status = null
-  runtime.error = null
-  runtime.message = null
-  runtime.cancelling = false
-  runtime.result = null
-  runtime.resultLoading = false
-  runtime.pageOffset = 0
-  runtime.startedAt = null
-  runtime.finishedAt = null
+  const runtime = activeRuntime.value
+  if (!runtime) return
+  void fetchResult(runtime, offset)
 }
 
 async function loadHistory(): Promise<void> {
@@ -893,38 +960,9 @@ function applySqlToActiveConsole(sqlText: string, datasourceId: string | null): 
 }
 
 // ── 元数据浏览器 ────────────────────────────────────────────────
-function completionCacheKey(datasourceId: string, schemaName: string): string {
-  return `${datasourceId}\u0000${schemaName}`
-}
-
-function completionInsertText(tableName: string): string {
-  return SIMPLE_SQL_IDENTIFIER.test(tableName)
-    ? tableName
-    : `"${tableName.replaceAll('"', '""')}"`
-}
-
-function completionTables(
-  datasourceId: string,
-  schemaName: string,
-): Promise<MetadataTableItem[]> {
-  const key = completionCacheKey(datasourceId, schemaName)
-  const cached = completionTableRequests.get(key)
-  if (cached) return cached
-  const request = listMetadataTables(datasourceId, schemaName, false).catch(() => [])
-  completionTableRequests.set(key, request)
-  return request
-}
-
-function clearCompletionTables(datasourceId: string): void {
-  const prefix = `${datasourceId}\u0000`
-  for (const key of completionTableRequests.keys()) {
-    if (key.startsWith(prefix)) completionTableRequests.delete(key)
-  }
-}
-
 async function loadMetadataSchemas(refresh: boolean): Promise<void> {
   if (!metadataDsId.value) return
-  if (refresh) clearCompletionTables(metadataDsId.value)
+  if (refresh) clearSqlMetadataCache(metadataDsId.value)
   metadataLoading.value = true
   metadataError.value = null
   try {
@@ -1004,12 +1042,13 @@ function selectTableIntoConsole(schemaName: string, node: MetadataTableNode): vo
 
 // ── 编辑器工具栏 ────────────────────────────────────────────────
 async function onFormatSql(): Promise<void> {
-  if (!editorSql.value.trim() || !selectedDs.value) return
+  const target = editorSqlTarget()
+  if (!target?.sql.trim() || !selectedDs.value) return
   toolError.value = null
   toolBusy.value = 'format'
   try {
-    const res = await formatSql(editorSql.value, selectedDs.value.db_type)
-    editorSql.value = res.formatted_sql
+    const res = await formatSql(target.sql, selectedDs.value.db_type)
+    replaceEditorSqlTarget(target, res.formatted_sql)
   } catch (e) {
     toolError.value = errorMessage(e)
   } finally {
@@ -1018,12 +1057,13 @@ async function onFormatSql(): Promise<void> {
 }
 
 async function onExpandStar(): Promise<void> {
-  if (!editorSql.value.trim() || !selectedDsId.value) return
+  const target = editorSqlTarget()
+  if (!target?.sql.trim() || !selectedDsId.value) return
   toolError.value = null
   toolBusy.value = 'expand'
   try {
-    const res = await expandSqlStar(editorSql.value, selectedDsId.value)
-    editorSql.value = res.expanded_sql
+    const res = await expandSqlStar(target.sql, selectedDsId.value)
+    replaceEditorSqlTarget(target, res.expanded_sql)
   } catch (e) {
     // 缓存缺失(409 metadata_cache_missing)→ 提示先刷新元数据。
     if (e instanceof ApiError && e.code === 'metadata_cache_missing') {
@@ -1038,7 +1078,8 @@ async function onExpandStar(): Promise<void> {
 
 async function onExplain(): Promise<void> {
   const consoleRow = activeConsole.value
-  if (!consoleRow || !selectedDsId.value || !editorSql.value.trim()) return
+  const target = editorSqlTarget()
+  if (!consoleRow || !selectedDsId.value || !target?.sql.trim()) return
   if (!explainSupported.value) return
   toolError.value = null
   toolBusy.value = 'explain'
@@ -1054,7 +1095,7 @@ async function onExplain(): Promise<void> {
     const response = await explainSql({
       datasource_id: selectedDsId.value,
       console_id: consoleRow.id,
-      sql: editorSql.value,
+      sql: target.sql,
     })
     runtime.planJobId = response.job_id
     startPlanPoll(consoleRow.id)
@@ -1074,11 +1115,12 @@ function applyGeneratedSql(sql: string): void {
 // SQL 体检(C-11):文本级 advisory findings 卡;若数据源支持 EXPLAIN,顺带触发一次
 // 库内 EXPLAIN(行数估算落 Plan tab)—— 复用既有端点,不自造行数解析。
 async function onPreflight(): Promise<void> {
-  if (!editorSql.value.trim()) return
+  const target = editorSqlTarget()
+  if (!target?.sql.trim()) return
   toolError.value = null
   toolBusy.value = 'preflight'
   try {
-    const res = await preflightSql(editorSql.value)
+    const res = await preflightSql(target.sql)
     preflightFindings.value = res.findings
     if (explainSupported.value) void onExplain()
   } catch (e) {
@@ -1103,14 +1145,15 @@ function resetAiDiagnose(): void {
 
 async function onDiagnoseSlowSql(): Promise<void> {
   const runtime = activeRuntime.value
-  if (!runtime || !selectedDsId.value || !editorSql.value.trim()) return
+  const sql = runtime?.statement || editorSqlTarget()?.sql || ''
+  if (!runtime || !selectedDsId.value || !sql.trim()) return
   resetAiDiagnose()
   aiDiagnoseBusy.value = true
   try {
     // 复用 Plan tab 已跑完的 explain job(有则带上,plan 进 AI 上下文;无则 AI 据结构+基线诊断)。
     const explainJobId = runtime.planStatus === 'success' ? runtime.planJobId : null
     const res = await diagnoseSlowSql(selectedDsId.value, {
-      sql: editorSql.value,
+      sql,
       explain_job_id: explainJobId,
     })
     if (!res.ok || !res.diagnosis) {
@@ -1239,52 +1282,8 @@ function scrollResultIntoView(): void {
   })
 }
 
-function registerSqlCompletionProvider(): void {
-  sqlCompletionProvider?.dispose()
-  sqlCompletionProvider = monaco.languages.registerCompletionItemProvider('sql', {
-    triggerCharacters: ['.'],
-    async provideCompletionItems(model, position) {
-      const linePrefix = model
-        .getLineContent(position.lineNumber)
-        .slice(0, position.column - 1)
-      const match = SCHEMA_COMPLETION_PREFIX.exec(linePrefix)
-      const datasource = selectedDs.value
-      if (!match || !datasource || !SUPPORTED_TOOL_DB_TYPES.has(datasource.db_type)) {
-        return { suggestions: [] }
-      }
-
-      const datasourceId = datasource.id
-      const schemaName = (match[1] ?? match[2] ?? '').replaceAll('""', '"')
-      const fragment = match[3] ?? ''
-      const tables = await completionTables(datasourceId, schemaName)
-      if (selectedDsId.value !== datasourceId) return { suggestions: [] }
-
-      const range = new monaco.Range(
-        position.lineNumber,
-        position.column - fragment.length,
-        position.lineNumber,
-        position.column,
-      )
-      return {
-        suggestions: tables.map((table) => ({
-          label: table.name,
-          kind: monaco.languages.CompletionItemKind.Class,
-          insertText: completionInsertText(table.name),
-          filterText: table.name,
-          sortText: table.name.toLocaleLowerCase(),
-          detail: table.schema_name,
-          range,
-        })),
-      }
-    },
-  })
-}
-
 function onEditorMount(editor: monaco.editor.IStandaloneCodeEditor): void {
-  registerSqlCompletionProvider()
-  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
-    void onExecute()
-  })
+  sqlEditor = editor
 }
 
 function elapsedSeconds(runtime: ConsoleRuntime): string {
@@ -1746,22 +1745,17 @@ function parseVariables(value: string): string[] {
           data-testid="sql-editor-panel"
           class="h-[38%] min-h-[10rem] shrink-0 min-w-0 max-w-full overflow-hidden border-b chrome-border relative"
         >
-          <VueMonacoEditor
-            v-model:value="editorSql"
-            language="sql"
+          <SqlEditor
+            :key="activeConsole.id"
+            v-model="editorSql"
+            :datasource-id="selectedDsId"
+            :db-type="selectedDs?.db_type"
+            :default-schema="selectedDs?.database"
+            :path="`sql-console-${activeConsole.id}.sql`"
             :theme="editorTheme"
-            :options="{
-              fontSize: 13,
-              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-              minimap: { enabled: false },
-              scrollBeyondLastLine: false,
-              tabSize: 2,
-              wordWrap: 'on',
-              renderLineHighlight: 'gutter',
-              padding: { top: 12, bottom: 12 },
-              readOnly: editorReadOnly,
-            }"
+            :read-only="editorReadOnly"
             @mount="onEditorMount"
+            @execute="onExecute"
           />
         </div>
 
@@ -1823,6 +1817,13 @@ function parseVariables(value: string): string[] {
             {{ toolBusy === 'preflight' ? t('common.submitting') : t('sql.tool_preflight') }}
           </button>
           <div class="flex-1" />
+          <span
+            v-if="!toolError"
+            class="hidden xl:inline text-[11px] chrome-text-muted truncate max-w-[24rem]"
+            :title="t('sql.metadata_editor_hint')"
+          >
+            {{ t('sql.metadata_editor_hint') }}
+          </span>
           <span v-if="toolError" class="text-xs text-red-600 dark:text-red-400 truncate max-w-[24rem]" :title="toolError">
             {{ toolError }}
           </span>
@@ -1920,6 +1921,25 @@ function parseVariables(value: string): string[] {
                 </div>
               </div>
             </div>
+          </div>
+
+          <div
+            v-if="activeRuntimes.length > 1"
+            data-testid="sql-statement-results"
+            class="flex items-center gap-1 px-5 py-1.5 border-b chrome-border-subtle overflow-x-auto"
+          >
+            <button
+              v-for="(runtime, index) in activeRuntimes"
+              :key="`${runtime.statementIndex}:${runtime.jobId ?? 'pending'}`"
+              type="button"
+              class="chrome-tab shrink-0 max-w-48"
+              :class="activeRuntime === runtime && 'chrome-accent-light-bg chrome-accent'"
+              :title="runtime.statement"
+              @click="selectRuntime(index)"
+            >
+              <span class="truncate">{{ t('sql.statement_result', { index: index + 1 }) }}</span>
+              <JobStatusBadge v-if="runtime.status" :status="runtime.status" />
+            </button>
           </div>
 
           <div
