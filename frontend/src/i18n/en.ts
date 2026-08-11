@@ -256,6 +256,7 @@ export default {
   },
   sql: {
     workspace: 'SQL workspace',
+    datasource: 'Datasource',
     tab_consoles: 'Consoles',
     tab_history: 'History',
     tab_templates: 'Templates',
@@ -371,6 +372,11 @@ export default {
     execute: 'Run',
     cancel: 'Cancel',
     cancelling: 'Cancelling…',
+    max_rows: 'Max rows',
+    max_rows_hint: 'The worker stops reading and marks the result truncated after this many rows.',
+    max_rows_custom: 'Custom…',
+    max_rows_custom_input: 'Custom maximum rows',
+    max_rows_invalid: 'Maximum rows must be an integer between 1 and {max}.',
     result: 'Result',
     statement_result: 'Result {index}',
     no_datasource: 'No datasource in this project',
@@ -1167,7 +1173,7 @@ export default {
     },
   },
   results: {
-    truncated_hint: 'Backend spool was truncated; only the persisted portion is shown',
+    truncated_hint: 'Result reached the query or storage limit; only the persisted portion is shown',
     too_many_rows: 'Rendering capped at {max} rows to keep the browser snappy',
     empty_title: 'Empty result set',
     empty_hint: 'SQL returned 0 rows',

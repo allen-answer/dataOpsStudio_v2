@@ -7,6 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.schema import Column, Row
 
+SQL_WORKSPACE_DEFAULT_MAX_ROWS = 1_000
+SQL_WORKSPACE_MAX_ROWS = 50_000
+
 
 class ResultRef(BaseModel):
     """跨存储 artifact 的逻辑引用 —— 不是 PG 外键。

@@ -20,7 +20,11 @@ from app.domain.ai_copilot import MAX_TABLES
 from app.domain.compare_result import encode_compare_result_row
 from app.domain.job import Job, JobKind
 from app.domain.license import LicenseMode
-from app.domain.result import ResultRef
+from app.domain.result import (
+    SQL_WORKSPACE_DEFAULT_MAX_ROWS,
+    SQL_WORKSPACE_MAX_ROWS,
+    ResultRef,
+)
 from app.domain.schema import Column, ColumnType, Index, Row, Schema, Table
 from app.domain.workflow import WorkflowSpec
 from app.services.ai.default_gateway import DefaultAiGateway
@@ -88,6 +92,7 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("GET", "/api/projects/{project_id}/lineage/impact") in routes
     assert ("POST", "/api/projects/{project_id}/lineage/ai-impact") in routes
     assert ("POST", "/api/projects/{project_id}/lineage/export") in routes
+
     assert ("PATCH", "/api/projects/{project_id}/lineage/edges/{edge_id}") in routes
     assert ("POST", "/api/projects/{project_id}/lineage/runs/{run_id}/ai-enrich") in routes
     assert ("GET", "/api/projects/{project_id}/lineage/runs/{run_id}/ai-enrich") in routes
@@ -124,6 +129,57 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("POST", "/api/admin/ai-config/test") in routes
     assert ("GET", "/api/admin/system-settings") in routes
     assert ("PUT", "/api/admin/system-settings") in routes
+
+
+@pytest.mark.parametrize(
+    ("requested_max_rows", "expected_max_rows"),
+    [
+        (None, SQL_WORKSPACE_DEFAULT_MAX_ROWS),
+        (5_000, 5_000),
+    ],
+)
+def test_sql_execute_enqueues_validated_row_limit(
+    requested_max_rows: int | None,
+    expected_max_rows: int,
+) -> None:
+    services = _Services(
+        _FakeEngine(
+            [
+                _datasource_row(),
+                {"id": "project-1"},
+            ]
+        )
+    )
+    app = create_app(services=cast(ApiServices, services))
+    body: dict[str, object] = {"sql": "SELECT * FROM users", "datasource_id": "ds-1"}
+    if requested_max_rows is not None:
+        body["max_rows"] = requested_max_rows
+
+    response = AsgiClient(app).post(
+        "/api/sql/execute",
+        headers=_auth_headers(),
+        json_body=body,
+    )
+
+    assert response.status_code == 202
+    assert services.job_backend.enqueued[0].payload["max_rows"] == expected_max_rows
+
+
+@pytest.mark.parametrize("max_rows", [0, SQL_WORKSPACE_MAX_ROWS + 1])
+def test_sql_execute_rejects_row_limit_outside_supported_range(max_rows: int) -> None:
+    app = create_app(services=cast(ApiServices, _Services(_FakeEngine([]))))
+
+    response = AsgiClient(app).post(
+        "/api/sql/execute",
+        headers=_auth_headers(),
+        json_body={
+            "sql": "SELECT * FROM users",
+            "datasource_id": "ds-1",
+            "max_rows": max_rows,
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_login_uses_admin_configured_access_token_ttl() -> None:

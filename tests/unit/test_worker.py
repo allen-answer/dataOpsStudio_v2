@@ -8,6 +8,7 @@ import time
 import zipfile
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, BinaryIO, Protocol
 from unittest.mock import patch
 
@@ -33,6 +34,7 @@ from app.domain.result import ResultRef
 from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import SecretKind, SecretRef
 from app.domain.workflow import WorkflowNode
+from app.infrastructure.resultstore.local_fs import LocalFsResultStore
 from app.services.notify import WorkflowNotifyService
 from app.worker import (
     _EXCEL_MAX_DATA_ROWS_PER_SHEET,
@@ -63,6 +65,69 @@ def test_worker_runs_sql_query_to_spool_and_completes() -> None:
     assert backend.completed == [("job-1", ResultRef(backend="local_fs", uri="spool/rs-1"))]
     assert backend.failed == []
     assert backend.cancelled == []
+
+
+def test_worker_stops_sql_query_at_requested_max_rows_and_marks_truncated() -> None:
+    job = _make_job(
+        payload={
+            "sql": "SELECT n",
+            "result_set_id": "rs-limited",
+            "max_rows": 3,
+        }
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    adapter = _RangeAdapter(100)
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=2),
+    )
+
+    assert runner.run_once() is True
+
+    assert result_store.rows_by_result_set["rs-limited"] == [
+        Row(values=[0]),
+        Row(values=[1]),
+        Row(values=[2]),
+    ]
+    assert result_store.get_spool_manifest("rs-limited")["truncated"] is True
+    assert adapter.rows_yielded == 4
+    assert adapter.closed is True
+    assert backend.failed == []
+
+
+def test_worker_stops_reading_when_spool_storage_limit_truncates(tmp_path: Path) -> None:
+    job = _make_job(
+        payload={
+            "sql": "SELECT n",
+            "result_set_id": "rs-storage-limited",
+            "max_rows": 10,
+        }
+    )
+    backend = _FakeBackend([job])
+    result_store = LocalFsResultStore(tmp_path, spool_max_rows=2)
+    adapter = _RangeAdapter(100)
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=3),
+    )
+
+    assert runner.run_once() is True
+
+    assert result_store.fetch_range("rs-storage-limited", 0, 10) == [
+        Row(values=[0]),
+        Row(values=[1]),
+    ]
+    assert result_store.get_spool_manifest("rs-storage-limited")["truncated"] is True
+    assert adapter.rows_yielded == 3
+    assert adapter.closed is True
+    assert backend.failed == []
 
 
 def test_worker_heartbeats_while_waiting_for_first_sql_row() -> None:
@@ -1109,6 +1174,7 @@ class _FakeResultStore:
         self.run_artifacts: dict[tuple[str, str], bytes] = {}
         self.downloads: dict[str, bytes] = {}
         self.deleted_spools: list[str] = []
+        self.truncated_result_sets: set[str] = set()
         self.gc_calls = 0
 
     def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]:
@@ -1116,6 +1182,9 @@ class _FakeResultStore:
 
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None:
         self.rows_by_result_set.setdefault(result_set_id, []).extend(rows)
+
+    def mark_spool_truncated(self, result_set_id: str) -> None:
+        self.truncated_result_sets.add(result_set_id)
 
     def put_export_artifact(self, export_id: str, name: str, stream: BinaryIO) -> ResultRef:
         data = stream.read()
@@ -1141,7 +1210,7 @@ class _FakeResultStore:
                 column.model_dump() for column in self.columns_by_result_set.get(result_set_id, [])
             ],
             "loaded_rows": len(self.rows_by_result_set.get(result_set_id, [])),
-            "truncated": False,
+            "truncated": result_set_id in self.truncated_result_sets,
         }
 
     def spool_ref(self, result_set_id: str) -> ResultRef:
@@ -1154,6 +1223,7 @@ class _FakeResultStore:
         )
         self.rows_by_result_set.pop(result_set_id, None)
         self.columns_by_result_set.pop(result_set_id, None)
+        self.truncated_result_sets.discard(result_set_id)
         return existed
 
     def gc_expired(self) -> int:
@@ -1166,6 +1236,7 @@ class _CountingResultStore:
         self.row_count_by_result_set: dict[str, int] = {}
         self.columns_by_result_set: dict[str, list[Column]] = {}
         self.deleted_spools: list[str] = []
+        self.truncated_result_sets: set[str] = set()
         self.gc_calls = 0
 
     def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]:
@@ -1176,6 +1247,9 @@ class _CountingResultStore:
         self.row_count_by_result_set[result_set_id] = self.row_count_by_result_set.get(
             result_set_id, 0
         ) + len(rows)
+
+    def mark_spool_truncated(self, result_set_id: str) -> None:
+        self.truncated_result_sets.add(result_set_id)
 
     def set_spool_columns(self, result_set_id: str, columns: list[Column]) -> None:
         self.columns_by_result_set[result_set_id] = list(columns)
@@ -1197,7 +1271,7 @@ class _CountingResultStore:
                 column.model_dump() for column in self.columns_by_result_set.get(result_set_id, [])
             ],
             "loaded_rows": self.row_count_by_result_set.get(result_set_id, 0),
-            "truncated": False,
+            "truncated": result_set_id in self.truncated_result_sets,
         }
 
     def spool_ref(self, result_set_id: str) -> ResultRef:
@@ -1211,6 +1285,7 @@ class _CountingResultStore:
         )
         self.row_count_by_result_set.pop(result_set_id, None)
         self.columns_by_result_set.pop(result_set_id, None)
+        self.truncated_result_sets.discard(result_set_id)
         return existed
 
     def gc_expired(self) -> int:
@@ -1307,6 +1382,7 @@ class _RangeAdapter:
     def __init__(self, row_count: int) -> None:
         self._row_count = row_count
         self.rows_yielded = 0
+        self.closed = False
         self._column_sink: Callable[[list[Column]], None] | None = None
 
     def with_column_sink(self, column_sink: Callable[[list[Column]], None]) -> _RangeAdapter:
@@ -1316,9 +1392,12 @@ class _RangeAdapter:
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
         if self._column_sink is not None:
             self._column_sink([Column(name="n", type=ColumnType.UNKNOWN)])
-        for index in range(self._row_count):
-            self.rows_yielded += 1
-            yield Row(values=[index])
+        try:
+            for index in range(self._row_count):
+                self.rows_yielded += 1
+                yield Row(values=[index])
+        finally:
+            self.closed = True
 
     def explain(self, sql: str) -> PlanNode:
         return PlanNode(operation="EXPLAIN", details={"rows": [{"rows": self._row_count}]})

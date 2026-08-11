@@ -60,6 +60,7 @@ async function mockBase(page: Page): Promise<{ patches: unknown[] }> {
   const patches: unknown[] = []
   await mockLicense(page)
   await page.route(/\/api\/datasources\?/, (r) => json(r, 200, [datasource()]))
+  await page.route(/\/api\/datasources\/[^/]+\/metadata\/schemas/, (r) => json(r, 200, []))
   await page.route('**/api/sql/consoles', (r: Route) =>
     r.request().method() === 'GET' ? json(r, 200, [consoleRow()]) : r.fallback(),
   )
@@ -146,7 +147,7 @@ test('typing schema dot suggests tables from the selected datasource', async ({ 
   })
 
   await page.goto('/projects/project-1/sql')
-  await expect(page.locator('main select')).toHaveValue('ds-1')
+  await expect(page.getByLabel('Datasource')).toHaveValue('ds-1')
   const input = page.locator('.monaco-editor textarea.inputarea')
   await input.press('Control+A')
   await input.type('SELECT * FROM app')
@@ -209,7 +210,7 @@ test('completion drops tables returned after the datasource changes', async ({ p
   )
 
   await page.goto('/projects/project-1/sql')
-  const datasourceSelect = page.locator('main select')
+  const datasourceSelect = page.getByLabel('Datasource')
   await expect(datasourceSelect).toHaveValue('ds-1')
   const input = page.locator('.monaco-editor textarea.inputarea')
   await input.press('Control+A')

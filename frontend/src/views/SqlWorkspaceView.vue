@@ -106,6 +106,9 @@ const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>([
 ])
 const ACTIVE: ReadonlySet<JobStatus> = new Set<JobStatus>(['pending', 'running'])
 const PAGE_SIZE = 100
+const DEFAULT_QUERY_MAX_ROWS = 1_000
+const QUERY_MAX_ROWS_LIMIT = 50_000
+const QUERY_MAX_ROWS_OPTIONS = [100, 500, 1_000, 5_000, 10_000] as const
 const POLL_MS = 1000
 const SAVE_DEBOUNCE_MS = 650
 // db2 后端 adapter 已具备执行能力,但 GA 决策维持 Preview,放开执行需单独 PR 人拍板。
@@ -194,6 +197,8 @@ const sidebarTab = ref<SidebarTab>('consoles')
 
 const editorSql = ref('SELECT 1 AS hello;')
 const selectedDsId = ref('')
+const maxRowsSelection = ref(String(DEFAULT_QUERY_MAX_ROWS))
+const customMaxRows = ref(DEFAULT_QUERY_MAX_ROWS)
 const suppressConsoleSave = ref(false)
 
 const runtimes = reactive<Record<string, ConsoleRuntime[]>>({})
@@ -282,6 +287,14 @@ const selectedDs = computed<DatasourceListItem | undefined>(() =>
 const unsupportedDb = computed<string | null>(() => {
   const ds = selectedDs.value
   return ds && !SUPPORTED_EXECUTION_DB_TYPES.has(ds.db_type) ? ds.db_type : null
+})
+const queryMaxRows = computed<number | null>(() => {
+  const value =
+    maxRowsSelection.value === 'custom'
+      ? Number(customMaxRows.value)
+      : Number(maxRowsSelection.value)
+  if (!Number.isInteger(value) || value < 1 || value > QUERY_MAX_ROWS_LIMIT) return null
+  return value
 })
 // 工具能力门:db_type 在白名单内 + (EXPLAIN 还需 operation_policy.allow_explain)。
 const toolsSupported = computed<boolean>(() => {
@@ -666,12 +679,17 @@ function selectRuntime(index: number): void {
 
 async function onExecute(): Promise<void> {
   const consoleRow = activeConsole.value
+  const requestedMaxRows = queryMaxRows.value
   if (!consoleRow || !selectedDsId.value || !editorSql.value.trim()) {
     execError.value = t('sql.error_pick_ds_or_sql')
     return
   }
   if (unsupportedDb.value) {
     execError.value = t('sql.unsupported_db_error', { db: unsupportedDb.value })
+    return
+  }
+  if (requestedMaxRows === null) {
+    execError.value = t('sql.max_rows_invalid', { max: QUERY_MAX_ROWS_LIMIT })
     return
   }
   execError.value = null
@@ -705,6 +723,7 @@ async function onExecute(): Promise<void> {
           // so the server's existing console-result eviction cannot remove sibling results.
           console_id: index === batchRuntimes.length - 1 ? consoleRow.id : null,
           sql: runtime.statement,
+          max_rows: requestedMaxRows,
         })
         runtime.jobId = response.job_id
         runtime.resultSetId = response.result_set_id
@@ -1686,7 +1705,7 @@ function parseVariables(value: string): string[] {
     </aside>
 
     <main class="flex-1 min-w-0 max-w-full overflow-hidden flex flex-col h-full">
-      <div class="flex items-center gap-3 px-5 py-3 border-b chrome-border chrome-bg-panel">
+      <div class="flex flex-wrap items-center gap-3 px-5 py-3 border-b chrome-border chrome-bg-panel">
         <div class="min-w-0">
           <div class="text-sm font-medium chrome-text-heading truncate">
             {{ activeConsole?.name || t('sql.no_console') }}
@@ -1697,9 +1716,11 @@ function parseVariables(value: string): string[] {
         </div>
         <div class="flex-1" />
         <select
+          id="sql-datasource"
           v-model="selectedDsId"
-          class="chrome-input min-w-[14rem]"
+          class="chrome-input min-w-[12rem] max-w-full"
           :disabled="dsQuery.isLoading.value || datasources.length === 0 || editorReadOnly"
+          :aria-label="t('sql.datasource')"
         >
           <option v-if="datasources.length === 0" disabled value="">
             {{ t('sql.no_datasource') }}
@@ -1708,12 +1729,40 @@ function parseVariables(value: string): string[] {
             {{ ds.name }} ({{ ds.db_type }} · {{ ds.environment }})
           </option>
         </select>
+        <div class="flex items-center gap-1.5 shrink-0">
+          <label for="sql-max-rows" class="text-xs chrome-text-muted whitespace-nowrap">
+            {{ t('sql.max_rows') }}
+          </label>
+          <select
+            id="sql-max-rows"
+            v-model="maxRowsSelection"
+            class="chrome-input w-[6.5rem]"
+            :disabled="editorReadOnly"
+            :title="t('sql.max_rows_hint')"
+          >
+            <option v-for="limit in QUERY_MAX_ROWS_OPTIONS" :key="limit" :value="String(limit)">
+              {{ limit.toLocaleString() }}
+            </option>
+            <option value="custom">{{ t('sql.max_rows_custom') }}</option>
+          </select>
+          <input
+            v-if="maxRowsSelection === 'custom'"
+            v-model.number="customMaxRows"
+            type="number"
+            min="1"
+            :max="QUERY_MAX_ROWS_LIMIT"
+            step="100"
+            class="chrome-input w-24"
+            :aria-label="t('sql.max_rows_custom_input')"
+            :disabled="editorReadOnly"
+          />
+        </div>
         <button
           v-if="!editorReadOnly"
           type="button"
           class="chrome-btn-primary"
           @click="onExecute"
-          :disabled="!activeConsole || !selectedDsId || !editorSql.trim() || !!unsupportedDb"
+          :disabled="!activeConsole || !selectedDsId || !editorSql.trim() || !!unsupportedDb || queryMaxRows === null"
           :title="unsupportedDb ? t('sql.unsupported_db_error', { db: unsupportedDb }) : ''"
         >
           <Play class="w-3.5 h-3.5" />

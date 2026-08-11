@@ -13,6 +13,7 @@ from app.domain.compare_infer import (
 from app.domain.datasource import DbType, OperationPolicy
 from app.domain.job import JobErrorCode, JobStatus
 from app.domain.notify import NotifyChannelName, NotifyEvent
+from app.domain.result import SQL_WORKSPACE_DEFAULT_MAX_ROWS, SQL_WORKSPACE_MAX_ROWS
 from app.domain.schema import Column
 from app.domain.workflow import WorkflowSpec
 
@@ -125,6 +126,11 @@ class SqlExecuteRequest(BaseModel):
     sql: str = Field(min_length=1)
     params: dict[str, Any] = Field(default_factory=dict)
     console_id: str | None = None
+    max_rows: int = Field(
+        default=SQL_WORKSPACE_DEFAULT_MAX_ROWS,
+        ge=1,
+        le=SQL_WORKSPACE_MAX_ROWS,
+    )
 
 
 class SqlExecuteResponse(BaseModel):

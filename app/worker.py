@@ -106,7 +106,7 @@ from app.domain.readers import (
     RowReader,
 )
 from app.domain.resource import ResourceProfile
-from app.domain.result import ResultRef
+from app.domain.result import SQL_WORKSPACE_MAX_ROWS, ResultRef
 from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import SecretKind, SecretRef
 from app.domain.workflow import WorkflowNode, WorkflowSpec
@@ -265,6 +265,8 @@ class ResultStoreLike(Protocol):
     def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]: ...
 
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None: ...
+
+    def mark_spool_truncated(self, result_set_id: str) -> None: ...
 
     def put_export_artifact(self, export_id: str, name: str, stream: BinaryIO) -> ResultRef: ...
 
@@ -640,6 +642,7 @@ class WorkerRunner:
         payload = job.payload
         sql = _required_payload_str(payload, "sql")
         params = _payload_params(payload)
+        max_rows = _payload_sql_max_rows(payload)
         datasource_id = _payload_datasource_id(job)
         result_set_id = str(payload.get("result_set_id") or job.id)
         console_id = _payload_optional_str(payload, "console_id")
@@ -661,28 +664,43 @@ class WorkerRunner:
         )
 
         batch: list[Row] = []
+        accepted_rows = 0
+        query_truncated = False
         rows_since_cancel_check = 0
         cancel_check_row_interval = self._config.cancel_check_row_interval
         last_heartbeat = time.monotonic()
-        for row in adapter.execute_select(sql, params):
-            rows_since_cancel_check += 1
-            if rows_since_cancel_check >= cancel_check_row_interval:
-                self._check_cancel(job.id)
-                rows_since_cancel_check = 0
-            batch.append(row)
-            if len(batch) >= self._config.sql_spool_batch_size:
-                self._flush_batch(job.id, result_set_id, batch)
-                self._write_result_set_streaming(
-                    job,
-                    result_set_id,
-                    columns or [],
-                    _spool_loaded_rows(self._result_store, result_set_id),
-                    console_id,
-                )
-                batch = []
-                last_heartbeat = self._heartbeat_if_due(job.id, last_heartbeat, force=True)
-            else:
-                last_heartbeat = self._heartbeat_if_due(job.id, last_heartbeat)
+        row_stream = iter(adapter.execute_select(sql, params))
+        try:
+            for row in row_stream:
+                if max_rows is not None and accepted_rows >= max_rows:
+                    query_truncated = True
+                    break
+                accepted_rows += 1
+                rows_since_cancel_check += 1
+                if rows_since_cancel_check >= cancel_check_row_interval:
+                    self._check_cancel(job.id)
+                    rows_since_cancel_check = 0
+                batch.append(row)
+                if len(batch) >= self._config.sql_spool_batch_size:
+                    self._flush_batch(job.id, result_set_id, batch)
+                    batch = []
+                    manifest = self._result_store.get_spool_manifest(result_set_id)
+                    self._write_result_set_streaming(
+                        job,
+                        result_set_id,
+                        columns or [],
+                        _manifest_int(manifest, "loaded_rows"),
+                        console_id,
+                    )
+                    last_heartbeat = self._heartbeat_if_due(job.id, last_heartbeat, force=True)
+                    if _manifest_bool(manifest, "truncated"):
+                        break
+                else:
+                    last_heartbeat = self._heartbeat_if_due(job.id, last_heartbeat)
+        finally:
+            closer = getattr(row_stream, "close", None)
+            if callable(closer):
+                closer()
 
         if batch:
             self._flush_batch(job.id, result_set_id, batch)
@@ -693,6 +711,8 @@ class WorkerRunner:
                 _spool_loaded_rows(self._result_store, result_set_id),
                 console_id,
             )
+        if query_truncated:
+            self._result_store.mark_spool_truncated(result_set_id)
         self._heartbeat(job.id)
         result_ref = self._result_store.spool_ref(result_set_id)
         self._write_result_set_catalog(job, result_set_id, result_ref, columns or [], console_id)
@@ -2457,6 +2477,19 @@ def _payload_params(payload: dict[str, object]) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError("Job payload params must be an object")
     return dict(value)
+
+
+def _payload_sql_max_rows(payload: dict[str, object]) -> int | None:
+    if "max_rows" not in payload:
+        return None
+    value = payload["max_rows"]
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= SQL_WORKSPACE_MAX_ROWS
+    ):
+        raise ValueError(f"Job payload requires max_rows in range 1..{SQL_WORKSPACE_MAX_ROWS}")
+    return value
 
 
 def _payload_datasource_id(job: Job) -> str:

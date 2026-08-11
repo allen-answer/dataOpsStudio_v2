@@ -993,6 +993,7 @@ def execute_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse
             "params": body.params,
             "result_set_id": result_set_id,
             "console_id": console_id,
+            "max_rows": body.max_rows,
         },
     )
     _create_result_set_placeholder(
