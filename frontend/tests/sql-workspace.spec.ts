@@ -76,6 +76,7 @@ async function mockWorkspace(
     jobCreatedAt?: string
     jobFinishedAt?: string
     progressiveRows?: number
+    hasMore?: boolean
   } = {},
 ): Promise<{
   patches: unknown[]
@@ -90,6 +91,7 @@ async function mockWorkspace(
   const resultRequestUrls: string[] = []
   let jobReads = 0
   const jobCreatedAt = options.jobCreatedAt ?? now
+  const jobStartedAt = jobCreatedAt
   const jobFinishedAt = options.jobFinishedAt ?? now
 
   await mockLicense(page)
@@ -142,6 +144,14 @@ async function mockWorkspace(
         total_rows: null,
         state: jobReads <= 1 ? 'running' : 'success',
         truncated: false,
+        has_more: options.hasMore ?? false,
+        page_size: 100,
+        max_result_rows: 1000,
+        pagination_mode: options.hasMore ? 'ordered_offset' : 'unavailable',
+        pagination_reason: options.hasMore
+          ? 'fresh_read_ordered_offset'
+          : 'top_level_order_by_required',
+        preview_truncated_cells: 0,
       })
     }
     return json(r, 200, {
@@ -167,7 +177,7 @@ async function mockWorkspace(
       kind: 'sql',
       status: jobReads <= 1 ? 'running' : 'success',
       created_at: jobCreatedAt,
-      started_at: now,
+      started_at: jobStartedAt,
       finished_at: jobReads <= 1 ? null : jobFinishedAt,
       error: null,
       error_code: null,
@@ -189,16 +199,17 @@ function expectNoConsoleErrors(): void {
   expect(consoleErrors, consoleErrors.join('\n')).toEqual([])
 }
 
-test('SQL execution sends the default maximum row limit', async ({ page }) => {
+test('SQL execution sends separate default page size and safety limit', async ({ page }) => {
   const state = await mockWorkspace(page)
 
   await page.goto('/projects/project-1/sql')
-  await expect(page.getByLabel('Max rows')).toHaveValue('1000')
+  await expect(page.getByLabel('Page size')).toHaveValue('100')
+  await expect(page.getByLabel('Safety limit')).toHaveValue('1000')
   await page.getByRole('button', { name: 'Run' }).click()
 
   await expect.poll(() => state.executeRequests.length).toBe(1)
   await expect.poll(() => state.getJobReads()).toBeGreaterThanOrEqual(2)
-  expect(state.executeRequests[0]).toMatchObject({ max_rows: 1000 })
+  expect(state.executeRequests[0]).toMatchObject({ page_size: 100, max_result_rows: 1000 })
   expectNoConsoleErrors()
 })
 
@@ -206,13 +217,123 @@ test('SQL execution accepts a custom maximum row limit', async ({ page }) => {
   const state = await mockWorkspace(page)
 
   await page.goto('/projects/project-1/sql')
-  await page.getByLabel('Max rows').selectOption('custom')
+  await page.getByLabel('Safety limit').selectOption('custom')
   await page.getByLabel('Custom maximum rows').fill('2500')
   await page.getByRole('button', { name: 'Run' }).click()
 
   await expect.poll(() => state.executeRequests.length).toBe(1)
   await expect.poll(() => state.getJobReads()).toBeGreaterThanOrEqual(2)
-  expect(state.executeRequests[0]).toMatchObject({ max_rows: 2500 })
+  expect(state.executeRequests[0]).toMatchObject({ page_size: 100, max_result_rows: 2500 })
+  expectNoConsoleErrors()
+})
+
+test('next page enqueues a database continuation while previous page stays cached', async ({
+  page,
+}) => {
+  const state = await mockWorkspace(page, { progressiveRows: 100, hasMore: true })
+  const pageRequests: Record<string, unknown>[] = []
+  await page.route('**/api/jobs/job-1/pages', (r) => {
+    pageRequests.push(r.request().postDataJSON())
+    return json(r, 202, {
+      job_id: 'job-2',
+      result_set_id: 'rs-1',
+      offset: 100,
+      cached: false,
+    })
+  })
+  await page.route('**/api/jobs/job-2', (r) =>
+    json(r, 200, {
+      id: 'job-2',
+      kind: 'sql_query',
+      status: 'success',
+      created_at: now,
+      started_at: now,
+      finished_at: now,
+      error: null,
+      error_code: null,
+      message: null,
+      result_set_id: 'rs-1',
+      timings: {
+        queue_ms: 5,
+        connect_ms: 10,
+        execute_first_row_ms: 20,
+        fetch_ms: 30,
+        spool_ms: 4,
+        total_ms: 69,
+      },
+    }),
+  )
+  await page.route(/\/api\/jobs\/job-2\/result\?/, (r) => {
+    const offset = Number(new URL(r.request().url()).searchParams.get('offset') ?? 0)
+    return json(r, 200, {
+      job_id: 'job-2',
+      result_set_id: 'rs-1',
+      offset,
+      limit: 100,
+      columns: [
+        { name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true },
+      ],
+      rows: Array.from({ length: 100 }, (_, index) => ({ values: [index + offset + 1] })),
+      loaded_rows: 200,
+      total_rows: null,
+      state: 'complete',
+      truncated: false,
+      has_more: true,
+      page_size: 100,
+      max_result_rows: 1000,
+      pagination_mode: 'ordered_offset',
+      pagination_reason: 'fresh_read_ordered_offset',
+      preview_truncated_cells: 0,
+    })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect.poll(() => state.getJobReads()).toBeGreaterThanOrEqual(2)
+  await expect(page.getByText('1-100 of 100+')).toBeVisible()
+  await page.getByRole('button', { name: 'Next page' }).click()
+
+  await expect.poll(() => pageRequests).toEqual([{ offset: 100 }])
+  await expect(page.getByRole('cell', { name: '101', exact: true }).last()).toBeVisible()
+  await page.getByRole('button', { name: 'Stats' }).click()
+  await expect(page.getByRole('cell', { name: '5ms', exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Result', exact: true }).click()
+  await page.getByRole('button', { name: 'Previous page' }).click()
+  await expect(page.getByRole('cell', { name: '1', exact: true }).last()).toBeVisible()
+  expectNoConsoleErrors()
+})
+
+test('deleting a console cancels its active query before closing it', async ({ page }) => {
+  await mockWorkspace(page)
+  let cancelRequests = 0
+  await page.route('**/api/jobs/job-1', (r) =>
+    json(r, 200, {
+      id: 'job-1',
+      kind: 'sql_query',
+      status: 'running',
+      created_at: now,
+      started_at: now,
+      finished_at: null,
+      error: null,
+      error_code: null,
+      message: null,
+      result_set_id: 'rs-1',
+    }),
+  )
+  await page.route('**/api/jobs/job-1/cancel', (r) => {
+    cancelRequests += 1
+    return json(r, 200, { cancelled: true })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.getByRole('button', { name: 'Cancel' })).toBeVisible()
+  const consoleItem = page.locator('.group', { hasText: 'query_1.sql' })
+  await consoleItem.hover()
+  await consoleItem.getByTitle('Delete').click()
+
+  await expect.poll(() => cancelRequests).toBe(1)
+  await expect(page.getByText('query_1.sql')).toHaveCount(0)
   expectNoConsoleErrors()
 })
 
@@ -236,7 +357,7 @@ test('SQL workspace tabs, history, templates, and progressive result render', as
   await expect(page.getByText('Recent users')).toBeVisible()
   await page.getByText('Recent users').click()
   await page.getByLabel('table_name').fill('users')
-  await page.getByLabel('limit').fill('10')
+  await page.getByLabel('limit', { exact: true }).fill('10')
   await page.getByRole('button', { name: 'Insert template' }).click()
   await expect.poll(() => state.renders.length).toBe(1)
   expect(state.renders[0]).toEqual({ values: { table_name: 'users', limit: '10' } })

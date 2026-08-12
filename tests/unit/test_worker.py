@@ -72,31 +72,146 @@ def test_worker_stops_sql_query_at_requested_max_rows_and_marks_truncated() -> N
         payload={
             "sql": "SELECT n",
             "result_set_id": "rs-limited",
-            "max_rows": 3,
+            "page_size": 100,
+            "max_result_rows": 100,
         }
     )
     backend = _FakeBackend([job])
     result_store = _FakeResultStore()
-    adapter = _RangeAdapter(100)
+    adapter = _RangeAdapter(1000)
+    requested_fetch_sizes: list[int] = []
+
+    def adapter_factory(
+        conn_info: DatasourceConnInfo,
+        cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
+    ) -> _RangeAdapter:
+        del conn_info, cancel_check
+        requested_fetch_sizes.append(fetch_chunk_size)
+        return adapter.with_column_sink(column_sink)
+
     runner = WorkerRunner(
         backend,
         result_store,
         lambda datasource_id: _conn_info(datasource_id),
-        _adapter_factory(adapter),
-        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=2),
+        adapter_factory,
+        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=1000),
     )
 
     assert runner.run_once() is True
 
     assert result_store.rows_by_result_set["rs-limited"] == [
-        Row(values=[0]),
-        Row(values=[1]),
-        Row(values=[2]),
+        Row(values=[index]) for index in range(100)
     ]
     assert result_store.get_spool_manifest("rs-limited")["truncated"] is True
-    assert adapter.rows_yielded == 4
+    assert requested_fetch_sizes == [100]
+    assert adapter.last_sql.endswith("LIMIT 101")
+    assert adapter.rows_yielded == 101
     assert adapter.closed is True
     assert backend.failed == []
+
+
+def test_worker_fetches_only_first_page_then_continuation_appends_next_database_page() -> None:
+    first = _make_job(
+        payload={
+            "sql": "SELECT n FROM items ORDER BY n",
+            "result_set_id": "rs-pages",
+            "page_size": 100,
+            "max_result_rows": 1000,
+            "pagination_mode": "ordered_offset",
+            "pagination_reason": "fresh_read_ordered_offset",
+            "page_offset": 0,
+        }
+    )
+    second = first.model_copy(
+        update={
+            "id": "job-2",
+            "payload": {**first.payload, "page_offset": 100, "pagination_root_job_id": first.id},
+        }
+    )
+    backend = _FakeBackend([first, second])
+    result_store = _FakeResultStore()
+    adapters = [
+        _FakeAdapter([Row(values=[index]) for index in range(101)]),
+        _FakeAdapter([Row(values=[index]) for index in range(100, 201)]),
+    ]
+    requested_sql: list[str] = []
+    requested_fetch_sizes: list[int] = []
+
+    def adapter_factory(
+        conn_info: DatasourceConnInfo,
+        cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
+    ) -> _FakeAdapter:
+        del conn_info, cancel_check
+        requested_fetch_sizes.append(fetch_chunk_size)
+        adapter = adapters.pop(0)
+        original_execute = adapter.execute_select
+
+        def execute(sql: str, params: dict[str, object]) -> Iterable[Row]:
+            requested_sql.append(sql)
+            return original_execute(sql, params)
+
+        adapter.execute_select = execute  # type: ignore[method-assign]
+        adapter._column_sink = column_sink
+        return adapter
+
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        adapter_factory,
+        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=1000),
+    )
+
+    assert runner.run_once() is True
+    assert result_store.fetch_range("rs-pages", 0, 200) == [
+        Row(values=[index]) for index in range(100)
+    ]
+    first_manifest = result_store.get_spool_manifest("rs-pages")
+    assert first_manifest["has_more"] is True
+    assert first_manifest["truncated"] is False
+
+    assert runner.run_once() is True
+    assert result_store.fetch_range("rs-pages", 0, 200) == [
+        Row(values=[index]) for index in range(200)
+    ]
+    assert result_store.get_spool_manifest("rs-pages")["has_more"] is True
+    assert requested_fetch_sizes == [100, 100]
+    assert requested_sql[0].endswith("LIMIT 101")
+    assert requested_sql[1].endswith("LIMIT 101 OFFSET 100")
+
+
+def test_worker_marks_unordered_query_continuation_unavailable() -> None:
+    job = _make_job(
+        payload={
+            "sql": "SELECT n FROM items",
+            "result_set_id": "rs-unordered",
+            "page_size": 2,
+            "max_result_rows": 10,
+            "pagination_mode": "unavailable",
+            "pagination_reason": "top_level_order_by_required",
+        }
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([Row(values=[1]), Row(values=[2]), Row(values=[3])])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is True
+
+    manifest = result_store.get_spool_manifest("rs-unordered")
+    assert manifest["loaded_rows"] == 2
+    assert manifest["has_more"] is True
+    assert manifest["pagination_mode"] == "unavailable"
+    assert manifest["pagination_reason"] == "top_level_order_by_required"
 
 
 def test_worker_stops_reading_when_spool_storage_limit_truncates(tmp_path: Path) -> None:
@@ -444,8 +559,9 @@ def test_worker_runs_compare_run_to_four_bucket_spools() -> None:
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
     ) -> _ColumnSinkAdapter:
-        del conn_info, cancel_check, column_sink
+        del conn_info, cancel_check, column_sink, fetch_chunk_size
         return adapters.pop(0)
 
     runner = WorkerRunner(
@@ -653,7 +769,7 @@ def test_worker_sample_quick_check_reports_zero_defect_upper_bound() -> None:
         backend,
         result_store,
         lambda datasource_id: _conn_info(datasource_id),
-        lambda conn_info, cancel_check, column_sink: adapters.pop(0),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size: adapters.pop(0),
         WorkerRunnerConfig(worker_id="worker-1"),
         compare_run_catalog=compare_catalog,
     )
@@ -850,7 +966,9 @@ def test_worker_unsupported_db_type_fails_with_precise_message() -> None:
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
     ) -> _ColumnSinkAdapter:
+        del cancel_check, column_sink, fetch_chunk_size
         raise UnsupportedDbTypeError(f"Unsupported datasource db_type: {conn_info.db_type.value}")
 
     runner = WorkerRunner(
@@ -876,8 +994,9 @@ def test_worker_sql_connection_error_gets_connection_failed_code() -> None:
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
     ) -> _ColumnSinkAdapter:
-        del conn_info, cancel_check, column_sink
+        del conn_info, cancel_check, column_sink, fetch_chunk_size
         raise AdapterConnectionError("adapter connection failed")
 
     runner = WorkerRunner(
@@ -1008,7 +1127,14 @@ def test_cancel_check_throttled_to_every_n_rows() -> None:
     batch_size = 1000
     flush_per_batch = 1
     expected_max = (rows // row_interval) + (rows // batch_size) * flush_per_batch + 5
-    job = _make_job(payload={"sql": "SELECT many", "result_set_id": "rs-many"})
+    job = _make_job(
+        payload={
+            "sql": "SELECT many",
+            "result_set_id": "rs-many",
+            "max_result_rows": rows,
+            "page_size": batch_size,
+        }
+    )
     backend = _FakeBackend([job])
     result_store = _CountingResultStore()
 
@@ -1016,7 +1142,9 @@ def test_cancel_check_throttled_to_every_n_rows() -> None:
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
     ) -> _RangeAdapter:
+        del conn_info, cancel_check, fetch_chunk_size
         return _RangeAdapter(rows).with_column_sink(column_sink)
 
     runner = WorkerRunner(
@@ -1045,7 +1173,14 @@ def test_cancel_check_throttled_to_every_n_rows() -> None:
 
 def test_worker_cancel_still_stops_within_interval() -> None:
     row_count = 20_000
-    job = _make_job(payload={"sql": "SELECT many", "result_set_id": "rs-cancel"})
+    job = _make_job(
+        payload={
+            "sql": "SELECT many",
+            "result_set_id": "rs-cancel",
+            "max_result_rows": row_count,
+            "page_size": 1000,
+        }
+    )
     backend = _FakeBackend([job])
     backend.cancel_after_checks = 2
     result_store = _CountingResultStore()
@@ -1055,7 +1190,9 @@ def test_worker_cancel_still_stops_within_interval() -> None:
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
     ) -> _RangeAdapter:
+        del conn_info, cancel_check, fetch_chunk_size
         adapter = _RangeAdapter(row_count).with_column_sink(column_sink)
         adapter_holder["adapter"] = adapter
         return adapter
@@ -1175,6 +1312,7 @@ class _FakeResultStore:
         self.downloads: dict[str, bytes] = {}
         self.deleted_spools: list[str] = []
         self.truncated_result_sets: set[str] = set()
+        self.pagination_by_result_set: dict[str, dict[str, object]] = {}
         self.gc_calls = 0
 
     def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]:
@@ -1185,6 +1323,20 @@ class _FakeResultStore:
 
     def mark_spool_truncated(self, result_set_id: str) -> None:
         self.truncated_result_sets.add(result_set_id)
+
+    def set_spool_pagination(
+        self,
+        result_set_id: str,
+        *,
+        has_more: bool,
+        mode: str,
+        reason: str | None = None,
+    ) -> None:
+        self.pagination_by_result_set[result_set_id] = {
+            "has_more": has_more or result_set_id in self.truncated_result_sets,
+            "pagination_mode": mode,
+            "pagination_reason": reason,
+        }
 
     def put_export_artifact(self, export_id: str, name: str, stream: BinaryIO) -> ResultRef:
         data = stream.read()
@@ -1211,6 +1363,7 @@ class _FakeResultStore:
             ],
             "loaded_rows": len(self.rows_by_result_set.get(result_set_id, [])),
             "truncated": result_set_id in self.truncated_result_sets,
+            **self.pagination_by_result_set.get(result_set_id, {}),
         }
 
     def spool_ref(self, result_set_id: str) -> ResultRef:
@@ -1224,6 +1377,7 @@ class _FakeResultStore:
         self.rows_by_result_set.pop(result_set_id, None)
         self.columns_by_result_set.pop(result_set_id, None)
         self.truncated_result_sets.discard(result_set_id)
+        self.pagination_by_result_set.pop(result_set_id, None)
         return existed
 
     def gc_expired(self) -> int:
@@ -1250,6 +1404,16 @@ class _CountingResultStore:
 
     def mark_spool_truncated(self, result_set_id: str) -> None:
         self.truncated_result_sets.add(result_set_id)
+
+    def set_spool_pagination(
+        self,
+        result_set_id: str,
+        *,
+        has_more: bool,
+        mode: str,
+        reason: str | None = None,
+    ) -> None:
+        del result_set_id, has_more, mode, reason
 
     def set_spool_columns(self, result_set_id: str, columns: list[Column]) -> None:
         self.columns_by_result_set[result_set_id] = list(columns)
@@ -1373,7 +1537,7 @@ def _filter_fake_compare_rows(sql: str, rows: list[Row]) -> list[Row]:
             for row in filtered
             if row.values and isinstance(row.values[0], int) and row.values[0] < end
         ]
-    if "FETCH FIRST 1 ROWS ONLY" in sql.upper() or " LIMIT 1" in sql.upper():
+    if re.search(r"\bFETCH FIRST 1 ROWS ONLY\b|\bLIMIT 1(?:\D|$)", sql.upper()):
         filtered = filtered[:1]
     return filtered
 
@@ -1383,6 +1547,7 @@ class _RangeAdapter:
         self._row_count = row_count
         self.rows_yielded = 0
         self.closed = False
+        self.last_sql = ""
         self._column_sink: Callable[[list[Column]], None] | None = None
 
     def with_column_sink(self, column_sink: Callable[[list[Column]], None]) -> _RangeAdapter:
@@ -1390,6 +1555,7 @@ class _RangeAdapter:
         return self
 
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
+        self.last_sql = sql
         if self._column_sink is not None:
             self._column_sink([Column(name="n", type=ColumnType.UNKNOWN)])
         try:
@@ -1464,14 +1630,16 @@ class _ColumnSinkAdapter(Protocol):
 def _adapter_factory(
     adapter: _ColumnSinkAdapter,
 ) -> Callable[
-    [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None]],
+    [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None], int],
     _ColumnSinkAdapter,
 ]:
     def factory(
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
     ) -> _ColumnSinkAdapter:
+        del conn_info, cancel_check, fetch_chunk_size
         return adapter.with_column_sink(column_sink)
 
     return factory
@@ -2309,8 +2477,9 @@ def test_workflow_compare_run_child_payload_executes_end_to_end() -> None:
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
     ) -> _ColumnSinkAdapter:
-        del conn_info, cancel_check, column_sink
+        del conn_info, cancel_check, column_sink, fetch_chunk_size
         return adapters.pop(0)
 
     runner = WorkerRunner(

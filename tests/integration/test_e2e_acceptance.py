@@ -236,12 +236,14 @@ def _start_worker_thread(
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
     ) -> MySQLAdapter:
         return MySQLAdapter(
             conn_info,
             secret_store,
             cancel_check=cancel_check,
             column_sink=column_sink,
+            fetch_chunk_size=fetch_chunk_size,
             statement_timeout_seconds=30,
             cursor_max_hold_seconds=300,
         )
@@ -252,7 +254,12 @@ def _start_worker_thread(
         datasource_loader,
         cast(
             Callable[
-                [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None]],
+                [
+                    DatasourceConnInfo,
+                    Callable[[], bool],
+                    Callable[[list[Column]], None],
+                    int,
+                ],
                 MySQLAdapter,
             ],
             adapter_factory,

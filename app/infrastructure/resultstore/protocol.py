@@ -40,6 +40,17 @@ class ResultStore(Protocol):
         """幂等标记 spool 已截断,供查询主动限行后关闭数据库游标。"""
         raise NotImplementedError
 
+    def set_spool_pagination(
+        self,
+        result_set_id: str,
+        *,
+        has_more: bool,
+        mode: str,
+        reason: str | None = None,
+    ) -> None:
+        """记录无 COUNT 分页状态;不保存 cursor、连接或业务行值。"""
+        raise NotImplementedError
+
     def get_manifest(self, run_id: str) -> Manifest:
         raise NotImplementedError
 

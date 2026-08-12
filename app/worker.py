@@ -38,6 +38,7 @@ from app.db.models import (
 )
 from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.protocol import AdapterConnectionError
+from app.dbclients.query_limit import apply_database_page, apply_database_row_limit
 from app.dbclients.sql_build import limit_clause as _limit_clause
 from app.dbclients.sql_build import quote_alias as _quote_alias
 from app.dbclients.sql_build import quote_identifier as _quote_identifier
@@ -106,7 +107,13 @@ from app.domain.readers import (
     RowReader,
 )
 from app.domain.resource import ResourceProfile
-from app.domain.result import SQL_WORKSPACE_MAX_ROWS, ResultRef
+from app.domain.result import (
+    SQL_WORKSPACE_DEFAULT_MAX_ROWS,
+    SQL_WORKSPACE_DEFAULT_PAGE_SIZE,
+    SQL_WORKSPACE_MAX_PAGE_SIZE,
+    SQL_WORKSPACE_MAX_ROWS,
+    ResultRef,
+)
 from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import SecretKind, SecretRef
 from app.domain.workflow import WorkflowNode, WorkflowSpec
@@ -268,6 +275,15 @@ class ResultStoreLike(Protocol):
 
     def mark_spool_truncated(self, result_set_id: str) -> None: ...
 
+    def set_spool_pagination(
+        self,
+        result_set_id: str,
+        *,
+        has_more: bool,
+        mode: str,
+        reason: str | None = None,
+    ) -> None: ...
+
     def put_export_artifact(self, export_id: str, name: str, stream: BinaryIO) -> ResultRef: ...
 
     def put_artifact(self, run_id: str, name: str, stream: BinaryIO) -> ResultRef: ...
@@ -420,7 +436,7 @@ class SensorTriggerCatalogLike(Protocol):
 
 DatasourceLoader = Callable[[str], DatasourceConnInfo]
 AdapterFactory = Callable[
-    [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None]],
+    [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None], int],
     DatabaseAdapterLike,
 ]
 
@@ -639,17 +655,42 @@ class WorkerRunner:
                 )
 
     def _execute_sql_query(self, job: Job) -> _ExecutionOutcome:
+        query_started_at = time.monotonic()
         payload = job.payload
         sql = _required_payload_str(payload, "sql")
         params = _payload_params(payload)
-        max_rows = _payload_sql_max_rows(payload)
+        max_result_rows = _payload_sql_max_result_rows(payload)
+        page_size = _payload_sql_page_size(payload)
         datasource_id = _payload_datasource_id(job)
         result_set_id = str(payload.get("result_set_id") or job.id)
         console_id = _payload_optional_str(payload, "console_id")
         datasource = self._datasource_loader(datasource_id)
         _require_operation_allowed(datasource.operation_policy, "select")
+        pagination_mode = _payload_optional_str(payload, "pagination_mode")
+        page_offset = _payload_non_negative_int(payload, "page_offset")
+        page_bounded = pagination_mode in {"ordered_offset", "unavailable"}
+        if page_bounded:
+            page_row_limit = min(page_size, max_result_rows - page_offset)
+            if page_row_limit <= 0:
+                raise ValueError("SQL page offset reached the configured result safety limit")
+            limited_sql = apply_database_page(
+                sql,
+                datasource.db_type,
+                page_offset=page_offset,
+                row_limit=page_row_limit + 1,
+            )
+            accepted_row_limit = page_row_limit
+        else:
+            limited_sql = apply_database_row_limit(sql, datasource.db_type, max_result_rows + 1)
+            accepted_row_limit = max_result_rows
         columns: list[Column] | None = None
-        self._write_result_set_streaming(job, result_set_id, [], 0, console_id)
+        self._write_result_set_streaming(
+            job,
+            result_set_id,
+            [],
+            _spool_loaded_rows(self._result_store, result_set_id),
+            console_id,
+        )
 
         def capture_columns(emitted_columns: list[Column]) -> None:
             nonlocal columns
@@ -661,18 +702,21 @@ class WorkerRunner:
             datasource,
             lambda: self._backend.is_cancel_requested(job.id),
             capture_columns,
+            min(page_size, accepted_row_limit + 1),
         )
 
         batch: list[Row] = []
         accepted_rows = 0
         query_truncated = False
+        spool_ms = 0
+        spool_batch_size = min(self._config.sql_spool_batch_size, page_size)
         rows_since_cancel_check = 0
         cancel_check_row_interval = self._config.cancel_check_row_interval
         last_heartbeat = time.monotonic()
-        row_stream = iter(adapter.execute_select(sql, params))
+        row_stream = iter(adapter.execute_select(limited_sql, params))
         try:
             for row in row_stream:
-                if max_rows is not None and accepted_rows >= max_rows:
+                if accepted_rows >= accepted_row_limit:
                     query_truncated = True
                     break
                 accepted_rows += 1
@@ -681,8 +725,10 @@ class WorkerRunner:
                     self._check_cancel(job.id)
                     rows_since_cancel_check = 0
                 batch.append(row)
-                if len(batch) >= self._config.sql_spool_batch_size:
+                if len(batch) >= spool_batch_size:
+                    spool_started_at = time.monotonic()
                     self._flush_batch(job.id, result_set_id, batch)
+                    spool_ms += _elapsed_ms(spool_started_at)
                     batch = []
                     manifest = self._result_store.get_spool_manifest(result_set_id)
                     self._write_result_set_streaming(
@@ -703,7 +749,9 @@ class WorkerRunner:
                 closer()
 
         if batch:
+            spool_started_at = time.monotonic()
             self._flush_batch(job.id, result_set_id, batch)
+            spool_ms += _elapsed_ms(spool_started_at)
             self._write_result_set_streaming(
                 job,
                 result_set_id,
@@ -711,10 +759,34 @@ class WorkerRunner:
                 _spool_loaded_rows(self._result_store, result_set_id),
                 console_id,
             )
-        if query_truncated:
+        if page_bounded:
+            reached_safety_limit = page_offset + accepted_rows >= max_result_rows
+            if query_truncated and reached_safety_limit:
+                self._result_store.mark_spool_truncated(result_set_id)
+            pagination_reason = _payload_optional_str(payload, "pagination_reason")
+            self._set_spool_pagination(
+                result_set_id,
+                has_more=query_truncated,
+                mode=pagination_mode or "unavailable",
+                reason=pagination_reason,
+            )
+        elif query_truncated:
             self._result_store.mark_spool_truncated(result_set_id)
         self._heartbeat(job.id)
         result_ref = self._result_store.spool_ref(result_set_id)
+        adapter_timings = _adapter_query_timings(adapter)
+        if job.parent_workflow_run_id is None and adapter_timings:
+            result_ref = result_ref.model_copy(
+                update={
+                    "metadata": {
+                        "timings": {
+                            **adapter_timings,
+                            "spool_ms": spool_ms,
+                            "worker_total_ms": _elapsed_ms(query_started_at),
+                        }
+                    }
+                }
+            )
         self._write_result_set_catalog(job, result_set_id, result_ref, columns or [], console_id)
         manifest = self._result_store.get_spool_manifest(result_set_id)
         return _ExecutionOutcome(
@@ -735,6 +807,7 @@ class WorkerRunner:
             datasource,
             lambda: self._backend.is_cancel_requested(job.id),
             lambda columns: None,
+            self._config.sql_spool_batch_size,
         )
 
         self._check_cancel(job.id)
@@ -766,6 +839,7 @@ class WorkerRunner:
             datasource,
             lambda: self._backend.is_cancel_requested(job.id),
             lambda columns: None,
+            self._config.sql_spool_batch_size,
         )
         started_at = time.monotonic()
         if not adapter.test_connection():
@@ -1127,6 +1201,7 @@ class WorkerRunner:
             datasource,
             lambda: self._backend.is_cancel_requested(job.id),
             lambda columns: None,
+            self._config.sql_spool_batch_size,
         )
         return _DatabaseCompareReader(
             adapter=adapter,
@@ -1723,6 +1798,7 @@ class WorkerRunner:
             datasource,
             lambda: self._backend.is_cancel_requested(job.id),
             lambda columns: None,
+            self._config.sql_spool_batch_size,
         )
         self._check_cancel(job.id)
         first_cell = _sensor_first_cell(adapter.execute_select(sensor_sql, {}))
@@ -1849,9 +1925,25 @@ class WorkerRunner:
             storage_ref=result_ref,
             columns=columns,
             loaded_rows=_manifest_int(manifest, "loaded_rows"),
-            truncated=_manifest_bool(manifest, "truncated"),
+            # An N+1 lookahead means the exact total is intentionally unknown,
+            # even though this individual stateless page job is complete.
+            truncated=(
+                _manifest_bool(manifest, "truncated") or _manifest_bool(manifest, "has_more")
+            ),
             console_id=console_id,
         )
+
+    def _set_spool_pagination(
+        self,
+        result_set_id: str,
+        *,
+        has_more: bool,
+        mode: str,
+        reason: str | None,
+    ) -> None:
+        setter = getattr(self._result_store, "set_spool_pagination", None)
+        if callable(setter):
+            setter(result_set_id, has_more=has_more, mode=mode, reason=reason)
 
     def _write_result_set_streaming(
         self,
@@ -2391,6 +2483,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
     ) -> DatabaseAdapterLike:
         return build_database_adapter(
             conn_info,
@@ -2399,6 +2492,7 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
             column_sink=column_sink,
             cursor_max_hold_seconds=actual_settings.result_store.cursor_max_hold_seconds,
             statement_timeout_seconds=actual_settings.worker.heartbeat_timeout_seconds,
+            fetch_chunk_size=fetch_chunk_size,
         )
 
     return WorkerRunner(
@@ -2479,16 +2573,29 @@ def _payload_params(payload: dict[str, object]) -> dict[str, object]:
     return dict(value)
 
 
-def _payload_sql_max_rows(payload: dict[str, object]) -> int | None:
-    if "max_rows" not in payload:
-        return None
-    value = payload["max_rows"]
+def _payload_sql_max_result_rows(payload: dict[str, object]) -> int:
+    value = payload.get("max_result_rows", payload.get("max_rows", SQL_WORKSPACE_DEFAULT_MAX_ROWS))
     if (
         isinstance(value, bool)
         or not isinstance(value, int)
         or not 1 <= value <= SQL_WORKSPACE_MAX_ROWS
     ):
-        raise ValueError(f"Job payload requires max_rows in range 1..{SQL_WORKSPACE_MAX_ROWS}")
+        raise ValueError(
+            f"Job payload requires max_result_rows in range 1..{SQL_WORKSPACE_MAX_ROWS}"
+        )
+    return value
+
+
+def _payload_sql_page_size(payload: dict[str, object]) -> int:
+    value = payload.get("page_size", SQL_WORKSPACE_DEFAULT_PAGE_SIZE)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= SQL_WORKSPACE_MAX_PAGE_SIZE
+    ):
+        raise ValueError(
+            f"Job payload requires page_size in range 1..{SQL_WORKSPACE_MAX_PAGE_SIZE}"
+        )
     return value
 
 
@@ -2770,6 +2877,18 @@ def _elapsed_seconds(started_at: float) -> float:
 
 def _elapsed_ms(started_at: float) -> int:
     return max(0, round((time.monotonic() - started_at) * 1000))
+
+
+def _adapter_query_timings(adapter: object) -> dict[str, int]:
+    raw = getattr(adapter, "query_timings_ms", {})
+    if not isinstance(raw, dict):
+        return {}
+    timings: dict[str, int] = {}
+    for key in ("connect_ms", "execute_first_row_ms", "fetch_ms"):
+        value = raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            timings[key] = value
+    return timings
 
 
 def _log_reap_report(report: object) -> None:

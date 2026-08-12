@@ -299,11 +299,12 @@ def _seed_dm_sample(env: dict[str, str]) -> Iterator[None]:
 def _adapter_factory(
     mysql_env: dict[str, str],
     dm_env: dict[str, str],
-) -> Callable[[DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None]], Any]:
+) -> Callable[[DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None], int], Any]:
     def factory(
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
     ) -> Any:
         del column_sink
         if conn_info.db_type is DbType.MYSQL:
@@ -311,11 +312,13 @@ def _adapter_factory(
                 conn_info,
                 cast(SecretStore, _EnvSecretStore(mysql_env["password"])),
                 cancel_check=cancel_check,
+                fetch_chunk_size=fetch_chunk_size,
             )
         return DMAdapter(
             conn_info,
             cast(SecretStore, _EnvSecretStore(dm_env["password"])),
             cancel_check=cancel_check,
+            fetch_chunk_size=fetch_chunk_size,
         )
 
     return factory

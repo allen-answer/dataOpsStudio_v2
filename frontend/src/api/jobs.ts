@@ -6,11 +6,22 @@ export interface JobResponse {
   kind: string
   status: JobStatus
   created_at?: string
+  started_at?: string | null
   finished_at?: string | null
   result_set_id: string | null
   error: string | null
   error_code: JobErrorCode | null
   message: string | null
+  timings?: JobStageTimings | null
+}
+
+export interface JobStageTimings {
+  queue_ms: number | null
+  connect_ms: number | null
+  execute_first_row_ms: number | null
+  fetch_ms: number | null
+  spool_ms: number | null
+  total_ms: number | null
 }
 
 export interface JobResultResponse {
@@ -24,6 +35,19 @@ export interface JobResultResponse {
   total_rows: number | null
   state: string | null
   truncated: boolean | null
+  has_more?: boolean | null
+  page_size?: number | null
+  max_result_rows?: number | null
+  preview_truncated_cells?: number
+  pagination_mode?: 'ordered_offset' | 'unavailable' | null
+  pagination_reason?: string | null
+}
+
+export interface JobPageResponse {
+  job_id: string
+  result_set_id: string
+  offset: number
+  cached: boolean
 }
 
 export interface ListJobsParams {
@@ -64,4 +88,12 @@ export function getJobResult(
  */
 export function cancelJob(jobId: string): Promise<{ cancelled: boolean }> {
   return apiClient.post<{ cancelled: boolean }>(`/jobs/${jobId}/cancel`)
+}
+
+/**
+ * POST /jobs/{id}/pages —— enqueue one ordered stateless database page.
+ * The server rejects unordered SQL instead of silently serving unstable pages.
+ */
+export function requestJobPage(jobId: string, offset: number): Promise<JobPageResponse> {
+  return apiClient.post<JobPageResponse>(`/jobs/${jobId}/pages`, { offset })
 }

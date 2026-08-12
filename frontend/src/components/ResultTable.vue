@@ -16,7 +16,7 @@
  */
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { ChevronLeft, ChevronRight, AlertTriangle, Database } from 'lucide-vue-next'
+import { ChevronLeft, ChevronRight, AlertTriangle, Database, Info } from 'lucide-vue-next'
 import EmptyState from './EmptyState.vue'
 import type { Column, ColumnType } from '../api/types'
 
@@ -79,8 +79,24 @@ const props = withDefaults(
     loadedRows?: number | null
     totalRows?: number | null
     truncated?: boolean | null
+    hasMore?: boolean | null
+    paginationMode?: 'ordered_offset' | 'unavailable' | null
+    paginationReason?: string | null
+    previewTruncatedCells?: number
+    maxResultRows?: number | null
+    loading?: boolean
   }>(),
-  { loadedRows: null, totalRows: null, truncated: null },
+  {
+    loadedRows: null,
+    totalRows: null,
+    truncated: null,
+    hasMore: null,
+    paginationMode: null,
+    paginationReason: null,
+    previewTruncatedCells: 0,
+    maxResultRows: null,
+    loading: false,
+  },
 )
 
 const emit = defineEmits<{
@@ -93,10 +109,18 @@ const MAX_ROWS = 1000
 const tooMany = computed(() => props.rows.length > MAX_ROWS)
 const displayRows = computed(() => (tooMany.value ? props.rows.slice(0, MAX_ROWS) : props.rows))
 
-const total = computed(() => props.totalRows ?? props.loadedRows ?? null)
+const totalLabel = computed(() => {
+  if (props.totalRows !== null) return String(props.totalRows)
+  if (props.loadedRows === null) return '?'
+  return props.hasMore ? `${props.loadedRows}+` : String(props.loadedRows)
+})
 const hasNext = computed(() => {
-  if (total.value === null) return props.rows.length === props.limit
-  return props.offset + props.rows.length < total.value
+  if (props.loading) return false
+  if (props.loadedRows !== null && props.offset + props.rows.length < props.loadedRows) return true
+  if (props.loadedRows !== null && props.maxResultRows !== null) {
+    if (props.loadedRows >= props.maxResultRows) return false
+  }
+  return Boolean(props.hasMore && props.paginationMode === 'ordered_offset')
 })
 const hasPrev = computed(() => props.offset > 0)
 
@@ -133,6 +157,28 @@ function isNull(v: unknown): boolean {
     >
       <AlertTriangle class="w-3.5 h-3.5 shrink-0" />
       <span>{{ t('results.too_many_rows', { max: MAX_ROWS }) }}</span>
+    </div>
+    <div
+      v-if="hasMore && paginationMode === 'unavailable'"
+      class="flex items-center gap-2 px-3 py-2 text-xs border-b chrome-border"
+      style="background-color: rgb(245 158 11 / 0.10); color: rgb(180 83 9);"
+    >
+      <AlertTriangle class="w-3.5 h-3.5 shrink-0" />
+      <span>{{ t('results.pagination_order_required') }}</span>
+    </div>
+    <div
+      v-else-if="hasMore && paginationMode === 'ordered_offset'"
+      class="flex items-center gap-2 px-3 py-2 text-xs border-b chrome-border chrome-text-muted"
+    >
+      <Info class="w-3.5 h-3.5 shrink-0" />
+      <span>{{ t('results.pagination_fresh_read') }}</span>
+    </div>
+    <div
+      v-if="previewTruncatedCells > 0"
+      class="flex items-center gap-2 px-3 py-2 text-xs border-b chrome-border chrome-text-muted"
+    >
+      <Info class="w-3.5 h-3.5 shrink-0" />
+      <span>{{ t('results.preview_truncated', { count: previewTruncatedCells }) }}</span>
     </div>
 
     <!-- 空态 -->
@@ -221,7 +267,7 @@ function isNull(v: unknown): boolean {
         {{ t('results.page_info', {
           start: startRow,
           end: endRow,
-          total: total ?? '?',
+          total: totalLabel,
         }) }}
       </span>
       <div class="flex items-center gap-1">

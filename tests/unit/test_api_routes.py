@@ -103,6 +103,14 @@ def test_get_job_result_returns_columns_and_positional_rows() -> None:
     assert payload["loaded_rows"] == 1
     assert payload["total_rows"] == 1
     assert payload["state"] == "complete"
+    assert payload["has_more"] is False
+    assert payload["page_size"] == 25
+    assert payload["max_result_rows"] == 500
+    assert payload["pagination_mode"] == "ordered_offset"
+    assert payload["pagination_reason"] == "fresh_read_ordered_offset"
+    assert payload["preview_truncated_cells"] == 2
+    assert payload["rows"][0]["values"][1] == "<binary 3 bytes; preview omitted>"
+    assert payload["rows"][0]["values"][2].endswith("<4 chars omitted>")
 
 
 def test_get_license_status_without_license_row_returns_trial_countdown() -> None:
@@ -319,7 +327,11 @@ class _ResultEngine:
                         "kind": "sql_query",
                         "status": "success",
                         "project_id": "project-1",
-                        "payload": {"result_set_id": "rs-1"},
+                        "payload": {
+                            "result_set_id": "rs-1",
+                            "page_size": 25,
+                            "max_result_rows": 500,
+                        },
                     },
                     {"id": "project-1"},
                 ]
@@ -345,7 +357,7 @@ class _ResultConnection:
 
 class _ResultStore:
     def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]:
-        return [Row(values=[2])]
+        return [Row(values=[2, b"abc", "x" * 4100])]
 
     def spool_exists(self, result_set_id: str) -> bool:
         del result_set_id
@@ -353,9 +365,16 @@ class _ResultStore:
 
     def get_spool_manifest(self, result_set_id: str) -> dict[str, object]:
         return {
-            "columns": [Column(name="r", type=ColumnType.UNKNOWN).model_dump()],
+            "columns": [
+                Column(name="r", type=ColumnType.UNKNOWN).model_dump(),
+                Column(name="blob", type=ColumnType.BYTES).model_dump(),
+                Column(name="text", type=ColumnType.STRING).model_dump(),
+            ],
             "loaded_rows": 1,
             "truncated": False,
+            "has_more": False,
+            "pagination_mode": "ordered_offset",
+            "pagination_reason": "fresh_read_ordered_offset",
         }
 
     def delete_spool(self, result_set_id: str) -> bool:

@@ -13,7 +13,12 @@ from app.domain.compare_infer import (
 from app.domain.datasource import DbType, OperationPolicy
 from app.domain.job import JobErrorCode, JobStatus
 from app.domain.notify import NotifyChannelName, NotifyEvent
-from app.domain.result import SQL_WORKSPACE_DEFAULT_MAX_ROWS, SQL_WORKSPACE_MAX_ROWS
+from app.domain.result import (
+    SQL_WORKSPACE_DEFAULT_MAX_ROWS,
+    SQL_WORKSPACE_DEFAULT_PAGE_SIZE,
+    SQL_WORKSPACE_MAX_PAGE_SIZE,
+    SQL_WORKSPACE_MAX_ROWS,
+)
 from app.domain.schema import Column
 from app.domain.workflow import WorkflowSpec
 
@@ -126,11 +131,28 @@ class SqlExecuteRequest(BaseModel):
     sql: str = Field(min_length=1)
     params: dict[str, Any] = Field(default_factory=dict)
     console_id: str | None = None
-    max_rows: int = Field(
-        default=SQL_WORKSPACE_DEFAULT_MAX_ROWS,
+    page_size: int = Field(
+        default=SQL_WORKSPACE_DEFAULT_PAGE_SIZE,
         ge=1,
-        le=SQL_WORKSPACE_MAX_ROWS,
+        le=SQL_WORKSPACE_MAX_PAGE_SIZE,
     )
+    max_result_rows: int | None = Field(default=None, ge=1, le=SQL_WORKSPACE_MAX_ROWS)
+    # Deprecated compatibility field for clients/jobs created before PR #187 follow-up.
+    max_rows: int | None = Field(default=None, ge=1, le=SQL_WORKSPACE_MAX_ROWS)
+
+    @model_validator(mode="after")
+    def validate_row_limits(self) -> SqlExecuteRequest:
+        if (
+            self.max_result_rows is not None
+            and self.max_rows is not None
+            and self.max_result_rows != self.max_rows
+        ):
+            raise ValueError("max_result_rows and legacy max_rows must match when both are set")
+        return self
+
+    @property
+    def effective_max_result_rows(self) -> int:
+        return self.max_result_rows or self.max_rows or SQL_WORKSPACE_DEFAULT_MAX_ROWS
 
 
 class SqlExecuteResponse(BaseModel):
@@ -940,16 +962,27 @@ class TraceCompareResponse(BaseModel):
     hops: list[TraceCompareHopItem] = Field(default_factory=list)
 
 
+class JobStageTimings(BaseModel):
+    queue_ms: int | None = None
+    connect_ms: int | None = None
+    execute_first_row_ms: int | None = None
+    fetch_ms: int | None = None
+    spool_ms: int | None = None
+    total_ms: int | None = None
+
+
 class JobResponse(BaseModel):
     id: str
     kind: str
     status: JobStatus
     created_at: datetime
+    started_at: datetime | None = None
     finished_at: datetime | None = None
     result_set_id: str | None = None
     error: str | None = None
     error_code: JobErrorCode | None = None
     message: str | None = None
+    timings: JobStageTimings | None = None
 
 
 class JobListItem(BaseModel):
@@ -978,6 +1011,23 @@ class JobResultResponse(BaseModel):
     total_rows: int | None = None
     state: str | None = None
     truncated: bool | None = None
+    has_more: bool | None = None
+    page_size: int | None = None
+    max_result_rows: int | None = None
+    preview_truncated_cells: int = 0
+    pagination_mode: Literal["ordered_offset", "unavailable"] | None = None
+    pagination_reason: str | None = None
+
+
+class JobPageRequest(BaseModel):
+    offset: int = Field(ge=1)
+
+
+class JobPageResponse(BaseModel):
+    job_id: str
+    result_set_id: str
+    offset: int
+    cached: bool = False
 
 
 ExportFormat = Literal["csv", "excel", "json", "sql"]

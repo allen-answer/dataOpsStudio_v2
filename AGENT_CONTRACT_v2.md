@@ -241,6 +241,14 @@ class ResultStore(Protocol):
     def put_artifact(self, run_id: str, name: str, stream: BinaryIO) -> ResultRef: ...
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None: ...  # 流式追加
     def mark_spool_truncated(self, result_set_id: str) -> None: ...  # 主动限行后幂等标记截断
+    def set_spool_pagination(
+        self,
+        result_set_id: str,
+        *,
+        has_more: bool,
+        mode: str,
+        reason: str | None = None,
+    ) -> None: ...  # 无 COUNT 的续页能力元数据;禁止放 cursor/凭据
     def get_manifest(self, run_id: str) -> Manifest: ...
     def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]: ...
     def open_download(self, ref: ResultRef) -> BinaryIO: ...
@@ -249,7 +257,7 @@ class ResultStore(Protocol):
 
 # 2.0.0:LocalFsResultStore。S3ResultStore 后置 hosted。
 # ResultRef 允许携带 additive metadata dict,仅放轻量诊断/展示信息
-# (如 connection_test 的 server_version / latency_ms),不得放敏感值或 cursor。
+# (如 connection_test 的 server_version / latency_ms、SQL 分阶段耗时),不得放敏感值或 cursor。
 ```
 
 ```python

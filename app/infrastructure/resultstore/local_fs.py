@@ -42,6 +42,9 @@ class _SpoolManifest:
     loaded_rows: int = 0
     data_bytes: int = 0
     truncated: bool = False
+    has_more: bool = False
+    pagination_mode: str | None = None
+    pagination_reason: str | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -182,9 +185,25 @@ class LocalFsResultStore(ResultStore):
 
     def mark_spool_truncated(self, result_set_id: str) -> None:
         manifest = self._read_spool_manifest(result_set_id)
-        if manifest.truncated:
+        if manifest.truncated and manifest.has_more:
             return
         manifest.truncated = True
+        manifest.has_more = True
+        manifest.updated_at = time.time()
+        self._write_spool_manifest(manifest)
+
+    def set_spool_pagination(
+        self,
+        result_set_id: str,
+        *,
+        has_more: bool,
+        mode: str,
+        reason: str | None = None,
+    ) -> None:
+        manifest = self._read_spool_manifest(result_set_id)
+        manifest.has_more = has_more or manifest.truncated
+        manifest.pagination_mode = mode
+        manifest.pagination_reason = reason
         manifest.updated_at = time.time()
         self._write_spool_manifest(manifest)
 
@@ -329,10 +348,12 @@ class LocalFsResultStore(ResultStore):
 
     def _write_spool_manifest(self, manifest: _SpoolManifest) -> None:
         path = self._spool_manifest_path(manifest.result_set_id)
-        path.write_text(
+        temporary_path = path.with_suffix(".tmp")
+        temporary_path.write_text(
             json.dumps(_spool_manifest_to_dict(manifest), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        temporary_path.replace(path)
 
     def _gc_children_older_than(self, base: Path, cutoff: float) -> int:
         if not base.exists():
@@ -461,6 +482,9 @@ def _spool_manifest_to_dict(manifest: _SpoolManifest) -> dict[str, Any]:
         "loaded_rows": manifest.loaded_rows,
         "data_bytes": manifest.data_bytes,
         "truncated": manifest.truncated,
+        "has_more": manifest.has_more or manifest.truncated,
+        "pagination_mode": manifest.pagination_mode,
+        "pagination_reason": manifest.pagination_reason,
         "created_at": manifest.created_at,
         "updated_at": manifest.updated_at,
     }
@@ -474,6 +498,17 @@ def _spool_manifest_from_dict(payload: dict[str, Any]) -> _SpoolManifest:
         loaded_rows=int(payload.get("loaded_rows", 0)),
         data_bytes=int(payload.get("data_bytes", 0)),
         truncated=bool(payload.get("truncated", False)),
+        has_more=bool(payload.get("has_more", payload.get("truncated", False))),
+        pagination_mode=(
+            str(payload["pagination_mode"])
+            if isinstance(payload.get("pagination_mode"), str)
+            else None
+        ),
+        pagination_reason=(
+            str(payload["pagination_reason"])
+            if isinstance(payload.get("pagination_reason"), str)
+            else None
+        ),
         created_at=float(payload.get("created_at", time.time())),
         updated_at=float(payload.get("updated_at", time.time())),
     )

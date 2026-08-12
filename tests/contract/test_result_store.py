@@ -45,6 +45,24 @@ def test_spool_exists_reflects_manifest_presence(result_store: ResultStore) -> N
     assert result_store.spool_exists("rs-present") is True
 
 
+def test_spool_pagination_metadata_persists_without_cursor_state(
+    result_store: ResultStore,
+) -> None:
+    result_store.append_spool("rs-pages", [Row(values=[1])])
+    result_store.set_spool_pagination(
+        "rs-pages",
+        has_more=True,
+        mode="ordered_offset",
+        reason="fresh_read_ordered_offset",
+    )
+
+    manifest = result_store.get_spool_manifest("rs-pages")
+    assert manifest["has_more"] is True
+    assert manifest["pagination_mode"] == "ordered_offset"
+    assert manifest["pagination_reason"] == "fresh_read_ordered_offset"
+    assert "cursor" not in manifest
+
+
 def test_put_artifact_returns_result_ref(result_store: ResultStore) -> None:
     """一次性写入(导出场景)返回 ResultRef。"""
     ref = result_store.put_artifact("run-1", "out.txt", BytesIO(b"hello"))

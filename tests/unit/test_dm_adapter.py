@@ -63,6 +63,20 @@ def test_execute_select_streams_with_plain_cursor_and_closes_resources() -> None
     assert fake_dm.connections[0].closed is True
 
 
+def test_execute_select_uses_request_scoped_fetch_size() -> None:
+    fake_dm = _FakeDM()
+    adapter = DMAdapter(
+        _conn_info(),
+        cast(SecretStore, _SecretStore("pwd")),
+        dm_module=fake_dm,
+        fetch_chunk_size=100,
+    )
+
+    list(adapter.execute_select("SELECT 1", {}))
+
+    assert fake_dm.connections[0].cursors[0].fetchmany_sizes == [100, 100]
+
+
 def test_execute_select_emits_columns_mapped_to_unified_enum() -> None:
     fake_dm = _FakeDM()
     captured: list[Column] = []
@@ -296,6 +310,7 @@ class _FakeCursor:
         self._rows: list[tuple[Any, ...]] = []
         self._offset = 0
         self.executed_sql = ""
+        self.fetchmany_sizes: list[int] = []
 
     def execute(self, sql: str, params: object = None) -> None:
         self.executed_sql = sql
@@ -331,6 +346,7 @@ class _FakeCursor:
         return rows[0] if rows else None
 
     def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
+        self.fetchmany_sizes.append(size)
         batch = self._rows[self._offset : self._offset + size]
         self._offset += len(batch)
         return batch
