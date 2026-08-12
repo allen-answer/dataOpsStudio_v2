@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 import sqlglot
 from sqlglot import exp
@@ -12,6 +13,14 @@ from app.domain.datasource import DbType
 
 class QueryLimitError(ValueError):
     """The query could not be safely rewritten with a database-side row cap."""
+
+
+@dataclass(frozen=True)
+class QueryLimitAnalysis:
+    query_shape: str
+    limit_pushdown: bool
+    limit_pushdown_reason: str
+    output_limit_applied: bool = True
 
 
 _DIALECTS: dict[DbType, str] = {
@@ -123,6 +132,62 @@ def supports_ordered_pagination(sql: str, db_type: DbType) -> bool:
         isinstance(order, exp.Order)
         and bool(order.expressions)
         and not _has_nonliteral_top_level_window(expression)
+    )
+
+
+def analyze_database_row_limit(sql: str, db_type: DbType) -> QueryLimitAnalysis:
+    """Describe whether the output cap can also reasonably reduce source work.
+
+    Every accepted query still receives the AST top-level output cap. The
+    ``limit_pushdown`` flag is deliberately conservative: operators which must
+    aggregate, de-duplicate, window, sort, or combine their input first are not
+    advertised as scan-reducing.
+    """
+
+    _, expression, _ = _parse_query(sql, db_type)
+    if isinstance(expression, (exp.Union, exp.Intersect, exp.Except)):
+        return QueryLimitAnalysis(
+            query_shape="set_operation",
+            limit_pushdown=False,
+            limit_pushdown_reason="set_operation_requires_combined_input",
+        )
+    if expression.find(exp.AggFunc) is not None or expression.args.get("group") is not None:
+        return QueryLimitAnalysis(
+            query_shape="aggregate",
+            limit_pushdown=False,
+            limit_pushdown_reason="aggregate_requires_full_input",
+        )
+    if expression.args.get("distinct") is not None:
+        return QueryLimitAnalysis(
+            query_shape="distinct",
+            limit_pushdown=False,
+            limit_pushdown_reason="distinct_requires_deduplication",
+        )
+    if expression.find(exp.Window) is not None:
+        return QueryLimitAnalysis(
+            query_shape="window",
+            limit_pushdown=False,
+            limit_pushdown_reason="window_requires_partition_input",
+        )
+    order = expression.args.get("order")
+    if isinstance(order, exp.Order) and order.expressions:
+        return QueryLimitAnalysis(
+            query_shape="ordered",
+            limit_pushdown=False,
+            limit_pushdown_reason="order_by_may_require_full_sort",
+        )
+    if expression.find(exp.Subquery) is not None or (
+        expression.args.get("with_") is not None or expression.args.get("with") is not None
+    ):
+        return QueryLimitAnalysis(
+            query_shape="complex_subquery",
+            limit_pushdown=False,
+            limit_pushdown_reason="subquery_scan_reduction_not_guaranteed",
+        )
+    return QueryLimitAnalysis(
+        query_shape="simple_select",
+        limit_pushdown=True,
+        limit_pushdown_reason="top_level_limit_can_stop_row_production",
     )
 
 
@@ -268,7 +333,9 @@ def _restore_pyformat_bindings(sql: str, bindings: list[tuple[str, str]]) -> str
 
 
 __all__ = [
+    "QueryLimitAnalysis",
     "QueryLimitError",
+    "analyze_database_row_limit",
     "apply_database_page",
     "apply_database_row_limit",
     "supports_ordered_pagination",

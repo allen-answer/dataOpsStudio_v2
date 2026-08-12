@@ -176,3 +176,24 @@ def test_complete_fail_require_constructor_worker_id() -> None:
 
     with pytest.raises(RuntimeError, match="complete/fail requires worker_id"):
         backend.fail("job-1", "boom")
+
+
+def test_update_result_ref_is_scoped_to_running_job_owned_by_worker() -> None:
+    connection = _RecordingConnection()
+    backend = PostgresJobBackend(cast(Connection, connection), worker_id="worker-1")
+    ref = ResultRef(
+        backend="local_fs",
+        uri="spool/job-1",
+        metadata={"execution": {"rows_returned": 100}},
+    )
+
+    backend.update_result_ref("job-1", ref)
+
+    statement = connection.executed[0][0]
+    sql = " ".join(str(statement).split())
+    params = statement.compile().params
+    assert "jobs.worker_id" in sql
+    assert "jobs.status" in sql
+    assert params["worker_id_1"] == "worker-1"
+    assert params["status_1"] == JobStatus.RUNNING.value
+    assert params["result_ref"]["metadata"]["execution"]["rows_returned"] == 100

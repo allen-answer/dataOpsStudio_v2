@@ -5,7 +5,43 @@ from typing import Any, cast
 
 from sqlalchemy.engine import Engine
 
-from app.api.services import ApiServices
+from app.api.services import ApiServices, RateLimiter
+
+
+def test_rate_limiter_keeps_policy_groups_and_users_independent() -> None:
+    limiter = RateLimiter()
+
+    for index in range(300):
+        assert limiter.check("user:user-1", group="job_read", now=float(index) / 10).allowed
+    assert not limiter.check("user:user-1", group="job_read", now=30.0).allowed
+    assert limiter.check("user:user-1", group="sql_control", now=30.0).allowed
+    assert limiter.check("user:user-2", group="job_read", now=30.0).allowed
+
+
+def test_rate_limiter_allows_long_adaptive_queries_but_blocks_malicious_burst() -> None:
+    limiter = RateLimiter()
+
+    # Two consoles polling every five seconds for ten minutes never exceed the
+    # 300/minute job-read window.
+    for second in range(0, 600, 5):
+        assert limiter.check("user:operator", group="job_read", now=float(second)).allowed
+        assert limiter.check("user:operator", group="job_read", now=float(second) + 0.01).allowed
+
+    burst = RateLimiter()
+    for index in range(300):
+        assert burst.check("user:operator", group="job_read", now=float(index) / 1000).allowed
+    decision = burst.check("user:operator", group="job_read", now=0.3)
+    assert decision.allowed is False
+    assert decision.retry_after_seconds > 59
+
+
+def test_rate_limiter_explicit_limit_overrides_all_groups_for_test_fixtures() -> None:
+    limiter = RateLimiter(limit=2, window_seconds=10)
+
+    assert limiter.check("same", group="auth", now=0).allowed
+    assert limiter.check("same", group="auth", now=1).allowed
+    assert not limiter.check("same", group="auth", now=2).allowed
+    assert limiter.check("same", group="job_read", now=2).allowed
 
 
 def test_is_token_revoked_uses_read_connection_only() -> None:

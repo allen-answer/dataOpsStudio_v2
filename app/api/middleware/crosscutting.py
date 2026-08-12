@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
@@ -16,7 +17,8 @@ from app.domain.license import LicenseMode
 
 logger = structlog.get_logger(__name__)
 
-_PUBLIC_PATHS = frozenset({"/api/auth/login", "/healthz"})
+_PUBLIC_PATHS = frozenset({"/api/auth/login", "/api/version", "/healthz"})
+_RATE_LIMIT_EXEMPT_PATHS = frozenset({"/api/version", "/healthz"})
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _LICENSE_UPDATE_PATHS = frozenset({"/api/admin/license", "/api/admin/license/upload"})
 _DIAGNOSTIC_EXPORT_PATHS = frozenset({"/api/admin/diagnostics", "/api/admin/diagnostics/export"})
@@ -78,48 +80,52 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
         client_ip = request.client.host if request.client else None
         user_agent = request.headers.get("user-agent")
         http_resource_id = _http_resource_id(request.method, path)
-        self._services.write_audit(
-            user_id=user.id if user else None,
-            project_id=None,
-            action="api_request_start",
-            resource_type="http",
-            resource_id=http_resource_id,
-            result="started",
-            request_id=request_id,
-            ip=client_ip,
-            user_agent=user_agent,
-        )
+        audit_request = _should_audit_request(request.method, path)
+        if audit_request:
+            self._services.write_audit(
+                user_id=user.id if user else None,
+                project_id=None,
+                action="api_request_start",
+                resource_type="http",
+                resource_id=http_resource_id,
+                result="started",
+                request_id=request_id,
+                ip=client_ip,
+                user_agent=user_agent,
+            )
 
         try:
             response = await call_next(request)
         except Exception:
+            if audit_request:
+                self._services.write_audit(
+                    user_id=user.id if user else None,
+                    project_id=None,
+                    action="api_request_end",
+                    resource_type="http",
+                    resource_id=http_resource_id,
+                    result="error",
+                    request_id=request_id,
+                    ip=client_ip,
+                    user_agent=user_agent,
+                )
+            logger.exception("api request failed", request_id=request_id, path=path)
+            raise
+
+        if audit_request:
+            result = "success" if response.status_code < 400 else "denied"
             self._services.write_audit(
                 user_id=user.id if user else None,
                 project_id=None,
                 action="api_request_end",
                 resource_type="http",
                 resource_id=http_resource_id,
-                result="error",
+                result=result,
                 request_id=request_id,
                 ip=client_ip,
                 user_agent=user_agent,
+                detail={"status_code": response.status_code},
             )
-            logger.exception("api request failed", request_id=request_id, path=path)
-            raise
-
-        result = "success" if response.status_code < 400 else "denied"
-        self._services.write_audit(
-            user_id=user.id if user else None,
-            project_id=None,
-            action="api_request_end",
-            resource_type="http",
-            resource_id=http_resource_id,
-            result=result,
-            request_id=request_id,
-            ip=client_ip,
-            user_agent=user_agent,
-            detail={"status_code": response.status_code},
-        )
         response.headers["X-Request-ID"] = request_id
         return response
 
@@ -163,10 +169,27 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
         return None
 
     def _rate_limit(self, request: Request) -> Response | None:
-        key = request.client.host if request.client else "unknown"
-        if self._services.rate_limiter.allow(key):
+        if request.url.path in _RATE_LIMIT_EXEMPT_PATHS:
             return None
-        return error_response(429, "rate_limited", "Too many requests")
+        user = _request_user(request)
+        identity = f"user:{user.id}" if user else f"ip:{_client_ip(request)}"
+        group = _rate_limit_group(request.method, request.url.path)
+        limiter = self._services.rate_limiter
+        checker = getattr(limiter, "check", None)
+        if callable(checker):
+            decision = checker(identity, group=group)
+            if decision.allowed:
+                return None
+            retry_after = max(1, math.ceil(decision.retry_after_seconds))
+        else:
+            # Test doubles and external service factories created before grouped
+            # limiting only expose allow(). Keep those callers source-compatible.
+            if limiter.allow(identity):
+                return None
+            retry_after = 1
+        response = error_response(429, "rate_limited", "Too many requests")
+        response.headers["Retry-After"] = str(retry_after)
+        return response
 
     def _is_frontend_request(self, path: str) -> bool:
         """前端 SPA 静态 / 路由请求(伺服前端时跳过鉴权管线)。
@@ -237,6 +260,35 @@ def _is_business_export_download(method: str, path: str) -> bool:
 def _request_user(request: Request) -> CurrentUser | None:
     user = getattr(request.state, "user", None)
     return user if isinstance(user, CurrentUser) else None
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_limit_group(method: str, path: str) -> str:
+    normalized_method = method.upper()
+    if path == "/api/auth/login":
+        return "auth"
+    if normalized_method in _SAFE_METHODS:
+        if path.startswith("/api/jobs/"):
+            return "job_read"
+        return "general_read"
+    if path in {"/api/sql/execute", "/api/sql/explain"}:
+        return "sql_control"
+    if path.startswith("/api/jobs/") and (
+        path.endswith("/pages") or path.endswith("/cancel") or path.endswith("/export")
+    ):
+        return "sql_control"
+    return "sensitive_write"
+
+
+def _should_audit_request(method: str, path: str) -> bool:
+    if path in _RATE_LIMIT_EXEMPT_PATHS:
+        return False
+    if method.upper() not in _SAFE_METHODS or not path.startswith("/api/jobs/"):
+        return True
+    return not (path.endswith("/progress") or path.endswith("/result"))
 
 
 def _http_resource_id(method: str, path: str) -> str:

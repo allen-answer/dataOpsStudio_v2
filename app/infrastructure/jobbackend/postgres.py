@@ -127,6 +127,26 @@ class PostgresJobBackend(JobBackend):
 
         self._write(op)
 
+    def update_result_ref(self, job_id: str, result_ref: ResultRef) -> None:
+        """Publish additive progress metadata for the currently owning worker.
+
+        This deliberately writes no job event: first-batch progress is an
+        observation update, not a business-state transition.
+        """
+
+        worker_id = self._require_worker_id("update_result_ref")
+
+        def op(conn: Connection) -> None:
+            conn.execute(
+                update(jobs)
+                .where(jobs.c.id == job_id)
+                .where(jobs.c.worker_id == worker_id)
+                .where(jobs.c.status == JobStatus.RUNNING.value)
+                .values(result_ref=_result_ref_to_json(result_ref))
+            )
+
+        self._write(op)
+
     def fail(self, job_id: str, error: str) -> None:
         worker_id = self._require_complete_fail_worker_id()
 

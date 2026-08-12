@@ -544,6 +544,10 @@ jobs:
   compose-stack:
     name: Compose form (§5 hard evidence)
     runs-on: ubuntu-latest
+    env:
+      DATAOPS_BUILD_VERSION: 2.0.1
+      DATAOPS_BUILD_COMMIT: ${{ github.sha }}
+      DATAOPS_IMAGE_VERSION: 2.0.1-ci-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v6
 
@@ -565,6 +569,19 @@ jobs:
           docker compose -f docker/compose.dataops.yml ps
           docker compose -f docker/compose.dataops.yml logs --tail 60
           exit 1
+
+      - name: Verify API build identity and API/worker image parity
+        run: |
+          curl -fs http://127.0.0.1:18020/api/version \
+            | jq -e --arg sha "$GITHUB_SHA" --arg image "$DATAOPS_IMAGE_VERSION" \
+              '.commit == $sha and .image_version == $image'
+          API_IMAGE_ID=$(docker inspect dataops-v2-stack-api --format '{{.Image}}')
+          WORKER_IMAGE_ID=$(docker inspect dataops-v2-stack-worker --format '{{.Image}}')
+          test "$API_IMAGE_ID" = "$WORKER_IMAGE_ID"
+          IMAGE_REVISION=$(docker image inspect "dataops-studio:$DATAOPS_IMAGE_VERSION" \
+            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+          test "$IMAGE_REVISION" = "$GITHUB_SHA"
+          echo "API and worker use the same image: ${API_IMAGE_ID:0:19}"
 
       - name: Admin create + authenticated §5 sample (login / license / projects)
         run: |

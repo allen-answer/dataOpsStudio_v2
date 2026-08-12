@@ -68,9 +68,11 @@ import {
 import {
   cancelJob,
   getJob,
+  getJobProgress,
   getJobResult,
   requestJobPage,
   type JobResponse,
+  type JobProgressResponse,
   type JobResultResponse,
   type JobStageTimings,
 } from '../api/jobs'
@@ -112,8 +114,11 @@ const PAGE_SIZE_OPTIONS = [50, 100, 200, 500] as const
 const DEFAULT_QUERY_MAX_ROWS = 1_000
 const QUERY_MAX_ROWS_LIMIT = 50_000
 const QUERY_MAX_ROWS_OPTIONS = [100, 500, 1_000, 5_000, 10_000] as const
-const FIRST_PAGE_POLL_MS = 150
 const POLL_MS = 1000
+const QUERY_POLL_BACKOFF_MS = [1000, 2000, 3000, 5000] as const
+const QUERY_POLL_HIDDEN_MS = 5000
+const QUERY_POLL_LEASE_MS = 15000
+const QUERY_POLL_LEASE_PREFIX = 'dataops-sql-progress-lease:'
 const SAVE_DEBOUNCE_MS = 650
 // db2 后端 adapter 已具备执行能力,但 GA 决策维持 Preview,放开执行需单独 PR 人拍板。
 const SUPPORTED_EXECUTION_DB_TYPES = new Set(['mysql', 'dm', 'postgresql', 'db2'])
@@ -143,6 +148,10 @@ interface ConsoleRuntime {
   startedAt: number | null
   finishedAt: number | null
   timings: JobStageTimings | null
+  progress: JobProgressResponse | null
+  resultVersion: number
+  unchangedPolls: number
+  networkFailures: number
   // EXPLAIN 计划态(独立于普通查询,落 Plan tab)
   planJobId: string | null
   planStatus: JobStatus | null
@@ -212,11 +221,14 @@ const suppressConsoleSave = ref(false)
 const runtimes = reactive<Record<string, ConsoleRuntime[]>>({})
 const activeRuntimeIndexes = reactive<Record<string, number>>({})
 const pollTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const pollControllers = new Map<string, AbortController>()
 const saveTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const pendingConsolePatches = new Map<string, SqlConsoleUpdateRequest>()
 const nowMs = ref(Date.now())
 let nowTimer: ReturnType<typeof setInterval> | null = null
 let sqlEditor: monaco.editor.IStandaloneCodeEditor | null = null
+const pollingTabId = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
+let progressChannel: BroadcastChannel | null = null
 
 const historyItems = ref<SqlHistoryItem[]>([])
 const historyLoading = ref(false)
@@ -374,6 +386,10 @@ const shouldShowResultTable = computed(() => {
   if (rt.status && TERMINAL.has(rt.status)) return true
   return rt.result.rows.length > 0 || rt.result.columns.length > 0
 })
+const limitScanWarning = computed(() => {
+  const execution = activeRuntime.value?.progress?.execution
+  return execution?.output_limit_applied === true && execution.limit_pushdown === false
+})
 const planActive = computed<boolean>(() => {
   const s = activeRuntime.value?.planStatus
   return s ? ACTIVE.has(s) : false
@@ -393,11 +409,21 @@ const statRows = computed<StatRow[]>(() => {
   rows.push({ label: t('sql.page_size'), value: String(rt.pageSize) })
   rows.push({
     label: t('sql.max_rows'),
-    value: res?.max_result_rows != null ? String(res.max_result_rows) : '-',
+    value:
+      res?.max_result_rows != null
+        ? String(res.max_result_rows)
+        : rt.progress?.execution?.max_rows != null
+          ? String(rt.progress.execution.max_rows)
+          : '-',
   })
   rows.push({
     label: t('sql.stats_has_more'),
-    value: res?.has_more ? t('sql.stats_yes') : t('sql.stats_no'),
+    value:
+      res?.has_more == null
+        ? '-'
+        : res.has_more
+          ? t('sql.stats_yes')
+          : t('sql.stats_no'),
   })
   rows.push({
     label: t('sql.stats_loaded_rows'),
@@ -425,6 +451,25 @@ const statRows = computed<StatRow[]>(() => {
     label: t('sql.stats_truncated'),
     value: res?.truncated ? t('sql.stats_yes') : t('sql.stats_no'),
   })
+  const execution = rt.progress?.execution
+  rows.push({
+    label: t('sql.stats_rows_read'),
+    value: execution?.rows_read != null ? String(execution.rows_read) : '-',
+  })
+  rows.push({
+    label: t('sql.stats_rows_returned'),
+    value: execution?.rows_returned != null ? String(execution.rows_returned) : '-',
+  })
+  rows.push({ label: t('sql.stats_query_shape'), value: execution?.query_shape ?? '-' })
+  rows.push({
+    label: t('sql.stats_limit_pushdown'),
+    value:
+      execution?.limit_pushdown == null
+        ? '-'
+        : execution.limit_pushdown
+          ? t('sql.stats_yes')
+          : t('sql.stats_output_only'),
+  })
   if (rt.jobId) rows.push({ label: t('sql.stats_job_id'), value: rt.jobId })
   return rows
 })
@@ -433,13 +478,15 @@ watch(datasources, (list) => {
   if (!selectedDsId.value && list.length > 0) selectedDsId.value = list[0].id
 })
 
-watch(activeConsoleId, () => {
+watch(activeConsoleId, (current, previous) => {
+  if (previous) stopConsolePoll(previous)
   const consoleRow = activeConsole.value
   suppressConsoleSave.value = true
   editorSql.value = consoleRow?.sql ?? 'SELECT 1 AS hello;'
   selectedDsId.value = consoleRow?.datasource_id ?? datasources.value[0]?.id ?? ''
   void nextTick(() => {
     suppressConsoleSave.value = false
+    if (current) resumeConsolePoll(current)
   })
 })
 
@@ -484,6 +531,11 @@ watch(metadataDsId, () => {
 })
 
 onMounted(async () => {
+  if (typeof BroadcastChannel !== 'undefined') {
+    progressChannel = new BroadcastChannel('dataops-sql-job-progress')
+    progressChannel.addEventListener('message', onProgressBroadcast)
+  }
+  document.addEventListener('visibilitychange', onVisibilityChange)
   nowTimer = setInterval(() => {
     nowMs.value = Date.now()
   }, 500)
@@ -494,6 +546,16 @@ onUnmounted(() => {
   void cancelConsoleQueries()
   sqlEditor = null
   for (const timer of pollTimers.values()) clearTimeout(timer)
+  for (const controller of pollControllers.values()) controller.abort()
+  for (const runtimeList of Object.values(runtimes)) {
+    for (const runtime of runtimeList) {
+      if (runtime.jobId) releasePollLease(runtime.jobId)
+    }
+  }
+  progressChannel?.removeEventListener('message', onProgressBroadcast)
+  progressChannel?.close()
+  progressChannel = null
+  document.removeEventListener('visibilitychange', onVisibilityChange)
   for (const timer of saveTimers.values()) clearTimeout(timer)
   for (const timer of exportPollTimers) clearTimeout(timer)
   if (nowTimer !== null) clearInterval(nowTimer)
@@ -518,6 +580,10 @@ function createRuntime(statement = '', statementIndex = 0, statementCount = 1): 
     startedAt: null,
     finishedAt: null,
     timings: null,
+    progress: null,
+    resultVersion: 0,
+    unchangedPolls: 0,
+    networkFailures: 0,
     planJobId: null,
     planStatus: null,
     planResult: null,
@@ -792,7 +858,11 @@ async function onCancel(): Promise<void> {
 }
 
 function startConsolePoll(consoleId: string, runtime: ConsoleRuntime): void {
-  void pollConsole(consoleId, runtime)
+  scheduleConsolePoll(
+    consoleId,
+    runtime,
+    document.hidden ? QUERY_POLL_HIDDEN_MS : POLL_MS,
+  )
 }
 
 function stopConsolePoll(consoleId: string): void {
@@ -801,6 +871,22 @@ function stopConsolePoll(consoleId: string): void {
     if (!key.startsWith(prefix)) continue
     clearTimeout(timer)
     pollTimers.delete(key)
+  }
+  for (const [key, controller] of pollControllers.entries()) {
+    if (!key.startsWith(prefix)) continue
+    controller.abort()
+    pollControllers.delete(key)
+  }
+  for (const runtime of runtimes[consoleId] ?? []) {
+    if (runtime.jobId) releasePollLease(runtime.jobId)
+  }
+}
+
+function resumeConsolePoll(consoleId: string): void {
+  for (const runtime of runtimes[consoleId] ?? []) {
+    if (runtime.jobId && runtime.status && ACTIVE.has(runtime.status)) {
+      startConsolePoll(consoleId, runtime)
+    }
   }
 }
 
@@ -818,65 +904,251 @@ async function cancelConsoleQueries(consoleId?: string): Promise<void> {
 async function pollConsole(consoleId: string, runtime: ConsoleRuntime): Promise<void> {
   if (!runtime.jobId) return
   if (!runtimes[consoleId]?.includes(runtime)) return
-  const pollKey = `query:${consoleId}:${runtime.jobId}`
+  if (activeConsoleId.value !== consoleId) return
+  const jobId = runtime.jobId
+  const pollKey = `query:${consoleId}:${jobId}`
+  pollTimers.delete(pollKey)
+  if (!tryAcquirePollLease(jobId)) {
+    scheduleConsolePoll(consoleId, runtime, POLL_MS)
+    return
+  }
+  const controller = new AbortController()
+  pollControllers.get(pollKey)?.abort()
+  pollControllers.set(pollKey, controller)
+  let nextDelay = POLL_MS
   try {
-    const job = await getJob(runtime.jobId)
-    applyJob(runtime, job)
-    if (job.status === 'pending' || job.status === 'running' || job.status === 'success') {
-      await fetchResult(runtime, runtime.pageOffset, false)
-    }
-    if (TERMINAL.has(job.status)) {
-      const timer = pollTimers.get(pollKey)
-      if (timer) clearTimeout(timer)
-      pollTimers.delete(pollKey)
+    const progress = await loadJobProgress(jobId, runtime, controller.signal)
+    if (runtime.jobId !== jobId || !runtimes[consoleId]?.includes(runtime)) return
+    await consumeJobProgress(runtime, progress, controller.signal)
+    progressChannel?.postMessage({ source: pollingTabId, progress })
+    if (progress.terminal) {
+      releasePollLease(jobId)
       return
     }
+    nextDelay = nextQueryPollDelay(runtime, progress.retry_after_ms)
   } catch (e) {
-    runtime.error = errorMessage(e)
+    if (isAbortError(e)) return
+    runtime.networkFailures += 1
+    if (e instanceof ApiError && (e.status === 429 || e.status === 0)) {
+      nextDelay = nextQueryPollErrorDelay(runtime, e.retryAfterMs)
+    } else {
+      runtime.error = errorMessage(e)
+      nextDelay = nextQueryPollErrorDelay(runtime)
+    }
+  } finally {
+    if (pollControllers.get(pollKey) === controller) pollControllers.delete(pollKey)
   }
+  if (runtime.jobId === jobId && runtime.status && !TERMINAL.has(runtime.status)) {
+    scheduleConsolePoll(consoleId, runtime, nextDelay)
+  }
+}
+
+function scheduleConsolePoll(consoleId: string, runtime: ConsoleRuntime, delayMs: number): void {
+  if (!runtime.jobId || activeConsoleId.value !== consoleId) return
+  const pollKey = `query:${consoleId}:${runtime.jobId}`
+  const existing = pollTimers.get(pollKey)
+  if (existing) clearTimeout(existing)
   pollTimers.set(
     pollKey,
     setTimeout(() => {
       void pollConsole(consoleId, runtime)
-    }, runtime.result?.rows.length ? POLL_MS : FIRST_PAGE_POLL_MS),
+    }, Math.max(POLL_MS, document.hidden ? QUERY_POLL_HIDDEN_MS : delayMs)),
   )
 }
 
-function applyJob(runtime: ConsoleRuntime, job: JobResponse): void {
-  const enteringTerminal = TERMINAL.has(job.status) && !TERMINAL.has(runtime.status ?? 'pending')
-  if (ACTIVE.has(job.status) && runtime.startedAt === null) {
-    runtime.startedAt = parseTimeMs(job.started_at) ?? parseTimeMs(job.created_at)
+async function loadJobProgress(
+  jobId: string,
+  runtime: ConsoleRuntime,
+  signal: AbortSignal,
+): Promise<JobProgressResponse> {
+  try {
+    return await getJobProgress(jobId, runtime.resultVersion, signal)
+  } catch (e) {
+    if (!(e instanceof ApiError) || e.status !== 404) throw e
+    // Rolling-upgrade fallback for an older API. It intentionally stays on the
+    // adaptive loop and is removed once every deployment exposes /progress.
+    const job = await getJob(jobId)
+    return legacyJobProgress(job, runtime.resultVersion)
+  }
+}
+
+function legacyJobProgress(job: JobResponse, resultVersion: number): JobProgressResponse {
+  const terminal = TERMINAL.has(job.status)
+  return {
+    job_id: job.id,
+    result_set_id: job.result_set_id,
+    status: job.status,
+    loaded_rows: 0,
+    result_version: resultVersion + (job.status === 'pending' ? 0 : 1),
+    columns_ready: job.status !== 'pending',
+    first_batch_ready: job.status !== 'pending',
+    terminal,
+    error: job.error,
+    error_code: job.error_code,
+    retry_after_ms: terminal ? 0 : POLL_MS,
+    has_new_result: job.status !== 'pending',
+    truncated: null,
+    has_more: null,
+    timings: job.timings ?? null,
+    execution: null,
+  }
+}
+
+async function consumeJobProgress(
+  runtime: ConsoleRuntime,
+  progress: JobProgressResponse,
+  signal?: AbortSignal,
+): Promise<void> {
+  applyJobProgress(runtime, progress)
+  const hasUnconsumedResult = progress.result_version > runtime.resultVersion
+  if (hasUnconsumedResult && (progress.columns_ready || progress.first_batch_ready)) {
+    const fetched = await fetchResult(runtime, runtime.pageOffset, false, signal)
+    if (fetched) runtime.resultVersion = progress.result_version
+  } else if (progress.result_version === 0 && progress.terminal && progress.columns_ready) {
+    await fetchResult(runtime, runtime.pageOffset, false, signal)
+  }
+  if (hasUnconsumedResult) {
+    runtime.unchangedPolls = 0
+  } else {
+    runtime.unchangedPolls += 1
+  }
+  runtime.networkFailures = 0
+}
+
+function applyJobProgress(runtime: ConsoleRuntime, progress: JobProgressResponse): void {
+  const enteringTerminal = progress.terminal && !TERMINAL.has(runtime.status ?? 'pending')
+  const execution = progress.execution
+  if (ACTIVE.has(progress.status) && runtime.startedAt === null) {
+    runtime.startedAt = parseTimeMs(execution?.claimed_at) ?? parseTimeMs(execution?.queued_at)
   }
   if (enteringTerminal) {
-    runtime.startedAt = parseTimeMs(job.started_at) ?? parseTimeMs(job.created_at) ?? runtime.startedAt
-    runtime.finishedAt = parseTimeMs(job.finished_at)
+    runtime.startedAt =
+      parseTimeMs(execution?.claimed_at) ?? parseTimeMs(execution?.queued_at) ?? runtime.startedAt
+    runtime.finishedAt = parseTimeMs(execution?.finished_at)
   }
-  runtime.status = job.status
-  runtime.resultSetId = job.result_set_id
-  runtime.error = job.error
-  runtime.message = job.message
-  runtime.timings = job.timings ?? runtime.timings
-  if (TERMINAL.has(job.status)) runtime.cancelling = false
+  runtime.status = progress.status
+  runtime.resultSetId = progress.result_set_id
+  runtime.error = progress.error
+  runtime.message = progress.error
+  runtime.timings = progress.timings ?? runtime.timings
+  runtime.progress = progress
+  if (runtime.result) {
+    runtime.result.loaded_rows = progress.loaded_rows
+    runtime.result.truncated = progress.truncated
+    runtime.result.has_more = progress.has_more
+    runtime.result.pagination_mode = progress.pagination_mode
+    runtime.result.pagination_reason = progress.pagination_reason
+  }
+  if (progress.terminal) runtime.cancelling = false
 }
 
 async function fetchResult(
   runtime: ConsoleRuntime,
   offset: number,
   showLoading: boolean = true,
-): Promise<void> {
-  if (!runtime.jobId) return
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!runtime.jobId) return false
   if (showLoading) runtime.resultLoading = true
   try {
-    runtime.result = await getJobResult(runtime.jobId, offset, runtime.pageSize)
+    runtime.result = await getJobResult(runtime.jobId, offset, runtime.pageSize, signal)
     runtime.pageOffset = offset
+    return true
   } catch (e) {
+    if (isAbortError(e)) throw e
     if (e instanceof ApiError && e.status === 409 && runtime.status && !TERMINAL.has(runtime.status)) {
-      return
+      return false
     }
     runtime.error = errorMessage(e)
+    return false
   } finally {
     runtime.resultLoading = false
   }
+}
+
+function nextQueryPollDelay(runtime: ConsoleRuntime, serverRetryMs: number): number {
+  const index = Math.min(runtime.unchangedPolls, QUERY_POLL_BACKOFF_MS.length - 1)
+  const adaptive = QUERY_POLL_BACKOFF_MS[index]
+  return Math.max(serverRetryMs, document.hidden ? QUERY_POLL_HIDDEN_MS : adaptive)
+}
+
+function nextQueryPollErrorDelay(runtime: ConsoleRuntime, retryAfterMs?: number): number {
+  const exponential = Math.min(5000, 1000 * 2 ** Math.min(runtime.networkFailures - 1, 3))
+  return Math.max(retryAfterMs ?? 0, document.hidden ? QUERY_POLL_HIDDEN_MS : exponential)
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError'
+}
+
+function tryAcquirePollLease(jobId: string): boolean {
+  const now = Date.now()
+  const key = `${QUERY_POLL_LEASE_PREFIX}${jobId}`
+  try {
+    const current = JSON.parse(localStorage.getItem(key) ?? 'null') as {
+      owner?: string
+      expiresAt?: number
+    } | null
+    if (current?.owner !== pollingTabId && (current?.expiresAt ?? 0) > now) return false
+    localStorage.setItem(
+      key,
+      JSON.stringify({ owner: pollingTabId, expiresAt: now + QUERY_POLL_LEASE_MS }),
+    )
+    const confirmed = JSON.parse(localStorage.getItem(key) ?? 'null') as { owner?: string } | null
+    return confirmed?.owner === pollingTabId
+  } catch {
+    return true
+  }
+}
+
+function releasePollLease(jobId: string): void {
+  const key = `${QUERY_POLL_LEASE_PREFIX}${jobId}`
+  try {
+    const current = JSON.parse(localStorage.getItem(key) ?? 'null') as { owner?: string } | null
+    if (current?.owner === pollingTabId) localStorage.removeItem(key)
+  } catch {
+    // Storage may be unavailable in privacy modes; the per-page loop remains safe.
+  }
+}
+
+function onProgressBroadcast(event: MessageEvent<unknown>): void {
+  const message = event.data as { source?: string; progress?: JobProgressResponse } | null
+  if (!message?.progress || message.source === pollingTabId) return
+  const progress = message.progress
+  for (const [consoleId, runtimeList] of Object.entries(runtimes)) {
+    for (const runtime of runtimeList) {
+      if (runtime.jobId !== progress.job_id) continue
+      if (activeConsoleId.value !== consoleId) {
+        applyJobProgress(runtime, progress)
+        continue
+      }
+      void consumeJobProgress(runtime, progress).then(() => {
+        if (progress.terminal) {
+          stopRuntimePoll(consoleId, runtime)
+        } else {
+          scheduleConsolePoll(consoleId, runtime, nextQueryPollDelay(runtime, progress.retry_after_ms))
+        }
+      })
+    }
+  }
+}
+
+function stopRuntimePoll(consoleId: string, runtime: ConsoleRuntime): void {
+  if (!runtime.jobId) return
+  const pollKey = `query:${consoleId}:${runtime.jobId}`
+  const timer = pollTimers.get(pollKey)
+  if (timer) clearTimeout(timer)
+  pollTimers.delete(pollKey)
+  pollControllers.get(pollKey)?.abort()
+  pollControllers.delete(pollKey)
+  releasePollLease(runtime.jobId)
+}
+
+function onVisibilityChange(): void {
+  const consoleId = activeConsoleId.value
+  if (!consoleId) return
+  stopConsolePoll(consoleId)
+  resumeConsolePoll(consoleId)
 }
 
 async function onChangePage(offset: number): Promise<void> {
@@ -900,12 +1172,16 @@ async function onChangePage(offset: number): Promise<void> {
       await fetchResult(runtime, offset, false)
       return
     }
+    if (activeConsoleId.value) stopRuntimePoll(activeConsoleId.value, runtime)
     runtime.jobId = page.job_id
     runtime.status = 'pending'
     runtime.pageOffset = offset
     runtime.startedAt = null
     runtime.finishedAt = null
     runtime.timings = null
+    runtime.progress = null
+    runtime.unchangedPolls = 0
+    runtime.networkFailures = 0
     if (activeConsoleId.value) startConsolePoll(activeConsoleId.value, runtime)
   } catch (e) {
     runtime.error = errorMessage(e)
@@ -2107,6 +2383,15 @@ function parseVariables(value: string): string[] {
             <button type="button" class="chrome-btn-primary py-1" @click="onDownloadExport">
               {{ t('sql.export_download') }}
             </button>
+          </div>
+          <div
+            v-if="limitScanWarning"
+            data-testid="sql-output-limit-warning"
+            class="flex items-start gap-2 px-5 py-2 border-b chrome-border-subtle text-xs"
+            style="background-color: rgb(245 158 11 / 0.10); color: rgb(180 83 9);"
+          >
+            <AlertTriangle class="w-3.5 h-3.5 shrink-0 mt-0.5" />
+            <span>{{ t('sql.output_limit_scan_warning') }}</span>
           </div>
 
           <!-- Result tab -->

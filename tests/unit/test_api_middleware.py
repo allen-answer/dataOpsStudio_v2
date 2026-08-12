@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 
 from app.api.middleware.crosscutting import CrossCuttingMiddleware
 from app.api.security import create_access_token
-from app.api.services import ApiServices
+from app.api.services import ApiServices, RateLimiter, RateLimitRule
 from app.domain.license import LicenseMode
 from tests._asgi_client import AsgiClient
 
@@ -208,6 +208,45 @@ def test_crosscutting_middleware_blocks_business_export_download_in_restricted_m
     assert grace_response.json()["error"] == "license_in_grace"
 
 
+def test_crosscutting_middleware_groups_job_reads_and_returns_retry_after() -> None:
+    services = _FakeServices()
+    services.rate_limiter = RateLimiter(
+        policies={
+            "auth": RateLimitRule(1),
+            "sensitive_write": RateLimitRule(1),
+            "sql_control": RateLimitRule(1),
+            "job_read": RateLimitRule(1),
+            "general_read": RateLimitRule(1),
+        }
+    )
+    app = _app_with_services(services)
+    token = create_access_token(user_id="user-1", role="admin", secret=services.jwt_secret)
+    headers = {"Authorization": f"Bearer {token}"}
+    client = AsgiClient(app)
+
+    first = client.get("/api/jobs/job-1/progress", headers=headers)
+    limited = client.get("/api/jobs/job-1/result", headers=headers)
+    control = client.post("/api/sql/execute", headers=headers)
+
+    assert first.status_code == 200
+    assert limited.status_code == 429
+    assert int(limited.headers["retry-after"]) >= 1
+    assert control.status_code == 200
+
+
+def test_crosscutting_middleware_does_not_write_generic_audit_for_poll_reads() -> None:
+    services = _FakeServices()
+    app = _app_with_services(services)
+    token = create_access_token(user_id="user-1", role="admin", secret=services.jwt_secret)
+    headers = {"Authorization": f"Bearer {token}"}
+    client = AsgiClient(app)
+
+    assert client.get("/api/jobs/job-1/progress", headers=headers).status_code == 200
+    assert client.get("/api/jobs/job-1/result", headers=headers).status_code == 200
+
+    assert services.audits == []
+
+
 def _app_with_services(services: _FakeServices) -> FastAPI:
     app = FastAPI()
     app.add_middleware(CrossCuttingMiddleware, services=cast(ApiServices, services))
@@ -240,6 +279,14 @@ def _app_with_services(services: _FakeServices) -> FastAPI:
     def render_sql_template(template_id: str) -> dict[str, str]:
         return {"template_id": template_id}
 
+    @app.get("/api/jobs/{job_id}/progress")
+    def job_progress(job_id: str) -> dict[str, str]:
+        return {"job_id": job_id}
+
+    @app.get("/api/jobs/{job_id}/result")
+    def job_result(job_id: str) -> dict[str, str]:
+        return {"job_id": job_id}
+
     return app
 
 
@@ -251,7 +298,7 @@ class _RateLimiter:
 class _FakeServices:
     def __init__(self) -> None:
         self.jwt_secret = "jwt-secret"
-        self.rate_limiter = _RateLimiter()
+        self.rate_limiter: _RateLimiter | RateLimiter = _RateLimiter()
         self.mode = LicenseMode.TRIAL
         self.audits: list[dict[str, object]] = []
         self.token_revoked = False
