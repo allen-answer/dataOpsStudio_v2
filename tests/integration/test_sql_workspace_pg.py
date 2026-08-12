@@ -339,8 +339,10 @@ def test_running_sql_result_can_read_spooled_rows(tmp_path: Path) -> None:
         json_body={
             "datasource_id": owner.datasource_id,
             "console_id": console_id,
-            "sql": "SELECT n FROM slow_source",
+            "sql": "SELECT n FROM slow_source ORDER BY n",
             "params": {},
+            "page_size": 1,
+            "max_result_rows": 10,
         },
     )
     assert execute_response.status_code == 202
@@ -357,7 +359,7 @@ def test_running_sql_result_can_read_spooled_rows(tmp_path: Path) -> None:
         WorkerRunnerConfig(
             worker_id="slow-worker",
             poll_interval_seconds=0.01,
-            sql_spool_batch_size=1,
+            sql_spool_batch_size=1000,
         ),
         _NotifyingCatalog(engine, first_row_spooled),
     )
@@ -392,7 +394,33 @@ def test_running_sql_result_can_read_spooled_rows(tmp_path: Path) -> None:
     )
     assert final_response.status_code == 200
     assert final_response.json()["state"] == "complete"
-    assert final_response.json()["loaded_rows"] == 2
+    assert final_response.json()["loaded_rows"] == 1
+    assert final_response.json()["has_more"] is True
+
+    page_response = client.post(
+        f"/api/jobs/{job_id}/pages",
+        headers=headers,
+        json_body={"offset": 1},
+    )
+    assert page_response.status_code == 202
+    page_job_id = page_response.json()["job_id"]
+    assert runner.run_once() is True
+    second_page = client.get(
+        f"/api/jobs/{page_job_id}/result",
+        headers=headers,
+        params={"offset": 1, "limit": 1},
+    )
+    assert second_page.status_code == 200
+    assert second_page.json()["rows"] == [{"values": [2]}]
+    assert second_page.json()["loaded_rows"] == 2
+    assert second_page.json()["has_more"] is False
+    cached_first_page = client.get(
+        f"/api/jobs/{page_job_id}/result",
+        headers=headers,
+        params={"offset": 0, "limit": 1},
+    )
+    assert cached_first_page.status_code == 200
+    assert cached_first_page.json()["rows"] == [{"values": [1]}]
 
 
 def _pg_engine_or_skip() -> Engine:
@@ -535,9 +563,12 @@ class _SlowAdapter:
         return self
 
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
-        del sql, params
+        del params
         if self._column_sink is not None:
             self._column_sink([Column(name="n", type=ColumnType.INTEGER)])
+        if "OFFSET 1" in sql.upper():
+            yield Row(values=[2])
+            return
         yield Row(values=[1])
         assert self._release_second_row.wait(timeout=5)
         yield Row(values=[2])
@@ -560,7 +591,7 @@ class _SlowAdapter:
 def _slow_adapter_factory(
     release_second_row: threading.Event,
 ) -> Callable[
-    [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None]],
+    [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None], int],
     _SlowAdapter,
 ]:
     adapter = _SlowAdapter(release_second_row)
@@ -569,8 +600,9 @@ def _slow_adapter_factory(
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
     ) -> _SlowAdapter:
-        del conn_info, cancel_check
+        del conn_info, cancel_check, fetch_chunk_size
         return adapter.with_column_sink(column_sink)
 
     return factory

@@ -25,6 +25,7 @@ def build_database_adapter(
     column_sink: Callable[[list[Column]], None] | None = None,
     cursor_max_hold_seconds: int = 300,
     statement_timeout_seconds: int = 300,
+    fetch_chunk_size: int = 1000,
     connect_timeout_seconds: int = 10,
 ) -> DatabaseAdapter:
     """db_type -> DatabaseAdapter dispatch.
@@ -42,6 +43,7 @@ def build_database_adapter(
             column_sink=column_sink,
             cursor_max_hold_seconds=cursor_max_hold_seconds,
             statement_timeout_seconds=statement_timeout_seconds,
+            fetch_chunk_size=fetch_chunk_size,
             connect_timeout_seconds=connect_timeout_seconds,
         )
     if conn_info.db_type is DbType.DM:
@@ -52,6 +54,7 @@ def build_database_adapter(
             column_sink=column_sink,
             cursor_max_hold_seconds=cursor_max_hold_seconds,
             statement_timeout_seconds=statement_timeout_seconds,
+            fetch_chunk_size=fetch_chunk_size,
             connect_timeout_seconds=connect_timeout_seconds,
         )
     if conn_info.db_type is DbType.POSTGRESQL:
@@ -62,6 +65,7 @@ def build_database_adapter(
             column_sink=column_sink,
             cursor_max_hold_seconds=cursor_max_hold_seconds,
             statement_timeout_seconds=statement_timeout_seconds,
+            fetch_chunk_size=fetch_chunk_size,
             connect_timeout_seconds=connect_timeout_seconds,
         )
     if conn_info.db_type is DbType.ORACLE:
@@ -72,6 +76,7 @@ def build_database_adapter(
             column_sink=column_sink,
             cursor_max_hold_seconds=cursor_max_hold_seconds,
             statement_timeout_seconds=statement_timeout_seconds,
+            fetch_chunk_size=fetch_chunk_size,
             connect_timeout_seconds=connect_timeout_seconds,
         )
     if conn_info.db_type is DbType.DB2:
@@ -82,6 +87,7 @@ def build_database_adapter(
             column_sink=column_sink,
             cursor_max_hold_seconds=cursor_max_hold_seconds,
             statement_timeout_seconds=statement_timeout_seconds,
+            fetch_chunk_size=fetch_chunk_size,
             connect_timeout_seconds=connect_timeout_seconds,
         )
     raise UnsupportedDbTypeError(f"Unsupported datasource db_type: {conn_info.db_type.value}")

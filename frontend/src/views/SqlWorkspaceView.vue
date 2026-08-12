@@ -69,8 +69,10 @@ import {
   cancelJob,
   getJob,
   getJobResult,
+  requestJobPage,
   type JobResponse,
   type JobResultResponse,
+  type JobStageTimings,
 } from '../api/jobs'
 import {
   createExport,
@@ -105,10 +107,12 @@ const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>([
   'timeout',
 ])
 const ACTIVE: ReadonlySet<JobStatus> = new Set<JobStatus>(['pending', 'running'])
-const PAGE_SIZE = 100
+const DEFAULT_PAGE_SIZE = 100
+const PAGE_SIZE_OPTIONS = [50, 100, 200, 500] as const
 const DEFAULT_QUERY_MAX_ROWS = 1_000
 const QUERY_MAX_ROWS_LIMIT = 50_000
 const QUERY_MAX_ROWS_OPTIONS = [100, 500, 1_000, 5_000, 10_000] as const
+const FIRST_PAGE_POLL_MS = 150
 const POLL_MS = 1000
 const SAVE_DEBOUNCE_MS = 650
 // db2 后端 adapter 已具备执行能力,但 GA 决策维持 Preview,放开执行需单独 PR 人拍板。
@@ -126,6 +130,7 @@ interface ConsoleRuntime {
   statementIndex: number
   statementCount: number
   jobId: string | null
+  rootJobId: string | null
   resultSetId: string | null
   status: JobStatus | null
   error: string | null
@@ -134,8 +139,10 @@ interface ConsoleRuntime {
   result: JobResultResponse | null
   resultLoading: boolean
   pageOffset: number
+  pageSize: number
   startedAt: number | null
   finishedAt: number | null
+  timings: JobStageTimings | null
   // EXPLAIN 计划态(独立于普通查询,落 Plan tab)
   planJobId: string | null
   planStatus: JobStatus | null
@@ -197,6 +204,7 @@ const sidebarTab = ref<SidebarTab>('consoles')
 
 const editorSql = ref('SELECT 1 AS hello;')
 const selectedDsId = ref('')
+const pageSizeSelection = ref(DEFAULT_PAGE_SIZE)
 const maxRowsSelection = ref(String(DEFAULT_QUERY_MAX_ROWS))
 const customMaxRows = ref(DEFAULT_QUERY_MAX_ROWS)
 const suppressConsoleSave = ref(false)
@@ -352,7 +360,7 @@ const statusSummary = computed(() => {
   if (rt.status === 'success') {
     const rows = rt.result?.total_rows ?? rt.result?.loaded_rows ?? loaded
     return t('sql.status_success_summary', {
-      rows,
+      rows: rt.result?.has_more ? `${rows}+` : rows,
       seconds: elapsedSeconds(rt),
     })
   }
@@ -382,10 +390,32 @@ const statRows = computed<StatRow[]>(() => {
   const rows: StatRow[] = []
   rows.push({ label: t('sql.stats_status'), value: rt.status ?? '-' })
   rows.push({ label: t('sql.stats_elapsed'), value: `${elapsedSeconds(rt)}s` })
+  rows.push({ label: t('sql.page_size'), value: String(rt.pageSize) })
+  rows.push({
+    label: t('sql.max_rows'),
+    value: res?.max_result_rows != null ? String(res.max_result_rows) : '-',
+  })
+  rows.push({
+    label: t('sql.stats_has_more'),
+    value: res?.has_more ? t('sql.stats_yes') : t('sql.stats_no'),
+  })
   rows.push({
     label: t('sql.stats_loaded_rows'),
     value: res?.loaded_rows != null ? String(res.loaded_rows) : '-',
   })
+  for (const [labelKey, timingKey] of [
+    ['sql.stats_queue', 'queue_ms'],
+    ['sql.stats_connect', 'connect_ms'],
+    ['sql.stats_execute_first_row', 'execute_first_row_ms'],
+    ['sql.stats_fetch', 'fetch_ms'],
+    ['sql.stats_spool', 'spool_ms'],
+    ['sql.stats_total', 'total_ms'],
+  ] as const) {
+    rows.push({
+      label: t(labelKey),
+      value: formatTiming(rt.timings?.[timingKey]),
+    })
+  }
   rows.push({
     label: t('sql.stats_total_rows'),
     value: res?.total_rows != null ? String(res.total_rows) : '-',
@@ -461,6 +491,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  void cancelConsoleQueries()
   sqlEditor = null
   for (const timer of pollTimers.values()) clearTimeout(timer)
   for (const timer of saveTimers.values()) clearTimeout(timer)
@@ -474,6 +505,7 @@ function createRuntime(statement = '', statementIndex = 0, statementCount = 1): 
     statementIndex,
     statementCount,
     jobId: null,
+    rootJobId: null,
     resultSetId: null,
     status: null,
     error: null,
@@ -482,8 +514,10 @@ function createRuntime(statement = '', statementIndex = 0, statementCount = 1): 
     result: null,
     resultLoading: false,
     pageOffset: 0,
+    pageSize: pageSizeSelection.value,
     startedAt: null,
     finishedAt: null,
+    timings: null,
     planJobId: null,
     planStatus: null,
     planResult: null,
@@ -537,6 +571,7 @@ async function createConsole(): Promise<void> {
 async function deleteConsole(consoleId: string): Promise<void> {
   consoleError.value = null
   try {
+    await cancelConsoleQueries(consoleId)
     await deleteSqlConsole(consoleId)
     consoles.value = consoles.value.filter((item) => item.id !== consoleId)
     stopConsolePoll(consoleId)
@@ -701,11 +736,11 @@ async function onExecute(): Promise<void> {
     return
   }
 
+  await cancelConsoleQueries(consoleRow.id)
   stopConsolePoll(consoleRow.id)
   const nextRuntimes = statements.map((statement, index) => {
     const runtime = createRuntime(statement.sql, index, statements.length)
     runtime.status = 'pending'
-    runtime.startedAt = Date.now()
     return runtime
   })
   runtimes[consoleRow.id] = nextRuntimes
@@ -723,9 +758,11 @@ async function onExecute(): Promise<void> {
           // so the server's existing console-result eviction cannot remove sibling results.
           console_id: index === batchRuntimes.length - 1 ? consoleRow.id : null,
           sql: runtime.statement,
-          max_rows: requestedMaxRows,
+          page_size: runtime.pageSize,
+          max_result_rows: requestedMaxRows,
         })
         runtime.jobId = response.job_id
+        runtime.rootJobId = response.job_id
         runtime.resultSetId = response.result_set_id
         startConsolePoll(consoleRow.id, runtime)
       } catch (e) {
@@ -767,6 +804,17 @@ function stopConsolePoll(consoleId: string): void {
   }
 }
 
+async function cancelConsoleQueries(consoleId?: string): Promise<void> {
+  const consoleIds = consoleId ? [consoleId] : Object.keys(runtimes)
+  const activeJobs = consoleIds.flatMap((id) =>
+    (runtimes[id] ?? [])
+      .filter((runtime) => runtime.jobId && runtime.status && ACTIVE.has(runtime.status))
+      .map((runtime) => runtime.jobId as string),
+  )
+  if (activeJobs.length === 0) return
+  await Promise.allSettled(activeJobs.map((jobId) => cancelJob(jobId)))
+}
+
 async function pollConsole(consoleId: string, runtime: ConsoleRuntime): Promise<void> {
   if (!runtime.jobId) return
   if (!runtimes[consoleId]?.includes(runtime)) return
@@ -790,23 +838,24 @@ async function pollConsole(consoleId: string, runtime: ConsoleRuntime): Promise<
     pollKey,
     setTimeout(() => {
       void pollConsole(consoleId, runtime)
-    }, POLL_MS),
+    }, runtime.result?.rows.length ? POLL_MS : FIRST_PAGE_POLL_MS),
   )
 }
 
 function applyJob(runtime: ConsoleRuntime, job: JobResponse): void {
   const enteringTerminal = TERMINAL.has(job.status) && !TERMINAL.has(runtime.status ?? 'pending')
   if (ACTIVE.has(job.status) && runtime.startedAt === null) {
-    runtime.startedAt = parseTimeMs(job.created_at)
+    runtime.startedAt = parseTimeMs(job.started_at) ?? parseTimeMs(job.created_at)
   }
   if (enteringTerminal) {
-    runtime.startedAt = parseTimeMs(job.created_at) ?? runtime.startedAt
+    runtime.startedAt = parseTimeMs(job.started_at) ?? parseTimeMs(job.created_at) ?? runtime.startedAt
     runtime.finishedAt = parseTimeMs(job.finished_at)
   }
   runtime.status = job.status
   runtime.resultSetId = job.result_set_id
   runtime.error = job.error
   runtime.message = job.message
+  runtime.timings = job.timings ?? runtime.timings
   if (TERMINAL.has(job.status)) runtime.cancelling = false
 }
 
@@ -818,7 +867,7 @@ async function fetchResult(
   if (!runtime.jobId) return
   if (showLoading) runtime.resultLoading = true
   try {
-    runtime.result = await getJobResult(runtime.jobId, offset, PAGE_SIZE)
+    runtime.result = await getJobResult(runtime.jobId, offset, runtime.pageSize)
     runtime.pageOffset = offset
   } catch (e) {
     if (e instanceof ApiError && e.status === 409 && runtime.status && !TERMINAL.has(runtime.status)) {
@@ -830,10 +879,39 @@ async function fetchResult(
   }
 }
 
-function onChangePage(offset: number): void {
+async function onChangePage(offset: number): Promise<void> {
   const runtime = activeRuntime.value
-  if (!runtime) return
-  void fetchResult(runtime, offset)
+  if (!runtime?.jobId || !runtime.result) return
+  const loadedRows = runtime.result.loaded_rows ?? 0
+  if (offset < loadedRows) {
+    await fetchResult(runtime, offset)
+    return
+  }
+  if (!runtime.result.has_more) return
+  if (runtime.result.pagination_mode !== 'ordered_offset') {
+    runtime.error = t('sql.pagination_order_required')
+    return
+  }
+  runtime.resultLoading = true
+  runtime.error = null
+  try {
+    const page = await requestJobPage(runtime.rootJobId ?? runtime.jobId, offset)
+    if (page.cached) {
+      await fetchResult(runtime, offset, false)
+      return
+    }
+    runtime.jobId = page.job_id
+    runtime.status = 'pending'
+    runtime.pageOffset = offset
+    runtime.startedAt = null
+    runtime.finishedAt = null
+    runtime.timings = null
+    if (activeConsoleId.value) startConsolePoll(activeConsoleId.value, runtime)
+  } catch (e) {
+    runtime.error = errorMessage(e)
+  } finally {
+    runtime.resultLoading = false
+  }
 }
 
 async function loadHistory(): Promise<void> {
@@ -1204,7 +1282,7 @@ async function pollPlan(consoleId: string): Promise<void> {
     const job = await getJob(runtime.planJobId)
     runtime.planStatus = job.status
     if (job.status === 'success') {
-      runtime.planResult = await getJobResult(runtime.planJobId, 0, PAGE_SIZE)
+      runtime.planResult = await getJobResult(runtime.planJobId, 0, DEFAULT_PAGE_SIZE)
     }
     if (TERMINAL.has(job.status)) {
       if (job.status !== 'success') {
@@ -1308,6 +1386,11 @@ function onEditorMount(editor: monaco.editor.IStandaloneCodeEditor): void {
 function elapsedSeconds(runtime: ConsoleRuntime): string {
   if (!runtime.startedAt) return '0.0'
   return (((runtime.finishedAt ?? nowMs.value) - runtime.startedAt) / 1000).toFixed(1)
+}
+
+function formatTiming(value: number | null | undefined): string {
+  if (value == null) return '-'
+  return value < 1000 ? `${value}ms` : `${(value / 1000).toFixed(2)}s`
 }
 
 function parseTimeMs(value: string | null | undefined): number | null {
@@ -1730,6 +1813,22 @@ function parseVariables(value: string): string[] {
           </option>
         </select>
         <div class="flex items-center gap-1.5 shrink-0">
+          <label for="sql-page-size" class="text-xs chrome-text-muted whitespace-nowrap">
+            {{ t('sql.page_size') }}
+          </label>
+          <select
+            id="sql-page-size"
+            v-model.number="pageSizeSelection"
+            class="chrome-input w-[5.5rem]"
+            :disabled="editorReadOnly"
+            :title="t('sql.page_size_hint')"
+          >
+            <option v-for="size in PAGE_SIZE_OPTIONS" :key="size" :value="size">
+              {{ size.toLocaleString() }}
+            </option>
+          </select>
+        </div>
+        <div class="flex items-center gap-1.5 shrink-0">
           <label for="sql-max-rows" class="text-xs chrome-text-muted whitespace-nowrap">
             {{ t('sql.max_rows') }}
           </label>
@@ -2030,6 +2129,12 @@ function parseVariables(value: string): string[] {
                 :loaded-rows="activeRuntime.result.loaded_rows"
                 :total-rows="activeRuntime.result.total_rows"
                 :truncated="activeRuntime.result.truncated"
+                :has-more="activeRuntime.result.has_more"
+                :pagination-mode="activeRuntime.result.pagination_mode"
+                :pagination-reason="activeRuntime.result.pagination_reason"
+                :preview-truncated-cells="activeRuntime.result.preview_truncated_cells"
+                :max-result-rows="activeRuntime.result.max_result_rows"
+                :loading="activeRuntime.resultLoading"
                 @change-page="onChangePage"
               />
               <div v-else class="h-full grid place-items-center chrome-text-muted text-sm">

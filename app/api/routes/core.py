@@ -19,6 +19,7 @@ from pydantic import ValidationError
 from sqlalchemy import Table as SqlaTable
 from sqlalchemy import and_, delete, func, insert, or_, select, text, union_all, update
 from sqlalchemy.engine import Connection, RowMapping
+from sqlalchemy.exc import IntegrityError
 from sqlglot import exp
 from sqlglot.errors import ParseError
 from starlette.background import BackgroundTask
@@ -74,8 +75,11 @@ from app.api.schemas import (
     ExportCreateResponse,
     ExportFormat,
     JobListItem,
+    JobPageRequest,
+    JobPageResponse,
     JobResponse,
     JobResultResponse,
+    JobStageTimings,
     LicenseStatusResponse,
     LineageAiEnrichmentResponse,
     LineageAiFallbackResult,
@@ -180,6 +184,7 @@ from app.db.models import (
 )
 from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
+from app.dbclients.query_limit import QueryLimitError, supports_ordered_pagination
 from app.dbclients.sql_build import limit_clause, quote_identifier
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.ai import AiContext, AiOptions, ContextItem, EgressLevel, ReasoningMode
@@ -326,6 +331,7 @@ _EXPORT_FORMATS = frozenset({"csv", "excel", "json", "sql"})
 _LINEAGE_EXPORT_LIMIT_BYTES = 50 * 1024 * 1024
 _COMPARE_BUCKET_QUERY = Query(default="diff")
 # UX-2 C-3:定位 SQL 最多列多少个主键(超过则截断并在响应标 truncated,防生成超长 SQL)。
+_RESULT_CELL_PREVIEW_MAX_CHARS = 4096
 _DIFF_SQL_PK_CAP = 500
 _UPLOAD_PURPOSE_QUERY = Query()
 _UPLOAD_FILENAME_QUERY = Query(min_length=1, max_length=255)
@@ -975,6 +981,16 @@ def execute_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse
     job_id = new_id()
     result_set_id = new_id()
     sql_hash = _sql_hash(sql)
+    try:
+        ordered_pagination = supports_ordered_pagination(sql, DbType(str(row["db_type"])))
+    except QueryLimitError as exc:
+        raise ApiError(400, "invalid_sql", "SQL could not be safely parsed") from exc
+    pagination_mode = "ordered_offset" if ordered_pagination else "unavailable"
+    pagination_reason = (
+        "fresh_read_ordered_offset"
+        if pagination_mode == "ordered_offset"
+        else "top_level_order_by_required"
+    )
     job = Job(
         id=job_id,
         kind=JobKind.SQL_QUERY,
@@ -993,7 +1009,12 @@ def execute_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse
             "params": body.params,
             "result_set_id": result_set_id,
             "console_id": console_id,
-            "max_rows": body.max_rows,
+            "page_size": body.page_size,
+            "max_result_rows": body.effective_max_result_rows,
+            "max_rows": body.effective_max_result_rows,
+            "pagination_mode": pagination_mode,
+            "pagination_reason": pagination_reason,
+            "page_offset": 0,
         },
     )
     _create_result_set_placeholder(
@@ -6337,18 +6358,153 @@ def get_job_result(
     if result_set_id is None:
         raise ApiError(404, "not_found", "Job result not found")
     rows = services.result_store.fetch_range(result_set_id, offset, limit)
+    preview_rows, preview_truncated_cells = _preview_result_rows(rows)
     manifest = _spool_manifest_or_none(services, result_set_id)
+    loaded_rows = _int_from_manifest(manifest, "loaded_rows")
+    total_rows = _result_set_total_rows(services, result_set_id)
+    state = _result_set_state(services, result_set_id)
+    truncated = _bool_from_manifest(manifest, "truncated")
+    has_more = bool(
+        state == "streaming"
+        or truncated
+        or _bool_from_manifest(manifest, "has_more")
+        or (loaded_rows is not None and offset + len(rows) < loaded_rows)
+    )
     return JobResultResponse(
         job_id=job_id,
         result_set_id=result_set_id,
         offset=offset,
         limit=limit,
         columns=_columns_from_manifest(manifest),
-        rows=[RowResponse(values=row.values) for row in rows],
-        loaded_rows=_int_from_manifest(manifest, "loaded_rows"),
-        total_rows=_result_set_total_rows(services, result_set_id),
-        state=_result_set_state(services, result_set_id),
-        truncated=_bool_from_manifest(manifest, "truncated"),
+        rows=[RowResponse(values=row.values) for row in preview_rows],
+        loaded_rows=loaded_rows,
+        total_rows=total_rows,
+        state=state,
+        truncated=truncated,
+        has_more=has_more,
+        page_size=_job_payload_int(row, "page_size", default=100),
+        max_result_rows=_job_payload_int(
+            row,
+            "max_result_rows",
+            fallback_key="max_rows",
+            default=1000,
+        ),
+        preview_truncated_cells=preview_truncated_cells,
+        pagination_mode=_manifest_pagination_mode(manifest),
+        pagination_reason=_manifest_optional_str(manifest, "pagination_reason"),
+    )
+
+
+@router.post(
+    "/jobs/{job_id}/pages",
+    response_model=JobPageResponse,
+    status_code=202,
+)
+def request_job_page(
+    job_id: str,
+    body: JobPageRequest,
+    request: Request,
+) -> JobPageResponse:
+    """Enqueue one ordered, stateless database continuation page.
+
+    Each page is a fresh read with the user's top-level ORDER BY and an AST
+    LIMIT/OFFSET window. No cursor, connection, or credential remains live
+    while the browser is idle. Queries without a top-level ORDER BY fail closed
+    rather than returning silently unstable pages.
+    """
+
+    services = services_from(request)
+    user = current_user_from(request)
+    source = _job_for_current_user(request, job_id)
+    root = _pagination_root_job(request, source)
+    if str(root["kind"]) != JobKind.SQL_QUERY.value:
+        raise ApiError(409, "pagination_unavailable", "Only SQL query results can be paged")
+    root_payload = root["payload"]
+    if not isinstance(root_payload, dict):
+        raise ApiError(409, "pagination_unavailable", "Query pagination metadata is missing")
+    result_set_id = _result_set_id_from_payload(root)
+    if result_set_id is None:
+        raise ApiError(404, "not_found", "Job result not found")
+    manifest = _spool_manifest_or_none(services, result_set_id)
+    if manifest is None:
+        raise ApiError(409, "result_not_ready", "Query result is not ready")
+    loaded_rows = _int_from_manifest(manifest, "loaded_rows") or 0
+    if body.offset < loaded_rows:
+        return JobPageResponse(
+            job_id=str(source["id"]),
+            result_set_id=result_set_id,
+            offset=body.offset,
+            cached=True,
+        )
+    if body.offset != loaded_rows:
+        raise ApiError(409, "nonsequential_page", "Pages must be requested sequentially")
+    if not _bool_from_manifest(manifest, "has_more"):
+        raise ApiError(409, "no_more_rows", "No more rows are available")
+    if manifest.get("pagination_mode") != "ordered_offset":
+        raise ApiError(
+            409,
+            "stable_order_required",
+            "Add a top-level ORDER BY before requesting another database page",
+        )
+    max_result_rows = _job_payload_int(
+        root,
+        "max_result_rows",
+        fallback_key="max_rows",
+        default=1000,
+    )
+    if body.offset >= max_result_rows:
+        raise ApiError(409, "result_limit_reached", "The result safety limit was reached")
+
+    root_job_id = str(root["id"])
+    page_job_id = _pagination_job_id(root_job_id, body.offset)
+    existing = services.job_backend.get_job(page_job_id)
+    if existing is not None:
+        return JobPageResponse(
+            job_id=existing.id,
+            result_set_id=result_set_id,
+            offset=body.offset,
+        )
+    page_payload = dict(root_payload)
+    page_payload.update(
+        {
+            "page_offset": body.offset,
+            "pagination_root_job_id": root_job_id,
+        }
+    )
+    page_job = Job(
+        id=page_job_id,
+        kind=JobKind.SQL_QUERY,
+        status=JobStatus.PENDING,
+        owner_user_id=user.id,
+        project_id=str(root["project_id"]),
+        datasource_ids=list(root["datasource_ids"] or []),
+        priority=int(root["priority"]),
+        timeout_seconds=int(root["timeout_seconds"]),
+        resource_profile=ResourceProfile.model_validate(root["resource_profile"] or {}),
+        audit_id=new_id(),
+        payload=page_payload,
+    )
+    try:
+        services.job_backend.enqueue(page_job)
+    except IntegrityError:
+        existing = services.job_backend.get_job(page_job_id)
+        if existing is None:
+            raise
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=str(root["project_id"]),
+        action="sql_page_request",
+        resource_type="job",
+        resource_id=page_job_id,
+        result="accepted",
+        detail={"root_job_id": root_job_id, "offset": body.offset},
+    )
+    return JobPageResponse(
+        job_id=page_job_id,
+        result_set_id=result_set_id,
+        offset=body.offset,
     )
 
 
@@ -8872,12 +9028,46 @@ def _job_response(row: RowMapping) -> JobResponse:
         kind=str(row["kind"]),
         status=status,
         created_at=row["created_at"],
+        started_at=row["started_at"],
         finished_at=row["finished_at"],
         result_set_id=_result_set_id_from_payload(row),
         error=error_code if status is JobStatus.FAILED else None,
         error_code=error_code,
         message="Job failed" if status is JobStatus.FAILED else None,
+        timings=_job_stage_timings(row),
     )
+
+
+def _job_stage_timings(row: RowMapping) -> JobStageTimings | None:
+    created_at = row["created_at"]
+    started_at = row["started_at"]
+    finished_at = row["finished_at"]
+    timings: dict[str, int | None] = {
+        "queue_ms": _datetime_delta_ms(created_at, started_at),
+        "connect_ms": None,
+        "execute_first_row_ms": None,
+        "fetch_ms": None,
+        "spool_ms": None,
+        "total_ms": _datetime_delta_ms(created_at, finished_at),
+    }
+    result_ref = row.get("result_ref")
+    if isinstance(result_ref, dict):
+        metadata = result_ref.get("metadata")
+        raw_timings = metadata.get("timings") if isinstance(metadata, dict) else None
+        if isinstance(raw_timings, dict):
+            for key in ("connect_ms", "execute_first_row_ms", "fetch_ms", "spool_ms"):
+                value = raw_timings.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    timings[key] = value
+    if not any(value is not None for value in timings.values()):
+        return None
+    return JobStageTimings(**timings)
+
+
+def _datetime_delta_ms(start: object, end: object) -> int | None:
+    if not isinstance(start, datetime) or not isinstance(end, datetime):
+        return None
+    return max(0, round((end - start).total_seconds() * 1000))
 
 
 def _require_exportable_source(row: RowMapping) -> None:
@@ -9084,6 +9274,46 @@ def _result_set_id_from_payload(row: RowMapping) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _job_payload_int(
+    row: RowMapping,
+    key: str,
+    *,
+    fallback_key: str | None = None,
+    default: int,
+) -> int:
+    payload = row["payload"]
+    if not isinstance(payload, dict):
+        return default
+    value = payload.get(key)
+    if value is None and fallback_key is not None:
+        value = payload.get(fallback_key)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return default
+
+
+def _preview_result_rows(rows: list[Row]) -> tuple[list[Row], int]:
+    preview_rows: list[Row] = []
+    truncated_cells = 0
+    for row in rows:
+        values: list[Any] = []
+        for value in row.values:
+            preview, truncated = _preview_result_value(value)
+            values.append(preview)
+            truncated_cells += int(truncated)
+        preview_rows.append(Row(values=values))
+    return preview_rows, truncated_cells
+
+
+def _preview_result_value(value: Any) -> tuple[Any, bool]:
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<binary {len(value)} bytes; preview omitted>", True
+    if isinstance(value, str) and len(value) > _RESULT_CELL_PREVIEW_MAX_CHARS:
+        omitted = len(value) - _RESULT_CELL_PREVIEW_MAX_CHARS
+        return f"{value[:_RESULT_CELL_PREVIEW_MAX_CHARS]}… <{omitted} chars omitted>", True
+    return value, False
+
+
 def _spool_manifest_or_none(
     services: ApiServices,
     result_set_id: str,
@@ -9105,6 +9335,33 @@ def _int_from_manifest(manifest: dict[str, Any] | None, key: str) -> int | None:
 def _bool_from_manifest(manifest: dict[str, Any] | None, key: str) -> bool | None:
     value = manifest.get(key) if manifest else None
     return value if isinstance(value, bool) else None
+
+
+def _manifest_optional_str(manifest: dict[str, Any] | None, key: str) -> str | None:
+    value = manifest.get(key) if manifest else None
+    return value if isinstance(value, str) else None
+
+
+def _manifest_pagination_mode(
+    manifest: dict[str, Any] | None,
+) -> Literal["ordered_offset", "unavailable"] | None:
+    value = _manifest_optional_str(manifest, "pagination_mode")
+    if value in {"ordered_offset", "unavailable"}:
+        return cast(Literal["ordered_offset", "unavailable"], value)
+    return None
+
+
+def _pagination_root_job(request: Request, source: RowMapping) -> RowMapping:
+    payload = source["payload"]
+    root_job_id = payload.get("pagination_root_job_id") if isinstance(payload, dict) else None
+    if isinstance(root_job_id, str) and root_job_id:
+        return _job_for_current_user(request, root_job_id)
+    return source
+
+
+def _pagination_job_id(root_job_id: str, offset: int) -> str:
+    digest = sha256(f"{root_job_id}:{offset}".encode()).hexdigest()
+    return f"page-{digest[:31]}"
 
 
 def _columns_from_manifest(manifest: dict[str, Any] | None) -> list[Column]:

@@ -22,6 +22,7 @@ from app.domain.job import Job, JobKind
 from app.domain.license import LicenseMode
 from app.domain.result import (
     SQL_WORKSPACE_DEFAULT_MAX_ROWS,
+    SQL_WORKSPACE_DEFAULT_PAGE_SIZE,
     SQL_WORKSPACE_MAX_ROWS,
     ResultRef,
 )
@@ -114,6 +115,7 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("GET", "/api/jobs") in routes
     assert ("GET", "/api/jobs/{job_id}") in routes
     assert ("GET", "/api/jobs/{job_id}/result") in routes
+    assert ("POST", "/api/jobs/{job_id}/pages") in routes
     assert ("POST", "/api/jobs/{job_id}/export") in routes
     assert ("POST", "/api/compare/runs/{run_id}/export") in routes
     assert ("GET", "/api/exports/{token}") in routes
@@ -162,7 +164,118 @@ def test_sql_execute_enqueues_validated_row_limit(
     )
 
     assert response.status_code == 202
-    assert services.job_backend.enqueued[0].payload["max_rows"] == expected_max_rows
+    payload = services.job_backend.enqueued[0].payload
+    assert payload["page_size"] == SQL_WORKSPACE_DEFAULT_PAGE_SIZE
+    assert payload["max_result_rows"] == expected_max_rows
+    assert payload["max_rows"] == expected_max_rows
+    assert payload["pagination_mode"] == "unavailable"
+    assert payload["pagination_reason"] == "top_level_order_by_required"
+
+
+def test_sql_execute_separates_page_size_and_safety_limit() -> None:
+    services = _Services(
+        _FakeEngine(
+            [
+                _datasource_row(),
+                {"id": "project-1"},
+            ]
+        )
+    )
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/sql/execute",
+        headers=_auth_headers(),
+        json_body={
+            "sql": "SELECT * FROM users ORDER BY id",
+            "datasource_id": "ds-1",
+            "page_size": 100,
+            "max_result_rows": 5_000,
+        },
+    )
+
+    assert response.status_code == 202
+    payload = services.job_backend.enqueued[0].payload
+    assert payload["page_size"] == 100
+    assert payload["max_result_rows"] == 5_000
+    assert payload["pagination_mode"] == "ordered_offset"
+
+
+def test_sql_execute_rejects_conflicting_new_and_legacy_safety_limits() -> None:
+    app = create_app(services=cast(ApiServices, _Services(_FakeEngine([]))))
+
+    response = AsgiClient(app).post(
+        "/api/sql/execute",
+        headers=_auth_headers(),
+        json_body={
+            "sql": "SELECT * FROM users",
+            "datasource_id": "ds-1",
+            "max_result_rows": 100,
+            "max_rows": 200,
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_request_job_page_enqueues_ordered_stateless_continuation() -> None:
+    root_row = _pagination_root_row(pagination_mode="ordered_offset")
+    backend = _JobBackend()
+    result_store = _ResultStore(
+        manifest={
+            "columns": [{"name": "id", "type": "integer"}],
+            "loaded_rows": 100,
+            "truncated": False,
+            "has_more": True,
+            "pagination_mode": "ordered_offset",
+            "pagination_reason": "fresh_read_ordered_offset",
+        }
+    )
+    services = _Services(
+        _FakeEngine([root_row, {"id": "project-1"}]),
+        job_backend=backend,
+        result_store=result_store,
+    )
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/jobs/job-root/pages",
+        headers=_auth_headers(),
+        json_body={"offset": 100},
+    )
+
+    assert response.status_code == 202
+    page_job = backend.enqueued[0]
+    assert page_job.payload["pagination_root_job_id"] == "job-root"
+    assert page_job.payload["page_offset"] == 100
+    assert page_job.payload["result_set_id"] == "rs-pages"
+    assert page_job.payload["params"] == {"min_id": 1}
+    assert page_job.datasource_ids == ["ds-1"]
+
+
+def test_request_job_page_fails_closed_without_stable_order() -> None:
+    services = _Services(
+        _FakeEngine([_pagination_root_row(pagination_mode="unavailable"), {"id": "project-1"}]),
+        result_store=_ResultStore(
+            manifest={
+                "loaded_rows": 100,
+                "truncated": False,
+                "has_more": True,
+                "pagination_mode": "unavailable",
+                "pagination_reason": "top_level_order_by_required",
+            }
+        ),
+    )
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/jobs/job-root/pages",
+        headers=_auth_headers(),
+        json_body={"offset": 100},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "stable_order_required"
 
 
 @pytest.mark.parametrize("max_rows", [0, SQL_WORKSPACE_MAX_ROWS + 1])
@@ -176,6 +289,23 @@ def test_sql_execute_rejects_row_limit_outside_supported_range(max_rows: int) ->
             "sql": "SELECT * FROM users",
             "datasource_id": "ds-1",
             "max_rows": max_rows,
+        },
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("page_size", [0, 1001])
+def test_sql_execute_rejects_page_size_outside_supported_range(page_size: int) -> None:
+    app = create_app(services=cast(ApiServices, _Services(_FakeEngine([]))))
+
+    response = AsgiClient(app).post(
+        "/api/sql/execute",
+        headers=_auth_headers(),
+        json_body={
+            "sql": "SELECT * FROM users",
+            "datasource_id": "ds-1",
+            "page_size": page_size,
         },
     )
 
@@ -450,6 +580,18 @@ def test_get_job_response_includes_timestamps_for_terminal_jobs() -> None:
                 "finished_at": _dt(9),
                 "error": None,
                 "error_code": None,
+                "result_ref": {
+                    "backend": "local_fs",
+                    "uri": "spool/rs-1",
+                    "metadata": {
+                        "timings": {
+                            "connect_ms": 120,
+                            "execute_first_row_ms": 340,
+                            "fetch_ms": 560,
+                            "spool_ms": 80,
+                        }
+                    },
+                },
                 "payload": {"result_set_id": "rs-1", "sql": "SELECT should_not_return"},
             },
             {"id": "project-1"},
@@ -465,7 +607,16 @@ def test_get_job_response_includes_timestamps_for_terminal_jobs() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["created_at"] == "2026-01-01T00:00:01Z"
+    assert payload["started_at"] == "2026-01-01T00:00:02Z"
     assert payload["finished_at"] == "2026-01-01T00:00:09Z"
+    assert payload["timings"] == {
+        "queue_ms": 1000,
+        "connect_ms": 120,
+        "execute_first_row_ms": 340,
+        "fetch_ms": 560,
+        "spool_ms": 80,
+        "total_ms": 8000,
+    }
     assert "SELECT should_not_return" not in response.body.decode("utf-8")
 
 
@@ -6971,6 +7122,35 @@ def _sample_result_payload() -> dict[str, object]:
     }
 
 
+def _pagination_root_row(*, pagination_mode: str) -> dict[str, object]:
+    return {
+        "id": "job-root",
+        "kind": "sql_query",
+        "status": "success",
+        "owner_user_id": "user-1",
+        "project_id": "project-1",
+        "datasource_ids": ["ds-1"],
+        "priority": 0,
+        "timeout_seconds": 300,
+        "resource_profile": {},
+        "payload": {
+            "datasource_id": "ds-1",
+            "sql": "SELECT id FROM users ORDER BY id",
+            "params": {"min_id": 1},
+            "result_set_id": "rs-pages",
+            "page_size": 100,
+            "max_result_rows": 1000,
+            "pagination_mode": pagination_mode,
+            "pagination_reason": (
+                "fresh_read_ordered_offset"
+                if pagination_mode == "ordered_offset"
+                else "top_level_order_by_required"
+            ),
+            "page_offset": 0,
+        },
+    }
+
+
 class _NoopServices:
     pass
 
@@ -7106,9 +7286,14 @@ class _JobBackend:
         self.enqueued: list[Job] = []
         self.cancel_requested: list[str] = []
         self.cancelled_pending: list[tuple[str, str]] = []
+        self.jobs_by_id: dict[str, Job] = {}
 
     def enqueue(self, job: Job) -> None:
         self.enqueued.append(job)
+        self.jobs_by_id[job.id] = job
+
+    def get_job(self, job_id: str) -> Job | None:
+        return self.jobs_by_id.get(job_id)
 
     def request_cancel(self, job_id: str) -> None:
         self.cancel_requested.append(job_id)
@@ -7123,10 +7308,12 @@ class _ResultStore:
         downloads: dict[str, bytes] | None = None,
         spool_exists: bool = True,
         rows: list[Row] | None = None,
+        manifest: dict[str, object] | None = None,
     ) -> None:
         self._downloads = downloads or {}
         self._spool_exists = spool_exists
         self._rows = rows or []
+        self._manifest = manifest
         self.export_artifacts: list[tuple[str, str, bytes]] = []
         self.upload_artifacts: list[tuple[str, str, bytes]] = []
 
@@ -7147,6 +7334,8 @@ class _ResultStore:
 
     def get_spool_manifest(self, result_set_id: str) -> dict[str, object]:
         del result_set_id
+        if self._manifest is not None:
+            return dict(self._manifest)
         return {
             "columns": [{"name": "value", "type": "string"}],
             "loaded_rows": 1,

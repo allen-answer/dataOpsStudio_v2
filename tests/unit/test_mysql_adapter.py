@@ -56,6 +56,20 @@ def test_execute_select_uses_sscursor_reveals_secret_and_closes_resources() -> N
     assert fake_pymysql.connections[0].closed is True
 
 
+def test_execute_select_uses_request_scoped_fetch_size() -> None:
+    fake_pymysql = _FakePyMySQL()
+    adapter = MySQLAdapter(
+        _conn_info(),
+        cast(SecretStore, _SecretStore("pwd")),
+        pymysql_module=fake_pymysql,
+        fetch_chunk_size=100,
+    )
+
+    list(adapter.execute_select("SELECT 1", {}))
+
+    assert fake_pymysql.connections[0].cursors[-1].fetchmany_sizes == [100, 100]
+
+
 def test_execute_select_emits_columns_without_leaking_cursor_reference() -> None:
     fake_pymysql = _FakePyMySQL()
     captured_columns: list[Column] = []
@@ -372,6 +386,7 @@ class _FakeCursor:
         self.description: tuple[tuple[str], ...] = (("n",),)
         self._rows: list[tuple[Any, ...]] = []
         self._offset = 0
+        self.fetchmany_sizes: list[int] = []
 
     def execute(self, sql: str, params: object = None) -> None:
         if sql.lower().startswith("set session"):
@@ -389,6 +404,7 @@ class _FakeCursor:
         return rows[0] if rows else None
 
     def fetchmany(self, size: int) -> list[tuple[Any, ...]]:
+        self.fetchmany_sizes.append(size)
         batch = self._rows[self._offset : self._offset + size]
         self._offset += len(batch)
         return batch

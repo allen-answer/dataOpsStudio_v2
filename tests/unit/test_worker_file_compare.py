@@ -96,8 +96,9 @@ def _run_worker(
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
     ) -> _ColumnSinkAdapter:
-        del conn_info, cancel_check, column_sink
+        del conn_info, cancel_check, column_sink, fetch_chunk_size
         return remaining.pop(0)
 
     runner = WorkerRunner(
