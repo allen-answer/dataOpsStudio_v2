@@ -49,7 +49,11 @@ x-app-image: &app-image
   build:
     context: ..
     dockerfile: Dockerfile
-  image: dataops-studio:2.0
+    args:
+      DATAOPS_BUILD_VERSION: "${DATAOPS_BUILD_VERSION:-2.0.1}"
+      DATAOPS_BUILD_COMMIT: "${DATAOPS_BUILD_COMMIT:-unknown}"
+      DATAOPS_IMAGE_VERSION: "${DATAOPS_IMAGE_VERSION:-2.0.1}"
+  image: "dataops-studio:${DATAOPS_IMAGE_VERSION:-2.0.1}"
 
 # Shared env for every app process. Points the launcher/app at the runtime root
 # inside the shared config + data volumes. No secret values here — only paths.

@@ -15,6 +15,7 @@ from app.api.routes import router
 from app.api.services import ApiServices, build_api_services
 from app.config import Form, Settings
 from app.services.workflow_scheduler import WorkflowScheduler
+from app.version import build_info
 
 ExceptionHandler = Callable[[Request, Exception], Response | Awaitable[Response]]
 
@@ -44,7 +45,7 @@ def create_app(
 
     app = FastAPI(
         title="DataOps Studio API",
-        version="2.0.0a0",
+        version=build_info()["version"],
         docs_url="/docs" if expose_docs else None,
         redoc_url="/redoc" if expose_docs else None,
         openapi_url="/openapi.json" if expose_docs else None,
@@ -63,6 +64,10 @@ def create_app(
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/api/version")
+    def version() -> dict[str, str]:
+        return build_info()
 
     # ★ 前端伺服必须在 /api 路由与 /healthz 之后挂载,使其优先匹配,
     # SPA catch-all 只兜住剩余 GET 路径(见 app.api.frontend 模块文档)。

@@ -60,8 +60,9 @@ export function setTokenProvider(fn: () => string | null): void {
  *   - 账户安全二次确认:改密 401 invalid_password、关 MFA / 重生成恢复码 401 invalid_mfa_code
  *     —— 这些 401 是「当前 TOTP / 旧密码不对」,不该把用户踢下线。
  */
-interface RequestOptions {
+export interface RequestOptions {
   skipAuthRedirect?: boolean
+  signal?: AbortSignal
 }
 
 async function request<T>(
@@ -80,8 +81,12 @@ async function request<T>(
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: options?.signal,
     })
   } catch (networkError) {
+    if (networkError instanceof DOMException && networkError.name === 'AbortError') {
+      throw networkError
+    }
     throw new ApiError(
       0,
       networkError instanceof Error ? networkError.message : 'Network error',
@@ -101,6 +106,7 @@ async function request<T>(
       errorBody.message ?? errorBody.error ?? response.statusText,
       errorBody.error,
       errorBody,
+      retryAfterMs(response.headers.get('Retry-After')),
     )
   }
 
@@ -216,7 +222,8 @@ export async function downloadTokenizedExport(
 }
 
 export const apiClient = {
-  get: <T>(path: string): Promise<T> => request<T>('GET', path),
+  get: <T>(path: string, options?: RequestOptions): Promise<T> =>
+    request<T>('GET', path, undefined, options),
   downloadBlob,
   postRaw,
   post: <T>(path: string, body?: unknown, options?: RequestOptions): Promise<T> =>
@@ -225,4 +232,13 @@ export const apiClient = {
     request<T>('PUT', path, body, options),
   patch: <T>(path: string, body?: unknown): Promise<T> => request<T>('PATCH', path, body),
   delete: <T>(path: string): Promise<T> => request<T>('DELETE', path),
+}
+
+function retryAfterMs(value: string | null): number | undefined {
+  if (!value) return undefined
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1000)
+  const deadline = Date.parse(value)
+  if (!Number.isFinite(deadline)) return undefined
+  return Math.max(0, deadline - Date.now())
 }

@@ -423,12 +423,20 @@ export class ApiError extends Error {
   status: number
   code?: string
   body?: ApiErrorBody
+  retryAfterMs?: number
 
-  constructor(status: number, message: string, code?: string, body?: ApiErrorBody) {
+  constructor(
+    status: number,
+    message: string,
+    code?: string,
+    body?: ApiErrorBody,
+    retryAfterMs?: number,
+  ) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
     this.body = body
+    this.retryAfterMs = retryAfterMs
   }
 }

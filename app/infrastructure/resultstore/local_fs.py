@@ -45,6 +45,8 @@ class _SpoolManifest:
     has_more: bool = False
     pagination_mode: str | None = None
     pagination_reason: str | None = None
+    result_version: int = 0
+    first_batch_at: float | None = None
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -166,6 +168,7 @@ class LocalFsResultStore(ResultStore):
         if len(rows_to_write) < len(candidate_rows):
             manifest.truncated = True
 
+        first_batch = manifest.loaded_rows == 0
         manifest.parts.append(
             _PartInfo(
                 path=str(part_path.relative_to(self._root)),
@@ -176,6 +179,8 @@ class LocalFsResultStore(ResultStore):
         manifest.loaded_rows += len(rows_to_write)
         manifest.data_bytes += part_bytes
         manifest.updated_at = time.time()
+        if first_batch:
+            manifest.first_batch_at = manifest.updated_at
         if (
             manifest.loaded_rows >= self._spool_max_rows
             or manifest.data_bytes >= self._spool_max_bytes
@@ -349,6 +354,7 @@ class LocalFsResultStore(ResultStore):
     def _write_spool_manifest(self, manifest: _SpoolManifest) -> None:
         path = self._spool_manifest_path(manifest.result_set_id)
         temporary_path = path.with_suffix(".tmp")
+        manifest.result_version += 1
         temporary_path.write_text(
             json.dumps(_spool_manifest_to_dict(manifest), ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -485,17 +491,34 @@ def _spool_manifest_to_dict(manifest: _SpoolManifest) -> dict[str, Any]:
         "has_more": manifest.has_more or manifest.truncated,
         "pagination_mode": manifest.pagination_mode,
         "pagination_reason": manifest.pagination_reason,
+        "result_version": manifest.result_version,
+        "first_batch_at": manifest.first_batch_at,
         "created_at": manifest.created_at,
         "updated_at": manifest.updated_at,
     }
 
 
 def _spool_manifest_from_dict(payload: dict[str, Any]) -> _SpoolManifest:
+    loaded_rows = int(payload.get("loaded_rows", 0))
+    updated_at = float(payload.get("updated_at", time.time()))
+    result_version = payload.get("result_version")
+    if not isinstance(result_version, int) or result_version < 0:
+        result_version = int(
+            bool(
+                loaded_rows
+                or payload.get("columns")
+                or payload.get("truncated")
+                or payload.get("pagination_mode")
+            )
+        )
+    first_batch_at = payload.get("first_batch_at")
+    if not isinstance(first_batch_at, (int, float)):
+        first_batch_at = updated_at if loaded_rows > 0 else None
     return _SpoolManifest(
         result_set_id=str(payload["result_set_id"]),
         parts=[_PartInfo(**part) for part in payload.get("parts", [])],
         columns=[Column.model_validate(column) for column in payload.get("columns", [])],
-        loaded_rows=int(payload.get("loaded_rows", 0)),
+        loaded_rows=loaded_rows,
         data_bytes=int(payload.get("data_bytes", 0)),
         truncated=bool(payload.get("truncated", False)),
         has_more=bool(payload.get("has_more", payload.get("truncated", False))),
@@ -509,8 +532,10 @@ def _spool_manifest_from_dict(payload: dict[str, Any]) -> _SpoolManifest:
             if isinstance(payload.get("pagination_reason"), str)
             else None
         ),
+        result_version=result_version,
+        first_batch_at=float(first_batch_at) if first_batch_at is not None else None,
         created_at=float(payload.get("created_at", time.time())),
-        updated_at=float(payload.get("updated_at", time.time())),
+        updated_at=updated_at,
     )
 
 

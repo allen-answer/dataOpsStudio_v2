@@ -1,11 +1,28 @@
 <script setup lang="ts">
 import { Search } from 'lucide-vue-next'
+import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import NavRail from '../components/NavRail.vue'
 import UserMenu from '../components/UserMenu.vue'
 import LicenseBanner from '../components/LicenseBanner.vue'
+import { getBuildInfo, type BuildInfo } from '../api/version'
 
 const { t } = useI18n()
+const buildInfo = ref<BuildInfo | null>(null)
+const versionLabel = computed(() => {
+  const info = buildInfo.value
+  if (!info) return '2.0'
+  const commit = info.commit === 'unknown' ? '' : ` · ${info.commit.slice(0, 7)}`
+  return `v${info.version}${commit}`
+})
+
+onMounted(async () => {
+  try {
+    buildInfo.value = await getBuildInfo()
+  } catch {
+    // Version display is diagnostic only; it must never block the application shell.
+  }
+})
 </script>
 
 <template>
@@ -24,8 +41,10 @@ const { t } = useI18n()
           </span>
           <span
             class="text-[10px] font-mono font-semibold px-1.5 py-0.5 rounded-input chrome-accent-light-bg chrome-accent uppercase tracking-wider"
+            :title="buildInfo ? `image ${buildInfo.image_version} · commit ${buildInfo.commit}` : 'build version unavailable'"
+            data-testid="build-version"
           >
-            2.0
+            {{ versionLabel }}
           </span>
         </div>
 

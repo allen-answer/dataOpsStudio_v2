@@ -59,6 +59,7 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("DELETE", "/api/datasources/{datasource_id}") in routes
     assert ("POST", "/api/datasources/{datasource_id}/test") in routes
     assert ("POST", "/api/sql/execute") in routes
+    assert ("GET", "/api/version") in routes
     assert ("GET", "/api/sql/consoles") in routes
     assert ("POST", "/api/sql/consoles") in routes
     assert ("PATCH", "/api/sql/consoles/{console_id}") in routes
@@ -114,6 +115,7 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("POST", "/api/datasources/{datasource_id}/ai/slow-sql-diagnose") in routes
     assert ("GET", "/api/jobs") in routes
     assert ("GET", "/api/jobs/{job_id}") in routes
+    assert ("GET", "/api/jobs/{job_id}/progress") in routes
     assert ("GET", "/api/jobs/{job_id}/result") in routes
     assert ("POST", "/api/jobs/{job_id}/pages") in routes
     assert ("POST", "/api/jobs/{job_id}/export") in routes
@@ -131,6 +133,24 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("POST", "/api/admin/ai-config/test") in routes
     assert ("GET", "/api/admin/system-settings") in routes
     assert ("PUT", "/api/admin/system-settings") in routes
+
+
+def test_version_is_public_and_reports_sanitized_build_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATAOPS_BUILD_VERSION", "2.0.1-test")
+    monkeypatch.setenv("DATAOPS_BUILD_COMMIT", "abcdef0123456789")
+    monkeypatch.setenv("DATAOPS_IMAGE_VERSION", "2.0.1-test-image")
+    app = create_app(services=cast(ApiServices, _NoopServices()))
+
+    response = AsgiClient(app).get("/api/version")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "version": "2.0.1-test",
+        "commit": "abcdef0123456789",
+        "image_version": "2.0.1-test-image",
+    }
 
 
 @pytest.mark.parametrize(
@@ -199,6 +219,96 @@ def test_sql_execute_separates_page_size_and_safety_limit() -> None:
     assert payload["page_size"] == 100
     assert payload["max_result_rows"] == 5_000
     assert payload["pagination_mode"] == "ordered_offset"
+    assert payload["db_type"] == "mysql"
+
+
+def test_job_progress_returns_manifest_version_without_fetching_rows() -> None:
+    created_at = datetime(2026, 8, 12, 1, 0, tzinfo=UTC)
+    started_at = created_at + timedelta(seconds=2)
+    job_row = {
+        "id": "job-progress",
+        "kind": "sql_query",
+        "status": "running",
+        "owner_user_id": "user-1",
+        "project_id": "project-1",
+        "datasource_ids": ["ds-1"],
+        "worker_id": "worker-a",
+        "created_at": created_at,
+        "started_at": started_at,
+        "finished_at": None,
+        "error_code": None,
+        "payload": {
+            "result_set_id": "rs-progress",
+            "max_result_rows": 1000,
+            "db_type": "mysql",
+            "limit_pushdown": False,
+            "limit_pushdown_reason": "aggregate_requires_full_input",
+            "output_limit_applied": True,
+            "query_shape": "aggregate",
+        },
+        "result_ref": {
+            "backend": "local_fs",
+            "uri": "resultsets/rs-progress/manifest.json",
+            "metadata": {
+                "timings": {"connect_ms": 12, "execute_first_row_ms": 30},
+                "execution": {
+                    "connect_started_at": "2026-08-12T01:00:02+00:00",
+                    "connected_at": "2026-08-12T01:00:02.012+00:00",
+                    "rows_read": 101,
+                    "rows_returned": 100,
+                    "effective_sql_hash": "a" * 64,
+                },
+            },
+        },
+    }
+    result_store = _ResultStore(
+        rows=[Row(values=["must-not-be-read"])],
+        manifest={
+            "columns": [{"name": "count", "type": "integer"}],
+            "loaded_rows": 100,
+            "result_version": 3,
+            "first_batch_at": created_at.timestamp() + 3,
+            "truncated": False,
+            "has_more": True,
+            "pagination_mode": "unavailable",
+            "pagination_reason": "top_level_order_by_required",
+        },
+    )
+    services = _Services(
+        _FakeEngine([job_row, {"id": "project-1"}]),
+        result_store=result_store,
+    )
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).get(
+        "/api/jobs/job-progress/progress",
+        headers=_auth_headers(),
+        params={"after_version": 2},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "running"
+    assert payload["loaded_rows"] == 100
+    assert payload["result_version"] == 3
+    assert payload["has_new_result"] is True
+    assert payload["first_batch_ready"] is True
+    assert payload["retry_after_ms"] == 1000
+    assert payload["timings"] == {
+        "queue_ms": 2000,
+        "connect_ms": 12,
+        "execute_first_row_ms": 30,
+        "fetch_ms": None,
+        "spool_ms": None,
+        "total_ms": None,
+    }
+    assert payload["execution"]["rows_read"] == 101
+    assert payload["execution"]["rows_returned"] == 100
+    assert payload["execution"]["limit_pushdown"] is False
+    assert payload["execution"]["output_limit_applied"] is True
+    assert payload["execution"]["query_shape"] == "aggregate"
+    assert payload["execution"]["worker_id"] == "worker-a"
+    assert "must-not-be-read" not in response.body.decode()
 
 
 def test_sql_execute_rejects_conflicting_new_and_legacy_safety_limits() -> None:

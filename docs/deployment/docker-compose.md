@@ -82,7 +82,14 @@ exported as `PGPASSWORD` for libpq — the same pattern the dev Makefile uses.
 
 ### 1. Build and start
 
+Set a unique image tag and the source commit for every release build, then start
+the stack. The values are public build metadata, not credentials.
+
 ```bash
+export DATAOPS_BUILD_VERSION=2.0.1
+export DATAOPS_BUILD_COMMIT="$(git rev-parse HEAD)"
+SHORT_COMMIT="$(git rev-parse --short=12 HEAD)"
+export DATAOPS_IMAGE_VERSION="2.0.1-${SHORT_COMMIT}"
 docker compose -f docker/compose.dataops.yml up -d --build
 ```
 
@@ -99,7 +106,19 @@ Health check:
 ```bash
 curl -sS http://127.0.0.1:18020/healthz
 # {"status":"ok"}
+
+curl -sS http://127.0.0.1:18020/api/version
+# {"version":"2.0.1","commit":"<git-sha>","image_version":"<image-tag>"}
+
+API_IMAGE_ID="$(docker inspect dataops-v2-stack-api --format '{{.Image}}')"
+WORKER_IMAGE_ID="$(docker inspect dataops-v2-stack-worker --format '{{.Image}}')"
+test "$API_IMAGE_ID" = "$WORKER_IMAGE_ID"
 ```
+
+The last assertion prevents a partial rollout in which the API serves new UI or
+contracts while the worker still executes old SQL behavior. The same build
+identity appears in the application header; hover it to see the image tag and
+full commit.
 
 ### 2. Create the admin user
 

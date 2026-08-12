@@ -616,6 +616,14 @@ test('export picks a format, polls the job, then downloads a one-time link', asy
       result_set_id: 'rs-1',
     }),
   )
+  await page.route(/\/api\/jobs\/job-1\/progress\?/, (r) =>
+    json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', status: 'success', loaded_rows: 1,
+      result_version: 1, columns_ready: true, first_batch_ready: true, terminal: true,
+      error: null, error_code: null, retry_after_ms: 0, has_new_result: true,
+      truncated: false, has_more: false, timings: null, execution: null,
+    }),
+  )
   await page.route(/\/api\/jobs\/job-1\/result\?/, (r) =>
     json(r, 200, {
       job_id: 'job-1',
@@ -701,6 +709,14 @@ test('export rate limit (429) shows a friendly hint', async ({ page }) => {
       error_code: null,
       message: null,
       result_set_id: 'rs-1',
+    }),
+  )
+  await page.route(/\/api\/jobs\/job-1\/progress\?/, (r) =>
+    json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', status: 'success', loaded_rows: 1,
+      result_version: 1, columns_ready: true, first_batch_ready: true, terminal: true,
+      error: null, error_code: null, retry_after_ms: 0, has_new_result: true,
+      truncated: false, has_more: false, timings: null, execution: null,
     }),
   )
   await page.route(/\/api\/jobs\/job-1\/result\?/, (r) =>

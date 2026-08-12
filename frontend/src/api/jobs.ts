@@ -24,6 +24,55 @@ export interface JobStageTimings {
   total_ms: number | null
 }
 
+export interface JobExecutionMetrics {
+  queued_at: string | null
+  claimed_at: string | null
+  connect_started_at: string | null
+  connected_at: string | null
+  execute_started_at: string | null
+  first_row_at: string | null
+  first_batch_at: string | null
+  finished_reading_at: string | null
+  finished_at: string | null
+  queue_ms: number | null
+  connect_ms: number | null
+  execute_to_first_row_ms: number | null
+  fetch_ms: number | null
+  spool_ms: number | null
+  total_ms: number | null
+  rows_read: number | null
+  rows_returned: number | null
+  max_rows: number | null
+  limit_pushdown: boolean | null
+  limit_pushdown_reason: string | null
+  output_limit_applied: boolean | null
+  query_shape: string | null
+  effective_sql_hash: string | null
+  db_type: string | null
+  worker_id: string | null
+}
+
+export interface JobProgressResponse {
+  job_id: string
+  result_set_id: string | null
+  status: JobStatus
+  loaded_rows: number
+  result_version: number
+  columns_ready: boolean
+  first_batch_ready: boolean
+  terminal: boolean
+  error: string | null
+  error_code: JobErrorCode | null
+  retry_after_ms: number
+  has_new_result: boolean
+  truncated: boolean | null
+  has_more: boolean | null
+  pagination_mode?: 'ordered_offset' | 'unavailable' | null
+  pagination_reason?: string | null
+  timings: JobStageTimings | null
+  execution: JobExecutionMetrics | null
+}
+
 export interface JobResultResponse {
   job_id: string
   result_set_id: string
@@ -70,6 +119,17 @@ export function getJob(jobId: string): Promise<JobResponse> {
   return apiClient.get<JobResponse>(`/jobs/${jobId}`)
 }
 
+export function getJobProgress(
+  jobId: string,
+  afterVersion: number,
+  signal?: AbortSignal,
+): Promise<JobProgressResponse> {
+  const qs = new URLSearchParams({ after_version: String(afterVersion) })
+  return apiClient.get<JobProgressResponse>(`/jobs/${jobId}/progress?${qs.toString()}`, {
+    signal,
+  })
+}
+
 /**
  * GET /jobs/{id}/result —— pending/running/success 均可拉;用于边拉边看。
  */
@@ -77,9 +137,10 @@ export function getJobResult(
   jobId: string,
   offset: number = 0,
   limit: number = 100,
+  signal?: AbortSignal,
 ): Promise<JobResultResponse> {
   const qs = new URLSearchParams({ offset: String(offset), limit: String(limit) })
-  return apiClient.get<JobResultResponse>(`/jobs/${jobId}/result?${qs.toString()}`)
+  return apiClient.get<JobResultResponse>(`/jobs/${jobId}/result?${qs.toString()}`, { signal })
 }
 
 /**

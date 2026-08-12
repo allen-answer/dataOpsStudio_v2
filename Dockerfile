@@ -48,6 +48,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ── Stage 2: lean runtime ─────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
 
+ARG DATAOPS_BUILD_VERSION=2.0.1
+ARG DATAOPS_BUILD_COMMIT=unknown
+ARG DATAOPS_IMAGE_VERSION=2.0.1
+
 # libpq runtime is bundled by psycopg[binary]; only need a CA bundle + tini for
 # correct PID-1 signal forwarding (graceful worker drain on SIGTERM).
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -71,7 +75,13 @@ COPY --from=builder --chown=dataops:dataops /app/pyproject.toml /app/pyproject.t
 # Put the venv on PATH so `python -m app.main` resolves the locked interpreter.
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    DATAOPS_BUILD_VERSION="${DATAOPS_BUILD_VERSION}" \
+    DATAOPS_BUILD_COMMIT="${DATAOPS_BUILD_COMMIT}" \
+    DATAOPS_IMAGE_VERSION="${DATAOPS_IMAGE_VERSION}"
+
+LABEL org.opencontainers.image.version="${DATAOPS_BUILD_VERSION}" \
+      org.opencontainers.image.revision="${DATAOPS_BUILD_COMMIT}"
 
 USER dataops
 

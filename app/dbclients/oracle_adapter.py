@@ -197,6 +197,10 @@ class OracleAdapter(DatabaseAdapter):
     def query_timings_ms(self) -> dict[str, int]:
         return self._query_timing.snapshot()
 
+    @property
+    def query_execution_metrics(self) -> dict[str, int | str | None]:
+        return self._query_timing.execution_snapshot()
+
     def execute_select(self, sql: str, params: dict[str, Any]) -> Iterator[Row]:
         guarded_sql = validate_readonly_sql(sql)
         return self._stream_select(guarded_sql, params)
@@ -361,6 +365,7 @@ class OracleAdapter(DatabaseAdapter):
         cursor = None
         started_at = time.monotonic()
         self._query_timing.reset()
+        self._query_timing.mark_connect_started()
         connect_started = time.monotonic()
         try:
             conn = self._connect()
@@ -374,6 +379,7 @@ class OracleAdapter(DatabaseAdapter):
             cursor = conn.cursor()
             cursor.arraysize = self._fetch_chunk_size
             try:
+                self._query_timing.mark_execute_started()
                 execute_started = time.monotonic()
                 cursor.execute(sql, params or None)
                 self._query_timing.record_execute(_elapsed_ms(execute_started))
@@ -386,7 +392,9 @@ class OracleAdapter(DatabaseAdapter):
                 try:
                     fetch_started = time.monotonic()
                     batch = cursor.fetchmany(self._fetch_chunk_size)
-                    self._query_timing.record_fetch(_elapsed_ms(fetch_started))
+                    self._query_timing.record_fetch(
+                        _elapsed_ms(fetch_started), row_count=len(batch)
+                    )
                 except Exception as exc:
                     raise self._driver_error("Oracle fetch failed", exc) from exc
                 if not batch:

@@ -26,22 +26,70 @@ DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 3600
 DEFAULT_LICENSE_ENFORCEMENT_ENABLED = True
 
 
+@dataclass(frozen=True)
+class RateLimitRule:
+    limit: int
+    window_seconds: int = 60
+
+
+@dataclass(frozen=True)
+class RateLimitDecision:
+    allowed: bool
+    retry_after_seconds: float = 0.0
+
+
+def _default_rate_limit_policies() -> dict[str, RateLimitRule]:
+    return {
+        "auth": RateLimitRule(limit=10),
+        "sensitive_write": RateLimitRule(limit=60),
+        "sql_control": RateLimitRule(limit=30),
+        "job_read": RateLimitRule(limit=300),
+        "general_read": RateLimitRule(limit=120),
+    }
+
+
 @dataclass
 class RateLimiter:
-    limit: int = 120
+    """Small in-process sliding-window limiter with independent policy buckets.
+
+    ``limit`` remains an explicit all-groups override for integration fixtures and
+    callers which used the pre-grouped limiter. Production defaults use ``policies``.
+    """
+
+    limit: int | None = None
     window_seconds: int = 60
-    _hits: dict[str, list[float]] = field(default_factory=dict)
+    policies: dict[str, RateLimitRule] = field(default_factory=_default_rate_limit_policies)
+    _hits: dict[tuple[str, str], list[float]] = field(default_factory=dict)
+
+    def check(
+        self,
+        key: str,
+        *,
+        group: str = "general_read",
+        now: float | None = None,
+    ) -> RateLimitDecision:
+        current = time.monotonic() if now is None else now
+        rule = self._rule(group)
+        bucket = (group, key)
+        cutoff = current - rule.window_seconds
+        hits = [item for item in self._hits.get(bucket, []) if item >= cutoff]
+        if len(hits) >= rule.limit:
+            self._hits[bucket] = hits
+            retry_after = max(0.001, hits[0] + rule.window_seconds - current)
+            return RateLimitDecision(allowed=False, retry_after_seconds=retry_after)
+        hits.append(current)
+        self._hits[bucket] = hits
+        return RateLimitDecision(allowed=True)
 
     def allow(self, key: str, *, now: float | None = None) -> bool:
-        current = time.monotonic() if now is None else now
-        cutoff = current - self.window_seconds
-        hits = [item for item in self._hits.get(key, []) if item >= cutoff]
-        if len(hits) >= self.limit:
-            self._hits[key] = hits
-            return False
-        hits.append(current)
-        self._hits[key] = hits
-        return True
+        """Compatibility entrypoint for existing tests and injected callers."""
+
+        return self.check(key, now=now).allowed
+
+    def _rule(self, group: str) -> RateLimitRule:
+        if self.limit is not None:
+            return RateLimitRule(limit=self.limit, window_seconds=self.window_seconds)
+        return self.policies.get(group, self.policies["general_read"])
 
 
 @dataclass

@@ -116,6 +116,10 @@ class PostgresqlAdapter(DatabaseAdapter):
     def query_timings_ms(self) -> dict[str, int]:
         return self._query_timing.snapshot()
 
+    @property
+    def query_execution_metrics(self) -> dict[str, int | str | None]:
+        return self._query_timing.execution_snapshot()
+
     def execute_select(self, sql: str, params: dict[str, Any]) -> Iterator[Row]:
         guarded_sql = validate_readonly_sql(sql)
         return self._stream_select(guarded_sql, params)
@@ -284,6 +288,7 @@ class PostgresqlAdapter(DatabaseAdapter):
         cursor = None
         started_at = time.monotonic()
         self._query_timing.reset()
+        self._query_timing.mark_connect_started()
         connect_started = time.monotonic()
         try:
             conn = self._connect()
@@ -293,6 +298,7 @@ class PostgresqlAdapter(DatabaseAdapter):
         try:
             self._apply_statement_timeout(conn)
             cursor = conn.cursor()
+            self._query_timing.mark_execute_started()
             execute_started = time.monotonic()
             self._execute_with_cancel(conn, cursor, sql, params)
             self._query_timing.record_execute(_elapsed_ms(execute_started))
@@ -302,7 +308,7 @@ class PostgresqlAdapter(DatabaseAdapter):
                 self._check_cursor_deadline(started_at)
                 fetch_started = time.monotonic()
                 batch = cursor.fetchmany(self._fetch_chunk_size)
-                self._query_timing.record_fetch(_elapsed_ms(fetch_started))
+                self._query_timing.record_fetch(_elapsed_ms(fetch_started), row_count=len(batch))
                 if not batch:
                     break
                 for raw_row in batch:

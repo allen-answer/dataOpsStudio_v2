@@ -74,9 +74,11 @@ from app.api.schemas import (
     ExportCreateRequest,
     ExportCreateResponse,
     ExportFormat,
+    JobExecutionMetrics,
     JobListItem,
     JobPageRequest,
     JobPageResponse,
+    JobProgressResponse,
     JobResponse,
     JobResultResponse,
     JobStageTimings,
@@ -184,7 +186,11 @@ from app.db.models import (
 )
 from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
-from app.dbclients.query_limit import QueryLimitError, supports_ordered_pagination
+from app.dbclients.query_limit import (
+    QueryLimitError,
+    analyze_database_row_limit,
+    supports_ordered_pagination,
+)
 from app.dbclients.sql_build import limit_clause, quote_identifier
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.ai import AiContext, AiOptions, ContextItem, EgressLevel, ReasoningMode
@@ -982,7 +988,9 @@ def execute_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse
     result_set_id = new_id()
     sql_hash = _sql_hash(sql)
     try:
-        ordered_pagination = supports_ordered_pagination(sql, DbType(str(row["db_type"])))
+        db_type = DbType(str(row["db_type"]))
+        ordered_pagination = supports_ordered_pagination(sql, db_type)
+        limit_analysis = analyze_database_row_limit(sql, db_type)
     except QueryLimitError as exc:
         raise ApiError(400, "invalid_sql", "SQL could not be safely parsed") from exc
     pagination_mode = "ordered_offset" if ordered_pagination else "unavailable"
@@ -1015,6 +1023,11 @@ def execute_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse
             "pagination_mode": pagination_mode,
             "pagination_reason": pagination_reason,
             "page_offset": 0,
+            "db_type": str(row["db_type"]),
+            "query_shape": limit_analysis.query_shape,
+            "limit_pushdown": limit_analysis.limit_pushdown,
+            "limit_pushdown_reason": limit_analysis.limit_pushdown_reason,
+            "output_limit_applied": limit_analysis.output_limit_applied,
         },
     )
     _create_result_set_placeholder(
@@ -6342,6 +6355,56 @@ def get_job(job_id: str, request: Request) -> JobResponse:
     return _job_response(row)
 
 
+@router.get("/jobs/{job_id}/progress", response_model=JobProgressResponse)
+def get_job_progress(
+    job_id: str,
+    request: Request,
+    after_version: int = Query(default=0, ge=0),
+) -> JobProgressResponse:
+    """Return job and spool progress without loading Parquet result rows."""
+
+    services = services_from(request)
+    row = _job_for_current_user(request, job_id)
+    status = JobStatus(str(row["status"]))
+    terminal = status in {
+        JobStatus.SUCCESS,
+        JobStatus.FAILED,
+        JobStatus.CANCELLED,
+        JobStatus.TIMEOUT,
+    }
+    result_set_id = _result_set_id_from_payload(row)
+    manifest = (
+        _spool_manifest_or_none(services, result_set_id) if result_set_id is not None else None
+    )
+    loaded_rows = _int_from_manifest(manifest, "loaded_rows") or 0
+    result_version = _int_from_manifest(manifest, "result_version") or 0
+    columns_ready = bool(_columns_from_manifest(manifest))
+    first_batch_at = _manifest_datetime(manifest, "first_batch_at")
+    first_batch_ready = first_batch_at is not None or (terminal and columns_ready)
+    has_new_result = result_version > after_version
+    error_code = _job_error_code(row)
+    return JobProgressResponse(
+        job_id=job_id,
+        result_set_id=result_set_id,
+        status=status,
+        loaded_rows=loaded_rows,
+        result_version=result_version,
+        columns_ready=columns_ready,
+        first_batch_ready=first_batch_ready,
+        terminal=terminal,
+        error="Job failed" if status in {JobStatus.FAILED, JobStatus.TIMEOUT} else None,
+        error_code=error_code,
+        retry_after_ms=0 if terminal else (1000 if has_new_result else 2000),
+        has_new_result=has_new_result,
+        truncated=_bool_from_manifest(manifest, "truncated"),
+        has_more=_bool_from_manifest(manifest, "has_more"),
+        pagination_mode=_manifest_pagination_mode(manifest),
+        pagination_reason=_manifest_optional_str(manifest, "pagination_reason"),
+        timings=_job_stage_timings(row),
+        execution=_job_execution_metrics(row, manifest),
+    )
+
+
 @router.get("/jobs/{job_id}/result", response_model=JobResultResponse)
 def get_job_result(
     job_id: str,
@@ -9062,6 +9125,132 @@ def _job_stage_timings(row: RowMapping) -> JobStageTimings | None:
     if not any(value is not None for value in timings.values()):
         return None
     return JobStageTimings(**timings)
+
+
+def _job_execution_metrics(
+    row: RowMapping,
+    manifest: dict[str, Any] | None,
+) -> JobExecutionMetrics:
+    payload = row["payload"] if isinstance(row["payload"], dict) else {}
+    execution = _job_result_metadata_section(row, "execution")
+    timings = _job_stage_timings(row)
+    loaded_rows = _int_from_manifest(manifest, "loaded_rows")
+    return JobExecutionMetrics(
+        queued_at=_row_datetime(row, "created_at"),
+        claimed_at=_row_datetime(row, "started_at"),
+        connect_started_at=_dict_datetime(execution, "connect_started_at"),
+        connected_at=_dict_datetime(execution, "connected_at"),
+        execute_started_at=_dict_datetime(execution, "execute_started_at"),
+        first_row_at=_dict_datetime(execution, "first_row_at"),
+        first_batch_at=(
+            _manifest_datetime(manifest, "first_batch_at")
+            or _dict_datetime(execution, "first_batch_at")
+        ),
+        finished_reading_at=_dict_datetime(execution, "finished_reading_at"),
+        finished_at=_row_datetime(row, "finished_at"),
+        queue_ms=timings.queue_ms if timings else None,
+        connect_ms=timings.connect_ms if timings else None,
+        execute_to_first_row_ms=timings.execute_first_row_ms if timings else None,
+        fetch_ms=timings.fetch_ms if timings else None,
+        spool_ms=timings.spool_ms if timings else None,
+        total_ms=timings.total_ms if timings else None,
+        rows_read=_dict_int(execution, "rows_read"),
+        rows_returned=_dict_int(execution, "rows_returned", fallback=loaded_rows),
+        max_rows=_payload_positive_int(payload, "max_result_rows", fallback_key="max_rows"),
+        limit_pushdown=_dict_bool_or_payload(execution, payload, "limit_pushdown"),
+        limit_pushdown_reason=_dict_str_or_payload(execution, payload, "limit_pushdown_reason"),
+        output_limit_applied=_dict_bool_or_payload(execution, payload, "output_limit_applied"),
+        query_shape=_dict_str_or_payload(execution, payload, "query_shape"),
+        effective_sql_hash=_dict_str(execution, "effective_sql_hash"),
+        db_type=_dict_str_or_payload(execution, payload, "db_type"),
+        worker_id=_row_optional_str(row, "worker_id"),
+    )
+
+
+def _job_result_metadata_section(row: RowMapping, key: str) -> dict[str, Any]:
+    result_ref = row.get("result_ref")
+    if not isinstance(result_ref, dict):
+        return {}
+    metadata = result_ref.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    value = metadata.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _row_datetime(row: RowMapping, key: str) -> datetime | None:
+    return _datetime_from_value(row.get(key))
+
+
+def _row_optional_str(row: RowMapping, key: str) -> str | None:
+    value = row.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _dict_datetime(values: dict[str, Any], key: str) -> datetime | None:
+    return _datetime_from_value(values.get(key))
+
+
+def _manifest_datetime(manifest: dict[str, Any] | None, key: str) -> datetime | None:
+    return _datetime_from_value(manifest.get(key) if manifest else None)
+
+
+def _datetime_from_value(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return datetime.fromtimestamp(value, UTC)
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _dict_int(values: dict[str, Any], key: str, *, fallback: int | None = None) -> int | None:
+    value = values.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return fallback
+
+
+def _payload_positive_int(
+    payload: dict[str, Any],
+    key: str,
+    *,
+    fallback_key: str | None = None,
+) -> int | None:
+    value = payload.get(key)
+    if value is None and fallback_key is not None:
+        value = payload.get(fallback_key)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def _dict_bool_or_payload(
+    values: dict[str, Any],
+    payload: dict[str, Any],
+    key: str,
+) -> bool | None:
+    value = values.get(key, payload.get(key))
+    return value if isinstance(value, bool) else None
+
+
+def _dict_str(values: dict[str, Any], key: str) -> str | None:
+    value = values.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _dict_str_or_payload(
+    values: dict[str, Any],
+    payload: dict[str, Any],
+    key: str,
+) -> str | None:
+    value = values.get(key, payload.get(key))
+    return value if isinstance(value, str) and value else None
 
 
 def _datetime_delta_ms(start: object, end: object) -> int | None:

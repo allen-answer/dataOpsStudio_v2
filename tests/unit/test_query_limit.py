@@ -4,6 +4,7 @@ import pytest
 
 from app.dbclients.query_limit import (
     QueryLimitError,
+    analyze_database_row_limit,
     apply_database_page,
     apply_database_row_limit,
     supports_ordered_pagination,
@@ -180,3 +181,72 @@ def test_parameterized_fetch_is_preserved_for_oracle_compatible_dialects(
 
     assert ":row_count" in limited
     assert limited.endswith("FETCH FIRST 101 ROWS ONLY")
+
+
+@pytest.mark.parametrize("db_type", [DbType.MYSQL, DbType.DM])
+@pytest.mark.parametrize(
+    ("sql", "shape", "pushdown", "reason"),
+    [
+        (
+            "SELECT id FROM items WHERE active = 1",
+            "simple_select",
+            True,
+            "top_level_limit_can_stop_row_production",
+        ),
+        (
+            "SELECT category, COUNT(*) FROM items GROUP BY category",
+            "aggregate",
+            False,
+            "aggregate_requires_full_input",
+        ),
+        (
+            "SELECT DISTINCT category FROM items",
+            "distinct",
+            False,
+            "distinct_requires_deduplication",
+        ),
+        (
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM items",
+            "window",
+            False,
+            "window_requires_partition_input",
+        ),
+        (
+            "SELECT id FROM current_items UNION ALL SELECT id FROM archived_items",
+            "set_operation",
+            False,
+            "set_operation_requires_combined_input",
+        ),
+        (
+            "SELECT id FROM items ORDER BY created_at",
+            "ordered",
+            False,
+            "order_by_may_require_full_sort",
+        ),
+    ],
+)
+def test_limit_analysis_does_not_confuse_output_cap_with_scan_reduction(
+    db_type: DbType,
+    sql: str,
+    shape: str,
+    pushdown: bool,
+    reason: str,
+) -> None:
+    analysis = analyze_database_row_limit(sql, db_type)
+
+    assert analysis.query_shape == shape
+    assert analysis.limit_pushdown is pushdown
+    assert analysis.limit_pushdown_reason == reason
+    assert analysis.output_limit_applied is True
+
+
+@pytest.mark.parametrize("db_type", [DbType.MYSQL, DbType.DM, DbType.POSTGRESQL])
+def test_aggregate_limit_is_applied_only_to_final_output(db_type: DbType) -> None:
+    limited = apply_database_row_limit(
+        "SELECT category, COUNT(*) AS item_count FROM items GROUP BY category",
+        db_type,
+        101,
+    )
+
+    assert limited.count("101") == 1
+    assert limited.rfind("101") > limited.rfind("GROUP BY")
