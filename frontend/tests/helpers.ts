@@ -24,6 +24,13 @@ export const ADMIN_JWT =
 
 /** 在页面加载前注入 token + 锁定语言为 en(断言文案稳定),并清状态。 */
 export async function seedAdminAuth(page: Page): Promise<void> {
+  await page.route('**/api/version', (route) =>
+    json(route, 200, {
+      version: '2.0.1-test',
+      commit: 'abcdef0123456789',
+      image_version: 'test',
+    }),
+  )
   await page.addInitScript(
     ([token]) => {
       localStorage.setItem('dataops-token', token)

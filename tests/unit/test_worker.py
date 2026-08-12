@@ -112,6 +112,84 @@ def test_worker_stops_sql_query_at_requested_max_rows_and_marks_truncated() -> N
     assert backend.failed == []
 
 
+def test_worker_publishes_first_batch_and_safe_execution_metrics(tmp_path: Path) -> None:
+    job = _make_job(
+        payload={
+            "sql": "SELECT n FROM items",
+            "params": {"private_value": "must-not-leak"},
+            "result_set_id": "rs-metrics",
+            "page_size": 100,
+            "max_result_rows": 100,
+            "query_shape": "simple_select",
+            "limit_pushdown": True,
+            "limit_pushdown_reason": "top_level_limit_can_stop_row_production",
+            "output_limit_applied": True,
+        }
+    )
+    backend = _FakeBackend([job])
+    result_store = LocalFsResultStore(tmp_path)
+    adapter = _TimedRangeAdapter(1000)
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=1000),
+    )
+
+    assert runner.run_once() is True
+
+    assert adapter.rows_yielded == 101
+    assert adapter.closed is True
+    assert len(backend.updated_result_refs) >= 2
+    first_batch_ref = next(
+        ref
+        for _, ref in backend.updated_result_refs
+        if ref.metadata.get("execution", {}).get("rows_returned") == 100
+    )
+    execution = first_batch_ref.metadata["execution"]
+    assert execution["rows_read"] == 100
+    assert execution["rows_returned"] == 100
+    assert execution["max_rows"] == 100
+    assert execution["limit_pushdown"] is True
+    assert execution["output_limit_applied"] is True
+    assert execution["first_batch_at"] is not None
+    assert execution["effective_sql_hash"] != job.payload["sql"]
+    assert "must-not-leak" not in repr(first_batch_ref)
+    final_execution = backend.completed[0][1].metadata["execution"]
+    assert final_execution["rows_read"] == 101
+    assert final_execution["finished_reading_at"] is not None
+
+
+def test_worker_failure_closes_stream_and_publishes_partial_metrics(tmp_path: Path) -> None:
+    job = _make_job(
+        payload={
+            "sql": "SELECT n FROM items",
+            "result_set_id": "rs-failed-metrics",
+            "page_size": 10,
+            "max_result_rows": 100,
+        }
+    )
+    backend = _FakeBackend([job])
+    adapter = _FailingTimedAdapter([Row(values=[1])])
+    runner = WorkerRunner(
+        backend,
+        LocalFsResultStore(tmp_path),
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.completed == []
+    assert backend.failed == [("job-1", "sql_failed")]
+    assert adapter.closed is True
+    execution = backend.updated_result_refs[-1][1].metadata["execution"]
+    assert execution["rows_read"] == 1
+    assert execution["finished_reading_at"] is not None
+
+
 def test_worker_fetches_only_first_page_then_continuation_appends_next_database_page() -> None:
     first = _make_job(
         payload={
@@ -1235,6 +1313,7 @@ class _FakeBackend:
         self.cancelled_pending: list[tuple[str, str]] = []
         self.jobs_by_id: dict[str, Job] = {job.id: job for job in jobs}
         self.get_job_calls: list[str] = []
+        self.updated_result_refs: list[tuple[str, ResultRef]] = []
 
     def claim_next(self, worker_id: str) -> Job | None:
         if not self._jobs:
@@ -1244,6 +1323,9 @@ class _FakeBackend:
 
     def complete(self, job_id: str, result_ref: ResultRef) -> None:
         self.completed.append((job_id, result_ref))
+
+    def update_result_ref(self, job_id: str, result_ref: ResultRef) -> None:
+        self.updated_result_refs.append((job_id, result_ref))
 
     def fail(self, job_id: str, error: str) -> None:
         self.failed.append((job_id, error))
@@ -1574,6 +1656,52 @@ class _RangeAdapter:
     def build_compare_hash_query(self, request: object) -> CompareHashPlan:
         del request
         return CompareHashPlan(execution_mode=CompareHashExecutionMode.CLIENT_ROW_HASH)
+
+
+class _TimedRangeAdapter(_RangeAdapter):
+    @property
+    def query_timings_ms(self) -> dict[str, int]:
+        return {"connect_ms": 4, "execute_first_row_ms": 8, "fetch_ms": 12}
+
+    @property
+    def query_execution_metrics(self) -> dict[str, int | str | None]:
+        return {
+            **self.query_timings_ms,
+            "connect_started_at": "2026-08-12T01:00:00+00:00",
+            "connected_at": "2026-08-12T01:00:00.004+00:00",
+            "execute_started_at": "2026-08-12T01:00:00.005+00:00",
+            "first_row_at": "2026-08-12T01:00:00.013+00:00",
+        }
+
+
+class _FailingTimedAdapter(_FakeAdapter):
+    def __init__(self, rows: list[Row]) -> None:
+        super().__init__(rows)
+        self.closed = False
+
+    @property
+    def query_timings_ms(self) -> dict[str, int]:
+        return {"connect_ms": 2, "execute_first_row_ms": 5, "fetch_ms": 0}
+
+    @property
+    def query_execution_metrics(self) -> dict[str, int | str | None]:
+        return {
+            **self.query_timings_ms,
+            "connect_started_at": "2026-08-12T01:00:00+00:00",
+            "connected_at": "2026-08-12T01:00:00.002+00:00",
+            "execute_started_at": "2026-08-12T01:00:00.003+00:00",
+            "first_row_at": "2026-08-12T01:00:00.008+00:00",
+        }
+
+    def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
+        del sql, params
+        if self._column_sink is not None:
+            self._column_sink(self._columns)
+        try:
+            yield from self._rows
+            raise RuntimeError("driver read failed")
+        finally:
+            self.closed = True
 
 
 def _make_job(

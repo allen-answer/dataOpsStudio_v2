@@ -709,10 +709,59 @@ class WorkerRunner:
         accepted_rows = 0
         query_truncated = False
         spool_ms = 0
+        finished_reading_at: str | None = None
+        first_batch_published = False
         spool_batch_size = min(self._config.sql_spool_batch_size, page_size)
         rows_since_cancel_check = 0
         cancel_check_row_interval = self._config.cancel_check_row_interval
         last_heartbeat = time.monotonic()
+        effective_sql_hash = sha256(limited_sql.encode("utf-8")).hexdigest()
+
+        def query_result_ref() -> ResultRef:
+            manifest = self._result_store.get_spool_manifest(result_set_id)
+            adapter_timings = _adapter_query_timings(adapter)
+            adapter_execution = _adapter_query_execution(adapter)
+            base_ref = self._result_store.spool_ref(result_set_id)
+            if not adapter_timings and not adapter_execution:
+                # Compatibility for protocol-level/test adapters predating the
+                # additive timing properties. Production adapters expose both.
+                return base_ref
+            execution = {
+                **adapter_execution,
+                "first_batch_at": _manifest_timestamp_iso(manifest, "first_batch_at"),
+                "finished_reading_at": finished_reading_at,
+                "rows_read": accepted_rows + int(query_truncated),
+                "rows_returned": accepted_rows,
+                "max_rows": max_result_rows,
+                "limit_pushdown": _payload_optional_bool(payload, "limit_pushdown"),
+                "limit_pushdown_reason": _payload_optional_str(payload, "limit_pushdown_reason"),
+                "output_limit_applied": _payload_optional_bool(payload, "output_limit_applied"),
+                "query_shape": _payload_optional_str(payload, "query_shape"),
+                "effective_sql_hash": effective_sql_hash,
+                "db_type": datasource.db_type.value,
+                "worker_id": self._config.worker_id,
+            }
+            return base_ref.model_copy(
+                update={
+                    "metadata": {
+                        "timings": {
+                            **adapter_timings,
+                            "spool_ms": spool_ms,
+                            "worker_total_ms": _elapsed_ms(query_started_at),
+                        },
+                        "execution": execution,
+                    }
+                }
+            )
+
+        def publish_query_progress() -> ResultRef:
+            result_ref = query_result_ref()
+            updater = getattr(self._backend, "update_result_ref", None)
+            if callable(updater) and job.parent_workflow_run_id is None:
+                updater(job.id, result_ref)
+            return result_ref
+
+        publish_query_progress()
         row_stream = iter(adapter.execute_select(limited_sql, params))
         try:
             for row in row_stream:
@@ -738,15 +787,26 @@ class WorkerRunner:
                         _manifest_int(manifest, "loaded_rows"),
                         console_id,
                     )
+                    if not first_batch_published:
+                        publish_query_progress()
+                        first_batch_published = True
                     last_heartbeat = self._heartbeat_if_due(job.id, last_heartbeat, force=True)
                     if _manifest_bool(manifest, "truncated"):
                         break
                 else:
                     last_heartbeat = self._heartbeat_if_due(job.id, last_heartbeat)
+        except Exception:
+            closer = getattr(row_stream, "close", None)
+            if callable(closer):
+                closer()
+            finished_reading_at = datetime.now(UTC).isoformat()
+            publish_query_progress()
+            raise
         finally:
             closer = getattr(row_stream, "close", None)
             if callable(closer):
                 closer()
+        finished_reading_at = datetime.now(UTC).isoformat()
 
         if batch:
             spool_started_at = time.monotonic()
@@ -759,6 +819,9 @@ class WorkerRunner:
                 _spool_loaded_rows(self._result_store, result_set_id),
                 console_id,
             )
+            if not first_batch_published:
+                publish_query_progress()
+                first_batch_published = True
         if page_bounded:
             reached_safety_limit = page_offset + accepted_rows >= max_result_rows
             if query_truncated and reached_safety_limit:
@@ -773,20 +836,7 @@ class WorkerRunner:
         elif query_truncated:
             self._result_store.mark_spool_truncated(result_set_id)
         self._heartbeat(job.id)
-        result_ref = self._result_store.spool_ref(result_set_id)
-        adapter_timings = _adapter_query_timings(adapter)
-        if job.parent_workflow_run_id is None and adapter_timings:
-            result_ref = result_ref.model_copy(
-                update={
-                    "metadata": {
-                        "timings": {
-                            **adapter_timings,
-                            "spool_ms": spool_ms,
-                            "worker_total_ms": _elapsed_ms(query_started_at),
-                        }
-                    }
-                }
-            )
+        result_ref = query_result_ref()
         self._write_result_set_catalog(job, result_set_id, result_ref, columns or [], console_id)
         manifest = self._result_store.get_spool_manifest(result_set_id)
         return _ExecutionOutcome(
@@ -2613,6 +2663,11 @@ def _payload_optional_str(payload: dict[str, object], key: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _payload_optional_bool(payload: dict[str, object], key: str) -> bool | None:
+    value = payload.get(key)
+    return value if isinstance(value, bool) else None
+
+
 def _payload_non_negative_int(payload: dict[str, object], key: str) -> int:
     value = payload.get(key, 0)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -2883,12 +2938,39 @@ def _adapter_query_timings(adapter: object) -> dict[str, int]:
     raw = getattr(adapter, "query_timings_ms", {})
     if not isinstance(raw, dict):
         return {}
+    execution = getattr(adapter, "query_execution_metrics", {})
+    execution = execution if isinstance(execution, dict) else {}
     timings: dict[str, int] = {}
     for key in ("connect_ms", "execute_first_row_ms", "fetch_ms"):
+        if key == "connect_ms" and not execution.get("connected_at"):
+            continue
+        if key == "execute_first_row_ms" and not execution.get("first_row_at"):
+            continue
+        if key == "fetch_ms" and not execution.get("execute_started_at"):
+            continue
         value = raw.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             timings[key] = value
     return timings
+
+
+def _adapter_query_execution(adapter: object) -> dict[str, str | None]:
+    raw = getattr(adapter, "query_execution_metrics", {})
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    execution: dict[str, str | None] = {}
+    for key in (
+        "connect_started_at",
+        "connected_at",
+        "execute_started_at",
+        "first_row_at",
+    ):
+        value = raw.get(key)
+        if isinstance(value, str) and value:
+            execution[key] = value
+        elif value is None:
+            execution[key] = None
+    return execution
 
 
 def _log_reap_report(report: object) -> None:
@@ -2910,6 +2992,15 @@ def _manifest_int(manifest: dict[str, Any], key: str) -> int:
 def _manifest_bool(manifest: dict[str, Any], key: str) -> bool:
     value = manifest.get(key, False)
     return value if isinstance(value, bool) else False
+
+
+def _manifest_timestamp_iso(manifest: dict[str, Any], key: str) -> str | None:
+    value = manifest.get(key)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return datetime.fromtimestamp(value, UTC).isoformat()
+    if isinstance(value, str) and value:
+        return value
+    return None
 
 
 def _columns_from_manifest(manifest: dict[str, Any]) -> list[Column]:

@@ -35,6 +35,9 @@ def test_append_spool_then_fetch_range(result_store: ResultStore) -> None:
         Row(values=[2, "b"]),
         Row(values=[3, "c"]),
     ]
+    manifest = result_store.get_spool_manifest("rs-1")
+    assert manifest["result_version"] == 2
+    assert manifest["first_batch_at"] is not None
 
 
 def test_spool_exists_reflects_manifest_presence(result_store: ResultStore) -> None:

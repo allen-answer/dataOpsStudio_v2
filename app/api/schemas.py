@@ -971,6 +971,55 @@ class JobStageTimings(BaseModel):
     total_ms: int | None = None
 
 
+class JobExecutionMetrics(BaseModel):
+    queued_at: datetime | None = None
+    claimed_at: datetime | None = None
+    connect_started_at: datetime | None = None
+    connected_at: datetime | None = None
+    execute_started_at: datetime | None = None
+    first_row_at: datetime | None = None
+    first_batch_at: datetime | None = None
+    finished_reading_at: datetime | None = None
+    finished_at: datetime | None = None
+    queue_ms: int | None = None
+    connect_ms: int | None = None
+    execute_to_first_row_ms: int | None = None
+    fetch_ms: int | None = None
+    spool_ms: int | None = None
+    total_ms: int | None = None
+    rows_read: int | None = None
+    rows_returned: int | None = None
+    max_rows: int | None = None
+    limit_pushdown: bool | None = None
+    limit_pushdown_reason: str | None = None
+    output_limit_applied: bool | None = None
+    query_shape: str | None = None
+    effective_sql_hash: str | None = None
+    db_type: str | None = None
+    worker_id: str | None = None
+
+
+class JobProgressResponse(BaseModel):
+    job_id: str
+    result_set_id: str | None = None
+    status: JobStatus
+    loaded_rows: int = 0
+    result_version: int = 0
+    columns_ready: bool = False
+    first_batch_ready: bool = False
+    terminal: bool = False
+    error: str | None = None
+    error_code: JobErrorCode | None = None
+    retry_after_ms: int = 0
+    has_new_result: bool = False
+    truncated: bool | None = None
+    has_more: bool | None = None
+    pagination_mode: Literal["ordered_offset", "unavailable"] | None = None
+    pagination_reason: str | None = None
+    timings: JobStageTimings | None = None
+    execution: JobExecutionMetrics | None = None
+
+
 class JobResponse(BaseModel):
     id: str
     kind: str

@@ -95,6 +95,9 @@ async function mockWorkspace(
   const jobFinishedAt = options.jobFinishedAt ?? now
 
   await mockLicense(page)
+  await page.route('**/api/version', (r) =>
+    json(r, 200, { version: '2.0.1-test', commit: 'abcdef0123456789', image_version: 'test' }),
+  )
   await page.route(/\/api\/datasources\?/, (r) =>
     json(r, 200, [datasource(options.datasource)]),
   )
@@ -170,8 +173,42 @@ async function mockWorkspace(
       truncated: false,
     })
   })
-  await page.route('**/api/jobs/job-1', (r) => {
+  await page.route(/\/api\/jobs\/job-1\/progress\?/, (r) => {
     jobReads += 1
+    const running = jobReads <= 1
+    const loadedRows = options.progressiveRows ?? 2
+    return json(r, 200, {
+      job_id: 'job-1',
+      result_set_id: 'rs-1',
+      status: running ? 'running' : 'success',
+      loaded_rows: loadedRows,
+      result_version: 1,
+      columns_ready: true,
+      first_batch_ready: true,
+      terminal: !running,
+      error: null,
+      error_code: null,
+      retry_after_ms: running ? 1000 : 0,
+      has_new_result: running,
+      truncated: false,
+      has_more: options.hasMore ?? false,
+      pagination_mode: options.hasMore ? 'ordered_offset' : 'unavailable',
+      pagination_reason: options.hasMore
+        ? 'fresh_read_ordered_offset'
+        : 'top_level_order_by_required',
+      timings: null,
+      execution: {
+        queued_at: jobCreatedAt,
+        claimed_at: jobStartedAt,
+        finished_at: running ? null : jobFinishedAt,
+        max_rows: 1000,
+        output_limit_applied: true,
+        limit_pushdown: true,
+        query_shape: 'simple_select',
+      },
+    })
+  })
+  await page.route('**/api/jobs/job-1', (r) => {
     return json(r, 200, {
       id: 'job-1',
       kind: 'sql',
@@ -263,6 +300,17 @@ test('next page enqueues a database continuation while previous page stays cache
       },
     }),
   )
+  await page.route(/\/api\/jobs\/job-2\/progress\?/, (r) =>
+    json(r, 200, {
+      job_id: 'job-2', result_set_id: 'rs-1', status: 'success', loaded_rows: 200,
+      result_version: 2, columns_ready: true, first_batch_ready: true, terminal: true,
+      error: null, error_code: null, retry_after_ms: 0, has_new_result: true,
+      truncated: false, has_more: true, pagination_mode: 'ordered_offset',
+      pagination_reason: 'fresh_read_ordered_offset',
+      timings: { queue_ms: 5, connect_ms: 10, execute_first_row_ms: 20, fetch_ms: 30, spool_ms: 4, total_ms: 69 },
+      execution: null,
+    }),
+  )
   await page.route(/\/api\/jobs\/job-2\/result\?/, (r) => {
     const offset = Number(new URL(r.request().url()).searchParams.get('offset') ?? 0)
     return json(r, 200, {
@@ -306,6 +354,14 @@ test('next page enqueues a database continuation while previous page stays cache
 test('deleting a console cancels its active query before closing it', async ({ page }) => {
   await mockWorkspace(page)
   let cancelRequests = 0
+  await page.route(/\/api\/jobs\/job-1\/progress\?/, (r) =>
+    json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', status: 'running', loaded_rows: 0,
+      result_version: 0, columns_ready: false, first_batch_ready: false, terminal: false,
+      error: null, error_code: null, retry_after_ms: 1000, has_new_result: false,
+      truncated: false, has_more: false, timings: null, execution: null,
+    }),
+  )
   await page.route('**/api/jobs/job-1', (r) =>
     json(r, 200, {
       id: 'job-1',
@@ -342,6 +398,7 @@ test('SQL workspace tabs, history, templates, and progressive result render', as
 
   await page.goto('/projects/project-1/sql')
   await expect(page.getByText('SQL workspace')).toBeVisible()
+  await expect(page.getByTestId('build-version')).toHaveText('v2.0.1-test · abcdef0')
   await expect(page.locator('aside').getByText('query_1.sql')).toBeVisible()
   await expect(page.getByLabel('Datasource')).toHaveValue('ds-1')
 
@@ -412,6 +469,125 @@ test('progressive results use bounded pages and polling stops at success', async
   const terminalJobReads = state.getJobReads()
   await page.waitForTimeout(1_200)
   expect(state.getJobReads()).toBe(terminalJobReads)
+  expectNoConsoleErrors()
+})
+
+test('unchanged progress backs off and does not read result without a new version', async ({
+  page,
+}) => {
+  const state = await mockWorkspace(page)
+  let progressReads = 0
+  await page.route(/\/api\/jobs\/job-1\/progress\?/, (r) => {
+    progressReads += 1
+    return json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', status: 'running', loaded_rows: 0,
+      result_version: 0, columns_ready: false, first_batch_ready: false, terminal: false,
+      error: null, error_code: null, retry_after_ms: 1000, has_new_result: false,
+      truncated: false, has_more: false, timings: null, execution: null,
+    })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await page.waitForTimeout(6_500)
+
+  expect(progressReads).toBe(3)
+  expect(state.resultRequestUrls).toEqual([])
+  expectNoConsoleErrors()
+})
+
+test('hidden SQL workspace lowers polling frequency and resumes when visible', async ({ page }) => {
+  await mockWorkspace(page)
+  let progressReads = 0
+  await page.route(/\/api\/jobs\/job-1\/progress\?/, (r) => {
+    progressReads += 1
+    return json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', status: 'running', loaded_rows: 0,
+      result_version: 0, columns_ready: false, first_batch_ready: false, terminal: false,
+      error: null, error_code: null, retry_after_ms: 1000, has_new_result: false,
+      truncated: false, has_more: false, timings: null, execution: null,
+    })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => true })
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  await page.getByRole('button', { name: 'Run' }).click()
+  await page.waitForTimeout(2_200)
+  expect(progressReads).toBe(0)
+
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => false })
+    document.dispatchEvent(new Event('visibilitychange'))
+  })
+  await expect.poll(() => progressReads).toBe(1)
+  expectNoConsoleErrors()
+})
+
+test('switching consoles stops the previous job polling loop', async ({ page }) => {
+  await mockWorkspace(page)
+  let progressReads = 0
+  await page.route(/\/api\/jobs\/job-1\/progress\?/, (r) => {
+    progressReads += 1
+    return json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', status: 'running', loaded_rows: 0,
+      result_version: 0, columns_ready: false, first_batch_ready: false, terminal: false,
+      error: null, error_code: null, retry_after_ms: 1000, has_new_result: false,
+      truncated: false, has_more: false, timings: null, execution: null,
+    })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect.poll(() => progressReads).toBe(1)
+  await page.getByTitle('New console').click()
+  await expect(page.locator('aside').getByText('query_2.sql')).toBeVisible()
+  const readsAfterSwitch = progressReads
+  await page.waitForTimeout(2_200)
+
+  expect(progressReads).toBe(readsAfterSwitch)
+  expectNoConsoleErrors()
+})
+
+test('progress polling respects 429 Retry-After and recovers without a request storm', async ({
+  page,
+}) => {
+  const state = await mockWorkspace(page, { progressiveRows: 1 })
+  const progressReadTimes: number[] = []
+  await page.route(/\/api\/jobs\/job-1\/progress\?/, (r) => {
+    progressReadTimes.push(Date.now())
+    if (progressReadTimes.length === 1) {
+      return r.fulfill({
+        status: 429,
+        headers: { 'Content-Type': 'application/json', 'Retry-After': '2' },
+        body: JSON.stringify({ error: 'rate_limited', message: 'Too many requests' }),
+      })
+    }
+    return json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', status: 'success', loaded_rows: 1,
+      result_version: 1, columns_ready: true, first_batch_ready: true, terminal: true,
+      error: null, error_code: null, retry_after_ms: 0, has_new_result: true,
+      truncated: false, has_more: false, timings: null,
+      execution: {
+        queued_at: now, claimed_at: now, finished_at: now, max_rows: 1000,
+        rows_read: 1, rows_returned: 1, output_limit_applied: true,
+        limit_pushdown: false, query_shape: 'aggregate',
+      },
+    })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.getByRole('cell', { name: '1', exact: true }).last()).toBeVisible()
+
+  expect(progressReadTimes).toHaveLength(2)
+  expect(progressReadTimes[1] - progressReadTimes[0]).toBeGreaterThanOrEqual(1_900)
+  expect(state.resultRequestUrls).toHaveLength(1)
+  await expect(page.getByTestId('sql-output-limit-warning')).toContainText(
+    'database output is capped',
+  )
   expectNoConsoleErrors()
 })
 
