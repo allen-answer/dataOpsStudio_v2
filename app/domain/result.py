@@ -7,6 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.schema import Column, Row
 
+SQL_WORKSPACE_DEFAULT_PAGE_SIZE = 100
+SQL_WORKSPACE_MAX_PAGE_SIZE = 1_000
 SQL_WORKSPACE_DEFAULT_MAX_ROWS = 1_000
 SQL_WORKSPACE_MAX_ROWS = 50_000
 

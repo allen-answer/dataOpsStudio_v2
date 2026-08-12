@@ -45,6 +45,7 @@ from app.dbclients.oracle_types import (
     description_type_to_driver_name,
 )
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
+from app.dbclients.query_timing import QueryTimingRecorder
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.capabilities import AdapterCapabilities
 from app.domain.compare import CompareHashPlan, CompareHashRequest
@@ -182,6 +183,7 @@ class OracleAdapter(DatabaseAdapter):
         self._column_sink = column_sink
         self._last_server_version: str | None = None
         self._last_connection_error: str | None = None
+        self._query_timing = QueryTimingRecorder()
 
     @property
     def last_server_version(self) -> str | None:
@@ -190,6 +192,10 @@ class OracleAdapter(DatabaseAdapter):
     @property
     def last_connection_error(self) -> str | None:
         return self._last_connection_error
+
+    @property
+    def query_timings_ms(self) -> dict[str, int]:
+        return self._query_timing.snapshot()
 
     def execute_select(self, sql: str, params: dict[str, Any]) -> Iterator[Row]:
         guarded_sql = validate_readonly_sql(sql)
@@ -354,18 +360,23 @@ class OracleAdapter(DatabaseAdapter):
         conn = None
         cursor = None
         started_at = time.monotonic()
+        self._query_timing.reset()
+        connect_started = time.monotonic()
         try:
             conn = self._connect()
         except Exception as exc:
             # 保留 cause(from exc):worker 的 logger.exception 带 cause 链便于排障,
             # 日志链路有 R5 脱敏 processor 兜底,原始驱动异常不会泄密。
             raise AdapterConnectionError("adapter connection failed") from exc
+        self._query_timing.record_connect(_elapsed_ms(connect_started))
         try:
             self._apply_statement_timeout(conn)
             cursor = conn.cursor()
             cursor.arraysize = self._fetch_chunk_size
             try:
+                execute_started = time.monotonic()
                 cursor.execute(sql, params or None)
+                self._query_timing.record_execute(_elapsed_ms(execute_started))
             except Exception as exc:
                 raise self._driver_error("Oracle execute failed", exc) from exc
             self._emit_columns(getattr(cursor, "description", None))
@@ -373,7 +384,9 @@ class OracleAdapter(DatabaseAdapter):
                 self._check_cancel()
                 self._check_cursor_deadline(started_at)
                 try:
+                    fetch_started = time.monotonic()
                     batch = cursor.fetchmany(self._fetch_chunk_size)
+                    self._query_timing.record_fetch(_elapsed_ms(fetch_started))
                 except Exception as exc:
                     raise self._driver_error("Oracle fetch failed", exc) from exc
                 if not batch:
@@ -709,6 +722,10 @@ def _safe_close(obj: object | None) -> None:
         close()
     except Exception:
         return
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, round((time.monotonic() - started_at) * 1000))
 
 
 __all__ = [
