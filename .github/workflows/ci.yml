@@ -634,6 +634,16 @@ jobs:
         run: npm run build
         working-directory: frontend
 
+      - name: Install Playwright Chromium
+        if: hashFiles('frontend/package.json') != ''
+        run: npx playwright install --with-deps chromium
+        working-directory: frontend
+
+      - name: Playwright e2e
+        if: hashFiles('frontend/package.json') != ''
+        run: npm run test:e2e
+        working-directory: frontend
+
       - name: Skip notice (frontend not present)
         if: hashFiles('frontend/package.json') == ''
         run: echo "::notice::frontend/package.json 不存在 — 跳过前端 build。"
