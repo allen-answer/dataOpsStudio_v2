@@ -826,7 +826,6 @@ export default {
     ai_impact_refs: '{count} 次引用',
     ai_impact_never: '近期无引用',
     ai_impact_last_seen: '最近 {days} 天前',
-    ai_egress: '出站级别 {level}',
     // SQL 解析
     datasource: '数据源',
     no_datasource: '此项目还没有数据源 —— 先创建数据源再解析血缘。',

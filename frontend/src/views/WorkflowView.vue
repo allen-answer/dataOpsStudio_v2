@@ -17,7 +17,6 @@ import { computed, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useQuery, useQueryClient } from '@tanstack/vue-query'
-import type { Query } from '@tanstack/vue-query'
 import {
   Bell,
   GitBranch,
@@ -45,9 +44,7 @@ import {
   type NotifyChannel,
   type NotifyEvent,
   type NotifyTargetInSpec,
-  type WorkflowSpec,
   type WorkflowNodeStatus,
-  type WorkflowRunStatusResponse,
   type WorkflowVariableValue,
 } from '../api/workflow'
 import { listDatasources } from '../api/datasources'
@@ -317,8 +314,8 @@ const runStatusQuery = useQuery({
   queryFn: () => getWorkflowRun(projectId.value, selectedRunId.value as string),
   enabled: computed(() => Boolean(projectId.value && selectedRunId.value)),
   // 轮询到终态:非终态每 1.5s 重取,终态返回 false 停轮(设计稿 §2.3 范式)
-  refetchInterval: (query: Query) => {
-    const data = query.state.data as WorkflowRunStatusResponse | undefined
+  refetchInterval: (query) => {
+    const data = query.state.data
     if (data && TERMINAL_RUN_STATUSES.has(data.status)) return false
     return 1500
   },

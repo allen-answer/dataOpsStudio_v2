@@ -858,7 +858,6 @@ export default {
     ai_impact_refs: '{count} refs',
     ai_impact_never: 'no recent refs',
     ai_impact_last_seen: 'last {days}d ago',
-    ai_egress: 'Egress level {level}',
     // analyze
     datasource: 'Datasource',
     no_datasource: 'This project has no datasources yet — create one before analyzing lineage.',

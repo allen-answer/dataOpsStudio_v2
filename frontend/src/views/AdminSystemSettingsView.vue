@@ -2,7 +2,7 @@
 import { computed, reactive, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
-import { CheckCircle2, RefreshCw, Save, Settings, ShieldCheck, TimerReset } from 'lucide-vue-next'
+import { CheckCircle2, RefreshCw, Save, ShieldCheck, TimerReset } from 'lucide-vue-next'
 import { getSystemSettings, putSystemSettings } from '../api/admin'
 import { ApiError, type SystemSettingsUpdateRequest } from '../api/types'
 import LoadingDots from '../components/LoadingDots.vue'

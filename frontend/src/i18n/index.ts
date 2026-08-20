@@ -2,7 +2,11 @@ import { createI18n } from 'vue-i18n'
 import zhCN from './zh-CN'
 import en from './en'
 
-type MessageSchema = typeof zhCN
+type WidenMessageSchema<T> = {
+  [K in keyof T]: T[K] extends string ? string : WidenMessageSchema<T[K]>
+}
+
+type MessageSchema = WidenMessageSchema<typeof zhCN>
 
 const STORAGE_KEY = 'dataops-locale'
 
@@ -13,7 +17,7 @@ function detectLocale(): 'zh-CN' | 'en' {
   return browser.startsWith('zh') ? 'zh-CN' : browser.startsWith('en') ? 'en' : 'zh-CN'
 }
 
-export const i18n = createI18n<[MessageSchema], 'zh-CN' | 'en'>({
+export const i18n = createI18n<[MessageSchema], 'zh-CN' | 'en', false>({
   legacy: false,
   locale: detectLocale(),
   fallbackLocale: 'zh-CN',
