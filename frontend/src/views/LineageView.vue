@@ -581,7 +581,7 @@ async function onAiEnrich(): Promise<void> {
       model: null,
       egress_level: 2,
       created_at: null,
-      error: e instanceof ApiError ? e.code : errorMessage(e),
+      error: e instanceof ApiError ? (e.code ?? errorMessage(e)) : errorMessage(e),
     }
   } finally {
     aiEnrichBusy.value = false
