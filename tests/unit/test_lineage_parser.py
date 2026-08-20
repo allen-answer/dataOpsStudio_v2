@@ -155,6 +155,36 @@ def test_parse_error_detail_includes_line_column_and_token() -> None:
     assert "token='('" in message
 
 
+def test_recursive_parse_error_does_not_abort_other_statements() -> None:
+    malformed = "SELECT " + "(" * 49 + "1" + ")" * 49 + " AS c FROM app.orders"
+    valid = "INSERT INTO app.target_orders (id) SELECT id FROM app.orders"
+
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text=f"{malformed};{valid}",
+            dialect="mysql",
+            schema=_schema(),
+            default_schema="app",
+        )
+    )
+
+    assert report.statement_count == 2
+    assert report.statements == [{"index": 1, "type": "INSERT"}]
+    assert report.parse_errors == [
+        {
+            "statement_index": 0,
+            "error_type": "parse_error",
+            "message": "RecursionError",
+            "unsupported": True,
+            "statement_type": None,
+        }
+    ]
+    assert {(edge["source_table"], edge["target_table"]) for edge in report.graph_edges} == {
+        ("app.orders", "app.target_orders")
+    }
+    assert _mapping(report.insert_mappings, "id", "app.orders", "id")["statement_index"] == 1
+
+
 def test_report_summary_truncates_parse_error_details() -> None:
     statements = ";\n".join(
         f"INSERT INTO app.target_orders SELECT id FROM app.unknown_{index}"

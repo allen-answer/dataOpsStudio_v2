@@ -8,7 +8,7 @@ from typing import Any, cast
 import sqlglot
 from pydantic import BaseModel, ConfigDict, Field
 from sqlglot import exp
-from sqlglot.errors import OptimizeError, ParseError
+from sqlglot.errors import ParseError, SqlglotError
 from sqlglot.lineage import lineage
 from sqlglot.optimizer.qualify import qualify
 
@@ -154,7 +154,7 @@ def _mark_segment_parse_status(procedure_segments: list[dict[str, Any]], dialect
     for segment in procedure_segments:
         try:
             sqlglot.parse_one(normalize_template_variables(str(segment["sql"])), read=dialect)
-        except ParseError:
+        except (SqlglotError, RecursionError):
             segment["parse_status"] = "unsupported"
         else:
             segment["parse_status"] = "parsed"
@@ -232,7 +232,7 @@ def _parse_or_split_plsql(sql_text: str, dialect: str) -> list[str]:
     normalized_sql = normalize_template_variables(sql_text)
     try:
         parsed = sqlglot.parse(normalized_sql, read=dialect)
-    except ParseError:
+    except (SqlglotError, RecursionError):
         parsed = []
     if parsed and not _looks_like_plsql(normalized_sql):
         return [expression.sql(dialect=dialect) for expression in parsed if expression is not None]
@@ -250,16 +250,16 @@ def _analyze_statement(
     statement = normalize_template_variables(statement)
     try:
         expression = cast(exp.Expression, sqlglot.parse_one(statement, read=context.dialect))
-    except ParseError as exc:
+    except (SqlglotError, RecursionError) as exc:
         # Oracle 别名前缀 INSERT(`insert into t a (a.col…)`)sqlglot 不认,
         # 仅在直解失败时尝试剥别名重写再解一次(限定爆炸半径)
-        rewritten = _rewrite_insert_alias(statement)
+        rewritten = _rewrite_insert_alias(statement) if isinstance(exc, ParseError) else None
         if rewritten is None:
             _append_parse_error(report, context, "parse_error", exc, statement_type=None)
             return
         try:
             expression = cast(exp.Expression, sqlglot.parse_one(rewritten, read=context.dialect))
-        except ParseError as rewritten_exc:
+        except (SqlglotError, RecursionError) as rewritten_exc:
             _append_parse_error(report, context, "parse_error", rewritten_exc, statement_type=None)
             return
     statement_type = expression.key.upper()
@@ -297,7 +297,7 @@ def _analyze_statement(
             expand_stars=True,
             validate_qualify_columns=True,
         )
-    except OptimizeError as exc:
+    except (SqlglotError, RecursionError) as exc:
         if context.lenient:
             _analyze_statement_table_level(expression, statement_type, context, report)
             return
@@ -723,7 +723,7 @@ def _append_output_mappings(
             schema=context.schema,
             dialect=context.dialect,
         )
-    except Exception as exc:  # sqlglot can raise OptimizeError here too
+    except (SqlglotError, RecursionError) as exc:
         _append_parse_error(report, context, "lineage_error", exc, statement_type=statement_type)
         return
     for source_table, source_column in _source_columns_from_node(node, context.default_schema):
@@ -763,7 +763,7 @@ def _append_set_operation_mappings(
                 schema=context.schema,
                 dialect=context.dialect,
             )
-        except Exception as exc:  # sqlglot can raise OptimizeError here too
+        except (SqlglotError, RecursionError) as exc:
             _append_parse_error(
                 report, context, "lineage_error", exc, statement_type=statement_type
             )
