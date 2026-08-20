@@ -106,8 +106,11 @@ jobs:
         run: uv sync --all-groups
 
       # 包含 R4/R5/R6/R7 的 Python 层校验(test_redlines.py + test_redaction.py 等)
-      - name: pytest unit
-        run: uv run pytest tests/unit -v
+      - name: pytest unit + contract
+        env:
+          PGPASSWORD: ci_test_pwd_not_real_secret
+          DATAOPS_TEST_PG_URL: postgresql+psycopg://dataops@localhost:15432/dataops
+        run: uv run pytest tests/unit tests/contract -v
 
       # 真实 alembic 迁移(契约 §10.5 each PR 验证 schema 可迁)
       - name: alembic upgrade head
