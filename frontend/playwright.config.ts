@@ -11,11 +11,11 @@ export default defineConfig({
   testDir: './tests',
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
-  retries: 0,
+  retries: process.env.CI ? 1 : 0,
   reporter: [['list']],
   use: {
     baseURL: process.env.E2E_BASE_URL ?? 'http://localhost:4173',
-    trace: 'off',
+    trace: process.env.CI ? 'retain-on-failure' : 'off',
   },
   projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
   // 默认起 vite preview;沙箱里 4173 可能被禁,可用 E2E_BASE_URL 指向已起的 preview
