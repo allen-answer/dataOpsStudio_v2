@@ -63,7 +63,6 @@ import {
   type SqlHistoryItem,
   type SqlTemplate,
   type SqlTemplateCreateRequest,
-  type SqlTemplateUpdateRequest,
 } from '../api/sql'
 import {
   cancelJob,
@@ -2174,7 +2173,7 @@ function parseVariables(value: string): string[] {
             v-model="editorSql"
             :datasource-id="selectedDsId"
             :db-type="selectedDs?.db_type"
-            :default-schema="selectedDs?.database"
+            :default-schema="selectedDs?.database ?? undefined"
             :path="`sql-console-${activeConsole.id}.sql`"
             :theme="editorTheme"
             :read-only="editorReadOnly"

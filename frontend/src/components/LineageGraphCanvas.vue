@@ -183,11 +183,15 @@ async function buildGraph(): Promise<void> {
     await nextTick()
     const g = new Graph(graphConfig(palette()) as never)
     graph.value = g
-    g.on('node:click', (evt: { target: { id: string } }) => {
-      emit('node-click', evt.target.id)
+    g.on('node:click', (evt) => {
+      if ('target' in evt && evt.target && 'id' in evt.target && typeof evt.target.id === 'string') {
+        emit('node-click', evt.target.id)
+      }
     })
-    g.on('edge:click', (evt: { target: { id: string } }) => {
-      emit('edge-click', evt.target.id)
+    g.on('edge:click', (evt) => {
+      if ('target' in evt && evt.target && 'id' in evt.target && typeof evt.target.id === 'string') {
+        emit('edge-click', evt.target.id)
+      }
     })
     await g.render()
   } catch (e) {
