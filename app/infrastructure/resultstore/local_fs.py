@@ -381,6 +381,11 @@ class LocalFsResultStore(ResultStore):
         part_path: Path,
         remaining_bytes: int,
     ) -> list[Row]:
+        _write_rows_parquet(rows, part_path)
+        if part_path.stat().st_size <= remaining_bytes:
+            return rows
+        part_path.unlink()
+
         low = 0
         high = len(rows)
         best = 0
