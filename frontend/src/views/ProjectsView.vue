@@ -5,11 +5,13 @@ import { useI18n } from 'vue-i18n'
 import { useQuery } from '@tanstack/vue-query'
 import { LayoutGrid, Plus, ChevronRight, AlertTriangle } from 'lucide-vue-next'
 import { listProjects } from '../api/projects'
-import { ApiError, type Project } from '../api/types'
+import type { Project } from '../api/types'
 import EmptyState from '../components/EmptyState.vue'
 import LoadingDots from '../components/LoadingDots.vue'
+import { createUserErrorMessage } from '../utils/userErrorMessage'
 
 const { t } = useI18n()
+const errorMessage = createUserErrorMessage(t)
 const router = useRouter()
 
 const query = useQuery({
@@ -29,14 +31,6 @@ function countMessage(n: number): string {
   return t('projects.count_other', { count: n })
 }
 
-function errorMessage(): string {
-  const e = query.error.value
-  if (e instanceof ApiError) {
-    if (e.status === 0) return t('common.error_network')
-    return e.message || t('common.error_unknown')
-  }
-  return t('common.error_unknown')
-}
 </script>
 
 <template>
@@ -83,7 +77,7 @@ function errorMessage(): string {
       <AlertTriangle class="w-5 h-5 text-red-500 dark:text-red-400 shrink-0 mt-0.5" />
       <div>
         <div class="text-sm font-medium text-red-700 dark:text-red-400">{{ t('common.error') }}</div>
-        <div class="text-sm text-red-600 dark:text-red-300 mt-0.5">{{ errorMessage() }}</div>
+        <div class="text-sm text-red-600 dark:text-red-300 mt-0.5">{{ errorMessage(query.error.value) }}</div>
         <button @click="query.refetch()" type="button" class="text-xs text-red-700 dark:text-red-400 underline mt-2">
           {{ t('common.retry') }}
         </button>

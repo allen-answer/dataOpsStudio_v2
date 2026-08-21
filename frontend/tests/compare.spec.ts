@@ -1002,3 +1002,42 @@ test('diff profile panel renders rates; AI explain overlays without blocking pro
   await expect(page.getByText('Per-column diff rate')).toBeVisible()
   expectNoConsoleErrors()
 })
+
+test('in-grace mode disables the primary compare write entry', async ({ page }) => {
+  await mockBase(page)
+  await mockLicense(page, { mode: 'in_grace' })
+  await page.route(/\/api\/projects\/project-1\/compare\/suggest-tasks/, (route) =>
+    json(route, 200, {
+      suggestions: [
+        {
+          source_schema: 'src',
+          source_table: 'orders',
+          target_schema: 'dst',
+          target_table: 'orders',
+          confidence: 1.0,
+          reason: 'exact',
+        },
+      ],
+    }),
+  )
+  let draftWrites = 0
+  await page.route('**/api/projects/project-1/compare/draft-task', (route) => {
+    draftWrites += 1
+    return json(route, 201, compareTask({ id: 'blocked-draft' }))
+  })
+
+  await page.goto('/projects/project-1/compare')
+  const run = page.getByRole('button', { name: 'Start compare' })
+  await expect(run).toBeDisabled()
+  await expect(run).toHaveAttribute(
+    'title',
+    'Write actions are disabled in the current license state (view / license update only)',
+  )
+  await page.getByRole('button', { name: 'Find table pairs' }).click()
+  const draft = page.locator('aside').getByTitle(
+    'Write actions are disabled in the current license state (view / license update only)',
+  ).last()
+  await expect(draft).toBeDisabled()
+  expect(draftWrites).toBe(0)
+  expectNoConsoleErrors()
+})

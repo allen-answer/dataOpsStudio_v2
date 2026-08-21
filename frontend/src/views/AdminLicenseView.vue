@@ -15,10 +15,12 @@ import { useI18n } from 'vue-i18n'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query'
 import { KeyRound, AlertTriangle, CheckCircle2, Clock, ShieldAlert, Upload, Clipboard, Download, FileText } from 'lucide-vue-next'
 import { getAdminLicense, putAdminLicense } from '../api/admin'
-import { ApiError, type LicenseStatus } from '../api/types'
+import type { LicenseStatus } from '../api/types'
 import LoadingDots from '../components/LoadingDots.vue'
+import { createUserErrorMessage } from '../utils/userErrorMessage'
 
 const { t } = useI18n()
+const errorMessage = createUserErrorMessage(t)
 const qc = useQueryClient()
 
 const query = useQuery({ queryKey: ['admin-license'], queryFn: getAdminLicense })
@@ -70,7 +72,7 @@ async function onUpload(): Promise<void> {
   try {
     await uploadMutation.mutateAsync()
   } catch (e) {
-    uploadError.value = e instanceof ApiError ? e.message : t('common.error_unknown')
+    uploadError.value = errorMessage(e)
   }
 }
 
@@ -129,14 +131,6 @@ function formatDate(iso: string | null): string {
 
 const limitEntries = computed(() => Object.entries(status.value?.limits ?? {}))
 
-function errorMessage(): string {
-  const e = query.error.value
-  if (e instanceof ApiError) {
-    if (e.status === 403) return t('admin.forbidden_hint')
-    return e.message || t('common.error_unknown')
-  }
-  return t('common.error_unknown')
-}
 </script>
 
 <template>
@@ -154,7 +148,7 @@ function errorMessage(): string {
       <AlertTriangle class="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
       <div>
         <div class="text-sm font-medium text-red-700 dark:text-red-400">{{ t('common.error') }}</div>
-        <div class="text-sm text-red-600 dark:text-red-300 mt-0.5">{{ errorMessage() }}</div>
+        <div class="text-sm text-red-600 dark:text-red-300 mt-0.5">{{ errorMessage(query.error.value) }}</div>
         <button @click="query.refetch()" type="button" class="text-xs text-red-700 dark:text-red-400 underline mt-2">{{ t('common.retry') }}</button>
       </div>
     </div>

@@ -762,3 +762,22 @@ test('run history paginates by offset and renders safe scalar outputs', async ({
   expect(state.runOffsets).toContain(20)
   expect(consoleErrors).toEqual([])
 })
+
+test('in-grace mode disables workflow creation and run triggers', async ({ page }) => {
+  const consoleErrors = trackConsoleErrors(page)
+  const state = await mockWorkflowPage(page)
+  await mockLicense(page, { mode: 'in_grace' })
+
+  await page.goto('/projects/project-1/workflows')
+  await expect(page.getByText('Daily QA', { exact: true }).first()).toBeVisible()
+  const title = 'Write actions are disabled in the current license state (view / license update only)'
+  const create = page.getByRole('button', { name: 'New', exact: true })
+  const run = page.getByRole('button', { name: 'Run', exact: true })
+  await expect(create).toBeDisabled()
+  await expect(create).toHaveAttribute('title', title)
+  await expect(run).toBeDisabled()
+  await expect(run).toHaveAttribute('title', title)
+
+  expect(state.workflowWrites).toEqual([])
+  expect(consoleErrors).toEqual([])
+})

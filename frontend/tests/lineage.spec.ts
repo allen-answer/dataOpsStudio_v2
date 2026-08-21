@@ -77,3 +77,34 @@ test('pending lineage batch response cannot restart polling after route unmount'
   expect(batchReads).toBe(1)
   expectNoConsoleErrors()
 })
+
+test('repair mode keeps lineage reads available while disabling SQL analysis', async ({ page }) => {
+  await mockBase(page)
+  await mockLicense(page, { mode: 'repair' })
+  await page.route(/\/api\/datasources\?/, (route) =>
+    json(route, 200, [
+      {
+        id: 'ds-1',
+        name: 'warehouse',
+        db_type: 'mysql',
+        host: 'db.local',
+        port: 3306,
+        environment: 'sandbox',
+        environment_verified: false,
+        database: 'app',
+        operation_policy: { allow_select: true },
+        created_at: now,
+      },
+    ]),
+  )
+
+  await page.goto('/projects/project-1/lineage')
+  await page.getByRole('button', { name: 'SQL analyze', exact: true }).click()
+  const analyze = page.getByRole('button', { name: 'Analyze', exact: true })
+  await expect(analyze).toBeDisabled()
+  await expect(analyze).toHaveAttribute(
+    'title',
+    'Write actions are disabled in the current license state (view / license update only)',
+  )
+  expectNoConsoleErrors()
+})

@@ -26,6 +26,7 @@ export default {
     copied: '已复制',
     done: '完成',
     error_network: '网络异常,请稍后重试',
+    error_forbidden: '你没有执行此操作的权限',
     error_unauthorized: '登录已过期,请重新登录',
     error_server: '服务器内部错误,请稍后重试',
     error_unknown: '未知错误',

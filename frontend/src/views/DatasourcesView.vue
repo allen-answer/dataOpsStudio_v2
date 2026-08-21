@@ -33,14 +33,18 @@ import {
   type DbType,
   type OperationPolicy,
 } from '../api/types'
+import { useLicense } from '../composables/useLicense'
 import JobStatusBadge from '../components/JobStatusBadge.vue'
 import EmptyState from '../components/EmptyState.vue'
 import LoadingDots from '../components/LoadingDots.vue'
 import Modal from '../components/Modal.vue'
+import { createUserErrorMessage } from '../utils/userErrorMessage'
 
 const { t } = useI18n()
+const errorMessage = createUserErrorMessage(t)
 const route = useRoute()
 const qc = useQueryClient()
+const { writesBlocked } = useLicense()
 
 const projectId = computed(() =>
   typeof route.params.id === 'string' ? route.params.id : '',
@@ -76,6 +80,7 @@ function testFailedText(code: DatasourceTestErrorCode | null): string {
 }
 
 async function onTest(ds: DatasourceListItem): Promise<void> {
+  if (writesBlocked.value) return
   testStates[ds.id] = 'pending'
   delete testErrors[ds.id]
   delete testOk[ds.id]
@@ -93,7 +98,7 @@ async function onTest(ds: DatasourceListItem): Promise<void> {
     }
   } catch (e) {
     testStates[ds.id] = 'failed'
-    testErrors[ds.id] = e instanceof ApiError ? e.message : t('common.error_unknown')
+    testErrors[ds.id] = errorMessage(e)
   }
 }
 
@@ -237,6 +242,7 @@ function resetForm(): void {
 }
 
 function openModal(): void {
+  if (writesBlocked.value) return
   editingId.value = null
   resetForm()
   modalOpen.value = true
@@ -244,6 +250,7 @@ function openModal(): void {
 
 // 编辑:开 modal → 拉详情 → 回填(密码字段始终留空 = 不改)。
 async function openEditModal(ds: DatasourceListItem): Promise<void> {
+  if (writesBlocked.value) return
   editingId.value = ds.id
   resetForm()
   modalOpen.value = true
@@ -261,12 +268,7 @@ async function openEditModal(ds: DatasourceListItem): Promise<void> {
     form.password = '' // 留空 = 不改密码
     form.operation_policy = { ...DEFAULT_OPERATION_POLICY, ...detail.operation_policy }
   } catch (e) {
-    formError.value =
-      e instanceof ApiError
-        ? e.status === 0
-          ? t('common.error_network')
-          : e.message
-        : t('common.error_unknown')
+    formError.value = errorMessage(e)
   } finally {
     editLoading.value = false
   }
@@ -327,6 +329,10 @@ const submitting = computed(
 
 async function onSubmit(): Promise<void> {
   formError.value = null
+  if (writesBlocked.value) {
+    formError.value = t('license.writes_blocked')
+    return
+  }
   if (editLoading.value) return
   // inline 必填校验:逐项红框 + 行内提示(不再只一句话静默)。
   submitAttempted.value = true
@@ -343,11 +349,7 @@ async function onSubmit(): Promise<void> {
     if (isEditing.value) await updateMutation.mutateAsync()
     else await createMutation.mutateAsync()
   } catch (e) {
-    if (e instanceof ApiError) {
-      formError.value = e.status === 0 ? t('common.error_network') : e.message
-    } else {
-      formError.value = t('common.error_unknown')
-    }
+    formError.value = errorMessage(e)
   }
 }
 
@@ -357,6 +359,7 @@ const deleteBlocked = ref<DatasourceDeleteBlocked | null>(null)
 const deleteError = ref<string | null>(null)
 
 function openDeleteModal(ds: DatasourceListItem): void {
+  if (writesBlocked.value) return
   deleteTarget.value = ds
   deleteBlocked.value = null
   deleteError.value = null
@@ -376,6 +379,10 @@ const deleteMutation = useMutation({
 })
 
 async function onConfirmDelete(): Promise<void> {
+  if (writesBlocked.value) {
+    deleteError.value = t('license.writes_blocked')
+    return
+  }
   const ds = deleteTarget.value
   if (!ds) return
   // 防 in-flight 双发(#33:快速双击在 isPending 反应式更新前发两次 DELETE)。
@@ -389,11 +396,7 @@ async function onConfirmDelete(): Promise<void> {
       // 被既有 job 引用:后端返 DatasourceDeleteBlocked 体(error/message/references)
       deleteBlocked.value = (e.body as DatasourceDeleteBlocked | undefined) ?? null
       if (!deleteBlocked.value) deleteError.value = e.message
-    } else if (e instanceof ApiError) {
-      deleteError.value = e.status === 0 ? t('common.error_network') : e.message
-    } else {
-      deleteError.value = t('common.error_unknown')
-    }
+    } else deleteError.value = errorMessage(e)
   }
 }
 
@@ -417,15 +420,6 @@ function formatDate(iso: string): string {
   } catch {
     return iso
   }
-}
-
-function errorMessage(): string {
-  const e = query.error.value
-  if (e instanceof ApiError) {
-    if (e.status === 0) return t('common.error_network')
-    return e.message || t('common.error_unknown')
-  }
-  return t('common.error_unknown')
 }
 
 // ─── DbTypeBadge:每个 db_type 配一个色系(Tailwind class)─────
@@ -490,7 +484,13 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
           {{ countMessage(datasources.length) }}
         </div>
       </div>
-      <button type="button" @click="openModal" class="chrome-btn-primary">
+      <button
+        type="button"
+        @click="openModal"
+        class="chrome-btn-primary"
+        :disabled="writesBlocked"
+        :title="writesBlocked ? t('license.writes_blocked') : ''"
+      >
         <Plus class="w-4 h-4" />
         {{ t('datasources.new') }}
       </button>
@@ -513,7 +513,7 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
       <AlertTriangle class="w-5 h-5 text-red-500 dark:text-red-400 shrink-0 mt-0.5" />
       <div>
         <div class="text-sm font-medium text-red-700 dark:text-red-400">{{ t('common.error') }}</div>
-        <div class="text-sm text-red-600 dark:text-red-300 mt-0.5">{{ errorMessage() }}</div>
+        <div class="text-sm text-red-600 dark:text-red-300 mt-0.5">{{ errorMessage(query.error.value) }}</div>
         <button
           @click="query.refetch()"
           type="button"
@@ -645,9 +645,9 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
                   <button
                     type="button"
                     @click="onTest(ds)"
-                    :disabled="testStates[ds.id] === 'pending'"
+                    :disabled="writesBlocked || testStates[ds.id] === 'pending'"
                     class="chrome-btn-ghost"
-                    :title="t('datasources.test_connection')"
+                    :title="writesBlocked ? t('license.writes_blocked') : t('datasources.test_connection')"
                   >
                     <Zap class="w-3.5 h-3.5" />
                   </button>
@@ -655,7 +655,8 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
                     type="button"
                     @click="openEditModal(ds)"
                     class="chrome-btn-ghost"
-                    :title="t('common.edit')"
+                    :disabled="writesBlocked"
+                    :title="writesBlocked ? t('license.writes_blocked') : t('common.edit')"
                   >
                     <Pencil class="w-3.5 h-3.5" />
                   </button>
@@ -663,7 +664,8 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
                     type="button"
                     @click="openDeleteModal(ds)"
                     class="chrome-btn-ghost hover:!text-red-600 dark:hover:!text-red-400"
-                    :title="t('common.delete')"
+                    :disabled="writesBlocked"
+                    :title="writesBlocked ? t('license.writes_blocked') : t('common.delete')"
                   >
                     <Trash2 class="w-3.5 h-3.5" />
                   </button>
@@ -899,7 +901,8 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
             type="submit"
             class="chrome-btn-primary"
             :class="{ 'chrome-btn-danger': form.environment === 'prod' && prodArmed }"
-            :disabled="submitting"
+            :disabled="submitting || writesBlocked"
+            :title="writesBlocked ? t('license.writes_blocked') : ''"
           >
             <template v-if="submitting">
               <LoadingDots />
@@ -979,7 +982,8 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
             type="button"
             @click="onConfirmDelete"
             class="chrome-btn-primary chrome-btn-danger"
-            :disabled="deleteMutation.isPending.value"
+            :disabled="writesBlocked || deleteMutation.isPending.value"
+            :title="writesBlocked ? t('license.writes_blocked') : ''"
           >
             <template v-if="deleteMutation.isPending.value">
               <LoadingDots />

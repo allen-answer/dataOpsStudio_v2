@@ -61,10 +61,14 @@ import {
   type WorkflowEditorValue,
 } from '../components/workflow/workflowEditor'
 import { useToast } from '../composables/useToast'
+import { useLicense } from '../composables/useLicense'
+import { createUserErrorMessage } from '../utils/userErrorMessage'
 
 type DetailTab = 'detail' | 'runs' | 'notify'
 
 const { t } = useI18n()
+const errorMessage = createUserErrorMessage(t)
+const { writesBlocked } = useLicense()
 const route = useRoute()
 const toast = useToast()
 const queryClient = useQueryClient()
@@ -140,11 +144,13 @@ const compareTasksQuery = useQuery({
 })
 
 function openCreate(): void {
+  if (writesBlocked.value) return
   editorIntent.value = 'create'
   editorKey.value += 1
 }
 
 function openEdit(): void {
+  if (writesBlocked.value) return
   if (!detail.value) return
   editorIntent.value = 'edit'
   editorKey.value += 1
@@ -155,6 +161,10 @@ function closeEditor(): void {
 }
 
 async function saveEditor(value: WorkflowEditorValue): Promise<void> {
+  if (writesBlocked.value) {
+    toast.error(t('license.writes_blocked'))
+    return
+  }
   editorBusy.value = true
   try {
     // Notification targets are a dedicated subresource. Never send the editor's
@@ -193,6 +203,10 @@ const deleteOpen = ref(false)
 const deleteBusy = ref(false)
 
 async function confirmDelete(): Promise<void> {
+  if (writesBlocked.value) {
+    toast.error(t('license.writes_blocked'))
+    return
+  }
   if (!selectedId.value) return
   deleteBusy.value = true
   try {
@@ -220,6 +234,7 @@ const triggerError = ref<string | null>(null)
 const triggerBusy = ref(false)
 
 function openTrigger(): void {
+  if (writesBlocked.value) return
   triggerVars.value = []
   triggerError.value = null
   triggerOpen.value = true
@@ -257,6 +272,10 @@ function validateVars(): { ok: boolean; vars: Record<string, string> } {
 
 async function submitTrigger(): Promise<void> {
   triggerError.value = null
+  if (writesBlocked.value) {
+    triggerError.value = t('license.writes_blocked')
+    return
+  }
   const { ok, vars } = validateVars()
   if (!ok) return
   triggerBusy.value = true
@@ -351,6 +370,10 @@ function nextRunPage(): void {
 
 const cancelBusy = ref(false)
 async function cancelRun(): Promise<void> {
+  if (writesBlocked.value) {
+    toast.error(t('license.writes_blocked'))
+    return
+  }
   if (!selectedRunId.value) return
   cancelBusy.value = true
   try {
@@ -416,6 +439,7 @@ function closeNotify(): void {
 }
 
 function openNotifyCreate(): void {
+  if (writesBlocked.value) return
   notifyForm.targetId = null
   notifyForm.channel = 'webhook'
   clearNotifyPlaintext()
@@ -432,6 +456,7 @@ function openNotifyCreate(): void {
 }
 
 function openNotifyEdit(target: NotifyTargetInSpec): void {
+  if (writesBlocked.value) return
   notifyForm.targetId = target.id
   notifyForm.channel = target.channel
   clearNotifyPlaintext()
@@ -466,6 +491,10 @@ function toggleNotifyEvent(event: NotifyEvent, checked: boolean): void {
 
 async function submitNotify(): Promise<void> {
   notifyError.value = null
+  if (writesBlocked.value) {
+    notifyError.value = t('license.writes_blocked')
+    return
+  }
   if (notifyForm.events.length === 0) {
     notifyError.value = t('workflow.err.invalid_notify_events')
     return
@@ -526,6 +555,10 @@ async function submitNotify(): Promise<void> {
 
 const notifyDeleteId = ref<string | null>(null)
 async function confirmDeleteNotify(): Promise<void> {
+  if (writesBlocked.value) {
+    toast.error(t('license.writes_blocked'))
+    return
+  }
   if (!notifyDeleteId.value) return
   const targetId = notifyDeleteId.value
   try {
@@ -597,9 +630,9 @@ function workflowErrorMessage(e: unknown): string {
       const translated = t(key)
       if (translated !== key) return translated
     }
-    return e.message || t('common.error_unknown')
+    return errorMessage(e)
   }
-  return t('common.error_unknown')
+  return errorMessage(e)
 }
 
 // 节点执行态徽标色(node exec status ≠ JobStatus;自成一套语义色)
@@ -647,7 +680,13 @@ function payloadPreview(payload: Record<string, unknown>): string {
         <div class="flex items-center gap-2 text-section font-semibold chrome-text-heading">
           <GitBranch class="w-4 h-4" /> {{ t('workflow.title') }}
         </div>
-        <button type="button" class="chrome-btn-primary text-xs" @click="openCreate">
+        <button
+          type="button"
+          class="chrome-btn-primary text-xs"
+          :disabled="writesBlocked"
+          :title="writesBlocked ? t('license.writes_blocked') : ''"
+          @click="openCreate"
+        >
           <Plus class="w-3.5 h-3.5" /> {{ t('workflow.new') }}
         </button>
       </div>
@@ -699,7 +738,7 @@ function payloadPreview(payload: Record<string, unknown>): string {
           :datasources="datasourceQuery.data.value ?? []"
           :compare-tasks="compareTasksQuery.data.value ?? []"
           :notifications="[]"
-          :busy="editorBusy"
+          :busy="editorBusy || writesBlocked"
           @save="saveEditor"
           @cancel="closeEditor"
         />
@@ -722,8 +761,8 @@ function payloadPreview(payload: Record<string, unknown>): string {
             <button
               type="button"
               class="chrome-btn-primary text-sm"
-              :disabled="!detail || !detail.enabled"
-              :title="detail && !detail.enabled ? t('workflow.disabled') : ''"
+              :disabled="writesBlocked || !detail || !detail.enabled"
+              :title="writesBlocked ? t('license.writes_blocked') : detail && !detail.enabled ? t('workflow.disabled') : ''"
               @click="openTrigger"
             >
               <Play class="w-3.5 h-3.5" /> {{ t('workflow.run') }}
@@ -731,7 +770,8 @@ function payloadPreview(payload: Record<string, unknown>): string {
             <button
               type="button"
               class="chrome-btn-secondary text-sm"
-              :disabled="!detail"
+              :disabled="writesBlocked || !detail"
+              :title="writesBlocked ? t('license.writes_blocked') : ''"
               @click="openEdit"
             >
               {{ t('workflow.editor.edit_definition') }}
@@ -740,6 +780,8 @@ function payloadPreview(payload: Record<string, unknown>): string {
               type="button"
               class="chrome-btn-ghost text-red-600 dark:text-red-400"
               :aria-label="t('workflow.delete')"
+              :disabled="writesBlocked"
+              :title="writesBlocked ? t('license.writes_blocked') : t('workflow.delete')"
               @click="deleteOpen = true"
             >
               <Trash2 class="w-4 h-4" />
@@ -786,7 +828,7 @@ function payloadPreview(payload: Record<string, unknown>): string {
             :datasources="datasourceQuery.data.value ?? []"
             :compare-tasks="compareTasksQuery.data.value ?? []"
             :notifications="detail?.spec.notifications ?? []"
-            :busy="editorBusy"
+            :busy="editorBusy || writesBlocked"
             @save="saveEditor"
             @cancel="closeEditor"
           />
@@ -967,7 +1009,8 @@ function payloadPreview(payload: Record<string, unknown>): string {
                         v-if="!runIsTerminal"
                         type="button"
                         class="ml-auto chrome-btn-secondary text-xs"
-                        :disabled="cancelBusy"
+                        :disabled="writesBlocked || cancelBusy"
+                        :title="writesBlocked ? t('license.writes_blocked') : ''"
                         @click="cancelRun"
                       >
                         <X class="w-3.5 h-3.5" /> {{ t('workflow.cancel_run') }}
@@ -1044,7 +1087,13 @@ function payloadPreview(payload: Record<string, unknown>): string {
                 <div class="text-xs font-medium chrome-text-heading">
                   {{ t('workflow.notify_title') }}
                 </div>
-                <button type="button" class="chrome-btn-primary text-xs" @click="openNotifyCreate">
+                <button
+                  type="button"
+                  class="chrome-btn-primary text-xs"
+                  :disabled="writesBlocked"
+                  :title="writesBlocked ? t('license.writes_blocked') : ''"
+                  @click="openNotifyCreate"
+                >
                   <Plus class="w-3.5 h-3.5" /> {{ t('workflow.notify_add') }}
                 </button>
               </div>
@@ -1068,13 +1117,21 @@ function payloadPreview(payload: Record<string, unknown>): string {
                 </span>
                 <span class="text-[11px] chrome-text-muted">{{ target.timeout_seconds }}s</span>
                 <div class="ml-auto flex items-center gap-1">
-                  <button type="button" class="chrome-btn-secondary text-xs" @click="openNotifyEdit(target)">
+                  <button
+                    type="button"
+                    class="chrome-btn-secondary text-xs"
+                    :disabled="writesBlocked"
+                    :title="writesBlocked ? t('license.writes_blocked') : ''"
+                    @click="openNotifyEdit(target)"
+                  >
                     {{ t('common.edit') }}
                   </button>
                   <button
                     type="button"
                     class="chrome-btn-ghost text-red-600 dark:text-red-400"
                     :aria-label="t('workflow.delete')"
+                    :disabled="writesBlocked"
+                    :title="writesBlocked ? t('license.writes_blocked') : t('workflow.delete')"
                     @click="notifyDeleteId = target.id"
                   >
                     <Trash2 class="w-4 h-4" />
@@ -1098,7 +1155,13 @@ function payloadPreview(payload: Record<string, unknown>): string {
           <button type="button" class="chrome-btn-secondary text-sm" @click="deleteOpen = false">
             {{ t('common.cancel') }}
           </button>
-          <button type="button" class="chrome-btn-danger text-sm" :disabled="deleteBusy" @click="confirmDelete">
+          <button
+            type="button"
+            class="chrome-btn-danger text-sm"
+            :disabled="writesBlocked || deleteBusy"
+            :title="writesBlocked ? t('license.writes_blocked') : ''"
+            @click="confirmDelete"
+          >
             {{ t('workflow.delete') }}
           </button>
         </div>
@@ -1140,7 +1203,13 @@ function payloadPreview(payload: Record<string, unknown>): string {
           <button type="button" class="chrome-btn-secondary text-sm" @click="triggerOpen = false">
             {{ t('common.cancel') }}
           </button>
-          <button type="button" class="chrome-btn-primary text-sm" :disabled="triggerBusy" @click="submitTrigger">
+          <button
+            type="button"
+            class="chrome-btn-primary text-sm"
+            :disabled="writesBlocked || triggerBusy"
+            :title="writesBlocked ? t('license.writes_blocked') : ''"
+            @click="submitTrigger"
+          >
             <Play class="w-3.5 h-3.5" /> {{ t('workflow.run') }}
           </button>
         </div>
@@ -1256,7 +1325,13 @@ function payloadPreview(payload: Record<string, unknown>): string {
           <button type="button" class="chrome-btn-secondary text-sm" @click="closeNotify">
             {{ t('common.cancel') }}
           </button>
-          <button type="button" class="chrome-btn-primary text-sm" :disabled="notifyBusy" @click="submitNotify">
+          <button
+            type="button"
+            class="chrome-btn-primary text-sm"
+            :disabled="writesBlocked || notifyBusy"
+            :title="writesBlocked ? t('license.writes_blocked') : ''"
+            @click="submitNotify"
+          >
             {{ t('common.save') }}
           </button>
         </div>
@@ -1271,7 +1346,13 @@ function payloadPreview(payload: Record<string, unknown>): string {
           <button type="button" class="chrome-btn-secondary text-sm" @click="notifyDeleteId = null">
             {{ t('common.cancel') }}
           </button>
-          <button type="button" class="chrome-btn-danger text-sm" @click="confirmDeleteNotify">
+          <button
+            type="button"
+            class="chrome-btn-danger text-sm"
+            :disabled="writesBlocked"
+            :title="writesBlocked ? t('license.writes_blocked') : ''"
+            @click="confirmDeleteNotify"
+          >
             {{ t('workflow.delete') }}
           </button>
         </div>

@@ -1,4 +1,5 @@
 import type { ConsoleMessage, Page, Route } from '@playwright/test'
+import type { LicenseStatus } from '../src/api/types'
 
 /**
  * 收集「真正的 JS / render 红错」,过滤掉浏览器对 mock 4xx/5xx 应答的
@@ -64,18 +65,24 @@ export function deferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve }
 }
 
-/** license 状态(LicenseBanner 会拉,给个 valid 免横条干扰)。 */
-export async function mockLicense(page: Page): Promise<void> {
+/** license 状态(LicenseBanner 与各页写操作守护共用)。 */
+export async function mockLicense(
+  page: Page,
+  overrides: Partial<LicenseStatus> = {},
+): Promise<void> {
+  const status: LicenseStatus = {
+    mode: 'valid',
+    edition: 'enterprise',
+    customer: 'test',
+    expires_at: null,
+    limits: {},
+    features: [],
+    repair_reason: null,
+    trial_days_remaining: null,
+    license_enforcement_enabled: true,
+    ...overrides,
+  }
   await page.route('**/api/license/status', (r) =>
-    json(r, 200, {
-      mode: 'valid',
-      edition: 'enterprise',
-      customer: 'test',
-      expires_at: null,
-      limits: {},
-      features: [],
-      repair_reason: null,
-      trial_days_remaining: null,
-    }),
+    json(r, 200, status),
   )
 }

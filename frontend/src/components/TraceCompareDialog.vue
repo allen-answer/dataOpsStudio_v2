@@ -18,7 +18,9 @@ import {
   createTraceCompare,
   type TraceCompareResponse,
 } from '../api/lineage'
-import { ApiError, type DatasourceListItem } from '../api/types'
+import type { DatasourceListItem } from '../api/types'
+import { useLicense } from '../composables/useLicense'
+import { createUserErrorMessage } from '../utils/userErrorMessage'
 
 const props = defineProps<{
   open: boolean
@@ -33,6 +35,8 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const errorMessage = createUserErrorMessage(t)
+const { writesBlocked } = useLicense()
 
 const sourceId = ref('')
 const targetId = ref('')
@@ -70,7 +74,8 @@ const canSubmit = computed(
     Boolean(targetId.value) &&
     !sameDatasource.value &&
     keyColumns.value.length > 0 &&
-    !busy.value,
+    !busy.value &&
+    !writesBlocked.value,
 )
 
 // 每次打开重置(避免残留上次的预览 / 结果)
@@ -88,6 +93,10 @@ watch(
 
 async function submit(dryRun: boolean): Promise<void> {
   error.value = null
+  if (writesBlocked.value) {
+    error.value = t('license.writes_blocked')
+    return
+  }
   if (!isColumnFocus.value) {
     error.value = t('lineage.tc_not_column')
     return
@@ -119,11 +128,9 @@ async function submit(dryRun: boolean): Promise<void> {
       if (res.workflow_id) emit('created', res.workflow_id)
     }
   } catch (e) {
-    if (e instanceof ApiError) {
-      error.value = e.code ? `${e.code}: ${e.message}` : e.message
-    } else {
-      error.value = (e as Error).message
-    }
+    error.value = errorMessage(e, (apiError) =>
+      apiError.code ? `${apiError.code}: ${apiError.message}` : undefined,
+    )
   } finally {
     busy.value = false
     mode.value = null
@@ -222,6 +229,7 @@ async function submit(dryRun: boolean): Promise<void> {
           type="button"
           class="chrome-btn-secondary text-sm"
           :disabled="!canSubmit"
+          :title="writesBlocked ? t('license.writes_blocked') : ''"
           @click="submit(true)"
         >
           <LoadingDots v-if="busy && mode === 'preview'" />
@@ -231,6 +239,7 @@ async function submit(dryRun: boolean): Promise<void> {
           type="button"
           class="chrome-btn-primary text-sm inline-flex items-center gap-1.5"
           :disabled="!canSubmit"
+          :title="writesBlocked ? t('license.writes_blocked') : ''"
           @click="submit(false)"
         >
           <LoadingDots v-if="busy && mode === 'create'" />
