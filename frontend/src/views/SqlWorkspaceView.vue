@@ -554,7 +554,7 @@ onUnmounted(() => {
   for (const controller of pollControllers.values()) controller.abort()
   for (const runtimeList of Object.values(runtimes)) {
     for (const runtime of runtimeList) {
-      invalidateResultRead(runtime)
+      cancelResultRead(runtime)
       if (runtime.jobId) releasePollLease(runtime.jobId)
     }
   }
@@ -898,7 +898,7 @@ function stopConsolePoll(consoleId: string): void {
     pollControllers.delete(key)
   }
   for (const runtime of runtimes[consoleId] ?? []) {
-    invalidateResultRead(runtime)
+    cancelResultRead(runtime)
     if (runtime.jobId) releasePollLease(runtime.jobId)
   }
 }
@@ -1041,6 +1041,7 @@ async function consumeJobProgress(
   } else if (progress.result_version === 0 && progress.terminal && progress.columns_ready) {
     await fetchResult(runtime, runtime.pageOffset, false, signal)
   }
+  if (progress.terminal) runtime.resultLoading = false
   if (hasUnconsumedResult) {
     runtime.unchangedPolls = 0
   } else {
@@ -1084,7 +1085,7 @@ async function fetchResult(
 ): Promise<boolean> {
   if (!runtime.jobId) return false
   const jobId = runtime.jobId
-  const generation = invalidateResultRead(runtime)
+  const generation = advanceResultGeneration(runtime)
   if (showLoading) runtime.resultLoading = true
   try {
     const result = await getJobResult(jobId, offset, runtime.pageSize, signal)
@@ -1119,7 +1120,7 @@ async function appendResultDelta(runtime: ConsoleRuntime, signal?: AbortSignal):
   const offset = current.offset + current.rows.length
   const limit = runtime.pageSize - current.rows.length
   if (limit <= 0) return true
-  const generation = invalidateResultRead(runtime)
+  const generation = advanceResultGeneration(runtime)
   try {
     const delta = await getJobResult(jobId, offset, limit, signal)
     if (
@@ -1175,10 +1176,15 @@ function isResultNotReady(error: unknown, runtime: ConsoleRuntime): boolean {
   )
 }
 
-function invalidateResultRead(runtime: ConsoleRuntime): number {
+function advanceResultGeneration(runtime: ConsoleRuntime): number {
   runtime.resultGeneration += 1
-  runtime.resultLoading = false
   return runtime.resultGeneration
+}
+
+function cancelResultRead(runtime: ConsoleRuntime): number {
+  const generation = advanceResultGeneration(runtime)
+  runtime.resultLoading = false
+  return generation
 }
 
 function isCurrentRuntime(consoleId: string, runtime: ConsoleRuntime): boolean {
@@ -1248,7 +1254,7 @@ function onProgressBroadcast(event: MessageEvent<unknown>): void {
 
 function stopRuntimePoll(consoleId: string, runtime: ConsoleRuntime): void {
   if (!runtime.jobId) return
-  invalidateResultRead(runtime)
+  cancelResultRead(runtime)
   const pollKey = `query:${consoleId}:${runtime.jobId}`
   const timer = pollTimers.get(pollKey)
   if (timer) clearTimeout(timer)
@@ -1288,7 +1294,7 @@ async function onChangePage(offset: number): Promise<void> {
   const originalRootJobId = runtime.rootJobId
   const requestJobId = runtime.rootJobId ?? runtime.jobId
   // Invalidate an in-flight progressive delta before changing the page/job.
-  const requestGeneration = invalidateResultRead(runtime)
+  const requestGeneration = cancelResultRead(runtime)
   runtime.resultLoading = true
   runtime.error = null
   let keepLoadingForNewPage = false

@@ -240,6 +240,73 @@ async function mockWorkspace(
   return { patches, renders, executeRequests, resultRequestUrls, getJobReads: () => jobReads }
 }
 
+interface PerfBaselineMetrics {
+  firstScreenMs: number
+  scrollDurationMs: number
+  frames: number
+  longTasks: number
+  initialRows: number
+}
+
+async function startPerfBaseline(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const baseline = { startedAt: performance.now(), longTasks: 0 }
+    ;(window as typeof window & { __sqlPerfBaseline?: typeof baseline }).__sqlPerfBaseline = baseline
+    if (typeof PerformanceObserver === 'undefined') return
+    const observer = new PerformanceObserver((list) => {
+      baseline.longTasks += list.getEntries().length
+    })
+    observer.observe({ type: 'longtask', buffered: true })
+  })
+}
+
+async function measurePerfBaseline(page: Page): Promise<PerfBaselineMetrics> {
+  await expect(page.locator('tr[data-row-index="0"]')).toBeVisible()
+  const firstScreenMs = await page.evaluate(() => {
+    const baseline = (window as typeof window & {
+      __sqlPerfBaseline?: { startedAt: number }
+    }).__sqlPerfBaseline
+    return baseline ? performance.now() - baseline.startedAt : -1
+  })
+  const initialRows = await page.locator('table.text-data tbody tr[data-row-index]').count()
+  const scrollMetrics = await page.getByTestId('result-table-scroll').evaluate(async (element) => {
+    const start = performance.now()
+    let frames = 0
+    const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight)
+    await new Promise<void>((resolve) => {
+      const tick = (timestamp: number) => {
+        frames += 1
+        const progress = Math.min(1, (timestamp - start) / 1000)
+        element.scrollTop = maxScrollTop * progress
+        if (progress >= 1) resolve()
+        else requestAnimationFrame(tick)
+      }
+      requestAnimationFrame(tick)
+    })
+    return { durationMs: performance.now() - start, frames }
+  })
+  const longTasks = await page.evaluate(
+    () =>
+      (window as typeof window & { __sqlPerfBaseline?: { longTasks: number } }).__sqlPerfBaseline
+        ?.longTasks ?? 0,
+  )
+  return {
+    firstScreenMs,
+    scrollDurationMs: scrollMetrics.durationMs,
+    frames: scrollMetrics.frames,
+    longTasks,
+    initialRows,
+  }
+}
+
+function logPerfBaseline(label: string, metrics: PerfBaselineMetrics): void {
+  console.log(
+    `[perf-baseline] ${label} first-screen=${metrics.firstScreenMs.toFixed(1)}ms ` +
+      `scroll=${metrics.scrollDurationMs.toFixed(1)}ms frames=${metrics.frames} ` +
+      `longtasks=${metrics.longTasks} initialRows=${metrics.initialRows}`,
+  )
+}
+
 let consoleErrors: string[] = []
 test.beforeEach(async ({ page }) => {
   consoleErrors = trackConsoleErrors(page)
@@ -325,9 +392,16 @@ test('next page enqueues a database continuation while previous page stays cache
       execution: null,
     }),
   )
-  await page.route(/\/api\/jobs\/job-2\/result\?/, (r) => {
+  const newPageResultStarted = deferred()
+  const releaseNewPageResult = deferred()
+  let newPageResultFinished = false
+  await page.route(/\/api\/jobs\/job-2\/result\?/, async (r) => {
     const offset = Number(new URL(r.request().url()).searchParams.get('offset') ?? 0)
-    return json(r, 200, {
+    if (offset === 100) {
+      newPageResultStarted.resolve()
+      await releaseNewPageResult.promise
+    }
+    await json(r, 200, {
       job_id: 'job-2',
       result_set_id: 'rs-1',
       offset,
@@ -347,6 +421,7 @@ test('next page enqueues a database continuation while previous page stays cache
       pagination_reason: 'fresh_read_ordered_offset',
       preview_truncated_cells: 0,
     })
+    if (offset === 100) newPageResultFinished = true
   })
 
   await page.goto('/projects/project-1/sql')
@@ -356,7 +431,13 @@ test('next page enqueues a database continuation while previous page stays cache
   await page.getByRole('button', { name: 'Next page' }).click()
 
   await expect.poll(() => pageRequests).toEqual([{ offset: 100 }])
+  await newPageResultStarted.promise
+  await expect(page.getByRole('button', { name: 'Next page' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Previous page' })).toBeDisabled()
+  releaseNewPageResult.resolve()
+  await expect.poll(() => newPageResultFinished).toBe(true)
   await expect(page.getByRole('cell', { name: '101', exact: true }).last()).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Previous page' })).toBeEnabled()
   await page.getByRole('button', { name: 'Stats' }).click()
   await expect(page.getByRole('cell', { name: '5ms', exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Result', exact: true }).click()
@@ -467,6 +548,28 @@ test('late previous-page result cannot leave navigation loading after console sw
   await expect(page.getByRole('button', { name: 'Previous page' })).toBeEnabled()
   await page.getByRole('button', { name: 'Previous page' }).click()
   await expect(page.getByRole('cell', { name: '1', exact: true }).last()).toBeVisible()
+  expectNoConsoleErrors()
+})
+
+test('terminal failure without a result clears result loading state', async ({ page }) => {
+  await mockWorkspace(page)
+  let progressReads = 0
+  await page.route(/\/api\/jobs\/job-1\/progress\?/, (r) => {
+    progressReads += 1
+    return json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', status: 'failed', loaded_rows: 0,
+      result_version: 0, columns_ready: false, first_batch_ready: false, terminal: true,
+      error: 'query failed', error_code: 'sql_failed', retry_after_ms: 0, has_new_result: false,
+      truncated: false, has_more: false, pagination_mode: null, pagination_reason: null,
+      timings: null, execution: null,
+    })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect.poll(() => progressReads).toBeGreaterThanOrEqual(1)
+  await expect(page.getByRole('button', { name: 'Cancel' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Run' })).toBeEnabled()
   expectNoConsoleErrors()
 })
 
@@ -633,55 +736,12 @@ test('synthetic ResultTable stress baseline (1000 rows x 20 columns)', async ({ 
   })
 
   await page.goto('/projects/project-1/sql')
-  await page.evaluate(() => {
-    const baseline = { startedAt: performance.now(), longTasks: 0 }
-    ;(window as typeof window & { __sqlPerfBaseline?: typeof baseline }).__sqlPerfBaseline = baseline
-    if (typeof PerformanceObserver === 'undefined') return
-    const observer = new PerformanceObserver((list) => {
-      baseline.longTasks += list.getEntries().length
-    })
-    observer.observe({ type: 'longtask', buffered: true })
-  })
-
+  await startPerfBaseline(page)
   await page.getByRole('button', { name: 'Run' }).click()
-  await expect(page.locator('tr[data-row-index="0"]')).toBeVisible()
-  const firstScreenMs = await page.evaluate(() => {
-    const baseline = (window as typeof window & {
-      __sqlPerfBaseline?: { startedAt: number }
-    }).__sqlPerfBaseline
-    return baseline ? performance.now() - baseline.startedAt : -1
-  })
-
-  const renderedRows = page.locator('table.text-data tbody tr[data-row-index]')
-  const initialRenderedRows = await renderedRows.count()
-  const scrollMetrics = await page.getByTestId('result-table-scroll').evaluate(async (element) => {
-    const start = performance.now()
-    let frames = 0
-    const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight)
-    await new Promise<void>((resolve) => {
-      const tick = (timestamp: number) => {
-        frames += 1
-        const progress = Math.min(1, (timestamp - start) / 1000)
-        element.scrollTop = maxScrollTop * progress
-        if (progress >= 1) resolve()
-        else requestAnimationFrame(tick)
-      }
-      requestAnimationFrame(tick)
-    })
-    return { durationMs: performance.now() - start, frames }
-  })
-  const longTasks = await page.evaluate(
-    () =>
-      (window as typeof window & { __sqlPerfBaseline?: { longTasks: number } }).__sqlPerfBaseline
-        ?.longTasks ?? 0,
-  )
-  console.log(
-    `[perf-baseline] 1000x20 first-screen=${firstScreenMs.toFixed(1)}ms ` +
-      `scroll=${scrollMetrics.durationMs.toFixed(1)}ms frames=${scrollMetrics.frames} ` +
-      `longtasks=${longTasks} initialRows=${initialRenderedRows}`,
-  )
-  expect(initialRenderedRows).toBeGreaterThan(0)
-  expect(initialRenderedRows).toBeLessThan(100)
+  const metrics = await measurePerfBaseline(page)
+  logPerfBaseline('synthetic 1000x20', metrics)
+  expect(metrics.initialRows).toBeGreaterThan(0)
+  expect(metrics.initialRows).toBeLessThan(100)
   await expect(page.locator('tr[data-row-index="999"]')).toBeVisible()
   expectNoConsoleErrors()
 })
@@ -695,54 +755,12 @@ test('production-shaped ResultTable baseline (500 rows x 20 columns)', async ({ 
 
   await page.goto('/projects/project-1/sql')
   await page.getByLabel('Page size').selectOption('500')
-  await page.evaluate(() => {
-    const baseline = { startedAt: performance.now(), longTasks: 0 }
-    ;(window as typeof window & { __sqlPerfBaseline?: typeof baseline }).__sqlPerfBaseline = baseline
-    if (typeof PerformanceObserver === 'undefined') return
-    const observer = new PerformanceObserver((list) => {
-      baseline.longTasks += list.getEntries().length
-    })
-    observer.observe({ type: 'longtask', buffered: true })
-  })
-
+  await startPerfBaseline(page)
   await page.getByRole('button', { name: 'Run' }).click()
-  await expect(page.locator('tr[data-row-index="0"]')).toBeVisible()
-  const firstScreenMs = await page.evaluate(() => {
-    const baseline = (window as typeof window & {
-      __sqlPerfBaseline?: { startedAt: number }
-    }).__sqlPerfBaseline
-    return baseline ? performance.now() - baseline.startedAt : -1
-  })
-  const renderedRows = page.locator('table.text-data tbody tr[data-row-index]')
-  const initialRenderedRows = await renderedRows.count()
-  const scrollMetrics = await page.getByTestId('result-table-scroll').evaluate(async (element) => {
-    const start = performance.now()
-    let frames = 0
-    const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight)
-    await new Promise<void>((resolve) => {
-      const tick = (timestamp: number) => {
-        frames += 1
-        const progress = Math.min(1, (timestamp - start) / 1000)
-        element.scrollTop = maxScrollTop * progress
-        if (progress >= 1) resolve()
-        else requestAnimationFrame(tick)
-      }
-      requestAnimationFrame(tick)
-    })
-    return { durationMs: performance.now() - start, frames }
-  })
-  const longTasks = await page.evaluate(
-    () =>
-      (window as typeof window & { __sqlPerfBaseline?: { longTasks: number } }).__sqlPerfBaseline
-        ?.longTasks ?? 0,
-  )
-  console.log(
-    `[perf-baseline] production-shaped 500x20 first-screen=${firstScreenMs.toFixed(1)}ms ` +
-      `scroll=${scrollMetrics.durationMs.toFixed(1)}ms frames=${scrollMetrics.frames} ` +
-      `longtasks=${longTasks} initialRows=${initialRenderedRows}`,
-  )
-  expect(initialRenderedRows).toBeGreaterThan(0)
-  expect(initialRenderedRows).toBeLessThan(100)
+  const metrics = await measurePerfBaseline(page)
+  logPerfBaseline('production-shaped 500x20', metrics)
+  expect(metrics.initialRows).toBeGreaterThan(0)
+  expect(metrics.initialRows).toBeLessThan(100)
   await expect(page.locator('tr[data-row-index="499"]')).toBeVisible()
   expectNoConsoleErrors()
 })
@@ -826,6 +844,49 @@ test('virtual window follows a result container resize and disconnects on unmoun
   expectNoConsoleErrors()
 })
 
+test('result table ref lifecycle recovers from empty to nonempty on the same page', async ({
+  page,
+}) => {
+  await mockWorkspace(page)
+  let progressReads = 0
+  let resultReads = 0
+  await page.route(/\/api\/jobs\/job-1\/progress\?/, (r) => {
+    progressReads += 1
+    const terminal = progressReads >= 2
+    return json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', status: terminal ? 'success' : 'running',
+      loaded_rows: terminal ? 1 : 0, result_version: terminal ? 2 : 1,
+      columns_ready: true, first_batch_ready: true, terminal,
+      error: null, error_code: null, retry_after_ms: terminal ? 0 : 1000,
+      has_new_result: true, truncated: false, has_more: false,
+      pagination_mode: 'unavailable', pagination_reason: 'top_level_order_by_required',
+      timings: null, execution: null,
+    })
+  })
+  await page.route(/\/api\/jobs\/job-1\/result\?/, (r) => {
+    resultReads += 1
+    return json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', offset: 0, limit: 100,
+      columns: resultReads === 1
+        ? []
+        : [{ name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true }],
+      rows: resultReads === 1 ? [] : [{ values: [1] }],
+      loaded_rows: resultReads === 1 ? 0 : 1, total_rows: null,
+      state: resultReads === 1 ? 'streaming' : 'complete', truncated: false,
+      has_more: false, page_size: 100, max_result_rows: 1000,
+      pagination_mode: 'unavailable', pagination_reason: 'top_level_order_by_required',
+      preview_truncated_cells: 0,
+    })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect.poll(() => resultReads).toBe(2)
+  await expect(page.getByTestId('result-table-scroll')).toBeVisible()
+  await expect(page.getByRole('cell', { name: '1', exact: true }).last()).toBeVisible()
+  expectNoConsoleErrors()
+})
+
 test('append-only progress does not refetch an already complete current page', async ({
   page,
 }) => {
@@ -870,6 +931,7 @@ test('append-only progress does not refetch an already complete current page', a
 
   await expect.poll(() => progressReads).toBe(3)
   await expect(page.getByText('1-100 of 200+')).toBeVisible()
+  await expect(page.locator('table.text-data')).toHaveAttribute('aria-rowcount', '-1')
 
   const domObservation = await page.locator('table.text-data tbody').evaluate((tbody) => {
     const observedWindow = window as typeof window & {

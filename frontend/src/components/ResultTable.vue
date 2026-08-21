@@ -14,7 +14,7 @@
  *
  * NULL 显示:斜体 muted "NULL";空字符串显示 "''";其他原样字符串化。
  */
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ChevronLeft, ChevronRight, AlertTriangle, Database, Info } from 'lucide-vue-next'
 import EmptyState from './EmptyState.vue'
@@ -147,7 +147,9 @@ const bottomSpacerHeight = computed(() =>
   Math.max(0, (displayRows.value.length - visibleRange.value.end) * ROW_HEIGHT),
 )
 const ariaRowCount = computed(() => {
-  const totalRows = props.totalRows ?? props.loadedRows ?? props.offset + props.rows.length
+  if (props.totalRows !== null) return props.totalRows + 1
+  if (props.hasMore === true) return -1
+  const totalRows = props.loadedRows ?? props.offset + props.rows.length
   return totalRows + 1 // Include the sticky header row in the table row count.
 })
 const ariaColCount = computed(() => props.columns.length + 1) // Include the row-number column.
@@ -165,7 +167,7 @@ const hasNext = computed(() => {
   }
   return Boolean(props.hasMore && props.paginationMode === 'ordered_offset')
 })
-const hasPrev = computed(() => props.offset > 0)
+const hasPrev = computed(() => !props.loading && props.offset > 0)
 
 const startRow = computed(() => (props.rows.length === 0 ? 0 : props.offset + 1))
 const endRow = computed(() => props.offset + props.rows.length)
@@ -208,37 +210,45 @@ function onScroll(event: Event): void {
   viewportHeight.value = target.clientHeight
 }
 
-function syncViewport(): void {
-  if (scrollContainer.value) viewportHeight.value = scrollContainer.value.clientHeight
+function syncViewport(target: HTMLElement | null = scrollContainer.value): void {
+  viewportHeight.value = target?.clientHeight ?? 0
 }
 
-onMounted(() => {
-  void nextTick(() => {
-    syncViewport()
-    const target = scrollContainer.value
-    if (!target || typeof ResizeObserver === 'undefined') return
-    resizeObserver = new ResizeObserver(syncViewport)
-    resizeObserver.observe(target)
-  })
-})
+function resetScrollPosition(): void {
+  scrollTop.value = 0
+  const target = scrollContainer.value
+  if (!target) {
+    viewportHeight.value = 0
+    return
+  }
+  target.scrollTop = 0
+  syncViewport(target)
+}
+
+function observeScrollContainer(target: HTMLElement | null): void {
+  resizeObserver?.disconnect()
+  resizeObserver = null
+  resetScrollPosition()
+  if (!target || typeof ResizeObserver === 'undefined') return
+  resizeObserver = new ResizeObserver(() => syncViewport(target))
+  resizeObserver.observe(target)
+}
+
+watch(scrollContainer, (target) => observeScrollContainer(target), { flush: 'post' })
+
+watch(
+  [() => props.offset, () => props.columns],
+  () => {
+    void nextTick(resetScrollPosition)
+  },
+  { flush: 'post' },
+)
 
 onUnmounted(() => {
   resizeObserver?.disconnect()
   resizeObserver = null
 })
 
-watch(
-  () => props.offset,
-  () => {
-    void nextTick(() => {
-      scrollTop.value = 0
-      if (scrollContainer.value) {
-        scrollContainer.value.scrollTop = 0
-        syncViewport()
-      }
-    })
-  },
-)
 </script>
 
 <template>
