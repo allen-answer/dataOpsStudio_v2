@@ -5,9 +5,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol, TypeVar, runtime_checkable
 
-import bcrypt
+import bcrypt  # noqa: TID251 - R3 contract seam
 import structlog
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet, InvalidToken  # noqa: TID251 - R3 contract seam
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.engine import Connection, Engine, RowMapping
 

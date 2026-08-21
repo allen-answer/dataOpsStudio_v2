@@ -249,11 +249,13 @@ def command_alembic_up(context: LauncherContext, args: argparse.Namespace) -> in
 
 def command_admin_create(context: LauncherContext, args: argparse.Namespace) -> int:
     username = str(args.username)
+    # ast-grep-ignore: r2-no-plaintext-password-access
     password = str(args.password) if args.password else getpass.getpass("Admin password: ")
     if not password:
         raise LauncherError("admin password must not be empty")
     role = str(args.role)
     project_name = str(args.project_name)
+    # ast-grep-ignore: r2-no-plaintext-prefixed-credential-attribute-access
     update_password = bool(args.update_password)
 
     bootstrap = _bootstrap(context)

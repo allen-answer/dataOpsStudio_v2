@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+# R3 contract seam:license verification may use cryptography.hazmat.
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: TID251
+    Ed25519PublicKey,
+)
 
 from app.domain.license import LicenseMode, LicenseState
 

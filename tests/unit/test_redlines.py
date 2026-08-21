@@ -6,7 +6,12 @@
 from __future__ import annotations
 
 import ast
+import json
 import pathlib
+import shutil
+import subprocess
+import tomllib
+from typing import Any, cast
 
 from app.db.models import APPLICATION_SECRET_KINDS, result_sets
 from app.domain.job import ALLOWED_WORKFLOW_NODE_KINDS, JobKind
@@ -14,6 +19,165 @@ from app.domain.result import ResultSet
 from app.domain.secret import SecretKind
 
 PROJECT_ROOT = pathlib.Path(__file__).parent.parent.parent
+SG_CONFIG = PROJECT_ROOT / "tools" / "lint" / "sgconfig.yml"
+R2_FIXTURE_ROOT = PROJECT_ROOT / "tests" / "fixtures" / "redlines" / "r2"
+
+
+def _required_tool(name: str) -> str:
+    executable = shutil.which(name)
+    if executable is not None:
+        return executable
+    for candidate in (
+        PROJECT_ROOT / ".venv" / "Scripts" / f"{name}.exe",
+        PROJECT_ROOT / ".venv" / "bin" / name,
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    raise AssertionError(f"required lint tool is not on PATH: {name}")
+
+
+def _run_r2_fixture_scan() -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            _required_tool("sg"),
+            "scan",
+            "--config",
+            str(SG_CONFIG),
+            "--filter",
+            "^r2-",
+            "--json=compact",
+            ".",
+        ],
+        cwd=R2_FIXTURE_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+
+def _ruff_check_stdin(filename: str, source: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            _required_tool("ruff"),
+            "check",
+            "--no-cache",
+            "--select",
+            "TID251",
+            "--stdin-filename",
+            filename,
+            "-",
+        ],
+        cwd=PROJECT_ROOT,
+        input=source,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+
+# ─── R2 source lint:app/** coverage + precise plaintext credential forms ───
+
+
+def test_r2_rule_detects_credential_access_across_app_without_false_positives() -> None:
+    """R2 CLI rule catches audited forms while preserving explicit contract seams."""
+    result = _run_r2_fixture_scan()
+    assert result.returncode == 1, result.stdout + result.stderr
+
+    decoded = json.loads(result.stdout)
+    assert isinstance(decoded, list)
+    matches = cast(list[dict[str, Any]], decoded)
+    actual = {(str(match["file"]).replace("\\", "/"), str(match["text"])) for match in matches}
+    assert actual == {
+        ("app/domain/unsafe_access.py", "credentials.password"),
+        ("app/domain/unsafe_access.py", "credentials.old_password"),
+        ("app/domain/unsafe_access.py", "credentials.smtp_password"),
+        ("app/domain/unsafe_access.py", "credentials.update_password"),
+        ("app/domain/unsafe_access.py", "credentials.api_key"),
+        ("app/domain/unsafe_access.py", "credentials.access_token"),
+        ("app/domain/unsafe_access.py", 'getattr(credentials, "token")'),
+        ("app/domain/unsafe_access.py", 'getattr(credentials, "new_password")'),
+        ("app/services/unsafe_access.py", "credentials.token"),
+        ("app/worker.py", 'row["password"]'),
+        ("app/worker.py", 'row.get("api_key")'),
+    }
+
+
+# ─── R3 source lint:TID251 exceptions stay primitive- and line-specific ───
+
+
+def test_r3_has_no_directory_wide_tid251_ignore() -> None:
+    """R1/R3 exceptions must be audited imports, never directory blankets."""
+    config = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    ignores = config["tool"]["ruff"]["lint"]["per-file-ignores"]
+    assert ignores == {}
+
+
+def test_r3_wrong_primitive_is_rejected_inside_license_directory() -> None:
+    """license may use hazmat/PyNaCl, but its path must not blanket-allow bcrypt."""
+    result = _ruff_check_stdin(
+        "app/infrastructure/license/probe.py",
+        "import bcrypt\n",
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "TID251" in result.stdout
+    assert "bcrypt" in result.stdout
+
+
+def test_r3_explicit_contract_primitive_waivers_are_accepted() -> None:
+    """Legitimate R3 imports remain possible through explicit, reviewable waivers."""
+    license_result = _ruff_check_stdin(
+        "app/infrastructure/license/probe.py",
+        "from cryptography.hazmat.primitives import hashes  # noqa: TID251\n",
+    )
+    secretstore_result = _ruff_check_stdin(
+        "app/infrastructure/secretstore/probe.py",
+        "import bcrypt  # noqa: TID251\nfrom cryptography.fernet import Fernet  # noqa: TID251\n",
+    )
+    assert license_result.returncode == 0, license_result.stdout + license_result.stderr
+    assert secretstore_result.returncode == 0, secretstore_result.stdout + secretstore_result.stderr
+
+
+def test_r3_tid251_waivers_match_the_contract_inventory() -> None:
+    """Every waiver names one currently required, contract-allowed import or test seam."""
+    actual: set[tuple[str, str]] = set()
+    for source_root in (PROJECT_ROOT / "app", PROJECT_ROOT / "tests"):
+        for source_path in source_root.rglob("*.py"):
+            lines = source_path.read_text(encoding="utf-8").splitlines()
+            tree = ast.parse("\n".join(lines))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Import | ast.ImportFrom):
+                    continue
+                source_line = lines[node.lineno - 1]
+                if "noqa: TID251" not in source_line:
+                    continue
+                actual.add((source_path.relative_to(PROJECT_ROOT).as_posix(), ast.unparse(node)))
+
+    assert actual == {
+        (
+            "app/infrastructure/license/verifier.py",
+            "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey",
+        ),
+        ("app/infrastructure/secretstore/local_file.py", "import bcrypt"),
+        (
+            "app/infrastructure/secretstore/local_file.py",
+            "from cryptography.fernet import Fernet, InvalidToken",
+        ),
+        (
+            "app/infrastructure/secretstore/v1_legacy.py",
+            "from cryptography.fernet import Fernet, InvalidToken",
+        ),
+        (
+            "tests/integration/test_migrate_from_v1_pg.py",
+            "from cryptography.fernet import Fernet",
+        ),
+        (
+            "tests/unit/test_license_verifier.py",
+            "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey",
+        ),
+        ("tests/unit/test_migrate_from_v1.py", "from cryptography.fernet import Fernet"),
+    }
 
 
 # ─── R4 一致性:Python SecretKind ↔ DB APPLICATION_SECRET_KINDS ───
