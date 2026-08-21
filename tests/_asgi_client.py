@@ -56,7 +56,7 @@ class AsgiClient:
         raw_body: bytes | None = None,
     ) -> AsgiResponse:
         return asyncio.run(
-            self._request(
+            self.request_async(
                 method,
                 path,
                 headers=headers,
@@ -66,14 +66,14 @@ class AsgiClient:
             )
         )
 
-    async def _request(
+    async def request_async(
         self,
         method: str,
         path: str,
         *,
-        headers: dict[str, str] | None,
-        json_body: object | None,
-        params: dict[str, object] | None,
+        headers: dict[str, str] | None = None,
+        json_body: object | None = None,
+        params: dict[str, object] | None = None,
         raw_body: bytes | None = None,
     ) -> AsgiResponse:
         path_only, _, raw_query = path.partition("?")
