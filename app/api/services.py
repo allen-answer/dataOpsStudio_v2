@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -24,6 +25,10 @@ SETTING_ACCESS_TOKEN_TTL_SECONDS = "auth.access_token_ttl_seconds"
 SETTING_LICENSE_ENFORCEMENT_ENABLED = "license.enforcement_enabled"
 DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 3600
 DEFAULT_LICENSE_ENFORCEMENT_ENABLED = True
+# Supported deployments run one API process and invalidate immediately after the
+# authoritative admin write. A future custom multi-process deployment could
+# observe an old mode for at most one second; HA remains unsupported.
+LICENSE_MODE_CACHE_TTL_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -110,6 +115,13 @@ class ApiServices:
     # 与 worker 推进器同源(Settings.worker.workflow_node_default_max_retries),
     # 避免状态展示与实际执行口径漂移。
     workflow_node_default_max_retries: int = 0
+    _license_mode_cache: LicenseMode | None = field(default=None, init=False, repr=False)
+    _license_mode_cache_expires_at: float = field(default=0.0, init=False, repr=False)
+    _license_mode_cache_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
 
     def access_token_ttl_seconds(self) -> int:
         value = self._system_setting(SETTING_ACCESS_TOKEN_TTL_SECONDS)
@@ -135,15 +147,28 @@ class ApiServices:
         return str(value) if value is not None else None
 
     def current_license_mode(self) -> LicenseMode:
-        with self.engine.connect() as conn:
-            row = (
-                conn.execute(select(license_state.c.mode).where(license_state.c.id == 1))
-                .mappings()
-                .one_or_none()
-            )
-        if row is None:
-            return LicenseMode.TRIAL
-        return LicenseMode(str(row["mode"]))
+        with self._license_mode_cache_lock:
+            cache_started_at = time.monotonic()
+            if (
+                self._license_mode_cache is not None
+                and cache_started_at < self._license_mode_cache_expires_at
+            ):
+                return self._license_mode_cache
+            with self.engine.connect() as conn:
+                row = (
+                    conn.execute(select(license_state.c.mode).where(license_state.c.id == 1))
+                    .mappings()
+                    .one_or_none()
+                )
+            mode = LicenseMode.TRIAL if row is None else LicenseMode(str(row["mode"]))
+            self._license_mode_cache = mode
+            self._license_mode_cache_expires_at = cache_started_at + LICENSE_MODE_CACHE_TTL_SECONDS
+            return mode
+
+    def invalidate_license_mode_cache(self) -> None:
+        with self._license_mode_cache_lock:
+            self._license_mode_cache = None
+            self._license_mode_cache_expires_at = 0.0
 
     def is_token_revoked(
         self,
