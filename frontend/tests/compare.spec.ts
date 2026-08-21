@@ -624,6 +624,160 @@ test('stale terminal results cannot overwrite a newer compare run', async ({ pag
   expectNoConsoleErrors()
 })
 
+test('large diff pages avoid per-cell linear scans while preserving pagination', async ({ page }) => {
+  const valueColumns = Array.from({ length: 12 }, (_, index) => `value_${String(index).padStart(2, '0')}`)
+  const task = compareTask({
+    columns: [
+      { name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true },
+      ...valueColumns.map((name) => ({
+        name,
+        type: 'string',
+        driver_type: 'VARCHAR',
+        nullable: true,
+        primary_key: false,
+      })),
+    ],
+    compare_rules: {
+      ...compareTask().compare_rules,
+      key_columns: ['id'],
+      column_mappings: {},
+    },
+  })
+  await mockBase(page, [task])
+
+  const failedRequests: string[] = []
+  const errorResponses: string[] = []
+  page.on('requestfailed', (request) => {
+    failedRequests.push(`${request.method()} ${new URL(request.url()).pathname}`)
+  })
+  page.on('response', (response) => {
+    if (response.url().includes('/api/') && response.status() >= 400) {
+      errorResponses.push(`${response.status()} ${new URL(response.url()).pathname}`)
+    }
+  })
+
+  await page.addInitScript(() => {
+    const metrics = { calls: 0, predicateChecks: 0 }
+    Object.defineProperty(window, '__compareCellFindMetrics', {
+      configurable: true,
+      value: metrics,
+    })
+    const originalFind = Array.prototype.find
+    const instrumentedFind = function <T>(
+      this: T[],
+      predicate: (value: T, index: number, array: T[]) => unknown,
+      thisArg?: unknown,
+    ): T | undefined {
+      const first = this[0]
+      const isCompareCellArray = Boolean(
+        first &&
+          typeof first === 'object' &&
+          'column' in first &&
+          ('source' in first || 'target' in first),
+      )
+      if (!isCompareCellArray) {
+        return Reflect.apply(originalFind, this, [predicate, thisArg]) as T | undefined
+      }
+      metrics.calls += 1
+      const countedPredicate = (value: T, index: number, array: T[]): unknown => {
+        metrics.predicateChecks += 1
+        return predicate.call(thisArg, value, index, array)
+      }
+      return Reflect.apply(originalFind, this, [countedPredicate, thisArg]) as T | undefined
+    }
+    Object.defineProperty(Array.prototype, 'find', {
+      configurable: true,
+      value: instrumentedFind,
+      writable: true,
+    })
+  })
+
+  await page.route('**/api/compare/tasks/task-1/run', (r) =>
+    json(r, 202, { job_id: 'job-large-diff', run_id: 'run-large-diff' }),
+  )
+  await page.route('**/api/jobs/job-large-diff', (r) =>
+    json(r, 200, {
+      id: 'job-large-diff',
+      kind: 'compare_run',
+      status: 'success',
+      created_at: now,
+      finished_at: now,
+      error: null,
+      error_code: null,
+      message: null,
+      result_set_id: null,
+    }),
+  )
+
+  const resultOffsets: number[] = []
+  await page.route(/\/api\/compare\/runs\/run-large-diff\/results/, (r) => {
+    const offset = Number(new URL(r.request().url()).searchParams.get('offset') ?? 0)
+    resultOffsets.push(offset)
+    const rows = Array.from({ length: 100 }, (_, rowOffset) => {
+      const rowIndex = offset + rowOffset
+      return {
+        pk: { id: rowIndex },
+        source: null,
+        target: null,
+        cells: valueColumns.map((column, columnIndex) => ({
+          column,
+          source: `source-${rowIndex}-${columnIndex}`,
+          target: `target-${rowIndex}-${columnIndex}`,
+        })),
+      }
+    })
+    return json(r, 200, {
+      job_id: 'job-large-diff',
+      run_id: 'run-large-diff',
+      bucket: 'diff',
+      offset,
+      limit: 100,
+      bucket_counts: { only_source: 0, only_target: 0, diff: 200, same: 0 },
+      progress,
+      diff_profile: diffProfile,
+      sample_result: null,
+      rows,
+    })
+  })
+  await page.route(/\/api\/compare\/runs\/run-large-diff\/profile/, (r) =>
+    json(r, 200, {
+      job_id: 'job-large-diff',
+      run_id: 'run-large-diff',
+      bucket_counts: { only_source: 0, only_target: 0, diff: 200, same: 0 },
+      progress,
+      diff_profile: diffProfile,
+      sample_result: null,
+    }),
+  )
+
+  await page.goto('/projects/project-1/compare')
+  await page.getByRole('button', { name: 'Start compare' }).click()
+  const firstSourceValue = page.getByText('S: source-0-0', { exact: true })
+  await expect(firstSourceValue).toBeVisible()
+  const resultBody = page.locator('tbody').filter({ has: firstSourceValue })
+  await expect(resultBody.locator('tr')).toHaveCount(100)
+  const initialCellCount = await resultBody.locator('td').count()
+
+  await page.getByRole('button', { name: 'Load 100 more' }).click()
+  await expect(resultBody.locator('tr')).toHaveCount(200)
+  const appendedCellCount = await resultBody.locator('td').count()
+  const metrics = await page.evaluate(() => {
+    const candidate = window as typeof window & {
+      __compareCellFindMetrics?: { calls: number; predicateChecks: number }
+    }
+    return candidate.__compareCellFindMetrics ?? { calls: -1, predicateChecks: -1 }
+  })
+
+  expect(initialCellCount).toBe(1300)
+  expect(appendedCellCount).toBe(2600)
+  expect(resultOffsets).toEqual([0, 100])
+  expect(metrics.calls).toBe(0)
+  expect(metrics.predicateChecks).toBe(0)
+  expect(failedRequests).toEqual([])
+  expect(errorResponses).toEqual([])
+  expectNoConsoleErrors()
+})
+
 test('run a compare, poll the job, then render 4 buckets with split cells', async ({ page }) => {
   await mockBase(page)
   await page.route('**/api/compare/tasks/task-1/run', (r) =>

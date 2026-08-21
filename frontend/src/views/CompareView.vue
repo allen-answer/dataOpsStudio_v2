@@ -67,6 +67,7 @@ import {
   type CompareAiAttributionResponse,
   type CompareAiMapSuggestItem,
   type CompareBucket,
+  type CompareCellDiff,
   type CompareDataRef,
   type CompareDiffSqlResponse,
   type CompareFileFormat,
@@ -112,6 +113,16 @@ interface BucketStyle {
   dot: string
   badge: string
   active: string
+}
+
+interface ResultGridCell {
+  column: string
+  diff: CompareCellDiff | undefined
+}
+
+interface ResultGridRow {
+  row: CompareResultRow
+  cells: ResultGridCell[]
 }
 // 4 桶语义色硬绑(像 JobStatusBadge),与 variant 无关 —— PRD §12 视觉锚点 4 色 token。
 const BUCKET_STYLE: Record<CompareBucket, BucketStyle> = {
@@ -498,6 +509,33 @@ const visibleColumns = computed<string[]>(() => {
   const filtered = compareColumns.value.filter((c) => diffPageColumns.value.has(c))
   // 当前页无 cell 差异信息(极端降级)时回退全列,避免只剩主键列的空表头。
   return filtered.length > 0 ? filtered : compareColumns.value
+})
+
+const resultCellDiffIndex = computed<
+  ReadonlyMap<CompareResultRow, ReadonlyMap<string, CompareCellDiff>>
+>(() => {
+  const index = new Map<CompareResultRow, ReadonlyMap<string, CompareCellDiff>>()
+  for (const row of resultData.value?.rows ?? []) {
+    const cells = new Map<string, CompareCellDiff>()
+    for (const cell of row.cells) {
+      if (!cells.has(cell.column)) cells.set(cell.column, cell)
+    }
+    index.set(row, cells)
+  }
+  return index
+})
+
+/** 每个可见格只从预索引读取一次;模板复用 cell.diff,不重复扫描 row.cells。 */
+const resultGridRows = computed<ResultGridRow[]>(() => {
+  const index = resultCellDiffIndex.value
+  const columns = visibleColumns.value
+  return (resultData.value?.rows ?? []).map((row) => {
+    const rowIndex = index.get(row)
+    return {
+      row,
+      cells: columns.map((column) => ({ column, diff: rowIndex?.get(column) })),
+    }
+  })
 })
 
 function onToggleShowAllColumns(event: Event): void {
@@ -1910,43 +1948,32 @@ function diffReason(cell: { source?: unknown; target?: unknown } | undefined): s
   if (String(source) === String(target)) return 'same text, different stored value/type'
   return 'value differs'
 }
-function cellDiffFor(row: CompareResultRow, column: string) {
-  return row.cells.find((c) => c.column === column)
+const ONLY_SIDE_ROW_STYLE = {
+  backgroundColor: 'rgb(254 226 226)',
+  boxShadow: 'inset 4px 0 0 rgb(220 38 38)',
+}
+const ONLY_SIDE_CELL_STYLE = {
+  backgroundColor: 'rgb(254 226 226)',
+  color: 'rgb(127 29 29)',
+}
+const DIFF_CELL_STYLE = {
+  backgroundColor: 'rgb(254 202 202)',
+  boxShadow: 'inset 0 0 0 1px rgb(248 113 113)',
 }
 
-function resultRowStyle(): Record<string, string> | undefined {
-  if (resultBucket.value === 'only_source' || resultBucket.value === 'only_target') {
-    return {
-      backgroundColor: 'rgb(254 226 226)',
-      boxShadow: 'inset 4px 0 0 rgb(220 38 38)',
-    }
-  }
-  return undefined
-}
+const isOnlySideBucket = computed<boolean>(
+  () => resultBucket.value === 'only_source' || resultBucket.value === 'only_target',
+)
+const resultRowStyle = computed<Record<string, string> | undefined>(() =>
+  isOnlySideBucket.value ? ONLY_SIDE_ROW_STYLE : undefined,
+)
+const resultKeyCellStyle = computed<Record<string, string> | undefined>(() =>
+  isOnlySideBucket.value ? ONLY_SIDE_CELL_STYLE : undefined,
+)
 
-function resultKeyCellStyle(): Record<string, string> | undefined {
-  if (resultBucket.value === 'only_source' || resultBucket.value === 'only_target') {
-    return {
-      backgroundColor: 'rgb(254 226 226)',
-      color: 'rgb(127 29 29)',
-    }
-  }
-  return undefined
-}
-
-function resultValueCellStyle(row: CompareResultRow, column: string): Record<string, string> | undefined {
-  if (resultBucket.value === 'diff' && cellDiffFor(row, column)) {
-    return {
-      backgroundColor: 'rgb(254 202 202)',
-      boxShadow: 'inset 0 0 0 1px rgb(248 113 113)',
-    }
-  }
-  if (resultBucket.value === 'only_source' || resultBucket.value === 'only_target') {
-    return {
-      backgroundColor: 'rgb(254 226 226)',
-      color: 'rgb(127 29 29)',
-    }
-  }
+function resultValueCellStyle(diff: CompareCellDiff | undefined): Record<string, string> | undefined {
+  if (resultBucket.value === 'diff' && diff) return DIFF_CELL_STYLE
+  if (isOnlySideBucket.value) return ONLY_SIDE_CELL_STYLE
   return undefined
 }
 
@@ -3241,45 +3268,45 @@ const missingTarget = computed(
               </thead>
               <tbody>
                 <tr
-                    v-for="(row, ri) in resultData.rows"
+                    v-for="(gridRow, ri) in resultGridRows"
                     :key="ri"
                     class="border-t chrome-border-subtle align-top"
-                    :style="resultRowStyle()"
+                    :style="resultRowStyle"
                   >
                   <td
                     v-for="kc in keyColumns"
                     :key="`k-${ri}-${kc}`"
                     class="px-3 py-2 font-mono chrome-text-heading sticky left-0 chrome-bg-panel border-r chrome-border"
-                    :style="resultKeyCellStyle()"
+                    :style="resultKeyCellStyle"
                   >
-                    <span :title="rawCellTitle(row.pk[kc])">{{ fmtCell(row.pk[kc]) }}</span>
+                    <span :title="rawCellTitle(gridRow.row.pk[kc])">{{ fmtCell(gridRow.row.pk[kc]) }}</span>
                   </td>
                   <td
-                    v-for="col in visibleColumns"
-                    :key="`c-${ri}-${col}`"
+                    v-for="cell in gridRow.cells"
+                    :key="`c-${ri}-${cell.column}`"
                     class="px-3 py-2 font-mono"
-                    :style="resultValueCellStyle(row, col)"
+                    :style="resultValueCellStyle(cell.diff)"
                   >
                     <!-- diff 桶:有 cell 差异 → 上下分裂(红删 / 绿增);否则单行 -->
-                    <template v-if="resultBucket === 'diff' && cellDiffFor(row, col)">
+                    <template v-if="resultBucket === 'diff' && cell.diff">
                       <div class="mb-1 text-[10px] font-semibold uppercase tracking-wide text-red-800 dark:text-red-200">
-                        {{ diffReason(cellDiffFor(row, col)) }}
+                        {{ diffReason(cell.diff) }}
                       </div>
-                      <div class="text-red-600 dark:text-red-400 line-through" :title="rawCellTitle(cellDiffFor(row, col)?.source)">
-                        S: {{ fmtCell(cellDiffFor(row, col)?.source) }}
+                      <div class="text-red-600 dark:text-red-400 line-through" :title="rawCellTitle(cell.diff.source)">
+                        S: {{ fmtCell(cell.diff.source) }}
                       </div>
-                      <div class="text-red-700 dark:text-red-300 font-semibold" :title="rawCellTitle(cellDiffFor(row, col)?.target)">
-                        T: {{ fmtCell(cellDiffFor(row, col)?.target) }}
+                      <div class="text-red-700 dark:text-red-300 font-semibold" :title="rawCellTitle(cell.diff.target)">
+                        T: {{ fmtCell(cell.diff.target) }}
                       </div>
                     </template>
                     <template v-else-if="resultBucket === 'only_source'">
-                      <span class="chrome-text-heading" :title="rawCellTitle(row.source?.[col])">{{ fmtCell(row.source?.[col]) }}</span>
+                      <span class="chrome-text-heading" :title="rawCellTitle(gridRow.row.source?.[cell.column])">{{ fmtCell(gridRow.row.source?.[cell.column]) }}</span>
                     </template>
                     <template v-else-if="resultBucket === 'only_target'">
-                      <span class="chrome-text-heading" :title="rawCellTitle(row.target?.[col])">{{ fmtCell(row.target?.[col]) }}</span>
+                      <span class="chrome-text-heading" :title="rawCellTitle(gridRow.row.target?.[cell.column])">{{ fmtCell(gridRow.row.target?.[cell.column]) }}</span>
                     </template>
                     <template v-else>
-                      <span class="chrome-text-muted" :title="rawCellTitle(row.source?.[col] ?? row.target?.[col])">{{ fmtCell(row.source?.[col] ?? row.target?.[col]) }}</span>
+                      <span class="chrome-text-muted" :title="rawCellTitle(gridRow.row.source?.[cell.column] ?? gridRow.row.target?.[cell.column])">{{ fmtCell(gridRow.row.source?.[cell.column] ?? gridRow.row.target?.[cell.column]) }}</span>
                     </template>
                   </td>
                 </tr>
