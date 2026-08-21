@@ -9,7 +9,7 @@ import sqlglot
 from pydantic import BaseModel, ConfigDict, Field
 from sqlglot import exp
 from sqlglot.errors import ParseError, SqlglotError
-from sqlglot.lineage import lineage
+from sqlglot.lineage import Node, lineage
 from sqlglot.optimizer.qualify import qualify
 
 from app.domain.lineage.dialects import register_lineage_dialects
@@ -407,6 +407,14 @@ def _analyze_query_write(
     _append_edges(report, target_table, source_tables, context.index)
     _append_tables(report, target_table, source_tables, context.index)
     branches = _query_branches(query)
+    first_branch = branches[0] if branches else None
+    output_lineage = _output_lineage_nodes(
+        qualified_expression,
+        output_names=(item.alias_or_name for item in first_branch.expressions)
+        if first_branch is not None
+        else (),
+        context=context,
+    )
     for branch in branches:
         _append_columns(report, branch, context.default_schema, cte_map)
         _append_clause_details(report, branch, context.index, context.default_schema, cte_map)
@@ -421,6 +429,7 @@ def _analyze_query_write(
             context=context,
             statement_type=statement_type,
             cte_map=cte_map,
+            output_lineage=output_lineage,
         )
         return
     for select_item, target_column in zip(query.expressions, target_columns, strict=False):
@@ -434,6 +443,7 @@ def _analyze_query_write(
             target_column=target_column,
             context=context,
             statement_type=statement_type,
+            output_lineage=output_lineage,
         )
         _append_indirect_mappings(
             report,
@@ -714,18 +724,23 @@ def _append_output_mappings(
     target_column: str,
     context: _StatementContext,
     statement_type: str,
+    output_lineage: Mapping[str, Node] | None,
 ) -> None:
     subtype = _transformation_subtype(select_item)
-    try:
-        node = lineage(
-            select_item.alias_or_name,
-            qualified_expression,
-            schema=context.schema,
-            dialect=context.dialect,
-        )
-    except (SqlglotError, RecursionError) as exc:
-        _append_parse_error(report, context, "lineage_error", exc, statement_type=statement_type)
-        return
+    node = output_lineage.get(select_item.alias_or_name) if output_lineage is not None else None
+    if node is None:
+        try:
+            node = lineage(
+                select_item.alias_or_name,
+                qualified_expression,
+                schema=context.schema,
+                dialect=context.dialect,
+            )
+        except (SqlglotError, RecursionError) as exc:
+            _append_parse_error(
+                report, context, "lineage_error", exc, statement_type=statement_type
+            )
+            return
     for source_table, source_column in _source_columns_from_node(node, context.default_schema):
         mapping = InsertMapping(
             target_table=target_table,
@@ -749,6 +764,7 @@ def _append_set_operation_mappings(
     context: _StatementContext,
     statement_type: str,
     cte_map: Mapping[str, exp.Expression],
+    output_lineage: Mapping[str, Node] | None,
 ) -> None:
     if not branches:
         return
@@ -756,18 +772,20 @@ def _append_set_operation_mappings(
         if not target_column or item_index >= len(branches[0].expressions):
             continue
         first_item = branches[0].expressions[item_index]
-        try:
-            node = lineage(
-                first_item.alias_or_name,
-                qualified_expression,
-                schema=context.schema,
-                dialect=context.dialect,
-            )
-        except (SqlglotError, RecursionError) as exc:
-            _append_parse_error(
-                report, context, "lineage_error", exc, statement_type=statement_type
-            )
-            return
+        node = output_lineage.get(first_item.alias_or_name) if output_lineage is not None else None
+        if node is None:
+            try:
+                node = lineage(
+                    first_item.alias_or_name,
+                    qualified_expression,
+                    schema=context.schema,
+                    dialect=context.dialect,
+                )
+            except (SqlglotError, RecursionError) as exc:
+                _append_parse_error(
+                    report, context, "lineage_error", exc, statement_type=statement_type
+                )
+                return
         branch_items = [
             branch.expressions[item_index]
             for branch in branches
@@ -812,6 +830,34 @@ def _append_set_operation_mappings(
                     context=context,
                     cte_map=cte_map,
                 )
+
+
+def _output_lineage_nodes(
+    qualified_expression: exp.Expression,
+    *,
+    output_names: Iterable[str],
+    context: _StatementContext,
+) -> dict[str, Node] | None:
+    names = list(output_names)
+    if not names or len(names) != len(set(names)):
+        return None
+    try:
+        # The report consumes only lineage leaf tables/columns, not each node's
+        # display-only SELECT source, so trimming would add per-output deep copies.
+        nodes = lineage(
+            None,
+            qualified_expression,
+            schema=context.schema,
+            dialect=context.dialect,
+            trim_selects=False,
+        )
+    except (SqlglotError, RecursionError, AttributeError, TypeError, ValueError):
+        # Preserve the existing per-column error degradation below if sqlglot
+        # cannot build all output lineages as one batch.
+        return None
+    if not isinstance(nodes, dict) or any(name not in nodes for name in names):
+        return None
+    return nodes
 
 
 def _append_indirect_mappings(
