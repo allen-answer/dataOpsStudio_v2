@@ -23,7 +23,7 @@ dependencies = [
     # SQL & data
     "sqlglot>=25.0",
     "pyarrow>=18",
-    "pandas>=2.2",
+    "numpy>=1.26.0",
     # File-source readers — C-1 file compare(app/domain/readers/,非 DB 驱动)
     "openpyxl>=3.1",
     # Secret crypto — import allowed ONLY in app/infrastructure/secretstore/ (R3)
