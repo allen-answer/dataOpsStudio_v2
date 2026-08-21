@@ -472,6 +472,125 @@ test('progressive results use bounded pages and polling stops at success', async
   expectNoConsoleErrors()
 })
 
+test('append-only progress does not refetch an already complete current page', async ({
+  page,
+}) => {
+  const state = await mockWorkspace(page, { progressiveRows: 100, hasMore: true })
+  let progressReads = 0
+  const observedProgress: Array<{ afterVersion: string | null; loadedRows: number; version: number }> = []
+  await page.route(/\/api\/jobs\/job-1\/progress\?/, (r) => {
+    progressReads += 1
+    const version = progressReads === 1 ? 1 : 2
+    const loadedRows = progressReads === 1 ? 100 : 200
+    observedProgress.push({
+      afterVersion: new URL(r.request().url()).searchParams.get('after_version'),
+      loadedRows,
+      version,
+    })
+    return json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', status: progressReads >= 3 ? 'success' : 'running',
+      loaded_rows: loadedRows, result_version: version, columns_ready: true,
+      first_batch_ready: true, terminal: progressReads >= 3, error: null, error_code: null,
+      retry_after_ms: progressReads >= 3 ? 0 : 1000, has_new_result: progressReads <= 2,
+      truncated: false, has_more: true, pagination_mode: 'ordered_offset',
+      pagination_reason: 'fresh_read_ordered_offset', timings: null, execution: null,
+    })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.locator('table.text-data tbody tr')).toHaveCount(100)
+  await expect.poll(() => state.resultRequestUrls.length).toBe(1)
+  await page.locator('table.text-data tbody').evaluate((tbody) => {
+    const observedWindow = window as typeof window & {
+      __sqlFirstResultRow?: Element | null
+      __sqlResultMutations?: number
+    }
+    observedWindow.__sqlFirstResultRow = tbody.firstElementChild
+    observedWindow.__sqlResultMutations = 0
+    new MutationObserver((records) => {
+      observedWindow.__sqlResultMutations =
+        (observedWindow.__sqlResultMutations ?? 0) + records.length
+    }).observe(tbody, { childList: true, subtree: true, characterData: true })
+  })
+
+  await expect.poll(() => progressReads).toBe(3)
+  await expect(page.getByText('1-100 of 200+')).toBeVisible()
+
+  const domObservation = await page.locator('table.text-data tbody').evaluate((tbody) => {
+    const observedWindow = window as typeof window & {
+      __sqlFirstResultRow?: Element | null
+      __sqlResultMutations?: number
+    }
+    return {
+      firstRowPreserved: observedWindow.__sqlFirstResultRow === tbody.firstElementChild,
+      mutations: observedWindow.__sqlResultMutations ?? 0,
+    }
+  })
+  expect({
+    observedProgress,
+    resultOffsets: state.resultRequestUrls.map((url) =>
+      new URL(url).searchParams.get('offset'),
+    ),
+    domObservation,
+  }).toEqual({
+    observedProgress: [
+      { afterVersion: '0', loadedRows: 100, version: 1 },
+      { afterVersion: '1', loadedRows: 200, version: 2 },
+      { afterVersion: '2', loadedRows: 200, version: 2 },
+    ],
+    resultOffsets: ['0'],
+    domObservation: { firstRowPreserved: true, mutations: 0 },
+  })
+  expectNoConsoleErrors()
+})
+
+test('progressive append refreshes an incomplete current page so new rows stay visible', async ({
+  page,
+}) => {
+  await mockWorkspace(page)
+  let progressReads = 0
+  let loadedRows = 0
+  const resultOffsets: Array<string | null> = []
+  await page.route(/\/api\/jobs\/job-1\/progress\?/, (r) => {
+    progressReads += 1
+    loadedRows = progressReads === 1 ? 50 : 100
+    const terminal = progressReads >= 3
+    return json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', status: terminal ? 'success' : 'running',
+      loaded_rows: loadedRows, result_version: progressReads === 1 ? 1 : 2,
+      columns_ready: true, first_batch_ready: true, terminal, error: null, error_code: null,
+      retry_after_ms: terminal ? 0 : 1000, has_new_result: progressReads <= 2,
+      truncated: false, has_more: false, pagination_mode: 'unavailable',
+      pagination_reason: 'top_level_order_by_required', timings: null, execution: null,
+    })
+  })
+  await page.route(/\/api\/jobs\/job-1\/result\?/, (r) => {
+    resultOffsets.push(new URL(r.request().url()).searchParams.get('offset'))
+    return json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', offset: 0, limit: 100,
+      columns: [
+        { name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true },
+      ],
+      rows: Array.from({ length: loadedRows }, (_, index) => ({ values: [index + 1] })),
+      loaded_rows: loadedRows, total_rows: null,
+      state: progressReads >= 3 ? 'complete' : 'streaming',
+      truncated: false, has_more: false, page_size: 100, max_result_rows: 1000,
+      pagination_mode: 'unavailable', pagination_reason: 'top_level_order_by_required',
+      preview_truncated_cells: 0,
+    })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.locator('table.text-data tbody tr')).toHaveCount(100)
+  await expect(page.getByRole('cell', { name: '100', exact: true }).last()).toBeVisible()
+  await expect.poll(() => progressReads).toBe(3)
+
+  expect(resultOffsets).toEqual(['0', '0'])
+  expectNoConsoleErrors()
+})
+
 test('unchanged progress backs off and does not read result without a new version', async ({
   page,
 }) => {
