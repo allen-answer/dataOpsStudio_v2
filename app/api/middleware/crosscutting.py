@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import structlog
 from fastapi import Request, Response
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
@@ -61,12 +62,12 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
             response.headers["X-Request-ID"] = request_id
             return response
 
-        auth_response = self._authenticate(request)
+        auth_response = await run_in_threadpool(self._authenticate, request)
         if auth_response is not None:
             auth_response.headers["X-Request-ID"] = request_id
             return auth_response
 
-        license_response = self._check_license(request)
+        license_response = await run_in_threadpool(self._check_license, request)
         if license_response is not None:
             license_response.headers["X-Request-ID"] = request_id
             return license_response
@@ -82,7 +83,8 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
         http_resource_id = _http_resource_id(request.method, path)
         audit_request = _should_audit_request(request.method, path)
         if audit_request:
-            self._services.write_audit(
+            await run_in_threadpool(
+                self._services.write_audit,
                 user_id=user.id if user else None,
                 project_id=None,
                 action="api_request_start",
@@ -98,7 +100,8 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
         except Exception:
             if audit_request:
-                self._services.write_audit(
+                await run_in_threadpool(
+                    self._services.write_audit,
                     user_id=user.id if user else None,
                     project_id=None,
                     action="api_request_end",
@@ -114,7 +117,8 @@ class CrossCuttingMiddleware(BaseHTTPMiddleware):
 
         if audit_request:
             result = "success" if response.status_code < 400 else "denied"
-            self._services.write_audit(
+            await run_in_threadpool(
+                self._services.write_audit,
                 user_id=user.id if user else None,
                 project_id=None,
                 action="api_request_end",
