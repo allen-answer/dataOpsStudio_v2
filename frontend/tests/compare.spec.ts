@@ -1,5 +1,5 @@
 import { test, expect, type Page, type Route } from '@playwright/test'
-import { json, mockLicense, seedAdminAuth, trackConsoleErrors } from './helpers'
+import { deferred, json, mockLicense, seedAdminAuth, trackConsoleErrors } from './helpers'
 
 /**
  * 2.2.0 Compare frontend —— 任务编辑(自动推断确认制)/ 4 桶结果(单元格分裂)/
@@ -164,7 +164,10 @@ const sampleResult = {
 const bucketCounts = { only_source: 1, only_target: 1, diff: 1, same: 7 }
 const progress = { scanned_segments: 2, skipped_segments: 1, skipped_rows: 7, row_mode_segments: 1 }
 
-async function mockBase(page: Page): Promise<void> {
+async function mockBase(
+  page: Page,
+  tasks: unknown[] = [compareTask()],
+): Promise<void> {
   await mockLicense(page)
   await page.route(/\/api\/projects\/project-1\/compare\/runs-dashboard/, (r) =>
     json(r, 200, {
@@ -180,7 +183,7 @@ async function mockBase(page: Page): Promise<void> {
     json(r, 200, [datasource(), datasource({ id: 'ds-target', name: 'warehouse_b' })]),
   )
   await page.route(/\/api\/compare\/tasks(\?|$)/, (r: Route) => {
-    if (r.request().method() === 'GET') return json(r, 200, [compareTask()])
+    if (r.request().method() === 'GET') return json(r, 200, tasks)
     return r.fallback()
   })
 }
@@ -452,6 +455,172 @@ test('execution failed state does not render zero buckets as empty results', asy
   await expect(page.getByText('Compare execution failed')).toBeVisible()
   await expect(page.getByText('No rows in this bucket.')).toBeHidden()
   await expect(page.getByRole('button', { name: /^Changed\s+0/ })).toBeHidden()
+  expectNoConsoleErrors()
+})
+
+test('pending compare response cannot restart polling after route unmount', async ({ page }) => {
+  await mockBase(page)
+  await page.route('**/api/projects', (r) => json(r, 200, []))
+  await page.route('**/api/compare/tasks/task-1/run', (r) =>
+    json(r, 202, { job_id: 'job-pending', run_id: 'run-pending' }),
+  )
+
+  let jobReads = 0
+  const firstJobRead = deferred()
+  const jobResponseGate = deferred()
+  await page.route('**/api/jobs/job-pending', async (r) => {
+    jobReads += 1
+    firstJobRead.resolve()
+    await jobResponseGate.promise
+    await json(r, 200, {
+      id: 'job-pending',
+      kind: 'compare_run',
+      status: 'running',
+      created_at: now,
+      finished_at: null,
+      error: null,
+      error_code: null,
+      message: null,
+      result_set_id: null,
+    })
+  })
+
+  await page.goto('/projects/project-1/compare')
+  await page.getByRole('button', { name: 'Start compare' }).click()
+  await firstJobRead.promise
+
+  await page.getByRole('button', { name: 'Projects', exact: true }).click()
+  await expect(page).toHaveURL(/\/projects$/)
+  jobResponseGate.resolve()
+
+  // Compare polls every 800 ms. A stale response used to schedule a second request here.
+  await page.waitForTimeout(1200)
+  expect(jobReads).toBe(1)
+  expectNoConsoleErrors()
+})
+
+test('stale terminal results cannot overwrite a newer compare run', async ({ page }) => {
+  await mockBase(page, [compareTask(), compareTask({ id: 'task-2', name: 'orders-next' })])
+  await page.route('**/api/compare/tasks/task-1/run', (r) =>
+    json(r, 202, { job_id: 'job-stale', run_id: 'run-stale' }),
+  )
+  await page.route('**/api/compare/tasks/task-2/run', (r) =>
+    json(r, 202, { job_id: 'job-current', run_id: 'run-current' }),
+  )
+  await page.route('**/api/jobs/job-stale', (r) =>
+    json(r, 200, {
+      id: 'job-stale',
+      kind: 'compare_run',
+      status: 'success',
+      created_at: now,
+      finished_at: now,
+      error: null,
+      error_code: null,
+      message: null,
+      result_set_id: null,
+    }),
+  )
+  const currentJobRead = deferred()
+  await page.route('**/api/jobs/job-current', async (r) => {
+    currentJobRead.resolve()
+    await json(r, 200, {
+      id: 'job-current',
+      kind: 'compare_run',
+      status: 'success',
+      created_at: now,
+      finished_at: now,
+      error: null,
+      error_code: null,
+      message: null,
+      result_set_id: null,
+    })
+  })
+
+  const staleResultRead = deferred()
+  const staleResultGate = deferred()
+  await page.route(/\/api\/compare\/runs\/run-stale\/results/, async (r) => {
+    staleResultRead.resolve()
+    await staleResultGate.promise
+    await json(r, 200, {
+      job_id: 'job-stale',
+      run_id: 'run-stale',
+      bucket: 'diff',
+      offset: 0,
+      limit: 100,
+      bucket_counts: bucketCounts,
+      progress,
+      diff_profile: diffProfile,
+      sample_result: null,
+      rows: [
+        {
+          pk: { id: 1 },
+          source: { id: 1, amount: 'stale-source' },
+          target: { id: 1, amount: 'stale-target' },
+          cells: [{ column: 'amount', source: 'stale-source', target: 'stale-target' }],
+        },
+      ],
+    })
+  })
+  await page.route(/\/api\/compare\/runs\/run-stale\/profile/, async (r) => {
+    await staleResultGate.promise
+    await json(r, 200, {
+      job_id: 'job-stale',
+      run_id: 'run-stale',
+      bucket_counts: bucketCounts,
+      progress,
+      diff_profile: diffProfile,
+      sample_result: null,
+    })
+  })
+  const currentResultRead = deferred()
+  await page.route(/\/api\/compare\/runs\/run-current\/results/, async (r) => {
+    currentResultRead.resolve()
+    await json(r, 200, {
+      job_id: 'job-current',
+      run_id: 'run-current',
+      bucket: 'diff',
+      offset: 0,
+      limit: 100,
+      bucket_counts: bucketCounts,
+      progress,
+      diff_profile: diffProfile,
+      sample_result: null,
+      rows: [
+        {
+          pk: { id: 2 },
+          source: { id: 2, amount: 'current-source' },
+          target: { id: 2, amount: 'current-target' },
+          cells: [{ column: 'amount', source: 'current-source', target: 'current-target' }],
+        },
+      ],
+    })
+  })
+  await page.route(/\/api\/compare\/runs\/run-current\/profile/, (r) =>
+    json(r, 200, {
+      job_id: 'job-current',
+      run_id: 'run-current',
+      bucket_counts: bucketCounts,
+      progress,
+      diff_profile: diffProfile,
+      sample_result: null,
+    }),
+  )
+
+  await page.goto('/projects/project-1/compare')
+  await page.getByRole('button', { name: 'Start compare' }).click()
+  await staleResultRead.promise
+
+  await page.locator('aside').getByText('orders-next', { exact: true }).click()
+  await expect(page.getByRole('button', { name: 'orders-next', exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Start compare' }).click()
+  await currentJobRead.promise
+  await currentResultRead.promise
+  await expect(page.getByText(/current-source/)).toBeVisible()
+
+  staleResultGate.resolve()
+  await page.waitForTimeout(200)
+  await expect(page.getByText(/current-source/)).toBeVisible()
+  await expect(page.getByText(/stale-source/)).toBeHidden()
   expectNoConsoleErrors()
 })
 

@@ -303,6 +303,8 @@ interface RunState {
 const run = reactive<RunState>({ jobId: null, runId: null, status: null, error: null, cancelling: false })
 let pollTimer: ReturnType<typeof setTimeout> | null = null
 let exportPollTimer: ReturnType<typeof setTimeout> | null = null
+let pollGeneration = 0
+let exportPollGeneration = 0
 
 const resultBucket = ref<CompareBucket>('diff')
 const resultData = ref<CompareRunResultResponse | null>(null)
@@ -946,8 +948,8 @@ onMounted(() => {
   void loadDashboard()
 })
 onUnmounted(() => {
-  if (pollTimer) clearTimeout(pollTimer)
-  if (exportPollTimer) clearTimeout(exportPollTimer)
+  stopRunPolling()
+  stopExportPolling()
 })
 
 watch(activeTask, (task) => {
@@ -1418,17 +1420,27 @@ async function onCreateDraftFromPair(pair: TablePairSuggestion): Promise<void> {
 }
 
 // ── run + poll ──────────────────────────────────────────────────────
-function resetExportState(): void {
+function stopRunPolling(): void {
+  pollGeneration += 1
+  if (pollTimer) clearTimeout(pollTimer)
+  pollTimer = null
+}
+
+function stopExportPolling(): void {
+  exportPollGeneration += 1
   if (exportPollTimer) clearTimeout(exportPollTimer)
   exportPollTimer = null
+}
+
+function resetExportState(): void {
+  stopExportPolling()
   exportBusy.value = false
   exportError.value = null
   exportReady.value = null
 }
 
 function resetRunState(): void {
-  if (pollTimer) clearTimeout(pollTimer)
-  pollTimer = null
+  stopRunPolling()
   run.jobId = null
   run.runId = null
   run.status = null
@@ -1450,14 +1462,17 @@ async function onRun(): Promise<void> {
   }
   if (!activeTask.value || runBlockedReason.value) return
   resetRunState()
+  const generation = pollGeneration
   run.status = 'pending'
   rightTab.value = 'results'
   try {
     const res = await runCompareTask(activeTask.value.id)
+    if (generation !== pollGeneration) return
     run.jobId = res.job_id
     run.runId = res.run_id
-    startPoll()
+    startPoll(generation)
   } catch (e) {
+    if (generation !== pollGeneration) return
     run.status = null
     if (e instanceof ApiError && e.code === 'compare_sql_aliases_stale') {
       editorError.value = t('compare.stale_aliases_error')
@@ -1468,30 +1483,37 @@ async function onRun(): Promise<void> {
   }
 }
 
-function startPoll(): void {
-  void pollRun()
+function startPoll(generation: number): void {
+  if (generation !== pollGeneration) return
+  void pollRun(generation)
 }
 
-async function pollRun(): Promise<void> {
-  if (!run.jobId) return
+async function pollRun(generation: number): Promise<void> {
+  if (generation !== pollGeneration || !run.jobId) return
+  const jobId = run.jobId
+  pollTimer = null
   try {
-    const job: JobResponse = await getJob(run.jobId)
+    const job: JobResponse = await getJob(jobId)
+    if (generation !== pollGeneration || run.jobId !== jobId) return
     run.status = job.status
     if (job.status === 'failed' || job.status === 'timeout') run.error = job.error
     if (job.status === 'cancelled') run.cancelling = false
     if (TERMINAL.has(job.status)) {
       if (job.status === 'success') {
         await Promise.all([loadResults(resultBucket.value), loadProfile()])
+        if (generation !== pollGeneration || run.jobId !== jobId) return
       }
       void loadDashboard() // run 终态 → 刷新仪表盘统计
       return
     }
   } catch (e) {
+    if (generation !== pollGeneration || run.jobId !== jobId) return
     run.error = errorMessage(e)
     return
   }
+  if (generation !== pollGeneration || run.jobId !== jobId) return
   pollTimer = setTimeout(() => {
-    void pollRun()
+    void pollRun(generation)
   }, POLL_MS)
 }
 
@@ -1510,11 +1532,14 @@ async function onCreateCompareExport(): Promise<void> {
   const runId = exportableRunId.value
   if (!runId || exportBusy.value) return
   resetExportState()
+  const generation = exportPollGeneration
   exportBusy.value = true
   try {
     const res = await createCompareExport(runId)
-    await pollCompareExportJob(res.job_id, res.download_token, res.filename)
+    if (generation !== exportPollGeneration) return
+    await pollCompareExportJob(res.job_id, res.download_token, res.filename, generation)
   } catch (e) {
+    if (generation !== exportPollGeneration) return
     exportBusy.value = false
     exportError.value = compareExportErrorMessage(e)
   }
@@ -1533,9 +1558,13 @@ async function pollCompareExportJob(
   jobId: string,
   token: string,
   filename: string,
+  generation: number,
 ): Promise<void> {
+  if (generation !== exportPollGeneration) return
+  exportPollTimer = null
   try {
     const job = await getJob(jobId)
+    if (generation !== exportPollGeneration) return
     if (TERMINAL.has(job.status)) {
       exportPollTimer = null
       exportBusy.value = false
@@ -1547,13 +1576,15 @@ async function pollCompareExportJob(
       return
     }
   } catch (e) {
+    if (generation !== exportPollGeneration) return
     exportPollTimer = null
     exportBusy.value = false
     exportError.value = errorMessage(e)
     return
   }
+  if (generation !== exportPollGeneration) return
   exportPollTimer = setTimeout(() => {
-    void pollCompareExportJob(jobId, token, filename)
+    void pollCompareExportJob(jobId, token, filename, generation)
   }, POLL_MS)
 }
 
@@ -1571,16 +1602,27 @@ async function onDownloadCompareExport(): Promise<void> {
 
 // ── results / profile ───────────────────────────────────────────────
 async function loadResults(bucket: CompareBucket): Promise<void> {
-  if (!run.runId) return
+  const generation = pollGeneration
+  const runId = run.runId
+  if (!runId) return
   resultBucket.value = bucket
   resultLoading.value = true
   resultError.value = null
   try {
-    resultData.value = await getCompareRunResults(run.runId, bucket, 0, PAGE_SIZE)
+    const data = await getCompareRunResults(runId, bucket, 0, PAGE_SIZE)
+    if (
+      generation !== pollGeneration ||
+      run.runId !== runId ||
+      resultBucket.value !== bucket
+    ) {
+      return
+    }
+    resultData.value = data
   } catch (e) {
+    if (generation !== pollGeneration || run.runId !== runId) return
     resultError.value = errorMessage(e)
   } finally {
-    resultLoading.value = false
+    if (generation === pollGeneration && run.runId === runId) resultLoading.value = false
   }
 }
 
@@ -1666,15 +1708,20 @@ async function copyDiffSql(side: 'source' | 'target'): Promise<void> {
 }
 
 async function loadProfile(): Promise<void> {
-  if (!run.runId) return
+  const generation = pollGeneration
+  const runId = run.runId
+  if (!runId) return
   profileLoading.value = true
   profileError.value = null
   try {
-    profileData.value = await getCompareRunProfile(run.runId)
+    const data = await getCompareRunProfile(runId)
+    if (generation !== pollGeneration || run.runId !== runId) return
+    profileData.value = data
   } catch (e) {
+    if (generation !== pollGeneration || run.runId !== runId) return
     profileError.value = errorMessage(e)
   } finally {
-    profileLoading.value = false
+    if (generation === pollGeneration && run.runId === runId) profileLoading.value = false
   }
 }
 
