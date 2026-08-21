@@ -1742,20 +1742,50 @@ def test_compare_suggest_tasks_contract_returns_normalized_table_pairs() -> None
         [
             {"id": "project-1"},
             [source_row, target_row],
-            _metadata_cache([{"name": "src"}]),
-            _metadata_cache(
-                [
-                    {"schema_name": "src", "name": "orders", "table_type": "BASE TABLE"},
-                    {"schema_name": "src", "name": "src_customer", "table_type": "BASE TABLE"},
-                ]
-            ),
-            _metadata_cache([{"name": "dst"}]),
-            _metadata_cache(
-                [
-                    {"schema_name": "dst", "name": "orders", "table_type": "BASE TABLE"},
-                    {"schema_name": "dst", "name": "customer", "table_type": "BASE TABLE"},
-                ]
-            ),
+            [
+                _metadata_cache_row("schemas", "", "", _metadata_cache([{"name": "src"}])),
+                _metadata_cache_row(
+                    "tables",
+                    "src",
+                    "",
+                    _metadata_cache(
+                        [
+                            {
+                                "schema_name": "src",
+                                "name": "orders",
+                                "table_type": "BASE TABLE",
+                            },
+                            {
+                                "schema_name": "src",
+                                "name": "src_customer",
+                                "table_type": "BASE TABLE",
+                            },
+                        ]
+                    ),
+                ),
+            ],
+            [
+                _metadata_cache_row("schemas", "", "", _metadata_cache([{"name": "dst"}])),
+                _metadata_cache_row(
+                    "tables",
+                    "dst",
+                    "",
+                    _metadata_cache(
+                        [
+                            {
+                                "schema_name": "dst",
+                                "name": "orders",
+                                "table_type": "BASE TABLE",
+                            },
+                            {
+                                "schema_name": "dst",
+                                "name": "customer",
+                                "table_type": "BASE TABLE",
+                            },
+                        ]
+                    ),
+                ),
+            ],
         ]
     )
     app = create_app(services=cast(ApiServices, _Services(engine)))
@@ -2768,7 +2798,7 @@ def test_ai_sql_table_candidates_rank_without_calling_gateway(
     monkeypatch.setattr(
         core_routes,
         "_metadata_all_tables",
-        lambda services, row, refresh: [
+        lambda services, row, refresh, **kwargs: [
             SimpleNamespace(schema_name="app", name="orders"),
             SimpleNamespace(schema_name="app", name="users"),
         ],
@@ -2776,7 +2806,7 @@ def test_ai_sql_table_candidates_rank_without_calling_gateway(
     monkeypatch.setattr(
         core_routes,
         "_metadata_columns_for_table",
-        lambda services, row, schema_name, table_name, refresh: [
+        lambda services, row, schema_name, table_name, refresh, **kwargs: [
             Column(name="customer_id", type=ColumnType.INTEGER),
             Column(
                 name="amount" if table_name == "orders" else "name",
@@ -2784,7 +2814,10 @@ def test_ai_sql_table_candidates_rank_without_calling_gateway(
             ),
         ],
     )
-    engine = _FakeEngine([_datasource_row(), {"id": "project-1"}])
+    engine = _FakeEngine(
+        [_datasource_row(), {"id": "project-1"}],
+        metadata_cache_miss=True,
+    )
     services = _Services(engine)
     app = create_app(services=cast(ApiServices, services))
 
@@ -2825,15 +2858,19 @@ def test_ai_sql_table_candidates_schema_scope_avoids_all_schema_enumeration(
         schema_name: str,
         table_name: str,
         refresh: bool,
+        metadata_request: object | None = None,
     ) -> list[Column]:
-        del services, row, refresh
+        del services, row, refresh, metadata_request
         column_calls.append((schema_name, table_name))
         return [Column(name="id", type=ColumnType.INTEGER)]
 
     monkeypatch.setattr(core_routes, "_metadata_all_tables", fail_all_tables)
     monkeypatch.setattr(core_routes, "_metadata_payload", schema_tables)
     monkeypatch.setattr(core_routes, "_metadata_columns_for_table", columns)
-    engine = _FakeEngine([_datasource_row(), {"id": "project-1"}])
+    engine = _FakeEngine(
+        [_datasource_row(), {"id": "project-1"}],
+        metadata_cache_miss=True,
+    )
     app = create_app(services=cast(ApiServices, _Services(engine)))
 
     response = AsgiClient(app).post(
@@ -2876,13 +2913,17 @@ def test_ai_sql_table_candidates_reports_truncated_schema_scope(
         schema_name: str,
         table_name: str,
         refresh: bool,
+        metadata_request: object | None = None,
     ) -> list[Column]:
-        del services, row, schema_name, refresh
+        del services, row, schema_name, refresh, metadata_request
         column_calls.append(table_name)
         return [Column(name="id", type=ColumnType.INTEGER)]
 
     monkeypatch.setattr(core_routes, "_metadata_columns_for_table", columns)
-    engine = _FakeEngine([_datasource_row(), {"id": "project-1"}])
+    engine = _FakeEngine(
+        [_datasource_row(), {"id": "project-1"}],
+        metadata_cache_miss=True,
+    )
     app = create_app(services=cast(ApiServices, _Services(engine)))
 
     response = AsgiClient(app).post(
@@ -2927,7 +2968,7 @@ def test_ai_sql_generate_without_schema_uses_only_unique_confirmed_table(
     monkeypatch.setattr(
         core_routes,
         "_metadata_all_tables",
-        lambda services, row, refresh: [
+        lambda services, row, refresh, **kwargs: [
             SimpleNamespace(schema_name="audit", name="events"),
             SimpleNamespace(schema_name="app", name="users"),
         ],
@@ -2939,15 +2980,19 @@ def test_ai_sql_generate_without_schema_uses_only_unique_confirmed_table(
         schema_name: str,
         table_name: str,
         refresh: bool,
+        metadata_request: object | None = None,
     ) -> list[Column]:
-        del services, row, refresh
+        del services, row, refresh, metadata_request
         column_calls.append((schema_name, table_name))
         return [Column(name="id", type=ColumnType.INTEGER)]
 
     monkeypatch.setattr(core_routes, "_metadata_columns_for_table", columns)
     gateway = _SequenceGateway([AiResponse(content="SELECT id FROM app.users")])
     monkeypatch.setattr(core_routes, "build_gateway_from_runtime_config", lambda runtime: gateway)
-    engine = _FakeEngine([_datasource_row(), {"id": "project-1"}, _ai_config_row()])
+    engine = _FakeEngine(
+        [_datasource_row(), {"id": "project-1"}, _ai_config_row()],
+        metadata_cache_miss=True,
+    )
     app = create_app(services=cast(ApiServices, _Services(engine)))
 
     response = AsgiClient(app).post(
@@ -2972,7 +3017,7 @@ def test_ai_sql_generate_without_schema_rejects_ambiguous_confirmed_table(
     monkeypatch.setattr(
         core_routes,
         "_metadata_all_tables",
-        lambda services, row, refresh: [
+        lambda services, row, refresh, **kwargs: [
             SimpleNamespace(schema_name="app", name="users"),
             SimpleNamespace(schema_name="audit", name="users"),
         ],
@@ -3139,8 +3184,10 @@ def test_slow_sql_diagnose_assembles_l3_context_with_baseline_and_audits() -> No
             _datasource_row(),  # _datasource_for_current_user: datasources select
             {"id": "project-1"},  # _require_project_access
             _ai_config_row_l3(),  # _ai_config_row_or_none (max_auto L3)
-            _slowsql_columns_cache(),  # _metadata_columns_for_table cache read
-            _slowsql_indexes_cache(),  # _metadata_indexes_for_table cache read
+            [
+                _metadata_cache_row("columns", "app", "orders", _slowsql_columns_cache()),
+                _metadata_cache_row("indexes", "app", "orders", _slowsql_indexes_cache()),
+            ],
             {  # historical baseline aggregate (same sql_hash)
                 "runs": 3,
                 "avg_seconds": 1.5,
@@ -3183,8 +3230,10 @@ def test_slow_sql_diagnose_degrades_gracefully_without_baseline() -> None:
             _datasource_row(),
             {"id": "project-1"},
             _ai_config_row_l3(),
-            _slowsql_columns_cache(),
-            _slowsql_indexes_cache(),
+            [
+                _metadata_cache_row("columns", "app", "orders", _slowsql_columns_cache()),
+                _metadata_cache_row("indexes", "app", "orders", _slowsql_indexes_cache()),
+            ],
             {  # no historical runs -> early-delivery graceful degradation
                 "runs": 0,
                 "avg_seconds": None,
@@ -3208,6 +3257,268 @@ def test_slow_sql_diagnose_degrades_gracefully_without_baseline() -> None:
     assert payload["ok"] is True
     assert payload["baseline_available"] is False
     assert payload["baseline_runs"] == 0
+
+
+def test_slow_sql_diagnose_batches_metadata_io_per_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _CountingMetadataAdapter()
+    adapter_builds: list[dict[str, object]] = []
+
+    def build_adapter(
+        conn_info: object,
+        secret_store: object,
+        **kwargs: object,
+    ) -> _CountingMetadataAdapter:
+        del conn_info, secret_store
+        adapter_builds.append(kwargs)
+        return adapter
+
+    monkeypatch.setattr(core_routes, "build_database_adapter", build_adapter)
+    engine = _FakeEngine(
+        [
+            _datasource_row(),
+            {"id": "project-1"},
+            _ai_config_row_l3(),
+            {
+                "runs": 0,
+                "avg_seconds": None,
+                "min_seconds": None,
+                "max_seconds": None,
+                "p95_seconds": None,
+            },
+        ],
+        metadata_cache_miss=True,
+    )
+    response = AsgiClient(create_app(services=cast(ApiServices, _Services(engine)))).post(
+        "/api/datasources/ds-1/ai/slow-sql-diagnose",
+        headers=_auth_headers(),
+        json_body={"sql": "SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id"},
+    )
+
+    assert response.status_code == 200
+    cache_reads = [
+        statement
+        for statement in engine.statements
+        if statement.lstrip().startswith("SELECT") and "FROM metadata_caches" in statement
+    ]
+    cache_write_transactions = [
+        statement
+        for statement in engine.statements
+        if statement.lstrip().startswith("DELETE FROM metadata_caches")
+    ]
+    cache_write_statements = [
+        statement
+        for statement in engine.statements
+        if statement.lstrip().startswith(
+            ("DELETE FROM metadata_caches", "INSERT INTO metadata_caches")
+        )
+    ]
+    # Pre-fix: 4 reads + 4 write transactions (8 statements) = 12 cache SQL executions.
+    assert len(cache_reads) == 1
+    assert len(cache_write_transactions) == 4
+    assert len(cache_write_statements) == 8
+    assert len(cache_reads) + len(cache_write_transactions) == 5
+    assert len(cache_reads) + len(cache_write_statements) == 9
+    assert len(adapter_builds) == 1
+    assert sorted(adapter.calls) == [
+        ("columns", "app", "orders"),
+        ("columns", "app", "users"),
+        ("indexes", "app", "orders"),
+        ("indexes", "app", "users"),
+    ]
+
+
+def test_ai_sql_table_candidates_batches_metadata_io_per_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _CountingMetadataAdapter()
+    adapter_builds: list[dict[str, object]] = []
+
+    def build_adapter(
+        conn_info: object,
+        secret_store: object,
+        **kwargs: object,
+    ) -> _CountingMetadataAdapter:
+        del conn_info, secret_store
+        adapter_builds.append(kwargs)
+        return adapter
+
+    monkeypatch.setattr(core_routes, "build_database_adapter", build_adapter)
+    engine = _FakeEngine(
+        [_datasource_row(), {"id": "project-1"}],
+        metadata_cache_miss=True,
+    )
+    response = AsgiClient(create_app(services=cast(ApiServices, _Services(engine)))).post(
+        "/api/datasources/ds-1/ai/sql-table-candidates",
+        headers=_auth_headers(),
+        json_body={"natural_language": "events", "schema_name": None},
+    )
+
+    assert response.status_code == 200
+    cache_reads = [
+        statement
+        for statement in engine.statements
+        if statement.lstrip().startswith("SELECT") and "FROM metadata_caches" in statement
+    ]
+    cache_write_transactions = [
+        statement
+        for statement in engine.statements
+        if statement.lstrip().startswith("DELETE FROM metadata_caches")
+    ]
+    cache_write_statements = [
+        statement
+        for statement in engine.statements
+        if statement.lstrip().startswith(
+            ("DELETE FROM metadata_caches", "INSERT INTO metadata_caches")
+        )
+    ]
+    # Pre-fix: 5 reads + 5 write transactions (10 statements) = 15 cache SQL executions.
+    assert len(cache_reads) == 2
+    assert len(cache_write_transactions) == 5
+    assert len(cache_write_statements) == 10
+    assert len(cache_reads) + len(cache_write_transactions) == 7
+    assert len(cache_reads) + len(cache_write_statements) == 12
+    assert len(adapter_builds) == 1
+    assert adapter.calls == [
+        ("schemas", "", ""),
+        ("tables", "app", ""),
+        ("tables", "audit", ""),
+        ("columns", "app", "app_events"),
+        ("columns", "audit", "audit_events"),
+    ]
+
+
+def test_slow_sql_diagnose_refreshes_only_expired_batch_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _CountingMetadataAdapter()
+    adapter_builds = 0
+
+    def build_adapter(
+        conn_info: object,
+        secret_store: object,
+        **kwargs: object,
+    ) -> _CountingMetadataAdapter:
+        nonlocal adapter_builds
+        del conn_info, secret_store, kwargs
+        adapter_builds += 1
+        return adapter
+
+    monkeypatch.setattr(core_routes, "build_database_adapter", build_adapter)
+    expired_indexes = _slowsql_indexes_cache()
+    expired_indexes["expires_at"] = datetime.now(UTC) - timedelta(seconds=1)
+    engine = _FakeEngine(
+        [
+            _datasource_row(),
+            {"id": "project-1"},
+            _ai_config_row_l3(),
+            [
+                _metadata_cache_row("columns", "app", "users", _slowsql_columns_cache()),
+                _metadata_cache_row("indexes", "app", "users", expired_indexes),
+                _metadata_cache_row("columns", "app", "orders", _slowsql_columns_cache()),
+                _metadata_cache_row("indexes", "app", "orders", _slowsql_indexes_cache()),
+            ],
+            {
+                "runs": 0,
+                "avg_seconds": None,
+                "min_seconds": None,
+                "max_seconds": None,
+                "p95_seconds": None,
+            },
+        ]
+    )
+    response = AsgiClient(create_app(services=cast(ApiServices, _Services(engine)))).post(
+        "/api/datasources/ds-1/ai/slow-sql-diagnose",
+        headers=_auth_headers(),
+        json_body={"sql": "SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["tables_analyzed"] == ["app.users", "app.orders"]
+    assert adapter_builds == 1
+    assert adapter.calls == [("indexes", "app", "users")]
+
+
+def test_slow_sql_diagnose_keeps_per_table_failure_degradation_with_shared_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _PartiallyFailingMetadataAdapter()
+    adapter_builds = 0
+
+    def build_adapter(
+        conn_info: object,
+        secret_store: object,
+        **kwargs: object,
+    ) -> _PartiallyFailingMetadataAdapter:
+        nonlocal adapter_builds
+        del conn_info, secret_store, kwargs
+        adapter_builds += 1
+        return adapter
+
+    monkeypatch.setattr(core_routes, "build_database_adapter", build_adapter)
+    engine = _FakeEngine(
+        [
+            _datasource_row(),
+            {"id": "project-1"},
+            _ai_config_row_l3(),
+            {
+                "runs": 0,
+                "avg_seconds": None,
+                "min_seconds": None,
+                "max_seconds": None,
+                "p95_seconds": None,
+            },
+        ],
+        metadata_cache_miss=True,
+    )
+    response = AsgiClient(create_app(services=cast(ApiServices, _Services(engine)))).post(
+        "/api/datasources/ds-1/ai/slow-sql-diagnose",
+        headers=_auth_headers(),
+        json_body={"sql": "SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["tables_analyzed"] == ["app.orders"]
+    assert adapter_builds == 1
+    assert sorted(adapter.calls) == [
+        ("columns", "app", "orders"),
+        ("columns", "app", "users"),
+        ("indexes", "app", "orders"),
+        ("indexes", "app", "users"),
+    ]
+
+
+def test_slow_sql_diagnose_degrades_when_batch_cache_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_adapter_build(*args: object, **kwargs: object) -> None:
+        raise AssertionError("cache read failure must not probe the datasource")
+
+    monkeypatch.setattr(core_routes, "build_database_adapter", fail_adapter_build)
+    engine = _FakeEngine(
+        [
+            _datasource_row(),
+            {"id": "project-1"},
+            _ai_config_row_l3(),
+            {
+                "runs": 0,
+                "avg_seconds": None,
+                "min_seconds": None,
+                "max_seconds": None,
+                "p95_seconds": None,
+            },
+        ],
+        metadata_cache_error=RuntimeError("metadata cache unavailable"),
+    )
+    response = AsgiClient(create_app(services=cast(ApiServices, _Services(engine)))).post(
+        "/api/datasources/ds-1/ai/slow-sql-diagnose",
+        headers=_auth_headers(),
+        json_body={"sql": "SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["tables_analyzed"] == []
 
 
 def test_slow_sql_diagnose_disabled_returns_structured_409() -> None:
@@ -7089,6 +7400,20 @@ def _metadata_cache(payload: list[dict[str, object]]) -> dict[str, object]:
     return {"payload": payload, "expires_at": datetime.now(UTC) + timedelta(days=1)}
 
 
+def _metadata_cache_row(
+    cache_level: str,
+    schema_name: str,
+    table_name: str,
+    cached: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "cache_level": cache_level,
+        "schema_name": schema_name,
+        "table_name": table_name,
+        **cached,
+    }
+
+
 def _policy(**overrides: bool) -> dict[str, bool]:
     values = {
         "allow_select": True,
@@ -7326,9 +7651,17 @@ class _RateLimiter:
 
 
 class _FakeEngine:
-    def __init__(self, results: list[object]) -> None:
+    def __init__(
+        self,
+        results: list[object],
+        *,
+        metadata_cache_miss: bool = False,
+        metadata_cache_error: Exception | None = None,
+    ) -> None:
         self.results = list(results)
         self.statements: list[str] = []
+        self.metadata_cache_miss = metadata_cache_miss
+        self.metadata_cache_error = metadata_cache_error
         # 原始 statement 对象(便于测试 compile 出绑定参数,如 UPDATE 的 dag_jsonb)。
         self.executed: list[Any] = []
 
@@ -7356,7 +7689,41 @@ class _FakeConnection:
         self._engine.executed.append(statement)
         command = statement_text.lstrip().upper()
         if command.startswith("SELECT") or command.startswith("WITH"):
-            return _FakeResult(self._engine.results.pop(0))
+            if (
+                self._engine.metadata_cache_error is not None
+                and "FROM metadata_caches" in statement_text
+            ):
+                raise self._engine.metadata_cache_error
+            if self._engine.metadata_cache_miss and "FROM metadata_caches" in statement_text:
+                return _FakeResult(None)
+            result = self._engine.results.pop(0)
+            if (
+                isinstance(result, dict)
+                and "payload" in result
+                and "metadata_caches.cache_level" in statement_text
+            ):
+                parameters = cast(
+                    dict[str, object],
+                    cast(Any, statement).compile().params,
+                )
+
+                def bound_value(prefix: str) -> object | None:
+                    return next(
+                        (value for key, value in parameters.items() if key.startswith(prefix)),
+                        None,
+                    )
+
+                cache_level = bound_value("cache_level")
+                schema_name = bound_value("schema_name")
+                table_name = bound_value("table_name")
+                if all(isinstance(value, str) for value in (cache_level, schema_name, table_name)):
+                    result = {
+                        "cache_level": cache_level,
+                        "schema_name": schema_name,
+                        "table_name": table_name,
+                        **result,
+                    }
+            return _FakeResult(result)
         return _FakeResult(None)
 
 
@@ -7369,6 +7736,10 @@ class _FakeResult:
         return self
 
     def all(self) -> list[dict[str, Any]]:
+        if self._result is None:
+            return []
+        if isinstance(self._result, dict):
+            return [dict(self._result)]
         if isinstance(self._result, list):
             return [dict(row) for row in self._result if isinstance(row, dict)]
         raise AssertionError(f"expected list result, got {type(self._result).__name__}")
@@ -7491,6 +7862,35 @@ class _MetadataAdapter:
 
     def list_indexes(self, schema: str, table: str) -> list[Index]:
         del schema, table
+        return [Index(name="PRIMARY", columns=["id"], is_unique=True, is_primary=True)]
+
+
+class _CountingMetadataAdapter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+
+    def list_schemas(self) -> list[Schema]:
+        self.calls.append(("schemas", "", ""))
+        return [Schema(name="app"), Schema(name="audit")]
+
+    def list_tables(self, schema: str) -> list[Table]:
+        self.calls.append(("tables", schema, ""))
+        return [Table(schema_name=schema, name=f"{schema}_events", table_type="BASE TABLE")]
+
+    def list_columns(self, schema: str, table: str) -> list[Column]:
+        self.calls.append(("columns", schema, table))
+        return [Column(name="id", type=ColumnType.INTEGER)]
+
+    def list_indexes(self, schema: str, table: str) -> list[Index]:
+        self.calls.append(("indexes", schema, table))
+        return [Index(name="PRIMARY", columns=["id"], is_unique=True, is_primary=True)]
+
+
+class _PartiallyFailingMetadataAdapter(_CountingMetadataAdapter):
+    def list_indexes(self, schema: str, table: str) -> list[Index]:
+        self.calls.append(("indexes", schema, table))
+        if table == "users":
+            raise AdapterConnectionError("metadata probe failed")
         return [Index(name="PRIMARY", columns=["id"], is_unique=True, is_primary=True)]
 
 

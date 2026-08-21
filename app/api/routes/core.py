@@ -5,7 +5,7 @@ import os
 import shutil
 import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from secrets import token_urlsafe
@@ -331,6 +331,7 @@ _METADATA_LEVEL_SCHEMAS = "schemas"
 _METADATA_LEVEL_TABLES = "tables"
 _METADATA_LEVEL_COLUMNS = "columns"
 _METADATA_LEVEL_INDEXES = "indexes"
+_MetadataCacheKey = tuple[str, str, str]
 _EXPORT_FORMATS = frozenset({"csv", "excel", "json", "sql"})
 # 血缘导出同步生成(子图 depth<=5 数据量小),不复用 worker 的 export_limit_mb 配置;
 # 50MB 上限只是防御性护栏,正常子图导出远小于此。
@@ -1150,6 +1151,8 @@ def _metadata_tables_for_schema(
     services: ApiServices,
     datasource_row: RowMapping,
     schema_name: str,
+    *,
+    metadata_request: _MetadataRequest | None = None,
 ) -> list[Table]:
     payload = _metadata_payload(
         services,
@@ -1158,14 +1161,15 @@ def _metadata_tables_for_schema(
         schema_name=schema_name,
         table_name="",
         refresh=False,
-        load=lambda: [
+        load=lambda adapter: [
             MetadataTableItem(
                 schema_name=item.schema_name,
                 name=item.name,
                 table_type=item.table_type,
             ).model_dump(mode="json")
-            for item in _metadata_adapter(services, datasource_row).list_tables(schema_name)
+            for item in adapter.list_tables(schema_name)
         ],
+        metadata_request=metadata_request,
     )
     return [Table.model_validate(item) for item in payload]
 
@@ -1348,9 +1352,26 @@ def _slow_sql_table_stats(
     """取 SQL 引用表的结构 + 索引统计(L2,元数据缓存;取不到的表跳过)。"""
     refs = extract_table_refs(sql, dialect=dialect)
     default_schema = _optional_str(datasource_row["database_name"])
+    table_refs = [
+        (schema_name or default_schema or "", table_name)
+        for schema_name, table_name in refs[:MAX_TABLES]
+    ]
+    metadata_request = _MetadataRequest(services, datasource_row)
+    try:
+        metadata_request.prefetch_keys(
+            [
+                (cache_level, schema_name, table_name)
+                for schema_name, table_name in table_refs
+                for cache_level in (_METADATA_LEVEL_COLUMNS, _METADATA_LEVEL_INDEXES)
+            ],
+            refresh=False,
+        )
+    except Exception:
+        # 与旧逐表 cache read 的降级等价:元数据库暂不可用时不阻断 AI 诊断。
+        payload, tables_used, truncated = build_table_stats([])
+        return payload, tables_used, truncated or len(refs) > MAX_TABLES
     collected: list[tuple[str, str, list[Column], list[Index]]] = []
-    for schema_name, table_name in refs[:MAX_TABLES]:
-        schema = schema_name or default_schema or ""
+    for schema, table_name in table_refs:
         try:
             columns = _metadata_columns_for_table(
                 services,
@@ -1358,6 +1379,7 @@ def _slow_sql_table_stats(
                 schema_name=schema,
                 table_name=table_name,
                 refresh=False,
+                metadata_request=metadata_request,
             )
             indexes = _metadata_indexes_for_table(
                 services,
@@ -1365,6 +1387,7 @@ def _slow_sql_table_stats(
                 schema_name=schema,
                 table_name=table_name,
                 refresh=False,
+                metadata_request=metadata_request,
             )
         except Exception:
             # 元数据取不到(缓存缺 + 探库失败 / 不支持)→ 跳过该表,诊断降级。
@@ -1445,9 +1468,9 @@ def list_datasource_metadata_schemas(
         schema_name="",
         table_name="",
         refresh=refresh,
-        load=lambda: [
+        load=lambda adapter: [
             MetadataSchemaItem(name=item.name).model_dump(mode="json")
-            for item in _metadata_adapter(services, row).list_schemas()
+            for item in adapter.list_schemas()
         ],
     )
     _audit_metadata(request, services, row, "metadata_schemas_list", datasource_id, refresh)
@@ -1473,13 +1496,13 @@ def list_datasource_metadata_tables(
         schema_name=schema,
         table_name="",
         refresh=refresh,
-        load=lambda: [
+        load=lambda adapter: [
             MetadataTableItem(
                 schema_name=item.schema_name,
                 name=item.name,
                 table_type=item.table_type,
             ).model_dump(mode="json")
-            for item in _metadata_adapter(services, row).list_tables(schema)
+            for item in adapter.list_tables(schema)
         ],
     )
     _audit_metadata(request, services, row, "metadata_tables_list", datasource_id, refresh)
@@ -1506,9 +1529,9 @@ def list_datasource_metadata_columns(
         schema_name=schema,
         table_name=table,
         refresh=refresh,
-        load=lambda: [
+        load=lambda adapter: [
             _metadata_column_item(column).model_dump(mode="json")
-            for column in _metadata_adapter(services, row).list_columns(schema, table)
+            for column in adapter.list_columns(schema, table)
         ],
     )
     _audit_metadata(request, services, row, "metadata_columns_list", datasource_id, refresh)
@@ -1535,9 +1558,9 @@ def list_datasource_metadata_indexes(
         schema_name=schema,
         table_name=table,
         refresh=refresh,
-        load=lambda: [
+        load=lambda adapter: [
             _metadata_index_item(index).model_dump(mode="json")
-            for index in _metadata_adapter(services, row).list_indexes(schema, table)
+            for index in adapter.list_indexes(schema, table)
         ],
     )
     _audit_metadata(request, services, row, "metadata_indexes_list", datasource_id, refresh)
@@ -1555,10 +1578,26 @@ def suggest_ai_sql_tables(
 ) -> SqlTableCandidatesResponse:
     services = services_from(request)
     row = _datasource_for_current_user(request, datasource_id)
+    metadata_request = _MetadataRequest(services, row)
     if body.schema_name is None:
-        filtered = _metadata_all_tables(services, row, refresh=False)
+        filtered = _metadata_all_tables(
+            services,
+            row,
+            refresh=False,
+            metadata_request=metadata_request,
+        )
     else:
-        filtered = _metadata_tables_for_schema(services, row, body.schema_name)
+        filtered = _metadata_tables_for_schema(
+            services,
+            row,
+            body.schema_name,
+            metadata_request=metadata_request,
+        )
+    limited_tables = filtered[:MAX_TABLES]
+    metadata_request.prefetch_keys(
+        [(_METADATA_LEVEL_COLUMNS, item.schema_name, item.name) for item in limited_tables],
+        refresh=False,
+    )
     table_schemas = [
         TableSchema(
             schema_name=item.schema_name,
@@ -1570,10 +1609,11 @@ def suggest_ai_sql_tables(
                     schema_name=item.schema_name,
                     table_name=item.name,
                     refresh=False,
+                    metadata_request=metadata_request,
                 )
             ),
         )
-        for item in filtered[:MAX_TABLES]
+        for item in limited_tables
     ]
     ranked = rank_table_candidates(
         body.natural_language,
@@ -1876,15 +1916,26 @@ def _schema_tables_for_ai(
     只为前 MAX_TABLES 张表取列(避免海量表时打爆缓存读),more=True 表示有表被略过。
     列取用走 metadata 缓存(#65),不额外打库;绝不读行值。
     """
+    metadata_request = _MetadataRequest(services, datasource_row)
     if body.schema_name and body.table_names:
         table_refs = [(body.schema_name, name) for name in body.table_names]
     elif body.schema_name:
         table_refs = [
             (item.schema_name, item.name)
-            for item in _metadata_tables_for_schema(services, datasource_row, body.schema_name)
+            for item in _metadata_tables_for_schema(
+                services,
+                datasource_row,
+                body.schema_name,
+                metadata_request=metadata_request,
+            )
         ]
     elif body.table_names:
-        all_tables = _metadata_all_tables(services, datasource_row, refresh=False)
+        all_tables = _metadata_all_tables(
+            services,
+            datasource_row,
+            refresh=False,
+            metadata_request=metadata_request,
+        )
         schemas_by_name: dict[str, set[str]] = {}
         for item in all_tables:
             schemas_by_name.setdefault(item.name, set()).add(item.schema_name)
@@ -1903,14 +1954,23 @@ def _schema_tables_for_ai(
         table_refs = []
 
     more_tables = len(table_refs) > MAX_TABLES
+    limited_refs = table_refs[:MAX_TABLES]
+    metadata_request.prefetch_keys(
+        [
+            (_METADATA_LEVEL_COLUMNS, schema_name, table_name)
+            for schema_name, table_name in limited_refs
+        ],
+        refresh=False,
+    )
     result: list[tuple[str, str, list[Column]]] = []
-    for schema_name, table_name in table_refs[:MAX_TABLES]:
+    for schema_name, table_name in limited_refs:
         columns = _metadata_columns_for_table(
             services,
             datasource_row,
             schema_name=schema_name,
             table_name=table_name,
             refresh=False,
+            metadata_request=metadata_request,
         )
         result.append((schema_name, table_name, columns))
     return result, more_tables
@@ -6881,6 +6941,73 @@ def _result_set_total_rows(services: ApiServices, result_set_id: str) -> int | N
     return int(value) if value is not None else None
 
 
+class _MetadataRequest:
+    """Request-local metadata cache snapshot with one lazily built adapter."""
+
+    def __init__(self, services: ApiServices, datasource_row: RowMapping) -> None:
+        self.services = services
+        self.datasource_row = datasource_row
+        self.datasource_id = str(datasource_row["id"])
+        self.now = datetime.now(UTC)
+        self._cached: dict[_MetadataCacheKey, list[dict[str, object]]] = {}
+        self._looked_up_keys: set[_MetadataCacheKey] = set()
+        self._looked_up_levels: set[str] = set()
+        self._adapter: DatabaseAdapter | None = None
+
+    def prefetch_keys(self, keys: list[_MetadataCacheKey], *, refresh: bool) -> None:
+        pending = list(
+            dict.fromkeys(
+                key
+                for key in keys
+                if key not in self._looked_up_keys and key[0] not in self._looked_up_levels
+            )
+        )
+        if not pending:
+            return
+        self._looked_up_keys.update(pending)
+        if refresh:
+            return
+        self._cached.update(
+            _read_metadata_caches_for_keys(
+                self.services,
+                self.datasource_id,
+                pending,
+                now=self.now,
+            )
+        )
+
+    def prefetch_levels(self, levels: list[str], *, refresh: bool) -> None:
+        pending = list(
+            dict.fromkeys(level for level in levels if level not in self._looked_up_levels)
+        )
+        if not pending:
+            return
+        self._looked_up_levels.update(pending)
+        if refresh:
+            return
+        self._cached.update(
+            _read_metadata_caches_for_levels(
+                self.services,
+                self.datasource_id,
+                pending,
+                now=self.now,
+            )
+        )
+
+    def cached_payload(
+        self, key: _MetadataCacheKey, *, refresh: bool
+    ) -> list[dict[str, object]] | None:
+        self.prefetch_keys([key], refresh=refresh)
+        if refresh:
+            return None
+        return self._cached.get(key)
+
+    def adapter(self) -> DatabaseAdapter:
+        if self._adapter is None:
+            self._adapter = _metadata_adapter(self.services, self.datasource_row)
+        return self._adapter
+
+
 def _metadata_payload(
     services: ApiServices,
     datasource_row: RowMapping,
@@ -6889,23 +7016,33 @@ def _metadata_payload(
     schema_name: str,
     table_name: str,
     refresh: bool,
-    load: Callable[[], list[dict[str, object]]],
+    load: Callable[[DatabaseAdapter], list[dict[str, object]]],
+    metadata_request: _MetadataRequest | None = None,
 ) -> list[dict[str, object]]:
     datasource_id = str(datasource_row["id"])
-    now = datetime.now(UTC)
+    now = metadata_request.now if metadata_request is not None else datetime.now(UTC)
+    cache_key = (cache_level, schema_name, table_name)
     if not refresh:
-        cached = _read_metadata_cache(
-            services,
-            datasource_id,
-            cache_level,
-            schema_name=schema_name,
-            table_name=table_name,
-            now=now,
-        )
+        if metadata_request is None:
+            cached = _read_metadata_cache(
+                services,
+                datasource_id,
+                cache_level,
+                schema_name=schema_name,
+                table_name=table_name,
+                now=now,
+            )
+        else:
+            cached = metadata_request.cached_payload(cache_key, refresh=False)
         if cached is not None:
             return cached
     try:
-        payload = load()
+        adapter = (
+            metadata_request.adapter()
+            if metadata_request is not None
+            else _metadata_adapter(services, datasource_row)
+        )
+        payload = load(adapter)
     except UnsupportedDbTypeError as exc:
         raise ApiError(
             400,
@@ -6930,6 +7067,112 @@ def _metadata_payload(
         now=now,
     )
     return payload
+
+
+def _metadata_cache_payload(
+    row: RowMapping,
+    *,
+    now: datetime,
+) -> list[dict[str, object]] | None:
+    expires_at = row["expires_at"]
+    if isinstance(expires_at, datetime):
+        normalized = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=UTC)
+        if normalized <= now:
+            return None
+    payload = row["payload"]
+    if not isinstance(payload, list):
+        return None
+    return [dict(item) for item in payload if isinstance(item, dict)]
+
+
+def _metadata_cache_rows(
+    rows: Sequence[RowMapping],
+    *,
+    now: datetime,
+) -> dict[_MetadataCacheKey, list[dict[str, object]]]:
+    cached: dict[_MetadataCacheKey, list[dict[str, object]]] = {}
+    for row in rows:
+        cache_level = row.get("cache_level")
+        schema_name = row.get("schema_name")
+        table_name = row.get("table_name")
+        if all(isinstance(value, str) for value in (cache_level, schema_name, table_name)):
+            key = (str(cache_level), str(schema_name), str(table_name))
+        else:
+            continue
+        payload = _metadata_cache_payload(row, now=now)
+        if payload is not None:
+            cached[key] = payload
+    return cached
+
+
+def _read_metadata_caches_for_keys(
+    services: ApiServices,
+    datasource_id: str,
+    keys: list[_MetadataCacheKey],
+    *,
+    now: datetime,
+) -> dict[_MetadataCacheKey, list[dict[str, object]]]:
+    if not keys:
+        return {}
+    key_conditions = [
+        and_(
+            metadata_caches.c.cache_level == cache_level,
+            metadata_caches.c.schema_name == schema_name,
+            metadata_caches.c.table_name == table_name,
+        )
+        for cache_level, schema_name, table_name in keys
+    ]
+    with services.engine.connect() as conn:
+        rows = (
+            conn.execute(
+                select(
+                    metadata_caches.c.cache_level,
+                    metadata_caches.c.schema_name,
+                    metadata_caches.c.table_name,
+                    metadata_caches.c.payload,
+                    metadata_caches.c.expires_at,
+                ).where(
+                    and_(
+                        metadata_caches.c.datasource_id == datasource_id,
+                        or_(*key_conditions),
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
+    return _metadata_cache_rows(rows, now=now)
+
+
+def _read_metadata_caches_for_levels(
+    services: ApiServices,
+    datasource_id: str,
+    levels: list[str],
+    *,
+    now: datetime,
+) -> dict[_MetadataCacheKey, list[dict[str, object]]]:
+    if not levels:
+        return {}
+    with services.engine.connect() as conn:
+        rows = (
+            conn.execute(
+                select(
+                    metadata_caches.c.cache_level,
+                    metadata_caches.c.schema_name,
+                    metadata_caches.c.table_name,
+                    metadata_caches.c.payload,
+                    metadata_caches.c.expires_at,
+                ).where(
+                    and_(
+                        metadata_caches.c.datasource_id == datasource_id,
+                        metadata_caches.c.cache_level.in_(levels),
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
+    return _metadata_cache_rows(rows, now=now)
 
 
 def _read_metadata_cache(
@@ -6958,15 +7201,7 @@ def _read_metadata_cache(
         )
     if row is None:
         return None
-    expires_at = row["expires_at"]
-    if isinstance(expires_at, datetime):
-        normalized = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=UTC)
-        if normalized <= now:
-            return None
-    payload = row["payload"]
-    if not isinstance(payload, list):
-        return None
-    return [dict(item) for item in payload if isinstance(item, dict)]
+    return _metadata_cache_payload(row, now=now)
 
 
 def _write_metadata_cache(
@@ -7040,6 +7275,7 @@ def _metadata_columns_for_table(
     schema_name: str,
     table_name: str,
     refresh: bool,
+    metadata_request: _MetadataRequest | None = None,
 ) -> list[Column]:
     payload = _metadata_payload(
         services,
@@ -7048,12 +7284,11 @@ def _metadata_columns_for_table(
         schema_name=schema_name,
         table_name=table_name,
         refresh=refresh,
-        load=lambda: [
+        load=lambda adapter: [
             _metadata_column_item(column).model_dump(mode="json")
-            for column in _metadata_adapter(services, datasource_row).list_columns(
-                schema_name, table_name
-            )
+            for column in adapter.list_columns(schema_name, table_name)
         ],
+        metadata_request=metadata_request,
     )
     return [Column.model_validate(item) for item in payload]
 
@@ -7065,6 +7300,7 @@ def _metadata_indexes_for_table(
     schema_name: str,
     table_name: str,
     refresh: bool,
+    metadata_request: _MetadataRequest | None = None,
 ) -> list[Index]:
     payload = _metadata_payload(
         services,
@@ -7073,12 +7309,11 @@ def _metadata_indexes_for_table(
         schema_name=schema_name,
         table_name=table_name,
         refresh=refresh,
-        load=lambda: [
+        load=lambda adapter: [
             _metadata_index_item(index).model_dump(mode="json")
-            for index in _metadata_adapter(services, datasource_row).list_indexes(
-                schema_name, table_name
-            )
+            for index in adapter.list_indexes(schema_name, table_name)
         ],
+        metadata_request=metadata_request,
     )
     return [Index.model_validate(item) for item in payload]
 
@@ -7088,7 +7323,13 @@ def _metadata_all_tables(
     datasource_row: RowMapping,
     *,
     refresh: bool,
+    metadata_request: _MetadataRequest | None = None,
 ) -> list[Table]:
+    request = metadata_request or _MetadataRequest(services, datasource_row)
+    request.prefetch_levels(
+        [_METADATA_LEVEL_SCHEMAS, _METADATA_LEVEL_TABLES],
+        refresh=refresh,
+    )
     schema_payload = _metadata_payload(
         services,
         datasource_row,
@@ -7096,10 +7337,11 @@ def _metadata_all_tables(
         schema_name="",
         table_name="",
         refresh=refresh,
-        load=lambda: [
+        load=lambda adapter: [
             MetadataSchemaItem(name=item.name).model_dump(mode="json")
-            for item in _metadata_adapter(services, datasource_row).list_schemas()
+            for item in adapter.list_schemas()
         ],
+        metadata_request=request,
     )
     tables: list[Table] = []
     for schema_item in schema_payload:
@@ -7107,14 +7349,17 @@ def _metadata_all_tables(
         if not isinstance(schema_name, str) or not schema_name:
             continue
 
-        def load_tables_for_schema(schema: str = schema_name) -> list[dict[str, object]]:
+        def load_tables_for_schema(
+            adapter: DatabaseAdapter,
+            schema: str = schema_name,
+        ) -> list[dict[str, object]]:
             return [
                 MetadataTableItem(
                     schema_name=item.schema_name,
                     name=item.name,
                     table_type=item.table_type,
                 ).model_dump(mode="json")
-                for item in _metadata_adapter(services, datasource_row).list_tables(schema)
+                for item in adapter.list_tables(schema)
             ]
 
         table_payload = _metadata_payload(
@@ -7125,6 +7370,7 @@ def _metadata_all_tables(
             table_name="",
             refresh=refresh,
             load=load_tables_for_schema,
+            metadata_request=request,
         )
         tables.extend(Table.model_validate(item) for item in table_payload)
     return tables
