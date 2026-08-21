@@ -148,12 +148,6 @@ jobs:
   #   - monkeypatch pymysql.connect 失败,fetch_range 仍能读 spool
   #     (证明数据落地本地 parquet,不在 cursor)
   # 用临时 mysql:8.0 service container,跑完销毁。每次 push/PR 自动守 R6。
-  #
-  # ★ Gate(临时):T2 (MySQL adapter) 合并前 tests/unit/test_mysql_adapter.py 不存在,
-  #   `pytest -m integration` 收集 0 个测试 exit 5 红整个 job。用 hashFiles 作为
-  #   存在性 gate 跳过本步骤,主 lint/test/gitleaks 三 job 仍绿。
-  #   T2 合并后此 gate 永真,本 job 强制跑。若有人之后删 @pytest.mark.integration
-  #   标记,本 job 仍会因 0 测试 exit 5 红 —— 那时主动关注。
   mysql-integration:
     name: MySQL Integration (R6)
     runs-on: ubuntu-latest
@@ -191,7 +185,6 @@ jobs:
       # 但本步再 ping 一次确认 + 留可见日志(健康检查日志在 service 容器里,
       # job 日志看不到,这里再 ping 暴露给 job log)
       - name: Wait for MySQL ready
-        if: hashFiles('tests/unit/test_mysql_adapter.py') != ''
         run: |
           for i in $(seq 1 30); do
             if mysqladmin ping -h 127.0.0.1 -uroot -pci_test_pwd_not_real_secret --silent 2>/dev/null; then
@@ -204,7 +197,6 @@ jobs:
           echo "MySQL did not become ready in 60s"; exit 1
 
       - name: pytest -m integration (R6 hard evidence)
-        if: hashFiles('tests/unit/test_mysql_adapter.py') != ''
         env:
           DATAOPS_TEST_MYSQL_HOST: 127.0.0.1
           DATAOPS_TEST_MYSQL_PORT: "3306"
@@ -212,10 +204,6 @@ jobs:
           DATAOPS_TEST_MYSQL_PASSWORD: ci_test_pwd_not_real_secret
           DATAOPS_TEST_MYSQL_DATABASE: app
         run: uv run pytest -m integration -v
-
-      - name: Skip notice (T2 not yet merged)
-        if: hashFiles('tests/unit/test_mysql_adapter.py') == ''
-        run: echo "::notice::tests/unit/test_mysql_adapter.py 不存在 — T2 (MySQL adapter) 尚未合并,跳过 R6 integration test。T2 合并后本 job 自动启用。"
 
   # ─── PG queue 并发硬证据:PostgresJobBackend FOR UPDATE SKIP LOCKED 真验证 ───
   # 跑 tests/integration/test_postgres_jobbackend.py 4 个并发 / 故障场景:
@@ -226,9 +214,6 @@ jobs:
   #   - retry budget=0 stale → 直接 failed
   #   - 旧 worker 迟到 complete → SQL ownership 条件拒(F1 不变量)
   # 与 mysql-integration 并行,独立 postgres:16-alpine service container。
-  #
-  # ★ Gate:T1 合并前 tests/integration/test_postgres_jobbackend.py 不存在,
-  #   hashFiles 跳过本步,主 4 job 仍绿。T1 合并后 gate 永真,强制跑。
   pg-integration:
     name: PG Queue Concurrency (T1 hard evidence)
     runs-on: ubuntu-latest
@@ -260,7 +245,6 @@ jobs:
 
       # PG service health check 已等 ready,这里再 ping 暴露版本到 job log
       - name: Wait for PG ready
-        if: hashFiles('tests/integration/test_postgres_jobbackend.py') != ''
         env:
           PGPASSWORD: ci_test_pwd_not_real_secret
         run: |
@@ -275,25 +259,16 @@ jobs:
           echo "PG did not become ready in 60s"; exit 1
 
       - name: pytest tests/integration/ (PG queue concurrency + reaper + ownership)
-        if: hashFiles('tests/integration/test_postgres_jobbackend.py') != ''
         env:
           # 测试用 metadata.create_all 自建 schema,直接给 URL 即可。
           # _pg_engine_or_skip 优先读 DATAOPS_TEST_PG_URL,fallback DATAOPS_DATABASE_URL。
           DATAOPS_TEST_PG_URL: postgresql+psycopg://dataops:ci_test_pwd_not_real_secret@127.0.0.1:15432/dataops
         run: uv run pytest -m integration tests/integration/ -v
 
-      - name: Skip notice (T1 not yet merged)
-        if: hashFiles('tests/integration/test_postgres_jobbackend.py') == ''
-        run: echo "::notice::tests/integration/test_postgres_jobbackend.py 不存在 — T1 (PG JobBackend) 尚未合并,跳过 PG queue 并发 integration test。T1 合并后本 job 自动启用。"
-
   # ─── e2e 双服务硬证据:契约 §5 验收路径(login → datasource → /test → SQL → /result) ───
   # 跑 tests/integration/test_e2e_acceptance.py(需要 PG + MySQL 都在)。
   # 这条 e2e 是 T4 + 2.0.0 骨架立住的核心判据 —— 前面 mysql-integration /
   # pg-integration 各只跑一半服务,e2e 被双 skip,等于契约 §5 验收从没真跑过。
-  # T4 起本 job 真验证。
-  #
-  # ★ Gate:T4 (API + middleware) 合并前 tests/integration/test_e2e_acceptance.py
-  #   不存在,本 job 跳过(其它 5 job 仍绿)。T4 合并后 gate 永真,强制真跑。
   e2e-integration:
     name: E2E Acceptance (contract §5 hard evidence)
     runs-on: ubuntu-latest
@@ -339,7 +314,6 @@ jobs:
         run: uv sync --locked --all-groups
 
       - name: Wait for PG ready
-        if: hashFiles('tests/integration/test_e2e_acceptance.py') != ''
         env:
           PGPASSWORD: ci_test_pwd_not_real_secret
         run: |
@@ -352,7 +326,6 @@ jobs:
           echo "PG did not become ready in 60s"; exit 1
 
       - name: Wait for MySQL ready
-        if: hashFiles('tests/integration/test_e2e_acceptance.py') != ''
         run: |
           for i in $(seq 1 30); do
             if mysqladmin ping -h 127.0.0.1 -uroot -pci_test_pwd_not_real_secret --silent 2>/dev/null; then
@@ -363,7 +336,6 @@ jobs:
           echo "MySQL did not become ready in 60s"; exit 1
 
       - name: pytest e2e acceptance (real PG + real MySQL)
-        if: hashFiles('tests/integration/test_e2e_acceptance.py') != ''
         env:
           DATAOPS_TEST_PG_URL: postgresql+psycopg://dataops:ci_test_pwd_not_real_secret@127.0.0.1:15432/dataops
           DATAOPS_TEST_MYSQL_HOST: 127.0.0.1
@@ -373,16 +345,11 @@ jobs:
           DATAOPS_TEST_MYSQL_DATABASE: app
         run: uv run pytest tests/integration/test_e2e_acceptance.py -v
 
-      - name: Skip notice (T4 not yet merged)
-        if: hashFiles('tests/integration/test_e2e_acceptance.py') == ''
-        run: echo "::notice::tests/integration/test_e2e_acceptance.py 不存在 — T4 尚未合并,跳过契约 §5 e2e。T4 合并后本 job 自动启用。"
-
   # ─── Cold-start hard evidence(T6 portable launcher) ────────────────────────
   # 跑 docs/deployment/quickstart.md 的 §1-§8 全链路:
   #   apt install pg-16 → launcher bootstrap init → pg-up → alembic-up →
   #   admin create → up(background)→ login → datasource → SELECT 1+1 →
   #   断言 columns[0].name=='r' && rows[0].values[0]==2
-  # ★ Gate:T6 合并前 hashFiles('app/launcher.py') == '',skip;合并后自动启用。
   cold-start:
     name: Cold-start (T6 hard evidence)
     runs-on: ubuntu-latest
@@ -412,7 +379,6 @@ jobs:
           enable-cache: true
 
       - name: Install PostgreSQL 16 binaries (apt)
-        if: hashFiles('app/launcher.py') != ''
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y postgresql-16 postgresql-client-16
@@ -421,39 +387,33 @@ jobs:
           sudo systemctl disable --now postgresql.service 2>/dev/null || true
 
       - name: uv sync (Prereq F1)
-        if: hashFiles('app/launcher.py') != ''
         run: uv sync --locked --all-groups
 
       - name: launcher doctor (must pass all checks)
-        if: hashFiles('app/launcher.py') != ''
         env:
           DATAOPS_HOME: ${{ github.workspace }}/.dataops-runtime
           DATAOPS_PG_BIN_DIR: /usr/lib/postgresql/16/bin
         run: uv run python -m app.launcher --root "$DATAOPS_HOME" --pg-bin-dir "$DATAOPS_PG_BIN_DIR" doctor
 
       - name: launcher bootstrap init
-        if: hashFiles('app/launcher.py') != ''
         env:
           DATAOPS_HOME: ${{ github.workspace }}/.dataops-runtime
           DATAOPS_PG_BIN_DIR: /usr/lib/postgresql/16/bin
         run: uv run python -m app.launcher --root "$DATAOPS_HOME" --pg-bin-dir "$DATAOPS_PG_BIN_DIR" bootstrap init
 
       - name: launcher pg-up
-        if: hashFiles('app/launcher.py') != ''
         env:
           DATAOPS_HOME: ${{ github.workspace }}/.dataops-runtime
           DATAOPS_PG_BIN_DIR: /usr/lib/postgresql/16/bin
         run: uv run python -m app.launcher --root "$DATAOPS_HOME" --pg-bin-dir "$DATAOPS_PG_BIN_DIR" pg-up
 
       - name: launcher alembic-up
-        if: hashFiles('app/launcher.py') != ''
         env:
           DATAOPS_HOME: ${{ github.workspace }}/.dataops-runtime
           DATAOPS_PG_BIN_DIR: /usr/lib/postgresql/16/bin
         run: uv run python -m app.launcher --root "$DATAOPS_HOME" --pg-bin-dir "$DATAOPS_PG_BIN_DIR" alembic-up
 
       - name: launcher admin create
-        if: hashFiles('app/launcher.py') != ''
         env:
           DATAOPS_HOME: ${{ github.workspace }}/.dataops-runtime
           DATAOPS_PG_BIN_DIR: /usr/lib/postgresql/16/bin
@@ -464,7 +424,6 @@ jobs:
             --project-name Default
 
       - name: launcher up (background) + healthz
-        if: hashFiles('app/launcher.py') != ''
         env:
           DATAOPS_HOME: ${{ github.workspace }}/.dataops-runtime
           DATAOPS_PG_BIN_DIR: /usr/lib/postgresql/16/bin
@@ -481,7 +440,6 @@ jobs:
           echo "API did not become ready in 60s"; exit 1
 
       - name: §6-§8 cold-start hard evidence (SELECT 1+1 → assert r=2)
-        if: hashFiles('app/launcher.py') != ''
         run: |
           set -e
           API=http://127.0.0.1:8020/api
@@ -523,7 +481,7 @@ jobs:
           echo "::notice::Cold-start §1-§8 verified: columns[0].name=r, rows[0].values[0]=2"
 
       - name: Dump logs on failure
-        if: failure() && hashFiles('app/launcher.py') != ''
+        if: failure()
         env:
           DATAOPS_HOME: ${{ github.workspace }}/.dataops-runtime
         run: |
@@ -532,14 +490,9 @@ jobs:
           echo "==worker.log=="; cat "$DATAOPS_HOME/logs/worker.log" 2>/dev/null || true
           echo "==pg.log=="; cat "$DATAOPS_HOME/logs/pg.log" 2>/dev/null || true
 
-      - name: Skip notice (T6 not yet merged)
-        if: hashFiles('app/launcher.py') == ''
-        run: echo "::notice::app/launcher.py 不存在 — T6 尚未合并,跳过 cold-start。T6 合并后本 job 自动启用。"
-
   # ─── 前端 build 底线(T7 phase 1+) ─────────────────────────────────
   # 前端进 git 就该有 CI 守:vue-tsc + vite build 能不能编译过。
   # 跟后端红线一个道理 —— build 是最低线,e2e 是另一回事。
-  # ★ Gate:frontend/ 不存在 hashFiles 跳过(防 PR revert)。
   # ─── Compose form hard evidence(contract §5"docker compose 跑通同样流程")────
   # 守护 #35 交付的 compose 形态不回归纸面:build → secrets-init → pg → migrate →
   # api+worker → healthz → 真登录 → license/projects 鉴权链路。
@@ -617,7 +570,6 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Setup Node 22
-        if: hashFiles('frontend/package.json') != ''
         uses: actions/setup-node@v6
         with:
           node-version: '22'
@@ -625,28 +577,20 @@ jobs:
           cache-dependency-path: 'frontend/package-lock.json'
 
       - name: npm ci (clean install)
-        if: hashFiles('frontend/package.json') != ''
         run: npm ci
         working-directory: frontend
 
       - name: vue-tsc + vite build
-        if: hashFiles('frontend/package.json') != ''
         run: npm run build
         working-directory: frontend
 
       - name: Install Playwright Chromium
-        if: hashFiles('frontend/package.json') != ''
         run: npx playwright install --with-deps chromium
         working-directory: frontend
 
       - name: Playwright e2e
-        if: hashFiles('frontend/package.json') != ''
         run: npm run test:e2e
         working-directory: frontend
-
-      - name: Skip notice (frontend not present)
-        if: hashFiles('frontend/package.json') == ''
-        run: echo "::notice::frontend/package.json 不存在 — 跳过前端 build。"
 
   # ─── 治理结构同步守护(AGENTS.md == CLAUDE.md,除首行) ───────────────
   # 两份是 agent 入口宪法,内容除标题外必须一字一致 —— 任何一边改了对面没改,
@@ -658,7 +602,6 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: diff AGENTS.md vs CLAUDE.md (skip first line title)
-        if: hashFiles('AGENTS.md') != '' && hashFiles('CLAUDE.md') != ''
         run: |
           if ! diff <(tail -n +2 AGENTS.md) <(tail -n +2 CLAUDE.md) > /dev/null; then
             echo "::error::AGENTS.md 和 CLAUDE.md 内容不一致(除首行标题外)。"
@@ -668,7 +611,3 @@ jobs:
             exit 1
           fi
           echo "✓ AGENTS.md ≡ CLAUDE.md (除首行标题)"
-
-      - name: Skip notice (one or both missing)
-        if: hashFiles('AGENTS.md') == '' || hashFiles('CLAUDE.md') == ''
-        run: echo "::notice::AGENTS.md 或 CLAUDE.md 不存在 — 治理结构尚未落地,跳过同步检查。"
