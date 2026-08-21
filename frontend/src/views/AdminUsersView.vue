@@ -43,8 +43,10 @@ import { useToast } from '../composables/useToast'
 import EmptyState from '../components/EmptyState.vue'
 import LoadingDots from '../components/LoadingDots.vue'
 import Modal from '../components/Modal.vue'
+import { createUserErrorMessage } from '../utils/userErrorMessage'
 
 const { t } = useI18n()
+const errorMessage = createUserErrorMessage(t)
 const qc = useQueryClient()
 const { writesBlocked } = useLicense()
 const toast = useToast()
@@ -93,7 +95,7 @@ async function submitCreate(): Promise<void> {
   try {
     await createMutation.mutateAsync()
   } catch (e) {
-    createError.value = e instanceof ApiError ? e.message : t('common.error_unknown')
+    createError.value = errorMessage(e)
   }
 }
 
@@ -137,7 +139,7 @@ async function submitRole(): Promise<void> {
   try {
     await roleMutation.mutateAsync()
   } catch (e) {
-    roleError.value = e instanceof ApiError ? e.message : t('common.error_unknown')
+    roleError.value = errorMessage(e)
   }
 }
 
@@ -166,7 +168,7 @@ async function submitReset(): Promise<void> {
   try {
     await resetMutation.mutateAsync()
   } catch (e) {
-    resetError.value = e instanceof ApiError ? e.message : t('common.error_unknown')
+    resetError.value = errorMessage(e)
   }
 }
 
@@ -204,7 +206,7 @@ async function submitForceLogout(): Promise<void> {
   try {
     await forceLogoutMutation.mutateAsync()
   } catch (e) {
-    forceLogoutError.value = e instanceof ApiError ? e.message : t('common.error_unknown')
+    forceLogoutError.value = errorMessage(e)
   }
 }
 
@@ -252,7 +254,7 @@ async function submitDelete(): Promise<void> {
       ownedProjects.value = body?.owned_projects ?? []
       deleteError.value = t('admin.users.delete_blocked')
     } else {
-      deleteError.value = e instanceof ApiError ? e.message : t('common.error_unknown')
+      deleteError.value = errorMessage(e)
     }
   }
 }
@@ -284,14 +286,6 @@ function roleClass(role: string): string {
   return ROLE_STYLE[role] ?? ROLE_STYLE.viewer
 }
 
-function errorMessage(): string {
-  const e = query.error.value
-  if (e instanceof ApiError) {
-    if (e.status === 403) return t('admin.forbidden_hint')
-    return e.message || t('common.error_unknown')
-  }
-  return t('common.error_unknown')
-}
 </script>
 
 <template>
@@ -338,7 +332,7 @@ function errorMessage(): string {
       <AlertTriangle class="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
       <div>
         <div class="text-sm font-medium text-red-700 dark:text-red-400">{{ t('common.error') }}</div>
-        <div class="text-sm text-red-600 dark:text-red-300 mt-0.5">{{ errorMessage() }}</div>
+        <div class="text-sm text-red-600 dark:text-red-300 mt-0.5">{{ errorMessage(query.error.value) }}</div>
         <button @click="query.refetch()" type="button" class="text-xs text-red-700 dark:text-red-400 underline mt-2">
           {{ t('common.retry') }}
         </button>

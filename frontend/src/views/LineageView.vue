@@ -69,8 +69,10 @@ import {
 import { uploadFile } from '../api/uploads'
 import { createStoredZip } from '../utils/zip'
 import { ApiError, type DatasourceListItem } from '../api/types'
+import { useLicense } from '../composables/useLicense'
 import LoadingDots from '../components/LoadingDots.vue'
 import TraceCompareDialog from '../components/TraceCompareDialog.vue'
+import { createUserErrorMessage } from '../utils/userErrorMessage'
 
 type Tab = 'subgraph' | 'impact' | 'analyze' | 'batch'
 
@@ -93,6 +95,8 @@ const ROW_H = 54
 const PAD = 28
 
 const { t } = useI18n()
+const errorMessage = createUserErrorMessage(t)
+const { writesBlocked } = useLicense()
 const route = useRoute()
 const projectId = computed(() => (typeof route.params.id === 'string' ? route.params.id : ''))
 
@@ -227,6 +231,10 @@ const exportError = ref<string | null>(null)
 
 /** 用「已查出的子图」的参数导出(与画面一致),拿到 token 后立即触发下载。 */
 async function onExportSubgraph(): Promise<void> {
+  if (writesBlocked.value) {
+    exportError.value = t('license.writes_blocked')
+    return
+  }
   const data = subgraphData.value
   if (!projectId.value || !data || exportBusy.value) return
   exportBusy.value = true
@@ -446,6 +454,10 @@ async function decideEdge(
   edge: LineageSubgraphEdge,
   status: LineageInferenceDecision,
 ): Promise<void> {
+  if (writesBlocked.value) {
+    inferenceError.value = t('license.writes_blocked')
+    return
+  }
   if (!projectId.value || inferencePendingId.value) return
   inferencePendingId.value = edge.id
   inferenceError.value = null
@@ -503,6 +515,7 @@ const aiImpactBusy = ref(false)
 const aiImpactResult = ref<LineageAiImpactResponse | null>(null)
 
 async function runAiImpact(): Promise<void> {
+  if (writesBlocked.value) return
   const focus = impactData.value?.focus
   if (!projectId.value || !focus || aiImpactBusy.value) return
   aiImpactBusy.value = true
@@ -566,6 +579,7 @@ const aiEnrichBusy = ref(false)
 const aiEnrichResult = ref<LineageAiEnrichmentResponse | null>(null)
 
 async function onAiEnrich(): Promise<void> {
+  if (writesBlocked.value) return
   const runId = analyzeResult.value?.run_id
   if (!runId || aiEnrichBusy.value) return
   aiEnrichBusy.value = true
@@ -589,6 +603,10 @@ async function onAiEnrich(): Promise<void> {
 }
 
 async function onAnalyze(): Promise<void> {
+  if (writesBlocked.value) {
+    analyzeError.value = t('license.writes_blocked')
+    return
+  }
   if (!analyzeDsId.value || !analyzeSourceRef.value.trim() || !analyzeSql.value.trim()) {
     analyzeError.value = t('lineage.analyze_required')
     return
@@ -657,6 +675,10 @@ const batchFileInput = ref<HTMLInputElement | null>(null)
 // 文件对话框(label 默认行为 + click 冒泡到 input),第二个空对话框取消时会
 // setFiles([]) 清空选择,表现为"上传用不了"。故改 div + ref + @click.stop。
 function openBatchFilePicker(): void {
+  if (writesBlocked.value) {
+    batchError.value = t('license.writes_blocked')
+    return
+  }
   if (!batchBusy.value) batchFileInput.value?.click()
 }
 const batchPhase = ref<BatchPhase>('idle')
@@ -729,6 +751,10 @@ function onBatchFileChange(event: Event): void {
 }
 
 function onBatchDrop(event: DragEvent): void {
+  if (writesBlocked.value) {
+    batchError.value = t('license.writes_blocked')
+    return
+  }
   if (batchBusy.value) return
   acceptBatchFiles(Array.from(event.dataTransfer?.files ?? []))
 }
@@ -781,6 +807,10 @@ async function pollBatch(generation: number): Promise<void> {
 }
 
 async function onBatchSubmit(): Promise<void> {
+  if (writesBlocked.value) {
+    batchError.value = t('license.writes_blocked')
+    return
+  }
   // 数据源可选:无库模式只需文件 + dialect(下拉恒有值);有库模式需选中数据源
   if (!projectId.value || !batchFiles.value.length) {
     batchError.value = t('lineage.batch_required')
@@ -876,10 +906,6 @@ function semanticRefreshLabel(mode: string | null): string {
 onBeforeUnmount(stopBatchPolling)
 
 // ── helpers ─────────────────────────────────────────────────────────
-function errorMessage(e: unknown): string {
-  if (e instanceof ApiError) return e.message || t('common.error_unknown')
-  return t('common.error_unknown')
-}
 </script>
 
 <template>
@@ -1008,7 +1034,8 @@ function errorMessage(e: unknown): string {
               v-if="subgraphData.edge_count > 0"
               type="button"
               class="chrome-btn-secondary text-xs ml-auto"
-              :disabled="exportBusy"
+              :disabled="writesBlocked || exportBusy"
+              :title="writesBlocked ? t('license.writes_blocked') : ''"
               @click="onExportSubgraph"
             >
               <Download class="w-3.5 h-3.5" :class="exportBusy && 'animate-pulse'" />
@@ -1018,6 +1045,8 @@ function errorMessage(e: unknown): string {
               v-if="subgraphData.edge_count > 0"
               type="button"
               class="chrome-btn-secondary text-xs"
+              :disabled="writesBlocked"
+              :title="writesBlocked ? t('license.writes_blocked') : ''"
               @click="traceCompareOpen = true"
             >
               <GitCompareArrows class="w-3.5 h-3.5" />
@@ -1301,7 +1330,8 @@ function errorMessage(e: unknown): string {
                 <button
                   type="button"
                   class="chrome-btn-secondary text-xs"
-                  :disabled="inferencePendingId !== null"
+                  :disabled="writesBlocked || inferencePendingId !== null"
+                  :title="writesBlocked ? t('license.writes_blocked') : ''"
                   @click="decideEdge(edge, 'confirmed')"
                 >
                   <Check class="w-3.5 h-3.5" /> {{ t('lineage.inference_confirm') }}
@@ -1309,7 +1339,8 @@ function errorMessage(e: unknown): string {
                 <button
                   type="button"
                   class="chrome-btn-secondary text-xs"
-                  :disabled="inferencePendingId !== null"
+                  :disabled="writesBlocked || inferencePendingId !== null"
+                  :title="writesBlocked ? t('license.writes_blocked') : ''"
                   @click="decideEdge(edge, 'rejected')"
                 >
                   <X class="w-3.5 h-3.5" /> {{ t('lineage.inference_reject') }}
@@ -1410,7 +1441,8 @@ function errorMessage(e: unknown): string {
             <button
               type="button"
               class="chrome-btn-secondary text-sm"
-              :disabled="aiImpactBusy"
+              :disabled="writesBlocked || aiImpactBusy"
+              :title="writesBlocked ? t('license.writes_blocked') : ''"
               @click="runAiImpact"
             >
               <Sparkles class="w-3.5 h-3.5" :class="aiImpactBusy && 'animate-pulse'" />
@@ -1532,7 +1564,8 @@ function errorMessage(e: unknown): string {
             <button
               type="button"
               class="chrome-btn-primary text-sm"
-              :disabled="analyzing"
+              :disabled="writesBlocked || analyzing"
+              :title="writesBlocked ? t('license.writes_blocked') : ''"
               @click="onAnalyze"
             >
               <RefreshCw class="w-4 h-4" :class="analyzing && 'animate-spin'" />
@@ -1637,7 +1670,8 @@ function errorMessage(e: unknown): string {
               <button
                 type="button"
                 class="chrome-btn-secondary text-xs"
-                :disabled="aiEnrichBusy"
+                :disabled="writesBlocked || aiEnrichBusy"
+                :title="writesBlocked ? t('license.writes_blocked') : ''"
                 @click="onAiEnrich"
               >
                 <Sparkles class="w-3.5 h-3.5" :class="aiEnrichBusy && 'animate-pulse'" />
@@ -1733,6 +1767,8 @@ function errorMessage(e: unknown): string {
             <div
               class="flex flex-col items-center justify-center gap-2 rounded-card border border-dashed chrome-border chrome-bg-elevated px-4 py-6 text-center"
               :class="batchBusy ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'"
+              :title="writesBlocked ? t('license.writes_blocked') : ''"
+              :aria-disabled="writesBlocked || batchBusy"
               role="button"
               tabindex="0"
               @click="openBatchFilePicker"
@@ -1747,7 +1783,7 @@ function errorMessage(e: unknown): string {
                 class="hidden"
                 accept=".zip,.sql,.txt"
                 multiple
-                :disabled="batchBusy"
+                :disabled="writesBlocked || batchBusy"
                 @click.stop
                 @change="onBatchFileChange"
               />
@@ -1773,7 +1809,8 @@ function errorMessage(e: unknown): string {
             <button
               type="button"
               class="chrome-btn-primary text-sm"
-              :disabled="batchBusy || !batchFiles.length"
+              :disabled="writesBlocked || batchBusy || !batchFiles.length"
+              :title="writesBlocked ? t('license.writes_blocked') : ''"
               @click="onBatchSubmit"
             >
               <Upload class="w-4 h-4" />

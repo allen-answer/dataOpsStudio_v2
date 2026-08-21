@@ -98,8 +98,10 @@ import LoadingDots from '../components/LoadingDots.vue'
 import Modal from '../components/Modal.vue'
 import AiSqlAssistantPanel from '../components/AiSqlAssistantPanel.vue'
 import SqlEditor from '../components/SqlEditor.vue'
+import { useLicense } from '../composables/useLicense'
 import { clearSqlMetadataCache } from '../utils/sqlIntelligence'
 import { splitSqlStatements, statementAtOffset } from '../utils/sqlStatements'
+import { createUserErrorMessage } from '../utils/userErrorMessage'
 
 const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>([
   'success',
@@ -187,7 +189,9 @@ interface TemplateForm {
 }
 
 const { t, te } = useI18n()
+const errorMessage = createUserErrorMessage(t)
 const route = useRoute()
+const { writesBlocked } = useLicense()
 const themeStore = useThemeStore()
 const authStore = useAuthStore()
 const { variant } = storeToRefs(themeStore)
@@ -617,6 +621,7 @@ async function loadConsoles(): Promise<void> {
 }
 
 async function createConsole(): Promise<void> {
+  if (writesBlocked.value) return
   consoleError.value = null
   try {
     await flushAllConsolePatches()
@@ -634,6 +639,7 @@ async function createConsole(): Promise<void> {
 }
 
 async function deleteConsole(consoleId: string): Promise<void> {
+  if (writesBlocked.value) return
   consoleError.value = null
   try {
     await cancelConsoleQueries(consoleId)
@@ -651,15 +657,18 @@ async function deleteConsole(consoleId: string): Promise<void> {
 }
 
 async function togglePinned(consoleRow: SqlConsole): Promise<void> {
+  if (writesBlocked.value) return
   await patchConsole(consoleRow.id, { pinned: !consoleRow.pinned })
 }
 
 function startRename(consoleRow: SqlConsole): void {
+  if (writesBlocked.value) return
   renameConsoleId.value = consoleRow.id
   renameConsoleDraft.value = consoleRow.name
 }
 
 async function submitRename(): Promise<void> {
+  if (writesBlocked.value) return
   if (!renameConsoleId.value || !renameConsoleDraft.value.trim()) return
   await patchConsole(renameConsoleId.value, { name: renameConsoleDraft.value.trim() })
   renameConsoleId.value = null
@@ -667,6 +676,7 @@ async function submitRename(): Promise<void> {
 }
 
 async function patchConsole(consoleId: string, patch: SqlConsoleUpdateRequest): Promise<void> {
+  if (writesBlocked.value) return
   patchLocalConsole(consoleId, patch)
   try {
     const updated = await updateSqlConsole(consoleId, patch)
@@ -678,6 +688,7 @@ async function patchConsole(consoleId: string, patch: SqlConsoleUpdateRequest): 
 }
 
 function scheduleConsolePatch(consoleId: string, patch: SqlConsoleUpdateRequest): void {
+  if (writesBlocked.value) return
   pendingConsolePatches.set(consoleId, {
     ...(pendingConsolePatches.get(consoleId) ?? {}),
     ...patch,
@@ -703,6 +714,7 @@ async function flushConsolePatch(consoleId: string): Promise<void> {
   const patch = pendingConsolePatches.get(consoleId)
   if (!patch) return
   pendingConsolePatches.delete(consoleId)
+  if (writesBlocked.value) return
   try {
     const updated = await updateSqlConsole(consoleId, patch)
     mergeConsole(updated)
@@ -778,6 +790,10 @@ function selectRuntime(index: number): void {
 }
 
 async function onExecute(): Promise<void> {
+  if (writesBlocked.value) {
+    execError.value = t('license.writes_blocked')
+    return
+  }
   const consoleRow = activeConsole.value
   const requestedMaxRows = queryMaxRows.value
   if (!consoleRow || !selectedDsId.value || !editorSql.value.trim()) {
@@ -840,6 +856,7 @@ async function onExecute(): Promise<void> {
 }
 
 async function onCancel(): Promise<void> {
+  if (writesBlocked.value) return
   const cancellable = activeRuntimes.value.filter(
     (runtime) => runtime.jobId && runtime.status && ACTIVE.has(runtime.status) && !runtime.cancelling,
   )
@@ -890,6 +907,7 @@ function resumeConsolePoll(consoleId: string): void {
 }
 
 async function cancelConsoleQueries(consoleId?: string): Promise<void> {
+  if (writesBlocked.value) return
   const consoleIds = consoleId ? [consoleId] : Object.keys(runtimes)
   const activeJobs = consoleIds.flatMap((id) =>
     (runtimes[id] ?? [])
@@ -1170,6 +1188,10 @@ async function onChangePage(offset: number): Promise<void> {
     runtime.error = t('sql.pagination_order_required')
     return
   }
+  if (writesBlocked.value) {
+    runtime.error = t('license.writes_blocked')
+    return
+  }
   runtime.resultLoading = true
   runtime.error = null
   try {
@@ -1251,6 +1273,10 @@ function selectTemplate(template: SqlTemplate): void {
 }
 
 async function applySelectedTemplate(): Promise<void> {
+  if (writesBlocked.value) {
+    templateRenderError.value = t('license.writes_blocked')
+    return
+  }
   if (!selectedTemplate.value) return
   templateRenderError.value = null
   try {
@@ -1264,6 +1290,7 @@ async function applySelectedTemplate(): Promise<void> {
 }
 
 function openTemplateCreate(): void {
+  if (writesBlocked.value) return
   Object.assign(templateForm, {
     id: null,
     name: '',
@@ -1277,6 +1304,7 @@ function openTemplateCreate(): void {
 }
 
 function openTemplateEdit(template: SqlTemplate): void {
+  if (writesBlocked.value) return
   Object.assign(templateForm, {
     id: template.id,
     name: template.name,
@@ -1290,6 +1318,10 @@ function openTemplateEdit(template: SqlTemplate): void {
 }
 
 async function submitTemplateForm(): Promise<void> {
+  if (writesBlocked.value) {
+    templatesError.value = t('license.writes_blocked')
+    return
+  }
   if (!templateForm.name.trim() || !templateForm.sql_text.trim()) return
   templateSaving.value = true
   const payload: SqlTemplateCreateRequest = {
@@ -1313,6 +1345,7 @@ async function submitTemplateForm(): Promise<void> {
 }
 
 async function removeTemplate(template: SqlTemplate): Promise<void> {
+  if (writesBlocked.value) return
   templatesError.value = null
   try {
     await deleteSqlTemplate(template.id)
@@ -1421,6 +1454,10 @@ function selectTableIntoConsole(schemaName: string, node: MetadataTableNode): vo
 
 // ── 编辑器工具栏 ────────────────────────────────────────────────
 async function onFormatSql(): Promise<void> {
+  if (writesBlocked.value) {
+    toolError.value = t('license.writes_blocked')
+    return
+  }
   const target = editorSqlTarget()
   if (!target?.sql.trim() || !selectedDs.value) return
   toolError.value = null
@@ -1436,6 +1473,10 @@ async function onFormatSql(): Promise<void> {
 }
 
 async function onExpandStar(): Promise<void> {
+  if (writesBlocked.value) {
+    toolError.value = t('license.writes_blocked')
+    return
+  }
   const target = editorSqlTarget()
   if (!target?.sql.trim() || !selectedDsId.value) return
   toolError.value = null
@@ -1456,6 +1497,10 @@ async function onExpandStar(): Promise<void> {
 }
 
 async function onExplain(): Promise<void> {
+  if (writesBlocked.value) {
+    toolError.value = t('license.writes_blocked')
+    return
+  }
   const consoleRow = activeConsole.value
   const target = editorSqlTarget()
   if (!consoleRow || !selectedDsId.value || !target?.sql.trim()) return
@@ -1494,6 +1539,10 @@ function applyGeneratedSql(sql: string): void {
 // SQL 体检(C-11):文本级 advisory findings 卡;若数据源支持 EXPLAIN,顺带触发一次
 // 库内 EXPLAIN(行数估算落 Plan tab)—— 复用既有端点,不自造行数解析。
 async function onPreflight(): Promise<void> {
+  if (writesBlocked.value) {
+    toolError.value = t('license.writes_blocked')
+    return
+  }
   const target = editorSqlTarget()
   if (!target?.sql.trim()) return
   toolError.value = null
@@ -1523,6 +1572,10 @@ function resetAiDiagnose(): void {
 }
 
 async function onDiagnoseSlowSql(): Promise<void> {
+  if (writesBlocked.value) {
+    aiDiagnoseError.value = t('license.writes_blocked')
+    return
+  }
   const runtime = activeRuntime.value
   const sql = runtime?.statement || editorSqlTarget()?.sql || ''
   if (!runtime || !selectedDsId.value || !sql.trim()) return
@@ -1589,6 +1642,10 @@ function resetExportState(): void {
 }
 
 async function onCreateExport(format: ExportFormat): Promise<void> {
+  if (writesBlocked.value) {
+    exportError.value = t('license.writes_blocked')
+    return
+  }
   const jobId = exportableJobId.value
   exportMenuOpen.value = false
   if (!jobId || exportBusy.value) return
@@ -1639,6 +1696,10 @@ async function pollExportJob(
 }
 
 async function onDownloadExport(): Promise<void> {
+  if (writesBlocked.value) {
+    exportError.value = t('license.writes_blocked')
+    return
+  }
   if (!exportReady.value) return
   const { token, filename } = exportReady.value
   try {
@@ -1688,11 +1749,6 @@ function formatDate(iso: string | null): string {
   } catch {
     return iso
   }
-}
-
-function errorMessage(e: unknown): string {
-  if (e instanceof ApiError) return e.message || t('common.error_unknown')
-  return t('common.error_unknown')
 }
 
 function extractVariables(sqlText: string): string[] {
@@ -1765,7 +1821,13 @@ function parseVariables(value: string): string[] {
           <span class="text-xs font-medium uppercase tracking-wider chrome-text-muted flex-1">
             {{ t('sql.tab_consoles') }}
           </span>
-          <button type="button" class="chrome-btn-ghost" :title="t('sql.new_console')" @click="createConsole">
+          <button
+            type="button"
+            class="chrome-btn-ghost"
+            :disabled="writesBlocked"
+            :title="writesBlocked ? t('license.writes_blocked') : t('sql.new_console')"
+            @click="createConsole"
+          >
             <Plus class="w-4 h-4" />
           </button>
         </div>
@@ -1776,7 +1838,13 @@ function parseVariables(value: string): string[] {
           <LoadingDots />
         </div>
         <div v-else-if="sortedConsoles.length === 0" class="p-4">
-          <button type="button" class="chrome-btn-primary w-full justify-center" @click="createConsole">
+          <button
+            type="button"
+            class="chrome-btn-primary w-full justify-center"
+            :disabled="writesBlocked"
+            :title="writesBlocked ? t('license.writes_blocked') : ''"
+            @click="createConsole"
+          >
             <Plus class="w-4 h-4" />
             {{ t('sql.new_console') }}
           </button>
@@ -1800,6 +1868,8 @@ function parseVariables(value: string): string[] {
                 v-if="renameConsoleId === consoleRow.id"
                 v-model="renameConsoleDraft"
                 class="chrome-input flex-1 min-w-0 py-1 text-xs"
+                :disabled="writesBlocked"
+                :title="writesBlocked ? t('license.writes_blocked') : ''"
                 @keyup.enter="submitRename"
                 @keyup.esc="renameConsoleId = null"
                 @click.stop
@@ -1810,7 +1880,8 @@ function parseVariables(value: string): string[] {
               <button
                 type="button"
                 class="chrome-btn-ghost opacity-0 group-hover:opacity-100"
-                :title="consoleRow.pinned ? t('sql.unpin_console') : t('sql.pin_console')"
+                :disabled="writesBlocked"
+                :title="writesBlocked ? t('license.writes_blocked') : consoleRow.pinned ? t('sql.unpin_console') : t('sql.pin_console')"
                 @click.stop="togglePinned(consoleRow)"
               >
                 <PinOff v-if="consoleRow.pinned" class="w-3.5 h-3.5" />
@@ -1819,7 +1890,8 @@ function parseVariables(value: string): string[] {
               <button
                 type="button"
                 class="chrome-btn-ghost opacity-0 group-hover:opacity-100"
-                :title="t('common.edit')"
+                :disabled="writesBlocked"
+                :title="writesBlocked ? t('license.writes_blocked') : t('common.edit')"
                 @click.stop="startRename(consoleRow)"
               >
                 <Pencil class="w-3.5 h-3.5" />
@@ -1827,7 +1899,8 @@ function parseVariables(value: string): string[] {
               <button
                 type="button"
                 class="chrome-btn-ghost opacity-0 group-hover:opacity-100"
-                :title="t('common.delete')"
+                :disabled="writesBlocked"
+                :title="writesBlocked ? t('license.writes_blocked') : t('common.delete')"
                 @click.stop="deleteConsole(consoleRow.id)"
               >
                 <Trash2 class="w-3.5 h-3.5" />
@@ -1890,7 +1963,14 @@ function parseVariables(value: string): string[] {
               <Search class="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 chrome-text-muted" />
               <input v-model="templateSearch" class="chrome-input w-full pl-7 text-xs" :placeholder="t('common.search_placeholder')" />
             </div>
-            <button v-if="isAdmin" type="button" class="chrome-btn-ghost" :title="t('sql.template_new')" @click="openTemplateCreate">
+            <button
+              v-if="isAdmin"
+              type="button"
+              class="chrome-btn-ghost"
+              :disabled="writesBlocked"
+              :title="writesBlocked ? t('license.writes_blocked') : t('sql.template_new')"
+              @click="openTemplateCreate"
+            >
               <Plus class="w-4 h-4" />
             </button>
           </div>
@@ -1915,10 +1995,24 @@ function parseVariables(value: string): string[] {
             >
               <div class="flex items-center gap-2">
                 <span class="flex-1 truncate text-sm chrome-text-heading">{{ template.name }}</span>
-                <button v-if="isAdmin" type="button" class="chrome-btn-ghost" @click.stop="openTemplateEdit(template)">
+                <button
+                  v-if="isAdmin"
+                  type="button"
+                  class="chrome-btn-ghost"
+                  :disabled="writesBlocked"
+                  :title="writesBlocked ? t('license.writes_blocked') : t('common.edit')"
+                  @click.stop="openTemplateEdit(template)"
+                >
                   <Pencil class="w-3.5 h-3.5" />
                 </button>
-                <button v-if="isAdmin" type="button" class="chrome-btn-ghost" @click.stop="removeTemplate(template)">
+                <button
+                  v-if="isAdmin"
+                  type="button"
+                  class="chrome-btn-ghost"
+                  :disabled="writesBlocked"
+                  :title="writesBlocked ? t('license.writes_blocked') : t('common.delete')"
+                  @click.stop="removeTemplate(template)"
+                >
                   <Trash2 class="w-3.5 h-3.5" />
                 </button>
               </div>
@@ -1941,7 +2035,13 @@ function parseVariables(value: string): string[] {
           <div v-if="templateRenderError" class="text-xs text-red-600 dark:text-red-400">
             {{ templateRenderError }}
           </div>
-          <button type="button" class="chrome-btn-primary w-full justify-center" @click="applySelectedTemplate">
+          <button
+            type="button"
+            class="chrome-btn-primary w-full justify-center"
+            :disabled="writesBlocked"
+            :title="writesBlocked ? t('license.writes_blocked') : ''"
+            @click="applySelectedTemplate"
+          >
             <Save class="w-3.5 h-3.5" />
             {{ t('sql.template_insert') }}
           </button>
@@ -2084,7 +2184,7 @@ function parseVariables(value: string): string[] {
           id="sql-datasource"
           v-model="selectedDsId"
           class="chrome-input min-w-[12rem] max-w-full"
-          :disabled="dsQuery.isLoading.value || datasources.length === 0 || editorReadOnly"
+          :disabled="writesBlocked || dsQuery.isLoading.value || datasources.length === 0 || editorReadOnly"
           :aria-label="t('sql.datasource')"
         >
           <option v-if="datasources.length === 0" disabled value="">
@@ -2102,7 +2202,7 @@ function parseVariables(value: string): string[] {
             id="sql-page-size"
             v-model.number="pageSizeSelection"
             class="chrome-input w-[5.5rem]"
-            :disabled="editorReadOnly"
+            :disabled="writesBlocked || editorReadOnly"
             :title="t('sql.page_size_hint')"
           >
             <option v-for="size in PAGE_SIZE_OPTIONS" :key="size" :value="size">
@@ -2118,7 +2218,7 @@ function parseVariables(value: string): string[] {
             id="sql-max-rows"
             v-model="maxRowsSelection"
             class="chrome-input w-[6.5rem]"
-            :disabled="editorReadOnly"
+            :disabled="writesBlocked || editorReadOnly"
             :title="t('sql.max_rows_hint')"
           >
             <option v-for="limit in QUERY_MAX_ROWS_OPTIONS" :key="limit" :value="String(limit)">
@@ -2135,7 +2235,7 @@ function parseVariables(value: string): string[] {
             step="100"
             class="chrome-input w-24"
             :aria-label="t('sql.max_rows_custom_input')"
-            :disabled="editorReadOnly"
+            :disabled="writesBlocked || editorReadOnly"
           />
         </div>
         <button
@@ -2143,13 +2243,20 @@ function parseVariables(value: string): string[] {
           type="button"
           class="chrome-btn-primary"
           @click="onExecute"
-          :disabled="!activeConsole || !selectedDsId || !editorSql.trim() || !!unsupportedDb || queryMaxRows === null"
-          :title="unsupportedDb ? t('sql.unsupported_db_error', { db: unsupportedDb }) : ''"
+          :disabled="writesBlocked || !activeConsole || !selectedDsId || !editorSql.trim() || !!unsupportedDb || queryMaxRows === null"
+          :title="writesBlocked ? t('license.writes_blocked') : unsupportedDb ? t('sql.unsupported_db_error', { db: unsupportedDb }) : ''"
         >
           <Play class="w-3.5 h-3.5" />
           {{ t('sql.execute') }}
         </button>
-        <button v-else type="button" class="chrome-btn-secondary" @click="onCancel" :disabled="activeRuntime?.cancelling">
+        <button
+          v-else
+          type="button"
+          class="chrome-btn-secondary"
+          @click="onCancel"
+          :disabled="writesBlocked || activeRuntime?.cancelling"
+          :title="writesBlocked ? t('license.writes_blocked') : ''"
+        >
           <Square class="w-3.5 h-3.5" />
           {{ activeRuntime?.cancelling ? t('sql.cancelling') : t('sql.cancel') }}
         </button>
@@ -2165,7 +2272,13 @@ function parseVariables(value: string): string[] {
       </div>
 
       <div v-if="!activeConsole" class="flex-1 grid place-items-center">
-        <button type="button" class="chrome-btn-primary" @click="createConsole">
+        <button
+          type="button"
+          class="chrome-btn-primary"
+          :disabled="writesBlocked"
+          :title="writesBlocked ? t('license.writes_blocked') : ''"
+          @click="createConsole"
+        >
           <Plus class="w-4 h-4" />
           {{ t('sql.new_console') }}
         </button>
@@ -2183,7 +2296,7 @@ function parseVariables(value: string): string[] {
             :default-schema="selectedDs?.database ?? undefined"
             :path="`sql-console-${activeConsole.id}.sql`"
             :theme="editorTheme"
-            :read-only="editorReadOnly"
+            :read-only="editorReadOnly || writesBlocked"
             @mount="onEditorMount"
             @execute="onExecute"
           />
@@ -2193,8 +2306,8 @@ function parseVariables(value: string): string[] {
           <button
             type="button"
             class="chrome-btn-secondary"
-            :disabled="!editorSql.trim() || !toolsSupported || editorReadOnly || toolBusy !== ''"
-            :title="!toolsSupported ? t('sql.tools_unsupported_db') : t('sql.tool_format_hint')"
+            :disabled="writesBlocked || !editorSql.trim() || !toolsSupported || editorReadOnly || toolBusy !== ''"
+            :title="writesBlocked ? t('license.writes_blocked') : !toolsSupported ? t('sql.tools_unsupported_db') : t('sql.tool_format_hint')"
             @click="onFormatSql"
           >
             <AlignLeft class="w-3.5 h-3.5" />
@@ -2203,8 +2316,8 @@ function parseVariables(value: string): string[] {
           <button
             type="button"
             class="chrome-btn-secondary"
-            :disabled="!editorSql.trim() || !toolsSupported || editorReadOnly || toolBusy !== ''"
-            :title="!toolsSupported ? t('sql.tools_unsupported_db') : t('sql.tool_expand_hint')"
+            :disabled="writesBlocked || !editorSql.trim() || !toolsSupported || editorReadOnly || toolBusy !== ''"
+            :title="writesBlocked ? t('license.writes_blocked') : !toolsSupported ? t('sql.tools_unsupported_db') : t('sql.tool_expand_hint')"
             @click="onExpandStar"
           >
             <Asterisk class="w-3.5 h-3.5" />
@@ -2213,9 +2326,11 @@ function parseVariables(value: string): string[] {
           <button
             type="button"
             class="chrome-btn-secondary"
-            :disabled="!editorSql.trim() || !explainSupported || editorReadOnly || toolBusy !== ''"
+            :disabled="writesBlocked || !editorSql.trim() || !explainSupported || editorReadOnly || toolBusy !== ''"
             :title="
-              !toolsSupported
+              writesBlocked
+                ? t('license.writes_blocked')
+                : !toolsSupported
                 ? t('sql.tools_unsupported_db')
                 : !explainSupported
                   ? t('sql.explain_not_allowed')
@@ -2229,8 +2344,8 @@ function parseVariables(value: string): string[] {
           <button
             type="button"
             class="chrome-btn-secondary"
-            :disabled="!selectedDsId || editorReadOnly"
-            :title="t('sql.ai_generate_hint')"
+            :disabled="writesBlocked || !selectedDsId || editorReadOnly"
+            :title="writesBlocked ? t('license.writes_blocked') : t('sql.ai_generate_hint')"
             @click="aiPanelOpen = true"
           >
             <Sparkles class="w-3.5 h-3.5" />
@@ -2239,8 +2354,8 @@ function parseVariables(value: string): string[] {
           <button
             type="button"
             class="chrome-btn-secondary"
-            :disabled="!editorSql.trim() || editorReadOnly || toolBusy !== ''"
-            :title="t('sql.tool_preflight_hint')"
+            :disabled="writesBlocked || !editorSql.trim() || editorReadOnly || toolBusy !== ''"
+            :title="writesBlocked ? t('license.writes_blocked') : t('sql.tool_preflight_hint')"
             @click="onPreflight"
           >
             <ShieldCheck class="w-3.5 h-3.5" />
@@ -2328,8 +2443,8 @@ function parseVariables(value: string): string[] {
                 <button
                   type="button"
                   class="chrome-btn-secondary"
-                  :disabled="!exportableJobId || exportBusy"
-                  :title="!exportableJobId ? t('sql.export_needs_success') : t('sql.export')"
+                  :disabled="writesBlocked || !exportableJobId || exportBusy"
+                  :title="writesBlocked ? t('license.writes_blocked') : !exportableJobId ? t('sql.export_needs_success') : t('sql.export')"
                   @click="exportMenuOpen = !exportMenuOpen"
                 >
                   <Download class="w-3.5 h-3.5" />
@@ -2386,7 +2501,13 @@ function parseVariables(value: string): string[] {
           >
             <Download class="w-3.5 h-3.5 shrink-0 chrome-accent" />
             <span class="flex-1 chrome-text-heading">{{ t('sql.export_ready', { file: exportReady.filename }) }}</span>
-            <button type="button" class="chrome-btn-primary py-1" @click="onDownloadExport">
+            <button
+              type="button"
+              class="chrome-btn-primary py-1"
+              :disabled="writesBlocked"
+              :title="writesBlocked ? t('license.writes_blocked') : ''"
+              @click="onDownloadExport"
+            >
               {{ t('sql.export_download') }}
             </button>
           </div>
@@ -2445,8 +2566,8 @@ function parseVariables(value: string): string[] {
               <button
                 type="button"
                 class="chrome-btn-secondary"
-                :disabled="aiDiagnoseBusy || !selectedDsId || !editorSql.trim()"
-                :title="t('sql.ai_diagnose_hint')"
+                :disabled="writesBlocked || aiDiagnoseBusy || !selectedDsId || !editorSql.trim()"
+                :title="writesBlocked ? t('license.writes_blocked') : t('sql.ai_diagnose_hint')"
                 @click="onDiagnoseSlowSql"
               >
                 <Sparkles class="w-3.5 h-3.5" />
@@ -2570,7 +2691,12 @@ function parseVariables(value: string): string[] {
             <X class="w-3.5 h-3.5" />
             {{ t('common.cancel') }}
           </button>
-          <button type="submit" class="chrome-btn-primary" :disabled="templateSaving">
+          <button
+            type="submit"
+            class="chrome-btn-primary"
+            :disabled="writesBlocked || templateSaving"
+            :title="writesBlocked ? t('license.writes_blocked') : ''"
+          >
             <Save class="w-3.5 h-3.5" />
             {{ templateSaving ? t('common.submitting') : t('common.save') }}
           </button>

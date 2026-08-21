@@ -26,6 +26,7 @@ export default {
     copied: 'Copied',
     done: 'Done',
     error_network: 'Network error, please retry',
+    error_forbidden: 'You do not have permission to perform this action',
     error_unauthorized: 'Session expired, please log in again',
     error_server: 'Server error, please retry later',
     error_unknown: 'Unknown error',

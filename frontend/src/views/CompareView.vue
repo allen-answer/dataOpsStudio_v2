@@ -91,8 +91,10 @@ import LoadingDots from '../components/LoadingDots.vue'
 import JobStatusBadge from '../components/JobStatusBadge.vue'
 import CompareExpressionLabel from '../components/CompareExpressionLabel.vue'
 import SqlEditor from '../components/SqlEditor.vue'
+import { useLicense } from '../composables/useLicense'
 import { useToast } from '../composables/useToast'
 import { useThemeStore } from '../stores/theme'
+import { createUserErrorMessage } from '../utils/userErrorMessage'
 
 const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>([
   'success',
@@ -152,6 +154,8 @@ const BUCKET_STYLE: Record<CompareBucket, BucketStyle> = {
 }
 
 const { t } = useI18n()
+const errorMessage = createUserErrorMessage(t)
+const { writesBlocked } = useLicense()
 const toast = useToast()
 const route = useRoute()
 const themeStore = useThemeStore()
@@ -909,6 +913,11 @@ function setDraftFile(
 /** 选文件 → 校验扩展名 → 复用上传基建拿 upload_id(purpose=compare_source)→ 自动预览。 */
 async function onFileSelected(side: RefSide, event: Event): Promise<void> {
   const input = event.target as HTMLInputElement
+  if (writesBlocked.value) {
+    previews[side].error = t('license.writes_blocked')
+    input.value = ''
+    return
+  }
   const file = input.files?.[0]
   if (!file) return
   const ext = file.name.toLowerCase().split('.').pop() ?? ''
@@ -1343,6 +1352,10 @@ function compareTaskErrorMessage(e: unknown): string {
 }
 
 async function onSaveTask(): Promise<void> {
+  if (writesBlocked.value) {
+    editorError.value = t('license.writes_blocked')
+    return
+  }
   if (!draft.name.trim() || !refReady('source') || !refReady('target')) {
     editorError.value = t('compare.save_incomplete')
     return
@@ -1394,6 +1407,10 @@ function mergeTask(task: CompareTaskResponse): void {
 }
 
 async function onDeleteTask(): Promise<void> {
+  if (writesBlocked.value) {
+    editorError.value = t('license.writes_blocked')
+    return
+  }
   if (!activeTask.value) return
   const id = activeTask.value.id
   try {
@@ -1407,6 +1424,10 @@ async function onDeleteTask(): Promise<void> {
 }
 
 async function onCloneTask(): Promise<void> {
+  if (writesBlocked.value) {
+    editorError.value = t('license.writes_blocked')
+    return
+  }
   if (!activeTask.value) return
   try {
     const cloned = await cloneCompareTask(activeTask.value.id)
@@ -1433,6 +1454,10 @@ async function onLoadSuggestions(): Promise<void> {
 }
 
 async function onCreateDraftFromPair(pair: TablePairSuggestion): Promise<void> {
+  if (writesBlocked.value) {
+    suggestError.value = t('license.writes_blocked')
+    return
+  }
   const key = `${pair.source_schema}.${pair.source_table}`
   draftingPair.value = key
   suggestError.value = null
@@ -1494,6 +1519,10 @@ function resetRunState(): void {
 }
 
 async function onRun(): Promise<void> {
+  if (writesBlocked.value) {
+    run.error = t('license.writes_blocked')
+    return
+  }
   if (!activeTask.value) {
     // 必须先保存才能跑(run 端点按 task_id)
     await onSaveTask()
@@ -1556,6 +1585,10 @@ async function pollRun(generation: number): Promise<void> {
 }
 
 async function onCancelRun(): Promise<void> {
+  if (writesBlocked.value) {
+    run.error = t('license.writes_blocked')
+    return
+  }
   if (!run.jobId || run.cancelling) return
   run.cancelling = true
   try {
@@ -1567,6 +1600,10 @@ async function onCancelRun(): Promise<void> {
 }
 
 async function onCreateCompareExport(): Promise<void> {
+  if (writesBlocked.value) {
+    exportError.value = t('license.writes_blocked')
+    return
+  }
   const runId = exportableRunId.value
   if (!runId || exportBusy.value) return
   resetExportState()
@@ -1627,6 +1664,10 @@ async function pollCompareExportJob(
 }
 
 async function onDownloadCompareExport(): Promise<void> {
+  if (writesBlocked.value) {
+    exportError.value = t('license.writes_blocked')
+    return
+  }
   if (!exportReady.value) return
   const ready = exportReady.value
   try {
@@ -1871,6 +1912,7 @@ function previewErrorMessage(e: unknown): string {
 }
 
 async function onAiExplain(): Promise<void> {
+  if (writesBlocked.value) return
   if (!run.runId || aiBusy.value) return
   aiBusy.value = true
   try {
@@ -1990,11 +2032,6 @@ function formatDate(iso: string | null): string {
   }
 }
 
-function errorMessage(e: unknown): string {
-  if (e instanceof ApiError) return e.message || t('common.error_unknown')
-  return t('common.error_unknown')
-}
-
 function aiAttributionText(value: string | null | undefined): string {
   return value?.trim() ?? ''
 }
@@ -2068,7 +2105,13 @@ const missingTarget = computed(
         <span class="text-xs font-medium uppercase tracking-wider chrome-text-muted flex-1">
           {{ t('compare.tasks') }}
         </span>
-        <button type="button" class="chrome-btn-ghost" :title="t('compare.new_task')" @click="startNewTask">
+        <button
+          type="button"
+          class="chrome-btn-ghost"
+          :disabled="writesBlocked"
+          :title="writesBlocked ? t('license.writes_blocked') : t('compare.new_task')"
+          @click="startNewTask"
+        >
           <Plus class="w-4 h-4" />
         </button>
       </div>
@@ -2152,8 +2195,8 @@ const missingTarget = computed(
             <button
               type="button"
               class="chrome-btn-ghost"
-              :title="t('compare.create_draft')"
-              :disabled="draftingPair === `${pair.source_schema}.${pair.source_table}`"
+              :title="writesBlocked ? t('license.writes_blocked') : t('compare.create_draft')"
+              :disabled="writesBlocked || draftingPair === `${pair.source_schema}.${pair.source_table}`"
               @click="onCreateDraftFromPair(pair)"
             >
               <Plus class="w-3.5 h-3.5" />
@@ -2208,8 +2251,8 @@ const missingTarget = computed(
         <button
           type="button"
           class="chrome-btn-secondary text-xs"
-          :disabled="!exportableRunId || exportBusy"
-          :title="!exportableRunId ? t('compare.export_needs_success') : t('compare.export')"
+          :disabled="writesBlocked || !exportableRunId || exportBusy"
+          :title="writesBlocked ? t('license.writes_blocked') : !exportableRunId ? t('compare.export_needs_success') : t('compare.export')"
           @click="onCreateCompareExport"
         >
           <Download class="w-3.5 h-3.5" :class="exportBusy && 'animate-pulse'" />
@@ -2220,7 +2263,8 @@ const missingTarget = computed(
           v-if="runActive"
           type="button"
           class="chrome-btn-secondary text-xs"
-          :disabled="run.cancelling"
+          :disabled="writesBlocked || run.cancelling"
+          :title="writesBlocked ? t('license.writes_blocked') : ''"
           @click="onCancelRun"
         >
           <Square class="w-3.5 h-3.5" /> {{ t('compare.cancel_run') }}
@@ -2228,8 +2272,8 @@ const missingTarget = computed(
         <button
           type="button"
           class="chrome-btn-primary text-xs"
-          :disabled="runActive || Boolean(runBlockedReason)"
-          :title="runBlockedReason ?? ''"
+          :disabled="writesBlocked || runActive || Boolean(runBlockedReason)"
+          :title="writesBlocked ? t('license.writes_blocked') : runBlockedReason ?? ''"
           @click="onRun"
         >
           <Play class="w-3.5 h-3.5" /> {{ runActive ? t('compare.running') : t('compare.run') }}
@@ -2250,7 +2294,13 @@ const missingTarget = computed(
       >
         <Download class="w-3.5 h-3.5 shrink-0 chrome-accent" />
         <span class="flex-1 chrome-text-heading">{{ t('compare.export_ready', { file: exportReady.filename }) }}</span>
-        <button type="button" class="chrome-btn-secondary text-xs" @click="onDownloadCompareExport">
+        <button
+          type="button"
+          class="chrome-btn-secondary text-xs"
+          :disabled="writesBlocked"
+          :title="writesBlocked ? t('license.writes_blocked') : ''"
+          @click="onDownloadCompareExport"
+        >
           {{ t('compare.export_download') }}
         </button>
       </div>
@@ -2333,10 +2383,14 @@ const missingTarget = computed(
               </p>
               <!-- 文件源(源):上传 → 解析参数 -->
               <div v-else-if="!draft.singleSql && draft.sourceKind === 'file'" class="space-y-2">
-                <label class="chrome-btn-secondary text-xs cursor-pointer w-full justify-center" :class="previews.source.uploading && 'opacity-60 pointer-events-none'">
+                <label
+                  class="chrome-btn-secondary text-xs cursor-pointer w-full justify-center"
+                  :class="(writesBlocked || previews.source.uploading) && 'opacity-60 pointer-events-none'"
+                  :title="writesBlocked ? t('license.writes_blocked') : ''"
+                >
                   <Upload class="w-3.5 h-3.5" :class="previews.source.uploading && 'animate-pulse'" />
                   {{ previews.source.uploading ? t('compare.file_uploading') : (draft.sourceUploadId ? t('compare.file_reupload') : t('compare.file_choose')) }}
-                  <input type="file" class="hidden" :accept="FILE_ACCEPT" @change="onFileSelected('source', $event)" />
+                  <input type="file" class="hidden" :accept="FILE_ACCEPT" :disabled="writesBlocked || previews.source.uploading" @change="onFileSelected('source', $event)" />
                 </label>
                 <div v-if="draft.sourceFilename" class="text-[11px] chrome-text-muted truncate">
                   {{ draft.sourceFilename }} · {{ t(`compare.file_format_${draft.sourceFileFormat}`) }}
@@ -2497,10 +2551,14 @@ const missingTarget = computed(
               </p>
               <!-- 文件源(目标):上传 → 解析参数 -->
               <div v-else-if="!draft.singleSql && draft.targetKind === 'file'" class="space-y-2">
-                <label class="chrome-btn-secondary text-xs cursor-pointer w-full justify-center" :class="previews.target.uploading && 'opacity-60 pointer-events-none'">
+                <label
+                  class="chrome-btn-secondary text-xs cursor-pointer w-full justify-center"
+                  :class="(writesBlocked || previews.target.uploading) && 'opacity-60 pointer-events-none'"
+                  :title="writesBlocked ? t('license.writes_blocked') : ''"
+                >
                   <Upload class="w-3.5 h-3.5" :class="previews.target.uploading && 'animate-pulse'" />
                   {{ previews.target.uploading ? t('compare.file_uploading') : (draft.targetUploadId ? t('compare.file_reupload') : t('compare.file_choose')) }}
-                  <input type="file" class="hidden" :accept="FILE_ACCEPT" @change="onFileSelected('target', $event)" />
+                  <input type="file" class="hidden" :accept="FILE_ACCEPT" :disabled="writesBlocked || previews.target.uploading" @change="onFileSelected('target', $event)" />
                 </label>
                 <div v-if="draft.targetFilename" class="text-[11px] chrome-text-muted truncate">
                   {{ draft.targetFilename }} · {{ t(`compare.file_format_${draft.targetFileFormat}`) }}
@@ -3063,13 +3121,21 @@ const missingTarget = computed(
 
           <div v-if="editorError" class="text-xs text-red-600 dark:text-red-400">{{ editorError }}</div>
           <div class="flex items-center gap-2">
-            <button type="button" class="chrome-btn-primary text-sm" :disabled="savingTask" @click="onSaveTask">
+            <button
+              type="button"
+              class="chrome-btn-primary text-sm"
+              :disabled="writesBlocked || savingTask"
+              :title="writesBlocked ? t('license.writes_blocked') : ''"
+              @click="onSaveTask"
+            >
               <Save class="w-4 h-4" /> {{ savingTask ? t('compare.saving') : t('compare.save_task') }}
             </button>
             <button
               v-if="activeTask"
               type="button"
               class="chrome-btn-secondary text-sm"
+              :disabled="writesBlocked"
+              :title="writesBlocked ? t('license.writes_blocked') : ''"
               @click="onCloneTask"
             >
               <Copy class="w-4 h-4" /> {{ t('compare.clone_task') }}
@@ -3078,6 +3144,8 @@ const missingTarget = computed(
               v-if="activeTask"
               type="button"
               class="chrome-btn-secondary text-sm"
+              :disabled="writesBlocked"
+              :title="writesBlocked ? t('license.writes_blocked') : ''"
               @click="onDeleteTask"
             >
               <Trash2 class="w-4 h-4" /> {{ t('compare.delete_task') }}
@@ -3395,7 +3463,13 @@ const missingTarget = computed(
 
             <!-- AI 归因(叠加层,非前置依赖) -->
             <div class="border-t chrome-border-subtle pt-4">
-              <button type="button" class="chrome-btn-secondary text-sm" :disabled="aiBusy" @click="onAiExplain">
+              <button
+                type="button"
+                class="chrome-btn-secondary text-sm"
+                :disabled="writesBlocked || aiBusy"
+                :title="writesBlocked ? t('license.writes_blocked') : ''"
+                @click="onAiExplain"
+              >
                 <Bot class="w-4 h-4" :class="aiBusy && 'animate-pulse'" />
                 {{ aiBusy ? t('compare.ai_explaining') : t('compare.ai_explain') }}
               </button>
@@ -3454,8 +3528,8 @@ const missingTarget = computed(
               v-if="item.status === 'success'"
               type="button"
               class="chrome-btn-secondary text-xs shrink-0"
-              :disabled="exportBusy"
-              :title="t('compare.history_export_hint')"
+              :disabled="writesBlocked || exportBusy"
+              :title="writesBlocked ? t('license.writes_blocked') : t('compare.history_export_hint')"
               @click="onExportHistoryRun(item)"
             >
               <Download class="w-3.5 h-3.5" :class="exportBusy && 'animate-pulse'" />

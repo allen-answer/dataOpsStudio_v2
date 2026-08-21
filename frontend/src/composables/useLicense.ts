@@ -7,6 +7,7 @@
  * ★ 后端 middleware(crosscutting.py)在 REPAIR / IN_GRACE 下对非安全方法返 403:
  *   - REPAIR:除 license 更新 / backup / restore / diagnostics 外,全部 POST/PUT/PATCH/DELETE 403
  *   - IN_GRACE:除 license 更新 / backup 外,全部写操作 403
+ *   - 两种模式都额外禁止业务导出文件 GET /api/exports/*
  *   前端据此把写按钮 disabled 并给出文案(/admin/license 例外,始终可用)。
  */
 import { computed } from 'vue'

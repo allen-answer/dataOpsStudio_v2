@@ -14,14 +14,16 @@ import { useI18n } from 'vue-i18n'
 import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { ListChecks, X, AlertTriangle } from 'lucide-vue-next'
 import { listJobs, getJobResult, cancelJob, type JobResultResponse } from '../api/jobs'
-import { ApiError, type JobListItem, type JobStatus } from '../api/types'
+import type { JobListItem, JobStatus } from '../api/types'
 import JobStatusBadge from '../components/JobStatusBadge.vue'
 import JobErrorBadge from '../components/JobErrorBadge.vue'
 import ResultTable from '../components/ResultTable.vue'
 import EmptyState from '../components/EmptyState.vue'
 import LoadingDots from '../components/LoadingDots.vue'
+import { createUserErrorMessage } from '../utils/userErrorMessage'
 
 const { t } = useI18n()
+const errorMessage = createUserErrorMessage(t)
 const route = useRoute()
 const qc = useQueryClient()
 
@@ -95,7 +97,7 @@ async function fetchDrawerPage(offset: number): Promise<void> {
   try {
     drawerResult.value = await getJobResult(drawerJob.value.id, offset, PAGE_SIZE)
   } catch (e) {
-    drawerError.value = e instanceof ApiError ? e.message : t('common.error_unknown')
+    drawerError.value = errorMessage(e)
   } finally {
     drawerLoading.value = false
   }
@@ -106,7 +108,7 @@ async function onCancel(j: JobListItem): Promise<void> {
     await cancelJob(j.id)
     await qc.invalidateQueries({ queryKey: queryKey.value })
   } catch (e) {
-    drawerError.value = e instanceof ApiError ? e.message : t('common.error_unknown')
+    drawerError.value = errorMessage(e)
   }
 }
 
@@ -148,11 +150,6 @@ function duration(j: JobListItem): string {
   return `${Math.floor(ms / 60_000)} min`
 }
 
-function errorMessage(): string {
-  const e = query.error.value
-  if (e instanceof ApiError) return e.message || t('common.error_unknown')
-  return t('common.error_unknown')
-}
 </script>
 
 <template>
@@ -202,7 +199,7 @@ function errorMessage(): string {
       <AlertTriangle class="w-5 h-5 text-red-500 dark:text-red-400 shrink-0 mt-0.5" />
       <div>
         <div class="text-sm font-medium text-red-700 dark:text-red-400">{{ t('common.error') }}</div>
-        <div class="text-sm text-red-600 dark:text-red-300 mt-0.5">{{ errorMessage() }}</div>
+        <div class="text-sm text-red-600 dark:text-red-300 mt-0.5">{{ errorMessage(query.error.value) }}</div>
         <button
           @click="query.refetch()"
           type="button"

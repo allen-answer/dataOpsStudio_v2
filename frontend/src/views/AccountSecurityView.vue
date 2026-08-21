@@ -41,8 +41,10 @@ import { ApiError, type AccountSecurityStatus } from '../api/types'
 import LoadingDots from '../components/LoadingDots.vue'
 import Modal from '../components/Modal.vue'
 import QrCode from '../components/QrCode.vue'
+import { createUserErrorMessage } from '../utils/userErrorMessage'
 
 const { t } = useI18n()
+const errorMessage = createUserErrorMessage(t)
 const qc = useQueryClient()
 
 const query = useQuery({ queryKey: ['account-security'], queryFn: getAccountSecurity })
@@ -111,7 +113,7 @@ async function submitPassword(): Promise<void> {
     if (e instanceof ApiError && e.code === 'invalid_password') {
       pwError.value = t('account.pw_invalid_old')
     } else {
-      pwError.value = e instanceof ApiError ? e.message : t('common.error_unknown')
+      pwError.value = errorMessage(e)
     }
   }
 }
@@ -143,7 +145,7 @@ async function startEnroll(): Promise<void> {
   try {
     await enrollMutation.mutateAsync()
   } catch (e) {
-    enrollError.value = e instanceof ApiError ? e.message : t('common.error_unknown')
+    enrollError.value = errorMessage(e)
   }
 }
 
@@ -171,7 +173,7 @@ async function submitVerify(): Promise<void> {
     if (e instanceof ApiError && e.code === 'invalid_mfa_code') {
       enrollError.value = t('account.mfa_invalid_code')
     } else {
-      enrollError.value = e instanceof ApiError ? e.message : t('common.error_unknown')
+      enrollError.value = errorMessage(e)
     }
   }
 }
@@ -219,7 +221,7 @@ async function submitDisable(): Promise<void> {
     if (e instanceof ApiError && e.code === 'invalid_mfa_code') {
       disableError.value = t('account.mfa_invalid_code')
     } else {
-      disableError.value = e instanceof ApiError ? e.message : t('common.error_unknown')
+      disableError.value = errorMessage(e)
     }
   }
 }
@@ -267,7 +269,7 @@ async function submitRegen(): Promise<void> {
     if (e instanceof ApiError && e.code === 'invalid_mfa_code') {
       regenError.value = t('account.mfa_invalid_code')
     } else {
-      regenError.value = e instanceof ApiError ? e.message : t('common.error_unknown')
+      regenError.value = errorMessage(e)
     }
   }
 }
