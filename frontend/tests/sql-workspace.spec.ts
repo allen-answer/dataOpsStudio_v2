@@ -1,5 +1,5 @@
 import { test, expect, type Page, type Route } from '@playwright/test'
-import { json, mockLicense, seedAdminAuth, trackConsoleErrors } from './helpers'
+import { deferred, json, mockLicense, seedAdminAuth, trackConsoleErrors } from './helpers'
 
 const now = '2026-06-12T06:00:00Z'
 
@@ -78,6 +78,7 @@ async function mockWorkspace(
     progressiveRows?: number
     hasMore?: boolean
     progressiveColumns?: number
+    progressivePageSize?: number
   } = {},
 ): Promise<{
   patches: unknown[]
@@ -136,11 +137,12 @@ async function mockWorkspace(
     if (options.progressiveRows !== undefined) {
       const rowCount = options.progressiveRows
       const columnCount = options.progressiveColumns ?? 1
+      const pageSize = options.progressivePageSize ?? 100
       return json(r, 200, {
         job_id: 'job-1',
         result_set_id: 'rs-1',
         offset: 0,
-        limit: 100,
+        limit: pageSize,
         columns: Array.from({ length: columnCount }, (_, columnIndex) => ({
           name: columnIndex === 0 ? 'id' : `value_${columnIndex}`,
           type: columnIndex === 0 ? 'integer' : 'string',
@@ -148,7 +150,9 @@ async function mockWorkspace(
           nullable: columnIndex !== 0,
           primary_key: columnIndex === 0,
         })),
-        rows: Array.from({ length: rowCount }, (_, index) => ({
+        // This helper normally returns one bounded page. A larger page size
+        // is opt-in for the synthetic virtualization stress test below.
+        rows: Array.from({ length: Math.min(rowCount, pageSize) }, (_, index) => ({
           values: Array.from({ length: columnCount }, (_, columnIndex) =>
             columnIndex === 0 ? index + 1 : `value-${index + 1}-${columnIndex}`,
           ),
@@ -158,7 +162,7 @@ async function mockWorkspace(
         state: jobReads <= 1 ? 'running' : 'success',
         truncated: false,
         has_more: options.hasMore ?? false,
-        page_size: 100,
+        page_size: pageSize,
         max_result_rows: 1000,
         pagination_mode: options.hasMore ? 'ordered_offset' : 'unavailable',
         pagination_reason: options.hasMore
@@ -361,6 +365,111 @@ test('next page enqueues a database continuation while previous page stays cache
   expectNoConsoleErrors()
 })
 
+test('late continuation response cannot overwrite a runtime after console switch', async ({
+  page,
+}) => {
+  await mockWorkspace(page, { progressiveRows: 50, hasMore: true })
+  const continuationStarted = deferred()
+  const releaseContinuation = deferred()
+  let continuationFinished = false
+  await page.route('**/api/jobs/job-1/pages', async (r) => {
+    continuationStarted.resolve()
+    await releaseContinuation.promise
+    await json(r, 202, {
+      job_id: 'job-2',
+      result_set_id: 'rs-1',
+      offset: 100,
+      cached: false,
+    })
+    continuationFinished = true
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.getByText('1-50 of 50+')).toBeVisible()
+  await page.getByRole('button', { name: 'Next page' }).click()
+  await continuationStarted.promise
+
+  await page.getByTitle('New console').click()
+  await expect(page.locator('aside').getByText('query_2.sql')).toBeVisible()
+  releaseContinuation.resolve()
+  await expect.poll(() => continuationFinished).toBe(true)
+
+  await page.locator('aside').getByText('query_1.sql').click()
+  await expect(page.getByText('1-50 of 50+')).toBeVisible()
+  await expect(page.getByRole('cell', { name: '1', exact: true }).last()).toBeVisible()
+  expectNoConsoleErrors()
+})
+
+test('late previous-page result cannot leave navigation loading after console switch', async ({
+  page,
+}) => {
+  await mockWorkspace(page, { progressiveRows: 100, hasMore: true })
+  await page.route('**/api/jobs/job-1/pages', (r) =>
+    json(r, 202, { job_id: 'job-2', result_set_id: 'rs-1', offset: 100, cached: false }),
+  )
+  await page.route(/\/api\/jobs\/job-2\/progress\?/, (r) =>
+    json(r, 200, {
+      job_id: 'job-2', result_set_id: 'rs-1', status: 'success', loaded_rows: 200,
+      result_version: 2, columns_ready: true, first_batch_ready: true, terminal: true,
+      error: null, error_code: null, retry_after_ms: 0, has_new_result: true,
+      truncated: false, has_more: true, pagination_mode: 'ordered_offset',
+      pagination_reason: 'fresh_read_ordered_offset', timings: null, execution: null,
+    }),
+  )
+  const previousFetchStarted = deferred()
+  const releasePreviousFetch = deferred()
+  let previousFetchCount = 0
+  let previousFetchFinished = false
+  await page.route(/\/api\/jobs\/job-2\/result\?/, async (r) => {
+    const offset = Number(new URL(r.request().url()).searchParams.get('offset') ?? 0)
+    if (offset === 0 && previousFetchCount === 0) {
+      previousFetchCount += 1
+      previousFetchStarted.resolve()
+      await releasePreviousFetch.promise
+      await json(r, 200, {
+        job_id: 'job-2', result_set_id: 'rs-1', offset: 0, limit: 100,
+        columns: [{ name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true }],
+        rows: Array.from({ length: 100 }, (_, index) => ({ values: [index + 1] })),
+        loaded_rows: 200, total_rows: null, state: 'complete', truncated: false,
+        has_more: true, page_size: 100, max_result_rows: 1000,
+        pagination_mode: 'ordered_offset', pagination_reason: 'fresh_read_ordered_offset',
+        preview_truncated_cells: 0,
+      })
+      previousFetchFinished = true
+      return
+    }
+    return json(r, 200, {
+      job_id: 'job-2', result_set_id: 'rs-1', offset, limit: 100,
+      columns: [{ name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true }],
+      rows: Array.from({ length: 100 }, (_, index) => ({ values: [index + offset + 1] })),
+      loaded_rows: 200, total_rows: null, state: 'complete', truncated: false,
+      has_more: true, page_size: 100, max_result_rows: 1000,
+      pagination_mode: 'ordered_offset', pagination_reason: 'fresh_read_ordered_offset',
+      preview_truncated_cells: 0,
+    })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.getByText('1-100 of 100+')).toBeVisible()
+  await page.getByRole('button', { name: 'Next page' }).click()
+  await expect(page.getByRole('cell', { name: '101', exact: true }).last()).toBeVisible()
+  await page.getByRole('button', { name: 'Previous page' }).click()
+  await previousFetchStarted.promise
+
+  await page.getByTitle('New console').click()
+  await expect(page.locator('aside').getByText('query_2.sql')).toBeVisible()
+  releasePreviousFetch.resolve()
+  await expect.poll(() => previousFetchFinished).toBe(true)
+
+  await page.locator('aside').getByText('query_1.sql').click()
+  await expect(page.getByRole('button', { name: 'Previous page' })).toBeEnabled()
+  await page.getByRole('button', { name: 'Previous page' }).click()
+  await expect(page.getByRole('cell', { name: '1', exact: true }).last()).toBeVisible()
+  expectNoConsoleErrors()
+})
+
 test('deleting a console cancels its active query before closing it', async ({ page }) => {
   await mockWorkspace(page)
   let cancelRequests = 0
@@ -492,7 +601,9 @@ test('progressive results use bounded pages and polling stops at success', async
 test('large result windows render a bounded row slice and reveal the tail on scroll', async ({
   page,
 }) => {
-  await mockWorkspace(page, { progressiveRows: 1000 })
+  // This deliberately requests a 1000-row mock page to stress the component;
+  // the production UI exposes page sizes only up to 500.
+  await mockWorkspace(page, { progressiveRows: 1000, progressivePageSize: 1000 })
 
   await page.goto('/projects/project-1/sql')
   await page.getByRole('button', { name: 'Run' }).click()
@@ -512,9 +623,17 @@ test('large result windows render a bounded row slice and reveal the tail on scr
   expectNoConsoleErrors()
 })
 
-test('1000 rows by 20 columns baseline stays windowed during scroll', async ({ page }) => {
-  await mockWorkspace(page, { progressiveRows: 1000, progressiveColumns: 20 })
-  await page.addInitScript(() => {
+test('synthetic ResultTable stress baseline (1000 rows x 20 columns)', async ({ page }) => {
+  // Synthetic component stress: 1000 rows exceed the production page-size
+  // maximum of 500 and must not be read as a real API protocol baseline.
+  await mockWorkspace(page, {
+    progressiveRows: 1000,
+    progressiveColumns: 20,
+    progressivePageSize: 1000,
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.evaluate(() => {
     const baseline = { startedAt: performance.now(), longTasks: 0 }
     ;(window as typeof window & { __sqlPerfBaseline?: typeof baseline }).__sqlPerfBaseline = baseline
     if (typeof PerformanceObserver === 'undefined') return
@@ -524,9 +643,8 @@ test('1000 rows by 20 columns baseline stays windowed during scroll', async ({ p
     observer.observe({ type: 'longtask', buffered: true })
   })
 
-  await page.goto('/projects/project-1/sql')
   await page.getByRole('button', { name: 'Run' }).click()
-  await expect(page.getByText(/loaded 1000 rows/)).toBeVisible()
+  await expect(page.locator('tr[data-row-index="0"]')).toBeVisible()
   const firstScreenMs = await page.evaluate(() => {
     const baseline = (window as typeof window & {
       __sqlPerfBaseline?: { startedAt: number }
@@ -562,9 +680,149 @@ test('1000 rows by 20 columns baseline stays windowed during scroll', async ({ p
       `scroll=${scrollMetrics.durationMs.toFixed(1)}ms frames=${scrollMetrics.frames} ` +
       `longtasks=${longTasks} initialRows=${initialRenderedRows}`,
   )
+  expect(initialRenderedRows).toBeGreaterThan(0)
   expect(initialRenderedRows).toBeLessThan(100)
   await expect(page.locator('tr[data-row-index="999"]')).toBeVisible()
-  expect(scrollMetrics.frames).toBeGreaterThan(0)
+  expectNoConsoleErrors()
+})
+
+test('production-shaped ResultTable baseline (500 rows x 20 columns)', async ({ page }) => {
+  await mockWorkspace(page, {
+    progressiveRows: 500,
+    progressiveColumns: 20,
+    progressivePageSize: 500,
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByLabel('Page size').selectOption('500')
+  await page.evaluate(() => {
+    const baseline = { startedAt: performance.now(), longTasks: 0 }
+    ;(window as typeof window & { __sqlPerfBaseline?: typeof baseline }).__sqlPerfBaseline = baseline
+    if (typeof PerformanceObserver === 'undefined') return
+    const observer = new PerformanceObserver((list) => {
+      baseline.longTasks += list.getEntries().length
+    })
+    observer.observe({ type: 'longtask', buffered: true })
+  })
+
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.locator('tr[data-row-index="0"]')).toBeVisible()
+  const firstScreenMs = await page.evaluate(() => {
+    const baseline = (window as typeof window & {
+      __sqlPerfBaseline?: { startedAt: number }
+    }).__sqlPerfBaseline
+    return baseline ? performance.now() - baseline.startedAt : -1
+  })
+  const renderedRows = page.locator('table.text-data tbody tr[data-row-index]')
+  const initialRenderedRows = await renderedRows.count()
+  const scrollMetrics = await page.getByTestId('result-table-scroll').evaluate(async (element) => {
+    const start = performance.now()
+    let frames = 0
+    const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight)
+    await new Promise<void>((resolve) => {
+      const tick = (timestamp: number) => {
+        frames += 1
+        const progress = Math.min(1, (timestamp - start) / 1000)
+        element.scrollTop = maxScrollTop * progress
+        if (progress >= 1) resolve()
+        else requestAnimationFrame(tick)
+      }
+      requestAnimationFrame(tick)
+    })
+    return { durationMs: performance.now() - start, frames }
+  })
+  const longTasks = await page.evaluate(
+    () =>
+      (window as typeof window & { __sqlPerfBaseline?: { longTasks: number } }).__sqlPerfBaseline
+        ?.longTasks ?? 0,
+  )
+  console.log(
+    `[perf-baseline] production-shaped 500x20 first-screen=${firstScreenMs.toFixed(1)}ms ` +
+      `scroll=${scrollMetrics.durationMs.toFixed(1)}ms frames=${scrollMetrics.frames} ` +
+      `longtasks=${longTasks} initialRows=${initialRenderedRows}`,
+  )
+  expect(initialRenderedRows).toBeGreaterThan(0)
+  expect(initialRenderedRows).toBeLessThan(100)
+  await expect(page.locator('tr[data-row-index="499"]')).toBeVisible()
+  expectNoConsoleErrors()
+})
+
+test('long multiline cells keep fixed row height and preserve virtual tail access', async ({
+  page,
+}) => {
+  await mockWorkspace(page, { progressiveRows: 100, progressivePageSize: 100 })
+  await page.route(/\/api\/jobs\/job-1\/result\?/, (r) =>
+    json(r, 200, {
+      job_id: 'job-1',
+      result_set_id: 'rs-1',
+      offset: 0,
+      limit: 100,
+      columns: [
+        { name: 'payload', type: 'string', driver_type: 'TEXT', nullable: true, primary_key: false },
+      ],
+      rows: Array.from({ length: 100 }, (_, index) => ({
+        values: [`row-${index + 1}\n${'x'.repeat(500)}`],
+      })),
+      loaded_rows: 100,
+      total_rows: null,
+      state: 'complete',
+      truncated: false,
+      has_more: false,
+      page_size: 100,
+      max_result_rows: 1000,
+      pagination_mode: 'unavailable',
+      pagination_reason: 'top_level_order_by_required',
+      preview_truncated_cells: 0,
+    }),
+  )
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.locator('tr[data-row-index="0"]')).toBeVisible()
+  const tableSemantics = await page.locator('table.text-data').evaluate((table) => ({
+    rowCount: table.getAttribute('aria-rowcount'),
+    colCount: table.getAttribute('aria-colcount'),
+    headerIndex: table.querySelector('thead tr')?.getAttribute('aria-rowindex'),
+    firstDataIndex: table.querySelector('tbody tr[data-row-index]')?.getAttribute('aria-rowindex'),
+  }))
+  expect(tableSemantics).toEqual({
+    rowCount: '101',
+    colCount: '2',
+    headerIndex: '1',
+    firstDataIndex: '2',
+  })
+
+  const heights = await page.locator('tr[data-row-index]').evaluateAll((rows) =>
+    rows.map((row) => Math.round(row.getBoundingClientRect().height)),
+  )
+  expect(heights.length).toBeGreaterThan(0)
+  expect(new Set(heights).size).toBe(1)
+
+  await page.getByTestId('result-table-scroll').evaluate((element) => {
+    element.scrollTop = element.scrollHeight
+    element.dispatchEvent(new Event('scroll'))
+  })
+  await expect(page.locator('tr[data-row-index="99"]')).toBeVisible()
+  expectNoConsoleErrors()
+})
+
+test('virtual window follows a result container resize and disconnects on unmount', async ({ page }) => {
+  await mockWorkspace(page, { progressiveRows: 500, progressivePageSize: 500 })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByLabel('Page size').selectOption('500')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.locator('tr[data-row-index="0"]')).toBeVisible()
+  const renderedRows = page.locator('table.text-data tbody tr[data-row-index]')
+  const initialCount = await renderedRows.count()
+  await page.getByTestId('result-table-scroll').evaluate((element) => {
+    element.style.flex = '0 0 auto'
+    element.style.height = '480px'
+  })
+  await expect.poll(() => renderedRows.count()).toBeGreaterThan(initialCount)
+
+  await page.goto('/projects/project-1/compare')
+  await expect(page).toHaveURL(/\/projects\/project-1\/compare$/)
   expectNoConsoleErrors()
 })
 
@@ -666,13 +924,14 @@ test('progressive append refreshes an incomplete current page so new rows stay v
     const offset = Number(requestUrl.searchParams.get('offset') ?? 0)
     const limit = Number(requestUrl.searchParams.get('limit') ?? 100)
     resultRequests.push({ offset, limit })
+    const responseRowCount = offset === 0 ? loadedRows : limit + 25
     return json(r, 200, {
       job_id: 'job-1', result_set_id: 'rs-1', offset, limit,
       columns: [
         { name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true },
       ],
       rows: Array.from(
-        { length: Math.max(0, Math.min(limit, loadedRows - offset)) },
+        { length: Math.max(0, Math.min(responseRowCount, loadedRows - offset + 25)) },
         (_, index) => ({ values: [index + offset + 1] }),
       ),
       loaded_rows: loadedRows, total_rows: null,
@@ -700,6 +959,7 @@ test('progressive append refreshes an incomplete current page so new rows stay v
     element.dispatchEvent(new Event('scroll'))
   })
   await expect(page.getByRole('cell', { name: '100', exact: true }).last()).toBeVisible()
+  await expect(page.locator('tr[data-row-index="100"]')).toHaveCount(0)
   await expect(page.getByText('3 large cell(s) were shortened for safe preview')).toBeVisible()
 
   expect(resultRequests).toEqual([

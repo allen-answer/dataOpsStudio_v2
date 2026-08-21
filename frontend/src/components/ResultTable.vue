@@ -14,7 +14,7 @@
  *
  * NULL 显示:斜体 muted "NULL";空字符串显示 "''";其他原样字符串化。
  */
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ChevronLeft, ChevronRight, AlertTriangle, Database, Info } from 'lucide-vue-next'
 import EmptyState from './EmptyState.vue'
@@ -116,6 +116,7 @@ interface VirtualRow {
 const scrollContainer = ref<HTMLElement | null>(null)
 const scrollTop = ref(0)
 const viewportHeight = ref(0)
+let resizeObserver: ResizeObserver | null = null
 
 // Column semantics are stable for a result page; compute them once rather
 // than scanning the numeric/temporal sets from every cell in the template.
@@ -145,6 +146,11 @@ const topSpacerHeight = computed(() => visibleRange.value.start * ROW_HEIGHT)
 const bottomSpacerHeight = computed(() =>
   Math.max(0, (displayRows.value.length - visibleRange.value.end) * ROW_HEIGHT),
 )
+const ariaRowCount = computed(() => {
+  const totalRows = props.totalRows ?? props.loadedRows ?? props.offset + props.rows.length
+  return totalRows + 1 // Include the sticky header row in the table row count.
+})
+const ariaColCount = computed(() => props.columns.length + 1) // Include the row-number column.
 
 const totalLabel = computed(() => {
   if (props.totalRows !== null) return String(props.totalRows)
@@ -207,7 +213,18 @@ function syncViewport(): void {
 }
 
 onMounted(() => {
-  void nextTick(syncViewport)
+  void nextTick(() => {
+    syncViewport()
+    const target = scrollContainer.value
+    if (!target || typeof ResizeObserver === 'undefined') return
+    resizeObserver = new ResizeObserver(syncViewport)
+    resizeObserver.observe(target)
+  })
+})
+
+onUnmounted(() => {
+  resizeObserver?.disconnect()
+  resizeObserver = null
 })
 
 watch(
@@ -278,12 +295,16 @@ watch(
 
     <!-- 表格 -->
     <div v-else ref="scrollContainer" class="flex-1 overflow-auto" data-testid="result-table-scroll" @scroll.passive="onScroll">
-      <table class="w-full text-data">
+      <table
+        class="w-full text-data"
+        :aria-rowcount="ariaRowCount"
+        :aria-colcount="ariaColCount"
+      >
         <thead
           class="sticky top-0 z-10 border-b chrome-border-subtle"
           style="background-color: rgb(var(--bg-panel-elevated));"
         >
-          <tr class="text-left text-xs chrome-text-muted uppercase tracking-wider">
+          <tr aria-rowindex="1" class="text-left text-xs chrome-text-muted uppercase tracking-wider">
             <th class="font-medium py-1.5 px-3 w-10 text-right tabular-nums">#</th>
             <th
               v-for="(meta, ci) in columnMeta"
@@ -334,8 +355,9 @@ watch(
             v-for="item in virtualRows"
             :key="item.index"
             :data-row-index="offset + item.index"
+            :aria-rowindex="offset + item.index + 2"
             :style="{ height: `${ROW_HEIGHT}px` }"
-            class="border-b chrome-border-subtle last:border-b-0 hover:chrome-bg-elevated transition-colors"
+            class="border-b chrome-border-subtle last:border-b-0 hover:chrome-bg-elevated transition-colors whitespace-nowrap"
           >
             <td class="py-1 px-3 text-right tabular-nums chrome-text-muted text-xs">
               {{ offset + item.index + 1 }}
@@ -343,7 +365,7 @@ watch(
             <td
               v-for="(cell, vi) in item.cells"
               :key="vi"
-              class="py-1 px-3 font-mono text-xs chrome-text-normal"
+              class="py-1 px-3 font-mono text-xs chrome-text-normal max-w-[32rem] overflow-hidden text-ellipsis whitespace-nowrap"
               :class="cell.className"
             >
               {{ cell.text }}

@@ -554,7 +554,7 @@ onUnmounted(() => {
   for (const controller of pollControllers.values()) controller.abort()
   for (const runtimeList of Object.values(runtimes)) {
     for (const runtime of runtimeList) {
-      runtime.resultGeneration += 1
+      invalidateResultRead(runtime)
       if (runtime.jobId) releasePollLease(runtime.jobId)
     }
   }
@@ -898,7 +898,7 @@ function stopConsolePoll(consoleId: string): void {
     pollControllers.delete(key)
   }
   for (const runtime of runtimes[consoleId] ?? []) {
-    runtime.resultGeneration += 1
+    invalidateResultRead(runtime)
     if (runtime.jobId) releasePollLease(runtime.jobId)
   }
 }
@@ -1084,7 +1084,7 @@ async function fetchResult(
 ): Promise<boolean> {
   if (!runtime.jobId) return false
   const jobId = runtime.jobId
-  const generation = ++runtime.resultGeneration
+  const generation = invalidateResultRead(runtime)
   if (showLoading) runtime.resultLoading = true
   try {
     const result = await getJobResult(jobId, offset, runtime.pageSize, signal)
@@ -1119,7 +1119,7 @@ async function appendResultDelta(runtime: ConsoleRuntime, signal?: AbortSignal):
   const offset = current.offset + current.rows.length
   const limit = runtime.pageSize - current.rows.length
   if (limit <= 0) return true
-  const generation = ++runtime.resultGeneration
+  const generation = invalidateResultRead(runtime)
   try {
     const delta = await getJobResult(jobId, offset, limit, signal)
     if (
@@ -1173,6 +1173,16 @@ function isResultNotReady(error: unknown, runtime: ConsoleRuntime): boolean {
     runtime.status !== null &&
     !TERMINAL.has(runtime.status)
   )
+}
+
+function invalidateResultRead(runtime: ConsoleRuntime): number {
+  runtime.resultGeneration += 1
+  runtime.resultLoading = false
+  return runtime.resultGeneration
+}
+
+function isCurrentRuntime(consoleId: string, runtime: ConsoleRuntime): boolean {
+  return activeConsoleId.value === consoleId && runtimes[consoleId]?.includes(runtime) === true
 }
 
 function nextQueryPollErrorDelay(runtime: ConsoleRuntime, retryAfterMs?: number): number {
@@ -1238,7 +1248,7 @@ function onProgressBroadcast(event: MessageEvent<unknown>): void {
 
 function stopRuntimePoll(consoleId: string, runtime: ConsoleRuntime): void {
   if (!runtime.jobId) return
-  runtime.resultGeneration += 1
+  invalidateResultRead(runtime)
   const pollKey = `query:${consoleId}:${runtime.jobId}`
   const timer = pollTimers.get(pollKey)
   if (timer) clearTimeout(timer)
@@ -1272,17 +1282,31 @@ async function onChangePage(offset: number): Promise<void> {
     runtime.error = t('license.writes_blocked')
     return
   }
+  const consoleId = activeConsoleId.value
+  if (!consoleId) return
+  const originalJobId = runtime.jobId
+  const originalRootJobId = runtime.rootJobId
+  const requestJobId = runtime.rootJobId ?? runtime.jobId
   // Invalidate an in-flight progressive delta before changing the page/job.
-  runtime.resultGeneration += 1
+  const requestGeneration = invalidateResultRead(runtime)
   runtime.resultLoading = true
   runtime.error = null
+  let keepLoadingForNewPage = false
   try {
-    const page = await requestJobPage(runtime.rootJobId ?? runtime.jobId, offset)
+    const page = await requestJobPage(requestJobId, offset)
+    if (
+      !isCurrentRuntime(consoleId, runtime) ||
+      runtime.resultGeneration !== requestGeneration ||
+      runtime.jobId !== originalJobId ||
+      runtime.rootJobId !== originalRootJobId
+    ) {
+      return
+    }
     if (page.cached) {
       await fetchResult(runtime, offset, false)
       return
     }
-    if (activeConsoleId.value) stopRuntimePoll(activeConsoleId.value, runtime)
+    stopRuntimePoll(consoleId, runtime)
     runtime.jobId = page.job_id
     runtime.status = 'pending'
     runtime.pageOffset = offset
@@ -1292,11 +1316,17 @@ async function onChangePage(offset: number): Promise<void> {
     runtime.progress = null
     runtime.unchangedPolls = 0
     runtime.networkFailures = 0
-    if (activeConsoleId.value) startConsolePoll(activeConsoleId.value, runtime)
+    runtime.resultLoading = true
+    keepLoadingForNewPage = true
+    startConsolePoll(consoleId, runtime)
   } catch (e) {
-    runtime.error = errorMessage(e)
+    if (isCurrentRuntime(consoleId, runtime) && runtime.resultGeneration === requestGeneration) {
+      runtime.error = errorMessage(e)
+    }
   } finally {
-    runtime.resultLoading = false
+    if (!keepLoadingForNewPage && isCurrentRuntime(consoleId, runtime) && runtime.resultGeneration === requestGeneration) {
+      runtime.resultLoading = false
+    }
   }
 }
 
