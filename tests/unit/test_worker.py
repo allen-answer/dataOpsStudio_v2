@@ -17,8 +17,15 @@ from sqlalchemy.exc import IntegrityError
 from structlog.testing import capture_logs
 
 from app.dbclients.factory import UnsupportedDbTypeError
+from app.dbclients.mysql_adapter import QueryCancelledError, QueryTimeoutError
 from app.dbclients.protocol import AdapterConnectionError
-from app.domain.compare import CompareHashExecutionMode, CompareHashPlan
+from app.domain.compare import (
+    CompareColumn,
+    CompareHashExecutionMode,
+    CompareHashPlan,
+    CompareRules,
+    CompareSegment,
+)
 from app.domain.compare_result import (
     compare_result_columns,
     decode_compare_result_row,
@@ -42,6 +49,7 @@ from app.worker import (
     WorkerRunnerConfig,
     _build_workflow_child_job,
     _compare_export_row_cap,
+    _DatabaseCompareReader,
     _workflow_children_snapshots,
 )
 
@@ -692,6 +700,49 @@ def test_worker_runs_compare_run_to_four_bucket_spools() -> None:
     assert result_ref.uri == "compare/run-1"
     assert result_ref.metadata["bucket_counts"] == completed_run["bucket_counts"]
     assert result_ref.metadata["diff_profile"] == diff_profile
+
+
+@pytest.mark.parametrize("error_type", [QueryCancelledError, QueryTimeoutError])
+def test_compare_db_hash_cancel_or_timeout_propagates_without_client_fallback(
+    error_type: type[RuntimeError],
+) -> None:
+    adapter = _DbHashFallbackAdapter(error_type("db hash interrupted"))
+    reader = _database_compare_reader(adapter)
+
+    with pytest.raises(error_type, match="db hash interrupted"):
+        reader.segment_fingerprint(CompareSegment(key_column="id", start=1, end=2))
+
+    assert adapter.build_hash_calls == 1
+    assert adapter.sql_calls == ["SELECT DB_HASH"]
+
+
+@pytest.mark.parametrize(
+    ("hash_error", "database_hash_supported", "expected_db_hash_queries"),
+    [
+        (None, False, 0),
+        (PermissionError("db hash permission denied"), True, 1),
+    ],
+)
+def test_compare_db_hash_ordinary_failure_falls_back_once_and_stays_disabled(
+    hash_error: Exception | None,
+    database_hash_supported: bool,
+    expected_db_hash_queries: int,
+) -> None:
+    adapter = _DbHashFallbackAdapter(
+        hash_error,
+        database_hash_supported=database_hash_supported,
+    )
+    reader = _database_compare_reader(adapter)
+    segment = CompareSegment(key_column="id", start=1, end=2)
+
+    first = reader.segment_fingerprint(segment)
+    second = reader.segment_fingerprint(segment)
+
+    assert first == second
+    assert first.row_count == 1
+    assert adapter.build_hash_calls == 1
+    assert adapter.sql_calls.count("SELECT DB_HASH") == expected_db_hash_queries
+    assert len(adapter.sql_calls) == expected_db_hash_queries + 2
 
 
 def test_compare_sql_reader_uses_generated_aliases_in_inner_and_outer_queries() -> None:
@@ -1599,6 +1650,55 @@ class _FakeAdapter:
     def build_compare_hash_query(self, request: object) -> CompareHashPlan:
         del request
         return CompareHashPlan(execution_mode=CompareHashExecutionMode.CLIENT_ROW_HASH)
+
+
+class _DbHashFallbackAdapter:
+    def __init__(
+        self,
+        hash_error: Exception | None,
+        *,
+        database_hash_supported: bool = True,
+    ) -> None:
+        self._hash_error = hash_error
+        self._database_hash_supported = database_hash_supported
+        self.build_hash_calls = 0
+        self.sql_calls: list[str] = []
+
+    def build_compare_hash_query(self, request: object) -> CompareHashPlan:
+        del request
+        self.build_hash_calls += 1
+        if not self._database_hash_supported:
+            return CompareHashPlan(execution_mode=CompareHashExecutionMode.CLIENT_ROW_HASH)
+        return CompareHashPlan(
+            execution_mode=CompareHashExecutionMode.DB_HASH,
+            sql="SELECT DB_HASH",
+        )
+
+    def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]:
+        del params
+        self.sql_calls.append(sql)
+        if sql == "SELECT DB_HASH" and self._hash_error is not None:
+            raise self._hash_error
+        return [Row(values=[1, "value"])]
+
+    def explain(self, sql: str) -> PlanNode:
+        raise AssertionError(f"unexpected explain: {sql}")
+
+    def test_connection(self) -> bool:
+        return True
+
+
+def _database_compare_reader(adapter: _DbHashFallbackAdapter) -> _DatabaseCompareReader:
+    return _DatabaseCompareReader(
+        adapter=adapter,
+        datasource=_conn_info("ds-compare"),
+        data_ref={"kind": "table", "schema_name": "app", "table_name": "items"},
+        key_columns=[CompareColumn(name="id", type=ColumnType.INTEGER)],
+        value_columns=[CompareColumn(name="value", type=ColumnType.STRING)],
+        select_key_names=["id"],
+        select_value_names=["value"],
+        rules=CompareRules(key_columns=["id"]),
+    )
 
 
 def _filter_fake_compare_rows(sql: str, rows: list[Row]) -> list[Row]:
