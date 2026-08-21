@@ -37,6 +37,28 @@ jobs:
       - name: Sync deps (all groups)
         run: uv sync --locked --all-groups
 
+      - name: Resolve analysis cache versions
+        id: analysis-versions
+        shell: bash
+        run: |
+          {
+            echo "python=$(uv run python -c 'import platform; print(platform.python_version())')"
+            echo "mypy=$(uv run python -c 'import mypy.version; print(mypy.version.__version__)')"
+            echo "ruff=$(uv run ruff --version | awk '{print $2}')"
+          } >> "$GITHUB_OUTPUT"
+
+      # Cache 只优化分析过程；下面的 ruff/mypy 命令无条件完整执行。
+      # 主 key 同时固定 Python、工具版本、uv.lock 和 pyproject.toml，避免跨环境陈旧复用。
+      - name: Restore mypy and ruff analysis caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            .mypy_cache
+            .ruff_cache
+          key: analysis-v1-${{ runner.os }}-${{ runner.arch }}-py-${{ steps.analysis-versions.outputs.python }}-mypy-${{ steps.analysis-versions.outputs.mypy }}-ruff-${{ steps.analysis-versions.outputs.ruff }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}-${{ github.sha }}
+          restore-keys: |
+            analysis-v1-${{ runner.os }}-${{ runner.arch }}-py-${{ steps.analysis-versions.outputs.python }}-mypy-${{ steps.analysis-versions.outputs.mypy }}-ruff-${{ steps.analysis-versions.outputs.ruff }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}-
+
       # R1 / R3:driver/crypto import 越界(ruff TID251 banned-api)
       - name: ruff check (R1/R3 banned-api)
         run: uv run ruff check app tests tools
@@ -151,6 +173,8 @@ jobs:
   mysql-integration:
     name: MySQL Integration (R6)
     runs-on: ubuntu-latest
+    env:
+      UV_NO_DEV: "1"
     services:
       mysql:
         image: mysql:8.0
@@ -179,7 +203,7 @@ jobs:
           enable-cache: true
 
       - name: Sync deps
-        run: uv sync --locked --all-groups
+        run: uv sync --locked --group test --no-dev
 
       # 双重保险:GitHub Actions service health check 已等 MySQL ready,
       # 但本步再 ping 一次确认 + 留可见日志(健康检查日志在 service 容器里,
@@ -217,6 +241,8 @@ jobs:
   pg-integration:
     name: PG Queue Concurrency (T1 hard evidence)
     runs-on: ubuntu-latest
+    env:
+      UV_NO_DEV: "1"
     services:
       postgres:
         image: postgres:16-alpine
@@ -241,7 +267,7 @@ jobs:
           enable-cache: true
 
       - name: Sync deps
-        run: uv sync --locked --all-groups
+        run: uv sync --locked --group test --no-dev
 
       # PG service health check 已等 ready,这里再 ping 暴露版本到 job log
       - name: Wait for PG ready
@@ -272,6 +298,8 @@ jobs:
   e2e-integration:
     name: E2E Acceptance (contract §5 hard evidence)
     runs-on: ubuntu-latest
+    env:
+      UV_NO_DEV: "1"
     services:
       postgres:
         image: postgres:16-alpine
@@ -311,7 +339,7 @@ jobs:
           enable-cache: true
 
       - name: Sync deps
-        run: uv sync --locked --all-groups
+        run: uv sync --locked --group test --no-dev
 
       - name: Wait for PG ready
         env:
@@ -353,6 +381,8 @@ jobs:
   cold-start:
     name: Cold-start (T6 hard evidence)
     runs-on: ubuntu-latest
+    env:
+      UV_NO_DEV: "1"
     services:
       mysql:
         image: mysql:8.0
@@ -387,7 +417,7 @@ jobs:
           sudo systemctl disable --now postgresql.service 2>/dev/null || true
 
       - name: uv sync (Prereq F1)
-        run: uv sync --locked --all-groups
+        run: uv sync --locked --no-dev
 
       - name: launcher doctor (must pass all checks)
         env:
