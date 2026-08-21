@@ -22,8 +22,8 @@ export function trackConsoleErrors(page: Page): string[] {
 export const ADMIN_JWT =
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbi11c2VyLTAwMDEiLCJyb2xlIjoiYWRtaW4ifQ.sig'
 
-/** 在页面加载前注入 token + 锁定语言为 en(断言文案稳定),并清状态。 */
-export async function seedAdminAuth(page: Page): Promise<void> {
+/** 在页面加载前注入 token + 锁定语言(默认 en,断言文案稳定),并清状态。 */
+export async function seedAdminAuth(page: Page, locale: 'zh-CN' | 'en' = 'en'): Promise<void> {
   await page.route('**/api/version', (route) =>
     json(route, 200, {
       version: '2.0.1-test',
@@ -32,11 +32,11 @@ export async function seedAdminAuth(page: Page): Promise<void> {
     }),
   )
   await page.addInitScript(
-    ([token]) => {
+    ([token, selectedLocale]) => {
       localStorage.setItem('dataops-token', token)
-      localStorage.setItem('dataops-locale', 'en')
+      localStorage.setItem('dataops-locale', selectedLocale)
     },
-    [ADMIN_JWT],
+    [ADMIN_JWT, locale],
   )
 }
 
