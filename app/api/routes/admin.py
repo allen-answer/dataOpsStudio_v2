@@ -830,6 +830,7 @@ def _upsert_license_state(services: ApiServices, state: Any) -> None:
             conn.execute(insert(license_state).values(**values))
         else:
             conn.execute(update(license_state).where(license_state.c.id == 1).values(**values))
+    services.invalidate_license_mode_cache()
 
 
 def _license_file_path() -> Path:
