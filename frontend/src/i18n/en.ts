@@ -3,6 +3,7 @@ export default {
     app_name: 'DataOps Studio',
     search_placeholder: 'Search…',
     loading: 'Loading',
+    refresh: 'Refresh',
     error: 'Error',
     retry: 'Retry',
     cancel: 'Cancel',
