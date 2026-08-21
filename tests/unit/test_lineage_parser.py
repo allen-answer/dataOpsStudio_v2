@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
+from sqlglot import exp
+from sqlglot.lineage import lineage as sqlglot_lineage_fn
 
 from app.domain.lineage import (
     LineageParseRequest,
@@ -81,6 +85,63 @@ def test_table_edges_column_mappings_and_transformations() -> None:
     join_mapping = _mapping(report.insert_mappings, "id", "app.customers", "id")
     assert join_mapping["transformation"] == TransformationKind.INDIRECT
     assert join_mapping["transformation_subtype"] == TransformationSubtype.JOIN
+
+
+def test_wide_insert_resolves_lineage_once_per_statement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    column_count = 25
+    columns = [f"c{index}" for index in range(column_count)]
+    lineage_calls = 0
+
+    def counting_lineage(column: str | exp.Column | None, *args: Any, **kwargs: Any) -> Any:
+        nonlocal lineage_calls
+        lineage_calls += 1
+        return sqlglot_lineage_fn(column, *args, **kwargs)
+
+    monkeypatch.setattr("app.domain.lineage.parser.lineage", counting_lineage)
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text=(
+                f"INSERT INTO app.target ({', '.join(columns)}) "
+                f"SELECT {', '.join(columns)} FROM app.source"
+            ),
+            dialect="mysql",
+            schema={
+                "app": {
+                    "target": {column: "integer" for column in columns},
+                    "source": {column: "integer" for column in columns},
+                }
+            },
+            default_schema="app",
+        )
+    )
+
+    assert report.parse_errors == []
+    assert len(report.insert_mappings) == column_count
+    assert lineage_calls == 1
+
+
+def test_batch_lineage_failure_falls_back_to_per_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def lineage_without_batch(column: str | exp.Column | None, *args: Any, **kwargs: Any) -> Any:
+        if column is None:
+            raise TypeError("batch lineage is unavailable")
+        return sqlglot_lineage_fn(column, *args, **kwargs)
+
+    monkeypatch.setattr("app.domain.lineage.parser.lineage", lineage_without_batch)
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text="INSERT INTO app.target_orders (id) SELECT id FROM app.orders",
+            dialect="mysql",
+            schema=_schema(),
+            default_schema="app",
+        )
+    )
+
+    assert report.parse_errors == []
+    assert _mapping(report.insert_mappings, "id", "app.orders", "id")
 
 
 def test_select_star_is_expanded_by_schema_aware_qualify() -> None:
@@ -829,6 +890,43 @@ def test_insert_union_all_merges_sources_per_branch_subtype() -> None:
     assert orders_mapping["transformation_subtype"] == TransformationSubtype.DIRECT
     customers_mapping = _mapping(report.insert_mappings, "id", "app.customers", "id")
     assert customers_mapping["transformation_subtype"] == TransformationSubtype.AGGREGATION
+
+
+def test_insert_union_all_keeps_multi_column_branch_lineage() -> None:
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text=(
+                "INSERT INTO app.target_orders (id, amount2) "
+                "SELECT o.id, o.amount FROM app.orders o "
+                "UNION ALL SELECT c.id, LENGTH(c.name) FROM app.customers c"
+            ),
+            dialect="mysql",
+            schema=_schema(),
+            default_schema="app",
+        )
+    )
+
+    assert report.parse_errors == []
+    assert (
+        _mapping(report.insert_mappings, "id", "app.orders", "id")["transformation_subtype"]
+        == TransformationSubtype.DIRECT
+    )
+    assert (
+        _mapping(report.insert_mappings, "id", "app.customers", "id")["transformation_subtype"]
+        == TransformationSubtype.DIRECT
+    )
+    assert (
+        _mapping(report.insert_mappings, "amount2", "app.orders", "amount")[
+            "transformation_subtype"
+        ]
+        == TransformationSubtype.DIRECT
+    )
+    assert (
+        _mapping(report.insert_mappings, "amount2", "app.customers", "name")[
+            "transformation_subtype"
+        ]
+        == TransformationSubtype.TRANSFORMATION
+    )
 
 
 def _mapping(
