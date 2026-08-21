@@ -3091,7 +3091,9 @@ class _DatabaseCompareReader:
         if not self._db_hash_disabled and self._can_use_db_hash():
             try:
                 return self._db_segment_fingerprint(segment)
-            except Exception:
+            except Exception as exc:
+                if _is_cancel_error(exc) or _is_timeout_error(exc):
+                    raise
                 self._db_hash_disabled = True
         rows = list(self.fetch_rows(segment))
         return SegmentFingerprint(
