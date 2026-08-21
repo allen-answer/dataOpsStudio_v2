@@ -58,10 +58,12 @@ def change_account_password(
     with services.engine.begin() as conn:
         row = _require_user(conn, user.id)
         if not services.secret_store.verify_password(
+            # ast-grep-ignore: r2-no-plaintext-prefixed-credential-attribute-access
             body.old_password,
             HashedRef(ref=str(row["password_hash"]), algorithm="bcrypt"),
         ):
             raise ApiError(401, "invalid_password", "Invalid current password")
+        # ast-grep-ignore: r2-no-plaintext-prefixed-credential-attribute-access
         password_hash = services.secret_store.hash_password(body.new_password).ref
         conn.execute(
             update(users)

@@ -233,6 +233,7 @@ def build_gateway_from_runtime_config(
         provider = _provider_from_values(
             provider_name=config.provider,
             endpoint=config.endpoint,
+            # ast-grep-ignore: r2-no-plaintext-password-access
             api_key=config.api_key,
             model=config.model,
         )

@@ -152,6 +152,7 @@ class OpenAICompatibleProvider:
         if reasoning_mode is not None and _supports_deepseek_thinking(model):
             body["thinking"] = {"type": reasoning_mode.value}
 
+        # ast-grep-ignore: r2-no-plaintext-password-access
         headers = {"authorization": f"Bearer {self.api_key}"}
         assert self.transport is not None  # __post_init__ 保证
         started = time.perf_counter()

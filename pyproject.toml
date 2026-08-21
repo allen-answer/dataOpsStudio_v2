@@ -115,7 +115,7 @@ select = [
 
 # R1/R3 红线:数据库驱动 + 加密原语的 banned-api。
 # 命中后在指定目录之外 import 即 fail。
-# 见 [tool.ruff.lint.per-file-ignores] 给出例外目录。
+# production 与 tests 的合法例外都必须在实际 import 行精确声明并由 redline test 审计。
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "psycopg".msg                  = "R1: PG 驱动只允许在 app/dbclients/ 或 app/infrastructure/db/、app/db/migrations/ import"
 "oracledb".msg                 = "R1: Oracle 驱动只允许在 app/dbclients/ import"
@@ -128,13 +128,8 @@ select = [
 "bcrypt".msg                   = "R3: bcrypt 只允许在 app/infrastructure/secretstore/ import"
 "nacl".msg                     = "R3: PyNaCl 只允许在 app/infrastructure/license/ import"
 
-# 例外:R1/R3 红线在指定目录内不适用(实现层本就需要 import)。
+# 禁止目录级 TID251 blanket;本空表由 redline test 锁定。
 [tool.ruff.lint.per-file-ignores]
-"app/dbclients/**"                              = ["TID251"]
-"app/infrastructure/**"                         = ["TID251"]
-"app/db/models.py"                              = ["TID251"]
-"app/db/migrations/**"                          = ["TID251"]
-"tests/**"                                      = ["TID251"]
 
 [tool.ruff.format]
 quote-style = "double"

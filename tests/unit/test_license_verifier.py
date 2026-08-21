@@ -6,7 +6,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+# R3 test seam:生成合成 license 签名,不进入业务代码。
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: TID251
+    Ed25519PrivateKey,
+)
 
 from app.domain.license import LicenseMode
 from app.infrastructure.license.verifier import read_license_limits, verify_license

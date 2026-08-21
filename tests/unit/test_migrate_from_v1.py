@@ -20,8 +20,8 @@ from typing import Any, cast
 
 import pytest
 
-# tests/** 在 ruff TID251 豁免名单内,可直接 import Fernet 构造 1.x 测试密文。
-from cryptography.fernet import Fernet
+# R3 test seam:构造 1.x 合成密文,不进入业务代码。
+from cryptography.fernet import Fernet  # noqa: TID251
 
 from app.domain.secret import SecretKind, SecretRef
 from app.infrastructure.secretstore.v1_legacy import V1FernetDecryptor, V1SecretDecryptError
