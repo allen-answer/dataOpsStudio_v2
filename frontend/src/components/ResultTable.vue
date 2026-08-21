@@ -14,7 +14,7 @@
  *
  * NULL 显示:斜体 muted "NULL";空字符串显示 "''";其他原样字符串化。
  */
-import { computed } from 'vue'
+import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ChevronLeft, ChevronRight, AlertTriangle, Database, Info } from 'lucide-vue-next'
 import EmptyState from './EmptyState.vue'
@@ -50,24 +50,6 @@ const TYPE_LABEL_CLASS: Record<ColumnType, string> = {
 const TYPE_MARKER: Partial<Record<ColumnType, string>> = {
   bytes: 'BYTES',
   json: 'JSON',
-}
-
-function isNumber(col: Column): boolean {
-  return NUMERIC_TYPES.has(col.type)
-}
-// datetime/date/time 单元格用独立色,跟普通字符串区分(DBA 一眼挑出时间列)。
-function isTemporal(col: Column): boolean {
-  return col.type === 'datetime' || col.type === 'date' || col.type === 'time'
-}
-function typeLabelClass(col: Column): string {
-  return TYPE_LABEL_CLASS[col.type] ?? 'chrome-text-muted'
-}
-function typeMarker(col: Column): string | undefined {
-  return TYPE_MARKER[col.type]
-}
-// 列头副行展示:有 driver_type 显原文,否则回退到统一枚举值。
-function typeText(col: Column): string {
-  return col.driver_type || col.type
 }
 
 const props = withDefaults(
@@ -106,8 +88,71 @@ const emit = defineEmits<{
 const { t } = useI18n()
 
 const MAX_ROWS = 1000
+const ROW_HEIGHT = 28
+const OVERSCAN = 8
+const DEFAULT_VIEWPORT_HEIGHT = 320
 const tooMany = computed(() => props.rows.length > MAX_ROWS)
 const displayRows = computed(() => (tooMany.value ? props.rows.slice(0, MAX_ROWS) : props.rows))
+
+interface ColumnMeta {
+  column: Column
+  isNumber: boolean
+  isTemporal: boolean
+  typeLabelClass: string
+  typeMarker: string | undefined
+  typeText: string
+}
+
+interface RenderedCell {
+  text: string
+  className: string
+}
+
+interface VirtualRow {
+  index: number
+  cells: RenderedCell[]
+}
+
+const scrollContainer = ref<HTMLElement | null>(null)
+const scrollTop = ref(0)
+const viewportHeight = ref(0)
+let resizeObserver: ResizeObserver | null = null
+
+// Column semantics are stable for a result page; compute them once rather
+// than scanning the numeric/temporal sets from every cell in the template.
+const columnMeta = computed<ColumnMeta[]>(() =>
+  props.columns.map((column) => ({
+    column,
+    isNumber: NUMERIC_TYPES.has(column.type),
+    isTemporal: column.type === 'datetime' || column.type === 'date' || column.type === 'time',
+    typeLabelClass: TYPE_LABEL_CLASS[column.type] ?? 'chrome-text-muted',
+    typeMarker: TYPE_MARKER[column.type],
+    typeText: column.driver_type || column.type,
+  })),
+)
+
+const visibleRange = computed(() => {
+  const rowCount = displayRows.value.length
+  const viewport = viewportHeight.value || DEFAULT_VIEWPORT_HEIGHT
+  const first = Math.min(
+    rowCount,
+    Math.max(0, Math.floor(scrollTop.value / ROW_HEIGHT) - OVERSCAN),
+  )
+  const visibleCount = Math.ceil(viewport / ROW_HEIGHT) + OVERSCAN * 2 + 1
+  return { start: first, end: Math.min(rowCount, first + visibleCount) }
+})
+
+const topSpacerHeight = computed(() => visibleRange.value.start * ROW_HEIGHT)
+const bottomSpacerHeight = computed(() =>
+  Math.max(0, (displayRows.value.length - visibleRange.value.end) * ROW_HEIGHT),
+)
+const ariaRowCount = computed(() => {
+  if (props.totalRows !== null) return props.totalRows + 1
+  if (props.hasMore === true) return -1
+  const totalRows = props.loadedRows ?? props.offset + props.rows.length
+  return totalRows + 1 // Include the sticky header row in the table row count.
+})
+const ariaColCount = computed(() => props.columns.length + 1) // Include the row-number column.
 
 const totalLabel = computed(() => {
   if (props.totalRows !== null) return String(props.totalRows)
@@ -122,7 +167,7 @@ const hasNext = computed(() => {
   }
   return Boolean(props.hasMore && props.paginationMode === 'ordered_offset')
 })
-const hasPrev = computed(() => props.offset > 0)
+const hasPrev = computed(() => !props.loading && props.offset > 0)
 
 const startRow = computed(() => (props.rows.length === 0 ? 0 : props.offset + 1))
 const endRow = computed(() => props.offset + props.rows.length)
@@ -136,6 +181,74 @@ function display(v: unknown): string {
 function isNull(v: unknown): boolean {
   return v === null || v === undefined
 }
+
+function cellClass(meta: ColumnMeta | undefined, value: unknown): string {
+  const nullValue = isNull(value)
+  return [
+    meta?.isNumber ? 'text-right tabular-nums' : 'text-left',
+    meta?.isTemporal && !nullValue && 'text-violet-600 dark:text-violet-400',
+    nullValue && 'italic chrome-text-muted',
+  ]
+    .filter(Boolean)
+    .join(' ')
+}
+
+const virtualRows = computed<VirtualRow[]>(() => {
+  const { start, end } = visibleRange.value
+  return displayRows.value.slice(start, end).map((row, index) => ({
+    index: start + index,
+    cells: row.values.map((value, valueIndex) => ({
+      text: display(value),
+      className: cellClass(columnMeta.value[valueIndex], value),
+    })),
+  }))
+})
+
+function onScroll(event: Event): void {
+  const target = event.currentTarget as HTMLElement
+  scrollTop.value = target.scrollTop
+  viewportHeight.value = target.clientHeight
+}
+
+function syncViewport(target: HTMLElement | null = scrollContainer.value): void {
+  viewportHeight.value = target?.clientHeight ?? 0
+}
+
+function resetScrollPosition(): void {
+  scrollTop.value = 0
+  const target = scrollContainer.value
+  if (!target) {
+    viewportHeight.value = 0
+    return
+  }
+  target.scrollTop = 0
+  syncViewport(target)
+}
+
+function observeScrollContainer(target: HTMLElement | null): void {
+  resizeObserver?.disconnect()
+  resizeObserver = null
+  resetScrollPosition()
+  if (!target || typeof ResizeObserver === 'undefined') return
+  resizeObserver = new ResizeObserver(() => syncViewport(target))
+  resizeObserver.observe(target)
+}
+
+watch(scrollContainer, (target) => observeScrollContainer(target), { flush: 'post' })
+
+watch(
+  [() => props.offset, () => props.columns],
+  () => {
+    void nextTick(resetScrollPosition)
+  },
+  { flush: 'post' },
+)
+
+onUnmounted(() => {
+  resizeObserver?.disconnect()
+  resizeObserver = null
+})
+
 </script>
 
 <template>
@@ -191,24 +304,28 @@ function isNull(v: unknown): boolean {
     </div>
 
     <!-- 表格 -->
-    <div v-else class="flex-1 overflow-auto">
-      <table class="w-full text-data">
+    <div v-else ref="scrollContainer" class="flex-1 overflow-auto" data-testid="result-table-scroll" @scroll.passive="onScroll">
+      <table
+        class="w-full text-data"
+        :aria-rowcount="ariaRowCount"
+        :aria-colcount="ariaColCount"
+      >
         <thead
           class="sticky top-0 z-10 border-b chrome-border-subtle"
           style="background-color: rgb(var(--bg-panel-elevated));"
         >
-          <tr class="text-left text-xs chrome-text-muted uppercase tracking-wider">
+          <tr aria-rowindex="1" class="text-left text-xs chrome-text-muted uppercase tracking-wider">
             <th class="font-medium py-1.5 px-3 w-10 text-right tabular-nums">#</th>
             <th
-              v-for="(c, ci) in columns"
+              v-for="(meta, ci) in columnMeta"
               :key="ci"
               class="font-medium py-1.5 px-3"
-              :class="isNumber(c) ? 'text-right' : 'text-left'"
+              :class="meta.isNumber ? 'text-right' : 'text-left'"
             >
               <div class="flex items-center gap-1">
-                <span>{{ c.name }}</span>
+                <span>{{ meta.column.name }}</span>
                 <span
-                  v-if="c.primary_key"
+                  v-if="meta.column.primary_key"
                   class="text-[9px] chrome-accent font-mono"
                   :title="t('results.col_pk')"
                 >
@@ -216,44 +333,63 @@ function isNull(v: unknown): boolean {
                 </span>
                 <!-- bytes / json 列额外标记 -->
                 <span
-                  v-if="typeMarker(c)"
+                  v-if="meta.typeMarker"
                   class="text-[8px] font-mono px-1 rounded border border-amber-300/60 text-amber-600 dark:border-amber-500/40 dark:text-amber-400"
                 >
-                  {{ typeMarker(c) }}
+                  {{ meta.typeMarker }}
                 </span>
               </div>
               <!-- 副行:driver_type 原文(tooltip 同样显原文 + 统一枚举);按枚举染色 -->
               <div
                 class="text-[10px] normal-case font-mono truncate max-w-[14rem]"
-                :class="typeLabelClass(c)"
-                :title="`${typeText(c)} · ${c.type}`"
+                :class="meta.typeLabelClass"
+                :title="`${meta.typeText} · ${meta.column.type}`"
               >
-                {{ typeText(c) }}
+                {{ meta.typeText }}
               </div>
             </th>
           </tr>
         </thead>
         <tbody>
           <tr
-            v-for="(r, ri) in displayRows"
-            :key="ri"
-            class="border-b chrome-border-subtle last:border-b-0 hover:chrome-bg-elevated transition-colors"
+            v-if="topSpacerHeight > 0"
+            aria-hidden="true"
+            data-testid="result-table-top-spacer"
+          >
+            <td
+              :colspan="columns.length + 1"
+              :style="{ height: `${topSpacerHeight}px`, padding: 0, border: 0 }"
+            />
+          </tr>
+          <tr
+            v-for="item in virtualRows"
+            :key="item.index"
+            :data-row-index="offset + item.index"
+            :aria-rowindex="offset + item.index + 2"
+            :style="{ height: `${ROW_HEIGHT}px` }"
+            class="border-b chrome-border-subtle last:border-b-0 hover:chrome-bg-elevated transition-colors whitespace-nowrap"
           >
             <td class="py-1 px-3 text-right tabular-nums chrome-text-muted text-xs">
-              {{ offset + ri + 1 }}
+              {{ offset + item.index + 1 }}
             </td>
             <td
-              v-for="(v, vi) in r.values"
+              v-for="(cell, vi) in item.cells"
               :key="vi"
-              class="py-1 px-3 font-mono text-xs chrome-text-normal"
-              :class="[
-                isNumber(columns[vi]) ? 'text-right tabular-nums' : 'text-left',
-                isTemporal(columns[vi]) && !isNull(v) && 'text-violet-600 dark:text-violet-400',
-                isNull(v) && 'italic chrome-text-muted',
-              ]"
+              class="py-1 px-3 font-mono text-xs chrome-text-normal max-w-[32rem] overflow-hidden text-ellipsis whitespace-nowrap"
+              :class="cell.className"
             >
-              {{ display(v) }}
+              {{ cell.text }}
             </td>
+          </tr>
+          <tr
+            v-if="bottomSpacerHeight > 0"
+            aria-hidden="true"
+            data-testid="result-table-bottom-spacer"
+          >
+            <td
+              :colspan="columns.length + 1"
+              :style="{ height: `${bottomSpacerHeight}px`, padding: 0, border: 0 }"
+            />
           </tr>
         </tbody>
       </table>
