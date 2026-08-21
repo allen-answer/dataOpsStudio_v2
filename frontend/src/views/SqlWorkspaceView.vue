@@ -163,6 +163,11 @@ interface ConsoleRuntime {
   resultTab: ResultTab
 }
 
+interface ResultReadOutcome {
+  applied: boolean
+  generation: number
+}
+
 // 元数据树节点态:数据源 -> schema -> 表 -> 列
 interface MetadataTableNode {
   table: MetadataTableItem
@@ -1022,9 +1027,15 @@ async function consumeJobProgress(
   progress: JobProgressResponse,
   signal?: AbortSignal,
   expectedResultGeneration = runtime.resultGeneration,
-): Promise<void> {
-  if (signal?.aborted || runtime.resultGeneration !== expectedResultGeneration) return
+): Promise<{
+  accepted: boolean
+  resultGeneration: number
+}> {
+  if (signal?.aborted || runtime.resultGeneration !== expectedResultGeneration) {
+    return { accepted: false, resultGeneration: runtime.resultGeneration }
+  }
   applyJobProgress(runtime, progress)
+  let readOutcome: ResultReadOutcome | null = null
   const hasUnconsumedResult = progress.result_version > runtime.resultVersion
   if (hasUnconsumedResult && (progress.columns_ready || progress.first_batch_ready)) {
     const currentPageComplete =
@@ -1033,13 +1044,16 @@ async function consumeJobProgress(
       // ResultStore only appends rows, so later versions cannot change an already full page.
       runtime.resultVersion = progress.result_version
     } else {
-      const fetched = runtime.result && runtime.result.offset === runtime.pageOffset
+      readOutcome = runtime.result && runtime.result.offset === runtime.pageOffset
         ? await appendResultDelta(runtime, signal)
         : await fetchResult(runtime, runtime.pageOffset, false, signal)
-      if (fetched) runtime.resultVersion = progress.result_version
+      if (readOutcome.applied) runtime.resultVersion = progress.result_version
     }
   } else if (progress.result_version === 0 && progress.terminal && progress.columns_ready) {
-    await fetchResult(runtime, runtime.pageOffset, false, signal)
+    readOutcome = await fetchResult(runtime, runtime.pageOffset, false, signal)
+  }
+  if (readOutcome && runtime.resultGeneration !== readOutcome.generation) {
+    return { accepted: false, resultGeneration: runtime.resultGeneration }
   }
   // A terminal consume may have awaited a result read that advanced the
   // generation. In that case the read's own finally owns loading cleanup;
@@ -1053,6 +1067,7 @@ async function consumeJobProgress(
     runtime.unchangedPolls += 1
   }
   runtime.networkFailures = 0
+  return { accepted: true, resultGeneration: runtime.resultGeneration }
 }
 
 function applyJobProgress(runtime: ConsoleRuntime, progress: JobProgressResponse): void {
@@ -1087,25 +1102,27 @@ async function fetchResult(
   offset: number,
   showLoading: boolean = true,
   signal?: AbortSignal,
-): Promise<boolean> {
-  if (!runtime.jobId) return false
+): Promise<ResultReadOutcome> {
+  if (!runtime.jobId) return { applied: false, generation: runtime.resultGeneration }
   const jobId = runtime.jobId
   const generation = advanceResultGeneration(runtime)
   if (showLoading) runtime.resultLoading = true
   try {
     const result = await getJobResult(jobId, offset, runtime.pageSize, signal)
     if (signal?.aborted || runtime.jobId !== jobId || runtime.resultGeneration !== generation) {
-      return false
+      return { applied: false, generation }
     }
     runtime.result = result
     runtime.pageOffset = offset
-    return true
+    return { applied: true, generation }
   } catch (e) {
     if (isAbortError(e)) throw e
-    if (runtime.jobId !== jobId || runtime.resultGeneration !== generation) return false
-    if (isResultNotReady(e, runtime)) return false
+    if (runtime.jobId !== jobId || runtime.resultGeneration !== generation) {
+      return { applied: false, generation }
+    }
+    if (isResultNotReady(e, runtime)) return { applied: false, generation }
     runtime.error = errorMessage(e)
-    return false
+    return { applied: false, generation }
   } finally {
     if (runtime.resultGeneration === generation) runtime.resultLoading = false
   }
@@ -1117,14 +1134,18 @@ async function fetchResult(
  * rows and re-render every cell. The generation check makes an aborted or
  * superseded request unable to contaminate the current page.
  */
-async function appendResultDelta(runtime: ConsoleRuntime, signal?: AbortSignal): Promise<boolean> {
-  if (!runtime.jobId || !runtime.result) return false
+async function appendResultDelta(runtime: ConsoleRuntime, signal?: AbortSignal): Promise<ResultReadOutcome> {
+  if (!runtime.jobId || !runtime.result) {
+    return { applied: false, generation: runtime.resultGeneration }
+  }
   const jobId = runtime.jobId
   const current = runtime.result
-  if (current.offset !== runtime.pageOffset || current.rows.length >= runtime.pageSize) return true
+  if (current.offset !== runtime.pageOffset || current.rows.length >= runtime.pageSize) {
+    return { applied: true, generation: runtime.resultGeneration }
+  }
   const offset = current.offset + current.rows.length
   const limit = runtime.pageSize - current.rows.length
-  if (limit <= 0) return true
+  if (limit <= 0) return { applied: true, generation: runtime.resultGeneration }
   const generation = advanceResultGeneration(runtime)
   try {
     const delta = await getJobResult(jobId, offset, limit, signal)
@@ -1135,7 +1156,7 @@ async function appendResultDelta(runtime: ConsoleRuntime, signal?: AbortSignal):
       runtime.result !== current ||
       delta.offset !== offset
     ) {
-      return false
+      return { applied: false, generation }
     }
     const appendedRows = delta.rows.slice(0, limit)
     runtime.result = {
@@ -1156,13 +1177,15 @@ async function appendResultDelta(runtime: ConsoleRuntime, signal?: AbortSignal):
       pagination_mode: delta.pagination_mode ?? current.pagination_mode,
       pagination_reason: delta.pagination_reason ?? current.pagination_reason,
     }
-    return true
+    return { applied: true, generation }
   } catch (e) {
     if (isAbortError(e)) throw e
-    if (runtime.jobId !== jobId || runtime.resultGeneration !== generation) return false
-    if (isResultNotReady(e, runtime)) return false
+    if (runtime.jobId !== jobId || runtime.resultGeneration !== generation) {
+      return { applied: false, generation }
+    }
+    if (isResultNotReady(e, runtime)) return { applied: false, generation }
     runtime.error = errorMessage(e)
-    return false
+    return { applied: false, generation }
   }
 }
 
@@ -1246,9 +1269,20 @@ function onProgressBroadcast(event: MessageEvent<unknown>): void {
         applyJobProgress(runtime, progress)
         continue
       }
-      void consumeJobProgress(runtime, progress, undefined, runtime.resultGeneration).then(() => {
+      const broadcastJobId = runtime.jobId
+      void consumeJobProgress(runtime, progress, undefined, runtime.resultGeneration).then((outcome) => {
+        if (
+          !outcome.accepted ||
+          !isCurrentRuntime(consoleId, runtime) ||
+          runtime.jobId !== broadcastJobId ||
+          runtime.resultGeneration !== outcome.resultGeneration
+        ) {
+          return
+        }
         if (progress.terminal) {
-          stopRuntimePoll(consoleId, runtime)
+          // consumeJobProgress owns any result read it awaited. Stop only the
+          // polling machinery so this broadcast cannot cancel a newer read.
+          stopRuntimePoll(consoleId, runtime, { cancelResultRead: false })
         } else {
           scheduleConsolePoll(consoleId, runtime, nextQueryPollDelay(runtime, progress.retry_after_ms))
         }
@@ -1257,9 +1291,13 @@ function onProgressBroadcast(event: MessageEvent<unknown>): void {
   }
 }
 
-function stopRuntimePoll(consoleId: string, runtime: ConsoleRuntime): void {
+function stopRuntimePoll(
+  consoleId: string,
+  runtime: ConsoleRuntime,
+  options: { cancelResultRead?: boolean } = {},
+): void {
   if (!runtime.jobId) return
-  cancelResultRead(runtime)
+  if (options.cancelResultRead !== false) cancelResultRead(runtime)
   const pollKey = `query:${consoleId}:${runtime.jobId}`
   const timer = pollTimers.get(pollKey)
   if (timer) clearTimeout(timer)

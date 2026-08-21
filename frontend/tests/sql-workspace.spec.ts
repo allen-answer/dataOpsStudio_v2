@@ -1157,6 +1157,128 @@ test('late terminal delta cannot clear loading for a newer continuation page', a
   expectNoConsoleErrors()
 })
 
+test('stale terminal BroadcastChannel progress cannot stop a newer continuation read', async ({
+  page,
+}) => {
+  await mockWorkspace(page, { progressiveRows: 50, hasMore: true })
+  const oldDeltaStarted = deferred()
+  const releaseOldDelta = deferred()
+  const newPageResultStarted = deferred()
+  const releaseNewPageResult = deferred()
+  const pageRequests: Record<string, unknown>[] = []
+  await page.route(/\/api\/jobs\/job-1\/progress\?/, (r) =>
+    json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', status: 'running', loaded_rows: 50,
+      result_version: 1, columns_ready: true, first_batch_ready: true, terminal: false,
+      error: null, error_code: null, retry_after_ms: 60_000, has_new_result: false,
+      truncated: false, has_more: true, pagination_mode: 'ordered_offset',
+      pagination_reason: 'fresh_read_ordered_offset', timings: null, execution: null,
+    }),
+  )
+  await page.route(/\/api\/jobs\/job-1\/result\?/, async (r) => {
+    const offset = Number(new URL(r.request().url()).searchParams.get('offset') ?? 0)
+    if (offset === 50) {
+      oldDeltaStarted.resolve()
+      await releaseOldDelta.promise
+      await json(r, 200, {
+        job_id: 'job-1', result_set_id: 'rs-1', offset: 50, limit: 50,
+        columns: [{ name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true }],
+        rows: Array.from({ length: 50 }, (_, index) => ({ values: [index + 51] })),
+        loaded_rows: 100, total_rows: null, state: 'complete', truncated: false,
+        has_more: true, page_size: 100, max_result_rows: 1000,
+        pagination_mode: 'ordered_offset', pagination_reason: 'fresh_read_ordered_offset',
+        preview_truncated_cells: 0,
+      })
+      return
+    }
+    return json(r, 200, {
+      job_id: 'job-1', result_set_id: 'rs-1', offset: 0, limit: 100,
+      columns: [{ name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true }],
+      rows: Array.from({ length: 50 }, (_, index) => ({ values: [index + 1] })),
+      loaded_rows: 50, total_rows: null, state: 'streaming', truncated: false,
+      has_more: true, page_size: 100, max_result_rows: 1000,
+      pagination_mode: 'ordered_offset', pagination_reason: 'fresh_read_ordered_offset',
+      preview_truncated_cells: 0,
+    })
+  })
+  await page.route('**/api/jobs/job-1/pages', (r) => {
+    pageRequests.push(r.request().postDataJSON())
+    return json(r, 202, { job_id: 'job-2', result_set_id: 'rs-1', offset: 100, cached: false })
+  })
+  await page.route(/\/api\/jobs\/job-2\/progress\?/, (r) =>
+    json(r, 200, {
+      job_id: 'job-2', result_set_id: 'rs-1', status: 'success', loaded_rows: 200,
+      result_version: 3, columns_ready: true, first_batch_ready: true, terminal: true,
+      error: null, error_code: null, retry_after_ms: 0, has_new_result: true,
+      truncated: false, has_more: true, pagination_mode: 'ordered_offset',
+      pagination_reason: 'fresh_read_ordered_offset', timings: null, execution: null,
+    }),
+  )
+  await page.route(/\/api\/jobs\/job-2\/result\?/, async (r) => {
+    newPageResultStarted.resolve()
+    await releaseNewPageResult.promise
+    return json(r, 200, {
+      job_id: 'job-2', result_set_id: 'rs-1', offset: 100, limit: 100,
+      columns: [{ name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true }],
+      rows: Array.from({ length: 100 }, (_, index) => ({ values: [index + 101] })),
+      loaded_rows: 200, total_rows: null, state: 'complete', truncated: false,
+      has_more: true, page_size: 100, max_result_rows: 1000,
+      pagination_mode: 'ordered_offset', pagination_reason: 'fresh_read_ordered_offset',
+      preview_truncated_cells: 0,
+    })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.getByText('1-50 of 50+')).toBeVisible()
+  await page.evaluate(() => {
+    const channel = new BroadcastChannel('dataops-sql-job-progress')
+    channel.postMessage({
+      source: 'broadcast-regression-test',
+      progress: {
+        job_id: 'job-1', result_set_id: 'rs-1', status: 'success', loaded_rows: 100,
+        result_version: 2, columns_ready: true, first_batch_ready: true, terminal: true,
+        error: null, error_code: null, retry_after_ms: 0, has_new_result: true,
+        truncated: false, has_more: true, pagination_mode: 'ordered_offset',
+        pagination_reason: 'fresh_read_ordered_offset', timings: null, execution: null,
+      },
+    })
+    setTimeout(() => channel.close(), 50)
+  })
+  await oldDeltaStarted.promise
+
+  const oldResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url())
+    return url.pathname.endsWith('/jobs/job-1/result') && url.searchParams.get('offset') === '50'
+  })
+  await page.getByRole('button', { name: 'Next page' }).click()
+  await expect.poll(() => pageRequests).toEqual([{ offset: 100 }])
+  await newPageResultStarted.promise
+  await expect(page.getByRole('button', { name: 'Next page' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Previous page' })).toBeDisabled()
+
+  releaseOldDelta.resolve()
+  const oldResponseValue = await oldResponse
+  await oldResponseValue.finished()
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+  }))
+  await expect(page.getByRole('button', { name: 'Next page' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Previous page' })).toBeDisabled()
+
+  const newResponse = page.waitForResponse((response) => {
+    const url = new URL(response.url())
+    return url.pathname.endsWith('/jobs/job-2/result') && url.searchParams.get('offset') === '100'
+  })
+  releaseNewPageResult.resolve()
+  const newResponseValue = await newResponse
+  await newResponseValue.finished()
+  await expect(page.getByRole('cell', { name: '101', exact: true }).last()).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Previous page' })).toBeEnabled()
+  expect(pageRequests).toHaveLength(1)
+  expectNoConsoleErrors()
+})
+
 test('empty result sets keep the result table empty state visible', async ({ page }) => {
   await mockWorkspace(page)
   await page.route(/\/api\/jobs\/job-1\/result\?/, (r) =>
