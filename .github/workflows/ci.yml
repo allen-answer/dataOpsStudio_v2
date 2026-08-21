@@ -35,7 +35,7 @@ jobs:
           enable-cache: true
 
       - name: Sync deps (all groups)
-        run: uv sync --all-groups
+        run: uv sync --locked --all-groups
 
       # R1 / R3:driver/crypto import 越界(ruff TID251 banned-api)
       - name: ruff check (R1/R3 banned-api)
@@ -103,7 +103,7 @@ jobs:
           enable-cache: true
 
       - name: Sync deps
-        run: uv sync --all-groups
+        run: uv sync --locked --all-groups
 
       # 真实 alembic 迁移(契约 §10.5 each PR 验证 schema 可迁)
       - name: alembic upgrade head
@@ -185,7 +185,7 @@ jobs:
           enable-cache: true
 
       - name: Sync deps
-        run: uv sync --all-groups
+        run: uv sync --locked --all-groups
 
       # 双重保险:GitHub Actions service health check 已等 MySQL ready,
       # 但本步再 ping 一次确认 + 留可见日志(健康检查日志在 service 容器里,
@@ -256,7 +256,7 @@ jobs:
           enable-cache: true
 
       - name: Sync deps
-        run: uv sync --all-groups
+        run: uv sync --locked --all-groups
 
       # PG service health check 已等 ready,这里再 ping 暴露版本到 job log
       - name: Wait for PG ready
@@ -336,7 +336,7 @@ jobs:
           enable-cache: true
 
       - name: Sync deps
-        run: uv sync --all-groups
+        run: uv sync --locked --all-groups
 
       - name: Wait for PG ready
         if: hashFiles('tests/integration/test_e2e_acceptance.py') != ''
@@ -422,7 +422,7 @@ jobs:
 
       - name: uv sync (Prereq F1)
         if: hashFiles('app/launcher.py') != ''
-        run: uv sync --all-groups
+        run: uv sync --locked --all-groups
 
       - name: launcher doctor (must pass all checks)
         if: hashFiles('app/launcher.py') != ''
