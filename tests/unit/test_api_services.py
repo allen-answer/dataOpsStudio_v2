@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import threading
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC
 from typing import Any, cast
 
+import pytest
 from sqlalchemy.engine import Engine
 
 from app.api.services import ApiServices, RateLimiter
+from app.domain.license import LicenseMode
 
 
 def test_rate_limiter_keeps_policy_groups_and_users_independent() -> None:
@@ -74,6 +80,94 @@ def test_revoke_user_tokens_prunes_expired_jti_rows_in_write_transaction() -> No
     assert engine.statements == ["delete", "update"]
 
 
+def test_current_license_mode_reuses_authoritative_read_within_policy_ttl() -> None:
+    engine = _ReadOnlyEngine([[{"mode": "valid"}], [{"mode": "repair"}]])
+    services = _services(engine)
+
+    assert services.current_license_mode() is LicenseMode.VALID
+    assert services.current_license_mode() is LicenseMode.VALID
+
+    assert engine.connect_count == 1
+    assert engine.statements == ["select"]
+
+
+def test_current_license_mode_refreshes_at_one_second_policy_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    engine = _ReadOnlyEngine([[{"mode": "valid"}], [{"mode": "repair"}]])
+    services = _services(engine)
+
+    assert services.current_license_mode() is LicenseMode.VALID
+    now[0] = 100.999
+    assert services.current_license_mode() is LicenseMode.VALID
+    now[0] = 101.0
+    assert services.current_license_mode() is LicenseMode.REPAIR
+
+    assert engine.connect_count == 2
+    assert engine.statements == ["select", "select"]
+
+
+def test_current_license_mode_does_not_extend_ttl_by_pg_read_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    engine = _ReadOnlyEngine(
+        [[{"mode": "valid"}], [{"mode": "repair"}]],
+        on_execute=lambda: now.__setitem__(0, 101.5),
+    )
+    services = _services(engine)
+
+    assert services.current_license_mode() is LicenseMode.VALID
+    assert services.current_license_mode() is LicenseMode.REPAIR
+
+    assert engine.connect_count == 2
+
+
+def test_current_license_mode_coalesces_concurrent_cache_misses() -> None:
+    workers = 8
+    start = threading.Barrier(workers)
+    engine = _ConcurrentReadEngine()
+    services = _services(engine)
+
+    def read_mode() -> LicenseMode:
+        start.wait(timeout=2.0)
+        return services.current_license_mode()
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        modes = list(executor.map(lambda _: read_mode(), range(workers)))
+
+    assert modes == [LicenseMode.VALID] * workers
+    assert engine.connect_count == 1
+    assert engine.statements == ["select"]
+
+
+def test_current_license_mode_does_not_cache_pg_failure_or_serve_expired_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    engine = _ReadOnlyEngine(
+        [
+            [{"mode": "valid"}],
+            RuntimeError("pg unavailable"),
+            [{"mode": "repair"}],
+        ]
+    )
+    services = _services(engine)
+
+    assert services.current_license_mode() is LicenseMode.VALID
+    now[0] = 101.0
+    with pytest.raises(RuntimeError, match="pg unavailable"):
+        services.current_license_mode()
+    assert services.current_license_mode() is LicenseMode.REPAIR
+
+    assert engine.connect_count == 3
+    assert engine.statements == ["select", "select", "select"]
+
+
 def _services(engine: object) -> ApiServices:
     return ApiServices(
         engine=cast(Engine, engine),
@@ -85,8 +179,14 @@ def _services(engine: object) -> ApiServices:
 
 
 class _ReadOnlyEngine:
-    def __init__(self, rows: list[list[dict[str, Any]]]) -> None:
+    def __init__(
+        self,
+        rows: list[list[dict[str, Any]] | Exception],
+        *,
+        on_execute: Callable[[], None] | None = None,
+    ) -> None:
         self.rows = rows
+        self.on_execute = on_execute
         self.statements: list[str] = []
         self.connect_count = 0
         self.begin_count = 0
@@ -111,6 +211,39 @@ class _WriteEngine:
         return _Connection(self)
 
 
+class _ConcurrentReadEngine:
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+        self.connect_count = 0
+        self._guard = threading.Lock()
+        self._second_connect = threading.Event()
+
+    def connect(self) -> _ConcurrentConnection:
+        with self._guard:
+            self.connect_count += 1
+            if self.connect_count > 1:
+                self._second_connect.set()
+        return _ConcurrentConnection(self)
+
+
+class _ConcurrentConnection:
+    def __init__(self, engine: _ConcurrentReadEngine) -> None:
+        self.engine = engine
+
+    def __enter__(self) -> _ConcurrentConnection:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        return None
+
+    def execute(self, statement: object) -> _Result:
+        del statement
+        self.engine._second_connect.wait(timeout=0.5)
+        with self.engine._guard:
+            self.engine.statements.append("select")
+        return _Result([{"mode": "valid"}])
+
+
 class _Connection:
     def __init__(self, engine: _ReadOnlyEngine | _WriteEngine) -> None:
         self.engine = engine
@@ -124,8 +257,13 @@ class _Connection:
     def execute(self, statement: object) -> _Result:
         visit_name = getattr(statement, "__visit_name__", type(statement).__name__)
         self.engine.statements.append(str(visit_name))
+        if isinstance(self.engine, _ReadOnlyEngine) and self.engine.on_execute is not None:
+            self.engine.on_execute()
         if self.engine.rows:
-            return _Result(self.engine.rows.pop(0))
+            result = self.engine.rows.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return _Result(result)
         return _Result([])
 
 

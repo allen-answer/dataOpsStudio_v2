@@ -9,7 +9,7 @@ from app.api.app import create_app
 from app.api.security import create_access_token
 from app.api.services import ApiServices
 from app.domain.ai import AiContext, AiOptions, AiResponse
-from app.domain.license import LicenseMode
+from app.domain.license import LicenseMode, LicenseState
 from app.domain.secret import SecretKind, SecretRef
 from tests._asgi_client import AsgiClient
 
@@ -120,6 +120,57 @@ def test_admin_force_logout_sets_user_cutoff_and_audits() -> None:
     }
     assert services.revoked_users == ["user-1"]
     assert any(item["action"] == "admin_user_force_logout" for item in services.audits)
+
+
+def test_admin_license_update_invalidates_cached_mode_after_authoritative_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    updated_at = datetime(2026, 1, 1, tzinfo=UTC)
+    engine = _QueueEngine(
+        [
+            [{"mode": "valid"}],
+            [{"id": 1}],
+            [],
+            [
+                {
+                    "id": 1,
+                    "edition": None,
+                    "customer": None,
+                    "expires_at": None,
+                    "features": [],
+                    "mode": "repair",
+                    "repair_reason": "invalid_signature",
+                    "updated_at": updated_at,
+                }
+            ],
+            [{"mode": "repair"}],
+        ]
+    )
+    services = _LicenseAdminServices(engine)
+    monkeypatch.setattr(
+        "app.api.routes.admin.verify_license",
+        lambda path: LicenseState(
+            mode=LicenseMode.REPAIR,
+            repair_reason="invalid_signature",
+        ),
+    )
+    monkeypatch.setattr("app.api.routes.admin._write_license_file", lambda path, content: None)
+    monkeypatch.setattr("app.api.routes.admin.read_license_limits", lambda path: {})
+
+    assert services.current_license_mode() is LicenseMode.VALID
+    app = create_app(services=services)
+    token = create_access_token(user_id="admin-1", role="admin", secret=services.jwt_secret)
+
+    response = AsgiClient(app).request(
+        "PUT",
+        "/api/admin/license",
+        json_body={"license_text": "synthetic-invalid-license"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["mode"] == "repair"
+    assert services.current_license_mode() is LicenseMode.REPAIR
 
 
 def test_admin_put_ai_config_stores_key_without_echoing_secret() -> None:
@@ -262,6 +313,34 @@ class _AdminServices:
 
     def write_audit(self, **kwargs: object) -> None:
         self.audits.append(kwargs)
+
+
+class _LicenseAdminServices(ApiServices):
+    def __init__(self, engine: object) -> None:
+        super().__init__(
+            engine=cast(Any, engine),
+            job_backend=cast(Any, object()),
+            secret_store=cast(Any, object()),
+            result_store=cast(Any, object()),
+            jwt_secret="x" * 32,
+        )
+
+    def license_enforcement_enabled(self) -> bool:
+        return True
+
+    def is_token_revoked(
+        self,
+        *,
+        user_id: str,
+        issued_at: int,
+        expires_at: int,
+        jti: str | None,
+    ) -> bool:
+        del user_id, issued_at, expires_at, jti
+        return False
+
+    def write_audit(self, **kwargs: object) -> None:
+        del kwargs
 
 
 class _RateLimiter:
