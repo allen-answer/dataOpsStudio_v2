@@ -77,6 +77,7 @@ async function mockWorkspace(
     jobFinishedAt?: string
     progressiveRows?: number
     hasMore?: boolean
+    progressiveColumns?: number
   } = {},
 ): Promise<{
   patches: unknown[]
@@ -134,15 +135,24 @@ async function mockWorkspace(
     resultRequestUrls.push(r.request().url())
     if (options.progressiveRows !== undefined) {
       const rowCount = options.progressiveRows
+      const columnCount = options.progressiveColumns ?? 1
       return json(r, 200, {
         job_id: 'job-1',
         result_set_id: 'rs-1',
         offset: 0,
         limit: 100,
-        columns: [
-          { name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true },
-        ],
-        rows: Array.from({ length: rowCount }, (_, index) => ({ values: [index + 1] })),
+        columns: Array.from({ length: columnCount }, (_, columnIndex) => ({
+          name: columnIndex === 0 ? 'id' : `value_${columnIndex}`,
+          type: columnIndex === 0 ? 'integer' : 'string',
+          driver_type: columnIndex === 0 ? 'INT' : 'VARCHAR',
+          nullable: columnIndex !== 0,
+          primary_key: columnIndex === 0,
+        })),
+        rows: Array.from({ length: rowCount }, (_, index) => ({
+          values: Array.from({ length: columnCount }, (_, columnIndex) =>
+            columnIndex === 0 ? index + 1 : `value-${index + 1}-${columnIndex}`,
+          ),
+        })),
         loaded_rows: rowCount,
         total_rows: null,
         state: jobReads <= 1 ? 'running' : 'success',
@@ -463,12 +473,98 @@ test('progressive results use bounded pages and polling stops at success', async
       (url) => new URL(url).searchParams.get('limit') === '100',
     ),
   ).toBe(true)
-  await expect(page.locator('table.text-data tbody tr')).toHaveCount(100)
+  const renderedRows = page.locator('table.text-data tbody tr[data-row-index]')
+  await expect.poll(() => renderedRows.count()).toBeLessThan(100)
+  const resultScroll = page.getByTestId('result-table-scroll')
+  await resultScroll.evaluate((element) => {
+    element.scrollTop = element.scrollHeight
+    element.dispatchEvent(new Event('scroll'))
+  })
+  await expect(page.getByRole('cell', { name: '100', exact: true }).last()).toBeVisible()
 
   await expect.poll(() => state.getJobReads()).toBe(2)
   const terminalJobReads = state.getJobReads()
   await page.waitForTimeout(1_200)
   expect(state.getJobReads()).toBe(terminalJobReads)
+  expectNoConsoleErrors()
+})
+
+test('large result windows render a bounded row slice and reveal the tail on scroll', async ({
+  page,
+}) => {
+  await mockWorkspace(page, { progressiveRows: 1000 })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.getByText(/loaded 1000 rows/)).toBeVisible()
+
+  const renderedRows = page.locator('table.text-data tbody tr[data-row-index]')
+  await expect.poll(() => renderedRows.count()).toBeLessThan(100)
+  await expect(page.locator('tr[data-row-index="0"]')).toBeVisible()
+  await expect(page.locator('tr[data-row-index="999"]')).toHaveCount(0)
+
+  await page.getByTestId('result-table-scroll').evaluate((element) => {
+    element.scrollTop = element.scrollHeight
+    element.dispatchEvent(new Event('scroll'))
+  })
+  await expect(page.locator('tr[data-row-index="999"]')).toBeVisible()
+  await expect(page.locator('tr[data-row-index="0"]')).toHaveCount(0)
+  expectNoConsoleErrors()
+})
+
+test('1000 rows by 20 columns baseline stays windowed during scroll', async ({ page }) => {
+  await mockWorkspace(page, { progressiveRows: 1000, progressiveColumns: 20 })
+  await page.addInitScript(() => {
+    const baseline = { startedAt: performance.now(), longTasks: 0 }
+    ;(window as typeof window & { __sqlPerfBaseline?: typeof baseline }).__sqlPerfBaseline = baseline
+    if (typeof PerformanceObserver === 'undefined') return
+    const observer = new PerformanceObserver((list) => {
+      baseline.longTasks += list.getEntries().length
+    })
+    observer.observe({ type: 'longtask', buffered: true })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.getByText(/loaded 1000 rows/)).toBeVisible()
+  const firstScreenMs = await page.evaluate(() => {
+    const baseline = (window as typeof window & {
+      __sqlPerfBaseline?: { startedAt: number }
+    }).__sqlPerfBaseline
+    return baseline ? performance.now() - baseline.startedAt : -1
+  })
+
+  const renderedRows = page.locator('table.text-data tbody tr[data-row-index]')
+  const initialRenderedRows = await renderedRows.count()
+  const scrollMetrics = await page.getByTestId('result-table-scroll').evaluate(async (element) => {
+    const start = performance.now()
+    let frames = 0
+    const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight)
+    await new Promise<void>((resolve) => {
+      const tick = (timestamp: number) => {
+        frames += 1
+        const progress = Math.min(1, (timestamp - start) / 1000)
+        element.scrollTop = maxScrollTop * progress
+        if (progress >= 1) resolve()
+        else requestAnimationFrame(tick)
+      }
+      requestAnimationFrame(tick)
+    })
+    return { durationMs: performance.now() - start, frames }
+  })
+  const longTasks = await page.evaluate(
+    () =>
+      (window as typeof window & { __sqlPerfBaseline?: { longTasks: number } }).__sqlPerfBaseline
+        ?.longTasks ?? 0,
+  )
+  console.log(
+    `[perf-baseline] 1000x20 first-screen=${firstScreenMs.toFixed(1)}ms ` +
+      `scroll=${scrollMetrics.durationMs.toFixed(1)}ms frames=${scrollMetrics.frames} ` +
+      `longtasks=${longTasks} initialRows=${initialRenderedRows}`,
+  )
+  expect(initialRenderedRows).toBeLessThan(100)
+  await expect(page.locator('tr[data-row-index="999"]')).toBeVisible()
+  expect(scrollMetrics.frames).toBeGreaterThan(0)
   expectNoConsoleErrors()
 })
 
@@ -499,7 +595,7 @@ test('append-only progress does not refetch an already complete current page', a
 
   await page.goto('/projects/project-1/sql')
   await page.getByRole('button', { name: 'Run' }).click()
-  await expect(page.locator('table.text-data tbody tr')).toHaveCount(100)
+  await expect.poll(() => page.locator('table.text-data tbody tr[data-row-index]').count()).toBeLessThan(100)
   await expect.poll(() => state.resultRequestUrls.length).toBe(1)
   await page.locator('table.text-data tbody').evaluate((tbody) => {
     const observedWindow = window as typeof window & {
@@ -551,7 +647,7 @@ test('progressive append refreshes an incomplete current page so new rows stay v
   await mockWorkspace(page)
   let progressReads = 0
   let loadedRows = 0
-  const resultOffsets: Array<string | null> = []
+  const resultRequests: Array<{ offset: number; limit: number }> = []
   await page.route(/\/api\/jobs\/job-1\/progress\?/, (r) => {
     progressReads += 1
     loadedRows = progressReads === 1 ? 50 : 100
@@ -566,28 +662,80 @@ test('progressive append refreshes an incomplete current page so new rows stay v
     })
   })
   await page.route(/\/api\/jobs\/job-1\/result\?/, (r) => {
-    resultOffsets.push(new URL(r.request().url()).searchParams.get('offset'))
+    const requestUrl = new URL(r.request().url())
+    const offset = Number(requestUrl.searchParams.get('offset') ?? 0)
+    const limit = Number(requestUrl.searchParams.get('limit') ?? 100)
+    resultRequests.push({ offset, limit })
     return json(r, 200, {
-      job_id: 'job-1', result_set_id: 'rs-1', offset: 0, limit: 100,
+      job_id: 'job-1', result_set_id: 'rs-1', offset, limit,
       columns: [
         { name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true },
       ],
-      rows: Array.from({ length: loadedRows }, (_, index) => ({ values: [index + 1] })),
+      rows: Array.from(
+        { length: Math.max(0, Math.min(limit, loadedRows - offset)) },
+        (_, index) => ({ values: [index + offset + 1] }),
+      ),
       loaded_rows: loadedRows, total_rows: null,
       state: progressReads >= 3 ? 'complete' : 'streaming',
       truncated: false, has_more: false, page_size: 100, max_result_rows: 1000,
       pagination_mode: 'unavailable', pagination_reason: 'top_level_order_by_required',
-      preview_truncated_cells: 0,
+      preview_truncated_cells: progressReads === 1 ? 1 : 2,
     })
   })
 
   await page.goto('/projects/project-1/sql')
   await page.getByRole('button', { name: 'Run' }).click()
-  await expect(page.locator('table.text-data tbody tr')).toHaveCount(100)
-  await expect(page.getByRole('cell', { name: '100', exact: true }).last()).toBeVisible()
+  await expect.poll(() => page.locator('table.text-data tbody tr[data-row-index]').count()).toBeLessThan(100)
+  await page.locator('tr[data-row-index="0"]').evaluate((row) => {
+    ;(window as typeof window & { __sqlDeltaFirstRow?: Element }).__sqlDeltaFirstRow = row
+  })
   await expect.poll(() => progressReads).toBe(3)
+  const firstRowPreserved = await page.locator('table.text-data tbody').evaluate((tbody) => {
+    const observedWindow = window as typeof window & { __sqlDeltaFirstRow?: Element }
+    return observedWindow.__sqlDeltaFirstRow === tbody.querySelector('tr[data-row-index="0"]')
+  })
+  expect(firstRowPreserved).toBe(true)
+  await page.getByTestId('result-table-scroll').evaluate((element) => {
+    element.scrollTop = element.scrollHeight
+    element.dispatchEvent(new Event('scroll'))
+  })
+  await expect(page.getByRole('cell', { name: '100', exact: true }).last()).toBeVisible()
+  await expect(page.getByText('3 large cell(s) were shortened for safe preview')).toBeVisible()
 
-  expect(resultOffsets).toEqual(['0', '0'])
+  expect(resultRequests).toEqual([
+    { offset: 0, limit: 100 },
+    { offset: 50, limit: 50 },
+  ])
+  expectNoConsoleErrors()
+})
+
+test('empty result sets keep the result table empty state visible', async ({ page }) => {
+  await mockWorkspace(page)
+  await page.route(/\/api\/jobs\/job-1\/result\?/, (r) =>
+    json(r, 200, {
+      job_id: 'job-1',
+      result_set_id: 'rs-1',
+      offset: 0,
+      limit: 100,
+      columns: [],
+      rows: [],
+      loaded_rows: 0,
+      total_rows: 0,
+      state: 'complete',
+      truncated: false,
+      has_more: false,
+      page_size: 100,
+      max_result_rows: 1000,
+      pagination_mode: 'unavailable',
+      pagination_reason: 'top_level_order_by_required',
+      preview_truncated_cells: 0,
+    }),
+  )
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Run' }).click()
+  await expect(page.getByText('Empty result set')).toBeVisible()
+  await expect(page.locator('table.text-data tbody tr[data-row-index]')).toHaveCount(0)
   expectNoConsoleErrors()
 })
 
