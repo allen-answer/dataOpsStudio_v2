@@ -758,3 +758,24 @@ test('terminal elapsed seconds use job timestamps instead of local clock', async
   )
   expectNoConsoleErrors()
 })
+
+test('repair mode disables SQL execution and the editor shortcut cannot enqueue a job', async ({
+  page,
+}) => {
+  const state = await mockWorkspace(page)
+  await mockLicense(page, { mode: 'repair' })
+
+  await page.goto('/projects/project-1/sql')
+  const run = page.getByRole('button', { name: 'Run' })
+  await expect(run).toBeDisabled()
+  await expect(run).toHaveAttribute(
+    'title',
+    'Write actions are disabled in the current license state (view / license update only)',
+  )
+
+  await page.locator('.monaco-editor').click()
+  await page.keyboard.press('Control+Enter')
+  await page.waitForTimeout(100)
+  expect(state.executeRequests).toEqual([])
+  expectNoConsoleErrors()
+})

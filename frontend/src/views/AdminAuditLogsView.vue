@@ -13,11 +13,13 @@ import { useI18n } from 'vue-i18n'
 import { useQuery, keepPreviousData } from '@tanstack/vue-query'
 import { ScrollText, AlertTriangle, ChevronDown, ChevronRight, RotateCcw } from 'lucide-vue-next'
 import { listAdminAuditLogs } from '../api/admin'
-import { ApiError, type AuditLogItem, type AuditLogFilters } from '../api/types'
+import type { AuditLogItem, AuditLogFilters } from '../api/types'
 import EmptyState from '../components/EmptyState.vue'
 import LoadingDots from '../components/LoadingDots.vue'
+import { createUserErrorMessage } from '../utils/userErrorMessage'
 
 const { t } = useI18n()
+const errorMessage = createUserErrorMessage(t)
 
 const PAGE_SIZE = 100
 
@@ -137,14 +139,6 @@ function copyRequestId(rid: string | null): void {
   if (rid) void navigator.clipboard?.writeText(rid).catch(() => {})
 }
 
-function errorMessage(): string {
-  const e = query.error.value
-  if (e instanceof ApiError) {
-    if (e.status === 403) return t('admin.forbidden_hint')
-    return e.message || t('common.error_unknown')
-  }
-  return t('common.error_unknown')
-}
 </script>
 
 <template>
@@ -203,7 +197,7 @@ function errorMessage(): string {
       <AlertTriangle class="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
       <div>
         <div class="text-sm font-medium text-red-700 dark:text-red-400">{{ t('common.error') }}</div>
-        <div class="text-sm text-red-600 dark:text-red-300 mt-0.5">{{ errorMessage() }}</div>
+        <div class="text-sm text-red-600 dark:text-red-300 mt-0.5">{{ errorMessage(query.error.value) }}</div>
         <button @click="query.refetch()" type="button" class="text-xs text-red-700 dark:text-red-400 underline mt-2">{{ t('common.retry') }}</button>
       </div>
     </div>

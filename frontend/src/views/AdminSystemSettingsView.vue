@@ -4,10 +4,12 @@ import { useI18n } from 'vue-i18n'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { CheckCircle2, RefreshCw, Save, ShieldCheck, TimerReset } from 'lucide-vue-next'
 import { getSystemSettings, putSystemSettings } from '../api/admin'
-import { ApiError, type SystemSettingsUpdateRequest } from '../api/types'
+import type { SystemSettingsUpdateRequest } from '../api/types'
 import LoadingDots from '../components/LoadingDots.vue'
+import { createUserErrorMessage } from '../utils/userErrorMessage'
 
 const { t } = useI18n()
+const errorMessage = createUserErrorMessage(t)
 const qc = useQueryClient()
 
 const presets = [
@@ -51,7 +53,7 @@ const mutation = useMutation({
   },
   onError: (error) => {
     saved.ok = false
-    saved.error = error instanceof ApiError ? error.message : t('common.error_unknown')
+    saved.error = errorMessage(error)
   },
 })
 
