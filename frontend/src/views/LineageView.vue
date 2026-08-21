@@ -666,6 +666,7 @@ const batchJobStatus = ref<LineageBatchJobStatus | null>(null)
 const batchReport = ref<LineageBatchReport | null>(null)
 const expandedFiles = ref<Set<string>>(new Set())
 let batchPollTimer: ReturnType<typeof setTimeout> | null = null
+let batchPollGeneration = 0
 
 // 'auto' = 自动识别(逐文件),默认项;其余为显式方言(L-1)
 const BATCH_DIALECTS = ['auto', 'mysql', 'oracle', 'dm', 'postgresql', 'tsql'] as const
@@ -733,6 +734,7 @@ function onBatchDrop(event: DragEvent): void {
 }
 
 function stopBatchPolling(): void {
+  batchPollGeneration += 1
   if (batchPollTimer !== null) {
     clearTimeout(batchPollTimer)
     batchPollTimer = null
@@ -746,11 +748,15 @@ function toggleFileRow(sourceRef: string): void {
   expandedFiles.value = next
 }
 
-async function pollBatch(): Promise<void> {
+async function pollBatch(generation: number): Promise<void> {
+  if (generation !== batchPollGeneration) return
   const jobId = batchJobId.value
-  if (!projectId.value || !jobId) return
+  const currentProjectId = projectId.value
+  if (!currentProjectId || !jobId) return
+  batchPollTimer = null
   try {
-    const res = await getLineageBatch(projectId.value, jobId)
+    const res = await getLineageBatch(currentProjectId, jobId)
+    if (generation !== batchPollGeneration || batchJobId.value !== jobId) return
     batchJobStatus.value = res.status
     if (res.status === 'success') {
       batchReport.value = res.report
@@ -765,8 +771,9 @@ async function pollBatch(): Promise<void> {
       return
     }
     // pending / running:继续轮询
-    batchPollTimer = setTimeout(() => void pollBatch(), BATCH_POLL_MS)
+    batchPollTimer = setTimeout(() => void pollBatch(generation), BATCH_POLL_MS)
   } catch (e) {
+    if (generation !== batchPollGeneration || batchJobId.value !== jobId) return
     batchError.value = errorMessage(e)
     batchPhase.value = 'failed'
     stopBatchPolling()
@@ -780,6 +787,7 @@ async function onBatchSubmit(): Promise<void> {
     return
   }
   stopBatchPolling()
+  const generation = batchPollGeneration
   batchError.value = null
   batchReport.value = null
   batchJobStatus.value = null
@@ -802,6 +810,7 @@ async function onBatchSubmit(): Promise<void> {
       fileToUpload = new File([blob], 'scripts.zip', { type: 'application/zip' })
     }
     const upload = await uploadFile(projectId.value, fileToUpload, 'lineage_batch')
+    if (generation !== batchPollGeneration) return
     batchPhase.value = 'running'
     const { job_id } = await createLineageBatch(projectId.value, {
       upload_id: upload.upload_id,
@@ -810,9 +819,11 @@ async function onBatchSubmit(): Promise<void> {
       dialect: batchNoDb.value ? batchManualDialect.value : null,
       default_schema: batchDefaultSchema.value.trim() || null,
     })
+    if (generation !== batchPollGeneration) return
     batchJobId.value = job_id
-    await pollBatch()
+    await pollBatch(generation)
   } catch (e) {
+    if (generation !== batchPollGeneration) return
     if (e instanceof ApiError && e.code === 'upload_too_large') {
       batchError.value = t('lineage.batch_file_too_large')
     } else {

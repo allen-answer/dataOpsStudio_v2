@@ -55,6 +55,15 @@ export function json(route: Route, status: number, body: unknown): Promise<void>
   })
 }
 
+/** 可控 pending response gate：测试先观察请求，再显式释放响应。 */
+export function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
 /** license 状态(LicenseBanner 会拉,给个 valid 免横条干扰)。 */
 export async function mockLicense(page: Page): Promise<void> {
   await page.route('**/api/license/status', (r) =>
