@@ -1001,8 +1001,15 @@ async function consumeJobProgress(
   applyJobProgress(runtime, progress)
   const hasUnconsumedResult = progress.result_version > runtime.resultVersion
   if (hasUnconsumedResult && (progress.columns_ready || progress.first_batch_ready)) {
-    const fetched = await fetchResult(runtime, runtime.pageOffset, false, signal)
-    if (fetched) runtime.resultVersion = progress.result_version
+    const currentPageComplete =
+      runtime.result?.offset === runtime.pageOffset && runtime.result.rows.length >= runtime.pageSize
+    if (currentPageComplete) {
+      // ResultStore only appends rows, so later versions cannot change an already full page.
+      runtime.resultVersion = progress.result_version
+    } else {
+      const fetched = await fetchResult(runtime, runtime.pageOffset, false, signal)
+      if (fetched) runtime.resultVersion = progress.result_version
+    }
   } else if (progress.result_version === 0 && progress.terminal && progress.columns_ready) {
     await fetchResult(runtime, runtime.pageOffset, false, signal)
   }
