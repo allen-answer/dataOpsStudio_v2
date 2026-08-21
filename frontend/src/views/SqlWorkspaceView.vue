@@ -1041,7 +1041,12 @@ async function consumeJobProgress(
   } else if (progress.result_version === 0 && progress.terminal && progress.columns_ready) {
     await fetchResult(runtime, runtime.pageOffset, false, signal)
   }
-  if (progress.terminal) runtime.resultLoading = false
+  // A terminal consume may have awaited a result read that advanced the
+  // generation. In that case the read's own finally owns loading cleanup;
+  // never clear a newer page request started while the old read was pending.
+  if (progress.terminal && runtime.resultGeneration === expectedResultGeneration) {
+    runtime.resultLoading = false
+  }
   if (hasUnconsumedResult) {
     runtime.unchangedPolls = 0
   } else {
