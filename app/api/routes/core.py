@@ -621,6 +621,7 @@ def login(body: LoginRequest, request: Request) -> TokenResponse:
     services = services_from(request)
     row = _user_by_username(services, body.username)
     if row is None or not services.secret_store.verify_password(
+        # ast-grep-ignore: r2-no-plaintext-password-access
         body.password,
         HashedRef(ref=str(row["password_hash"]), algorithm="bcrypt"),
     ):
@@ -710,6 +711,7 @@ def create_datasource(body: DatasourceCreateRequest, request: Request) -> Dataso
     with services.engine.begin() as conn:
         _require_project_access(conn, body.project_id, user.id)
         secret_ref = services.secret_store.store_secret(
+            # ast-grep-ignore: r2-no-plaintext-password-access
             body.password,
             SecretKind.DATASOURCE_PASSWORD,
         )
@@ -843,8 +845,10 @@ def update_datasource(
             values["capability_profile"] = body.extra
         if body.operation_policy is not None:
             values["operation_policy"] = body.operation_policy.model_dump()
+        # ast-grep-ignore: r2-no-plaintext-password-access
         if body.password:
             secret_ref = services.secret_store.store_secret(
+                # ast-grep-ignore: r2-no-plaintext-password-access
                 body.password,
                 SecretKind.DATASOURCE_PASSWORD,
             )
@@ -5444,9 +5448,12 @@ def create_workflow_notification(
         url_secret_ref: str | None = None
         password_secret_ref: str | None = None
         if body.channel == "email":
+            # ast-grep-ignore: r2-no-plaintext-prefixed-credential-attribute-access
             if body.smtp_password is not None:
                 password_secret_ref = services.secret_store.store_secret(
-                    body.smtp_password, SecretKind.SMTP_PASSWORD
+                    # ast-grep-ignore: r2-no-plaintext-prefixed-credential-attribute-access
+                    body.smtp_password,
+                    SecretKind.SMTP_PASSWORD,
                 ).ref
         else:
             if body.url is None:
@@ -5511,9 +5518,12 @@ def update_workflow_notification(
         url_secret_ref = existing.url_secret_ref
         password_secret_ref = existing.password_secret_ref
         if existing.channel == "email":
+            # ast-grep-ignore: r2-no-plaintext-prefixed-credential-attribute-access
             if body.smtp_password is not None:
                 secret_ref = services.secret_store.store_secret(
-                    body.smtp_password, SecretKind.SMTP_PASSWORD
+                    # ast-grep-ignore: r2-no-plaintext-prefixed-credential-attribute-access
+                    body.smtp_password,
+                    SecretKind.SMTP_PASSWORD,
                 )
                 old_password_ref = existing.password_secret_ref
                 password_secret_ref = secret_ref.ref

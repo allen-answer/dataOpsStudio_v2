@@ -25,7 +25,7 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet, InvalidToken  # noqa: TID251 - R3 contract seam
 
 # 1.x secret_crypto.PREFIX
 _V1_FERNET_PREFIX = "fernet:"
