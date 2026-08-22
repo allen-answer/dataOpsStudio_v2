@@ -111,6 +111,11 @@ class ApiConfig(BaseSettings):
     export_per_user_per_hour: int = Field(default=10, ge=1, le=1000)
     download_url_ttl_seconds: int = Field(default=300, ge=30, le=3600)
 
+    # SQL 控制台会话(Session Broker,设计 §6)的上线保险丝。off = API 进程不装配
+    # broker、会话端点如实 409 console_session_disabled,前端整体回落 job 路径。
+    # 非长期分支:双路径共存是给"非会话方言 + 出事回退"用的,不是永久形态。
+    console_session_enabled: bool = True
+
 
 class WorkerConfig(BaseSettings):
     """Worker 进程配置(契约 §3.1 JobBackend.heartbeat + 设计稿 §2.2.3)。"""

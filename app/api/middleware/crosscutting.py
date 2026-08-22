@@ -26,6 +26,11 @@ _DIAGNOSTIC_EXPORT_PATHS = frozenset({"/api/admin/diagnostics", "/api/admin/diag
 _BACKUP_PATHS = frozenset({"/api/admin/backups", "/api/admin/backups/export"})
 _RESTORE_PATHS = frozenset({"/api/admin/backups/restore"})
 _BUSINESS_EXPORT_PREFIX = "/api/exports/"
+# SQL 控制台会话(设计 §3.2 限流分组):变更类(attach/submit/cancel/close/txn)
+# 归 sql_control(30/min),观察类(observe/progress/result)归 job_read(300/min)。
+_SQL_SESSION_PREFIX = "/api/sql/sessions"
+_SQL_STATEMENT_PREFIX = "/api/sql/statements/"
+_POLL_READ_PREFIXES = ("/api/jobs/", _SQL_STATEMENT_PREFIX)
 _AUDIT_RESOURCE_ID_MAX_LENGTH = 64
 _AUDIT_RESOURCE_ID_HASH_LENGTH = 12
 
@@ -277,8 +282,14 @@ def _rate_limit_group(method: str, path: str) -> str:
     if normalized_method in _SAFE_METHODS:
         if path.startswith("/api/jobs/"):
             return "job_read"
+        # 会话 observe 与语句 progress/result 都是轮询面(设计 §3.2),
+        # 与 job 轮询共享 job_read 预算,不占变更类的 30/min。
+        if path.startswith(_SQL_SESSION_PREFIX) or path.startswith(_SQL_STATEMENT_PREFIX):
+            return "job_read"
         return "general_read"
     if path in {"/api/sql/execute", "/api/sql/explain"}:
+        return "sql_control"
+    if path.startswith(_SQL_SESSION_PREFIX) or path.startswith(_SQL_STATEMENT_PREFIX):
         return "sql_control"
     if path.startswith("/api/jobs/") and (
         path.endswith("/pages") or path.endswith("/cancel") or path.endswith("/export")
@@ -290,9 +301,21 @@ def _rate_limit_group(method: str, path: str) -> str:
 def _should_audit_request(method: str, path: str) -> bool:
     if path in _RATE_LIMIT_EXEMPT_PATHS:
         return False
-    if method.upper() not in _SAFE_METHODS or not path.startswith("/api/jobs/"):
+    if method.upper() not in _SAFE_METHODS:
         return True
-    return not (path.endswith("/progress") or path.endswith("/result"))
+    return not _is_poll_read(path)
+
+
+def _is_poll_read(path: str) -> bool:
+    """高频轮询 GET 的审计豁免(ADR-0022 / 设计 §3.2)。
+
+    语句 progress/result 与 job 同频轮询,逐次写 audit_logs 会把审计表淹掉;
+    会话 attach/submit/cancel/close 这些**变更**仍逐条留痕,证据链不缺口。
+    """
+
+    if not path.startswith(_POLL_READ_PREFIXES):
+        return False
+    return path.endswith("/progress") or path.endswith("/result")
 
 
 def _http_resource_id(method: str, path: str) -> str:

@@ -24,6 +24,9 @@ class ApiError(Exception):
     code: str
     message: str
     internal_detail: str | None = None
+    # 随错误体一起返回的**非敏感**上下文键(如 409 stale_session_epoch 的
+    # current_epoch,设计 §2.3 M1)。None = 载荷形态与既有错误完全一致。
+    extra: dict[str, object] | None = None
 
 
 def error_payload(code: str, message: str) -> dict[str, str]:
@@ -42,6 +45,9 @@ async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
             code=exc.code,
             detail=exc.internal_detail,
         )
+    if exc.extra:
+        payload: dict[str, object] = {**error_payload(exc.code, exc.message), **exc.extra}
+        return JSONResponse(status_code=exc.status_code, content=payload)
     return error_response(exc.status_code, exc.code, exc.message)
 
 

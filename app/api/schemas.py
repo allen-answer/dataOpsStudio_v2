@@ -10,6 +10,11 @@ from app.domain.compare_infer import (
     PrimaryKeyCandidate,
     TablePairSuggestion,
 )
+from app.domain.console_session import (
+    ConsoleSessionState,
+    ConsoleStatementState,
+    ServerCancelState,
+)
 from app.domain.datasource import DbType, OperationPolicy
 from app.domain.job import JobErrorCode, JobStatus
 from app.domain.notify import NotifyChannelName, NotifyEvent
@@ -1101,6 +1106,130 @@ class ExportCreateResponse(BaseModel):
 
 class CancelResponse(BaseModel):
     cancelled: bool
+
+
+# ── SQL 控制台会话(Session Broker,设计 §3.1)────────────────────────────────
+#
+# 观察类响应恒带 `current_epoch`(设计 §2.3):被接管的旧 tab 据此渲染
+# "已被另一窗口接管",无需先撞一次 409。
+# 载荷脱敏纪律沿用 ADR-0022:会话/语句载荷不含 SQL 原文、绑定参数、主机地址。
+
+
+class SessionAttachRequest(BaseModel):
+    console_id: str = Field(min_length=1)
+
+
+class SessionResponse(BaseModel):
+    session_id: str
+    # 本次 attach 分配到的 epoch;与 current_epoch 相等即"我仍是当前持有者"。
+    epoch: int
+    current_epoch: int
+    state: ConsoleSessionState
+    db_type: DbType
+    server_cancel: ServerCancelState
+    current_statement_id: str | None = None
+    idle_deadline: datetime | None = None
+    last_activity_at: datetime
+    close_reason: str | None = None
+    error_code: str | None = None
+
+
+class StatementSubmitRequest(BaseModel):
+    epoch: int = Field(ge=0)
+    sql: str = Field(min_length=1)
+    # 幂等回执键(设计 §3.1):同 (session_id, client_request_id) 重发只回原语句行。
+    client_request_id: str = Field(min_length=1, max_length=64)
+    page_size: int = Field(
+        default=SQL_WORKSPACE_DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=SQL_WORKSPACE_MAX_PAGE_SIZE,
+    )
+    max_result_rows: int = Field(
+        default=SQL_WORKSPACE_DEFAULT_MAX_ROWS,
+        ge=1,
+        le=SQL_WORKSPACE_MAX_ROWS,
+    )
+    # 0 = 不限(DataGrip 语义,设计 §4.2);省略则取 broker 默认 600s。
+    timeout_seconds: int | None = Field(default=None, ge=0, le=86_400)
+
+
+class StatementSubmitResponse(BaseModel):
+    statement_id: str
+    # A4 的 lane 还不落 spool(spool 平价是 A5),故此处恒为 null。
+    result_set_id: str | None = None
+    seq: int
+    deduplicated: bool = False
+
+
+class StatementSessionBlock(BaseModel):
+    """progress 响应内嵌的会话块(设计 §3.2):一条轮询同时驱动语句与会话渲染。"""
+
+    session_id: str
+    state: ConsoleSessionState
+    current_epoch: int
+
+
+class StatementProgressResponse(BaseModel):
+    """与 `JobProgressResponse` **字段镜像**(设计 §3.2);镜像断言在 A5 钉死。
+
+    差异只在主键与状态枚举:job 用 `job_id`/`status: JobStatus`,
+    语句用 `statement_id`/`state: ConsoleStatementState`。
+    """
+
+    statement_id: str
+    session: StatementSessionBlock
+    result_set_id: str | None = None
+    state: ConsoleStatementState
+    loaded_rows: int = 0
+    result_version: int = 0
+    columns_ready: bool = False
+    first_batch_ready: bool = False
+    terminal: bool = False
+    error: str | None = None
+    error_code: str | None = None
+    retry_after_ms: int = 0
+    has_new_result: bool = False
+    truncated: bool | None = None
+    has_more: bool | None = None
+    pagination_mode: Literal["ordered_offset", "unavailable"] | None = None
+    pagination_reason: str | None = None
+    timings: JobStageTimings | None = None
+    execution: JobExecutionMetrics | None = None
+
+
+class StatementResultResponse(BaseModel):
+    """与 `JobResultResponse` 同形;`state` 沿用 result_set 状态口径。"""
+
+    statement_id: str
+    statement_state: ConsoleStatementState
+    result_set_id: str
+    offset: int
+    limit: int
+    columns: list[Column] = Field(default_factory=list)
+    rows: list[RowResponse]
+    loaded_rows: int | None = None
+    total_rows: int | None = None
+    state: str | None = None
+    truncated: bool | None = None
+    has_more: bool | None = None
+    page_size: int | None = None
+    max_result_rows: int | None = None
+    preview_truncated_cells: int = 0
+    pagination_mode: Literal["ordered_offset", "unavailable"] | None = None
+    pagination_reason: str | None = None
+
+
+class StatementCancelRequest(BaseModel):
+    epoch: int = Field(ge=0)
+
+
+class StatementCancelResponse(BaseModel):
+    accepted: bool
+    statement_state: ConsoleStatementState
+
+
+class SessionCloseRequest(BaseModel):
+    epoch: int = Field(ge=0)
 
 
 class MetadataSchemaItem(BaseModel):
