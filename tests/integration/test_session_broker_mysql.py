@@ -73,8 +73,16 @@ def test_kill_query_returns_1317_and_owner_connection_is_reusable() -> None:
         owner = MySQLInteractiveConnection(_conn_info(), _secret_store(), default_timeout_seconds=0)
         try:
             marker_ready.put(owner.open())
+            cancelled: ClassifiedError | AssertionError
             try:
-                list(owner.execute(StatementRequest(sql="SELECT SLEEP(10)", timeout_seconds=0)))
+                list(
+                    owner.execute(
+                        StatementRequest(
+                            sql=("SELECT 1 FROM information_schema.tables WHERE SLEEP(10) = 0"),
+                            timeout_seconds=0,
+                        )
+                    )
+                )
             except InteractiveExecuteError as exc:
                 cancelled = exc.classified
             else:
@@ -114,7 +122,10 @@ def test_max_execution_time_hint_returns_3024_timeout() -> None:
         with pytest.raises(InteractiveExecuteError) as timeout_error:
             owner.execute(
                 StatementRequest(
-                    sql="SELECT /*+ MAX_EXECUTION_TIME(100) */ SLEEP(2)",
+                    sql=(
+                        "SELECT /*+ MAX_EXECUTION_TIME(100) */ COUNT(*) "
+                        "FROM information_schema.tables WHERE SLEEP(2) = 0"
+                    ),
                     timeout_seconds=0,
                 )
             )

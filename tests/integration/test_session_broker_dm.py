@@ -141,6 +141,7 @@ def test_sp_cancel_finishes_under_one_second_and_owner_connection_is_reusable(
         owner = DMInteractiveConnection(_conn_info(), _secret_store())
         try:
             marker_ready.put(owner.open())
+            cancelled: ClassifiedError | AssertionError
             try:
                 list(owner.execute(StatementRequest(sql=long_query, timeout_seconds=0)))
             except InteractiveExecuteError as exc:
