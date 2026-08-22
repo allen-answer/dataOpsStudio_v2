@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import cast
 
+import structlog
 from fastapi import FastAPI
 from starlette.requests import Request
 from starlette.responses import Response
@@ -16,6 +17,8 @@ from app.api.services import ApiServices, build_api_services
 from app.config import Form, Settings
 from app.services.workflow_scheduler import WorkflowScheduler
 from app.version import build_info
+
+logger = structlog.get_logger(__name__)
 
 ExceptionHandler = Callable[[Request, Exception], Response | Awaitable[Response]]
 
@@ -32,14 +35,33 @@ def create_app(
     )
     scheduler = _build_scheduler(actual_services, settings)
 
+    # 测试与外部 service factory 造的 services 替身可能没有这个字段(既有 app.py
+    # 对 license/rate_limiter 也用同样的宽容读法),缺失即等于"未装配 broker"。
+    broker = getattr(actual_services, "session_broker", None)
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         # cron tick 后台线程随 API 进程起停(ADR-0009 §1:进程内调度,无独立进程)。
         if scheduler is not None:
             scheduler.start()
+        # Session broker 是 API 进程内组件(设计 D1)。start() 先跑启动清扫(M5):
+        # 把上一个 boot 遗留的 active 会话收敛成 session_lost,再起 timer 线程。
+        if broker is not None:
+            report = broker.start()
+            logger.info(
+                "session broker started",
+                boot_id=broker.boot_id,
+                sessions_lost=report.sessions_lost,
+                read_failed=report.read_failed,
+                write_outcome_unknown=report.write_outcome_unknown,
+            )
         try:
             yield
         finally:
+            # 优雅停机:先收会话(close_reason=shutdown,先取消在跑语句再断连),
+            # 再停 scheduler —— 反过来会让 lane 在 join 期间还有 cron 入队的活。
+            if broker is not None:
+                broker.shutdown()
             if scheduler is not None:
                 scheduler.stop()
 

@@ -10,6 +10,8 @@ import structlog
 from sqlalchemy import URL, create_engine, delete, insert, select, update
 from sqlalchemy.engine import Engine
 
+from app.broker import SessionBroker
+from app.broker.wiring import build_session_broker
 from app.config import Settings, load_settings
 from app.db.models import audit_logs, license_state, revoked_tokens, system_settings, users
 from app.domain.license import LicenseMode
@@ -104,6 +106,10 @@ class ApiServices:
     secret_store: LocalFileSecretStore
     result_store: LocalFsResultStore
     jwt_secret: str
+    # SQL 控制台会话 broker(设计 D1:API 进程内组件,不是独立进程)。
+    # None = 回退开关关闭或测试 app 未装配 —— 会话端点如实 409,job 路径不受影响。
+    # start/shutdown 归 app lifespan,不在此构造期做线程启动。
+    session_broker: SessionBroker | None = None
     rate_limiter: RateLimiter = field(default_factory=RateLimiter)
     job_wait_timeout_seconds: float = 10.0
     max_active_resultsets_per_console: int = 3
@@ -268,10 +274,16 @@ def build_api_services(settings: Settings | None = None) -> ApiServices:
         license_file=actual_settings.bootstrap.license_file,
     )
     engine = _create_metadata_engine(actual_settings, bootstrap.get_pg_app_password())
+    secret_store = LocalFileSecretStore(engine, bootstrap)
     return ApiServices(
         engine=engine,
         job_backend=PostgresJobBackend(engine),
-        secret_store=LocalFileSecretStore(engine, bootstrap),
+        secret_store=secret_store,
+        session_broker=(
+            build_session_broker(engine, secret_store)
+            if actual_settings.api.console_session_enabled
+            else None
+        ),
         result_store=LocalFsResultStore(
             actual_settings.result_store.local_root,
             spool_max_rows=actual_settings.result_store.spool_max_rows,
