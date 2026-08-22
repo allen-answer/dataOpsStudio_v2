@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -17,6 +18,12 @@ from uuid import uuid4
 
 import structlog
 
+from app.broker.results import (
+    NullStatementResults,
+    StatementMetrics,
+    StatementResults,
+    StatementSpool,
+)
 from app.broker.state import transition_session, transition_statement
 from app.broker.store import AttachRequest, BrokerStore, SweepReport
 from app.dbclients.interactive import (
@@ -38,6 +45,7 @@ from app.domain.console_session import (
     ConsoleStatementState,
     ServerCancelState,
 )
+from app.domain.schema import Column, Row
 
 Clock = Callable[[], datetime]
 ConnectionFactory = Callable[[ConsoleSession], InteractiveConnection]
@@ -75,10 +83,15 @@ class BrokerConfig:
     idle_timeout_seconds: int = 1800
     cancel_grace_seconds: float = 5.0
     timer_poll_seconds: float = 0.25
+    # 落 spool 的批大小上限(与 worker 的 sql_spool_batch_size 同口径);
+    # 实际批大小 = min(本值, 语句 page_size)。
+    spool_batch_size: int = 1000
 
     def __post_init__(self) -> None:
         if self.mailbox_size <= 0:
             raise ValueError("mailbox_size must be positive")
+        if self.spool_batch_size <= 0:
+            raise ValueError("spool_batch_size must be positive")
         if self.idle_timeout_seconds <= 0:
             raise ValueError("idle_timeout_seconds must be positive")
         if self.cancel_grace_seconds < 0:
@@ -135,6 +148,8 @@ class _SessionRuntime:
     condition: Condition
     statements: dict[str, ConsoleStatement] = field(default_factory=dict)
     requests: dict[str, str] = field(default_factory=dict)
+    # statement_id → 结果集句柄(submit 时分配,lane 执行期落 spool)。
+    spools: dict[str, StatementSpool] = field(default_factory=dict)
     accepting: bool = True
     pending_count: int = 0
     current_statement_id: str | None = None
@@ -161,6 +176,7 @@ class SessionBroker:
         *,
         connection_factory: ConnectionFactory,
         cancel_channel_factory: CancelChannelFactory,
+        results: StatementResults | None = None,
         config: BrokerConfig | None = None,
         clock: Clock | None = None,
         boot_id: str | None = None,
@@ -169,6 +185,9 @@ class SessionBroker:
         self._store = store
         self._connection_factory = connection_factory
         self._cancel_channel_factory = cancel_channel_factory
+        # 缺省是不落盘替身:状态机单测不需要真 spool。生产装配在
+        # `app/broker/wiring.py` 注入 `SpoolStatementResults`。
+        self._results = results or NullStatementResults()
         self._config = config or BrokerConfig()
         self._clock = clock or _utc_now
         self._boot_id = boot_id or str(uuid4())
@@ -316,11 +335,15 @@ class SessionBroker:
         client_request_id: str,
         *,
         timeout_seconds: int = 600,
+        page_size: int = 100,
+        max_result_rows: int = 1000,
     ) -> SubmitReceipt:
         if not client_request_id or len(client_request_id) > 64:
             raise ValueError("client_request_id must contain 1..64 characters")
         if timeout_seconds < 0:
             raise ValueError("timeout_seconds must not be negative")
+        if page_size <= 0 or max_result_rows <= 0:
+            raise ValueError("page_size and max_result_rows must be positive")
         with self._lock:
             runtime = self._require_runtime(session_id)
             self._require_epoch(runtime, epoch)
@@ -347,6 +370,32 @@ class SessionBroker:
             self._statement_sessions[statement.id] = runtime.session.id
             if deduplicated:
                 return SubmitReceipt(statement, deduplicated=True)
+            # 结果集在**受理时**分配(job 路径同型):前端拿到 submit 回执即可
+            # 开始按 result_set_id 轮询,不必等 lane 排到这条语句。
+            try:
+                spool = self._results.register(
+                    statement,
+                    page_size=page_size,
+                    max_result_rows=max_result_rows,
+                )
+            except Exception:
+                # 结果集建不出来就**别把语句排进 mailbox** —— 否则它会永远停在
+                # accepted,前端轮到天荒地老。按 F9 记 failed(resultstore_error):
+                # 会话续用,幂等重发看到的是这条失败语句而不是"什么都没发生"。
+                self._set_statement_state(
+                    runtime,
+                    statement,
+                    ConsoleStatementState.FAILED,
+                    now=now,
+                    error_code="resultstore_error",
+                    error_summary="statement result set could not be created",
+                )
+                self._record_event(runtime, runtime.statements[statement.id], "terminal", now=now)
+                raise
+            runtime.spools[statement.id] = spool
+            statement = replace(statement, result_set_id=spool.result_set_id)
+            runtime.statements[statement.id] = statement
+            self._store.update_statement(statement)
             try:
                 runtime.mailbox.put_nowait(_LaneCommand("execute", statement_id=statement.id))
             except Full as exc:  # pending_count 与 Queue 必须同锁同向; 命中即内部不变量坏。
@@ -547,12 +596,27 @@ class SessionBroker:
         error_code: str | None = None
         error_summary: str | None = None
         connection_lost = False
+        spool = runtime.spools.get(statement.id)
+        columns: list[Column] = []
+        metrics = StatementMetrics(
+            execute_started_at=now,
+            db_type=runtime.connection.db_type.value,
+            effective_sql_hash=statement.sql_hash,
+        )
         try:
+
+            def capture_columns(emitted: list[Column]) -> None:
+                columns.clear()
+                columns.extend(emitted)
+                if spool is not None:
+                    self._results.set_columns(spool, emitted)
+
             stream = runtime.connection.execute(
                 StatementRequest(
                     sql=statement.sql_text,
-                    fetch_size=1000,
+                    fetch_size=self._fetch_size(spool),
                     timeout_seconds=statement.timeout_seconds,
+                    column_sink=capture_columns,
                 )
             )
             with self._lock:
@@ -563,8 +627,7 @@ class SessionBroker:
                         state=transition_statement(current.state, ConsoleStatementState.STREAMING),
                     )
                     self._store.update_statement(runtime.statements[statement.id])
-            for _row in stream:
-                pass
+            self._drain_to_spool(statement, stream, spool, columns, metrics)
             terminal_state = ConsoleStatementState.SUCCEEDED
         except (InteractiveExecuteError, SoftCancelledError) as exc:
             classified = exc.classified
@@ -603,6 +666,29 @@ class SessionBroker:
             error_code = "broker_execution_error"
             error_summary = "statement execution failed"
 
+        if metrics.finished_reading_at is None:
+            metrics.finished_reading_at = self._clock()
+
+        # 先封存结果集,**再**把语句翻到终态:反过来会开一个"progress 已报
+        # terminal、结果集还停在 streaming"的窗口,前端读到的就是自相矛盾的一页。
+        # 锁外做(一次 PG 写 + 一次 manifest 读),别让别的会话 attach/observe 陪等。
+        # 终态是 cancelled/timeout 也照样封存 —— 已落的行保持可读可导出
+        # (设计 §2.2 / §11-7,与 job 路径"取消即删 spool"刻意不同)。
+        if spool is not None:
+            try:
+                self._results.finalize(
+                    spool,
+                    runtime.statements[statement.id],
+                    columns=columns,
+                    metrics=metrics,
+                )
+            except Exception:
+                self._logger.info(
+                    "broker statement result finalize failed",
+                    statement_id=statement.id,
+                    sql_hash=statement.sql_hash,
+                )
+
         with self._lock:
             now = self._clock()
             current = runtime.statements[statement.id]
@@ -637,6 +723,83 @@ class SessionBroker:
             lost = runtime.session.state is ConsoleSessionState.SESSION_LOST
         if lost:
             runtime.connection.close()
+
+    def _fetch_size(self, spool: StatementSpool | None) -> int:
+        """驱动侧 fetchmany 批大小。多取一行用于判"还有更多"(job 路径同型)。"""
+
+        if spool is None:
+            return self._config.spool_batch_size
+        return max(1, min(spool.page_size, spool.max_result_rows + 1))
+
+    def _drain_to_spool(
+        self,
+        statement: ConsoleStatement,
+        stream: Iterator[Row],
+        spool: StatementSpool | None,
+        columns: list[Column],
+        metrics: StatementMetrics,
+    ) -> None:
+        """取数循环:批量落 spool,取够 max_result_rows 就停并标 truncated。
+
+        截断是**客户端取够就停**(DataGrip 语义),不改写 SQL、不断连接 ——
+        会话与游标随后照常续用。异常(取消/超时/连接死亡)由调用方分类;
+        本函数只保证**已落的行不丢**:每批 append 后 catalog 同步一次。
+        """
+
+        batch: list[Row] = []
+        batch_size = (
+            self._config.spool_batch_size
+            if spool is None
+            else max(1, min(self._config.spool_batch_size, spool.page_size))
+        )
+        limit = None if spool is None else spool.max_result_rows
+        drain_started_at = time.monotonic()
+        try:
+            for row in stream:
+                if metrics.first_row_at is None:
+                    metrics.first_row_at = self._clock()
+                    metrics.execute_to_first_row_ms = _delta_ms(
+                        metrics.execute_started_at, metrics.first_row_at
+                    )
+                metrics.rows_read += 1
+                if limit is not None and metrics.rows_returned >= limit:
+                    # 多读到的这一行只用来证明"还有更多",不落盘。
+                    metrics.output_limit_applied = True
+                    break
+                metrics.rows_returned += 1
+                batch.append(row)
+                if len(batch) >= batch_size:
+                    metrics.spool_ms += self._flush_batch(statement, spool, columns, batch)
+                    batch = []
+        finally:
+            metrics.finished_reading_at = self._clock()
+            if batch:
+                metrics.spool_ms += self._flush_batch(statement, spool, columns, batch)
+            if spool is not None and metrics.output_limit_applied:
+                self._results.mark_truncated(spool)
+            drain_ms = int((time.monotonic() - drain_started_at) * 1000)
+            metrics.fetch_ms = max(0, drain_ms - metrics.spool_ms)
+
+    def _flush_batch(
+        self,
+        statement: ConsoleStatement,
+        spool: StatementSpool | None,
+        columns: list[Column],
+        batch: list[Row],
+    ) -> int:
+        """落一批并同步 catalog,返回本批耗时 ms(喂 `timings.spool_ms`)。
+
+        **不取 broker 锁**:这是每批都走的热路径,让别的会话 attach/observe 陪着
+        排队没有意义。空闲回收也不会误伤 —— 语句在跑时会话是 executing,
+        idle 回收只看 idle 态(`run_timers_once`)。
+        """
+
+        if spool is None:
+            return 0
+        started_at = time.monotonic()
+        self._results.append(spool, batch)
+        self._results.publish_streaming(spool, statement, columns=columns)
+        return int((time.monotonic() - started_at) * 1000)
 
     def _close_on_lane(self, runtime: _SessionRuntime, reason: str) -> None:
         with self._lock:
@@ -1051,6 +1214,12 @@ _TERMINAL_STATEMENT_STATES = frozenset(
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _delta_ms(start: datetime | None, end: datetime | None) -> int | None:
+    if start is None or end is None:
+        return None
+    return max(0, int((end - start).total_seconds() * 1000))
 
 
 __all__ = [

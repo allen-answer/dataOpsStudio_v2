@@ -6,7 +6,7 @@ import re
 import threading
 import time
 import zipfile
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, BinaryIO, Protocol
@@ -1248,6 +1248,76 @@ def test_worker_run_once_triggers_result_store_gc_on_interval() -> None:
     assert result_store.gc_calls == 1
 
 
+class _FakeActiveConsoleResultSets:
+    def __init__(self, ids: set[str], *, fail: bool = False) -> None:
+        self.ids = ids
+        self.fail = fail
+        self.calls = 0
+
+    def active_result_set_ids(self) -> frozenset[str]:
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("metadata database is unavailable")
+        return frozenset(self.ids)
+
+
+def test_worker_gc_passes_active_console_result_sets_as_protected() -> None:
+    """★ 评审修订 R3:GC 前先问 catalog "哪些结果集还属于活着的会话"。"""
+
+    result_store = _FakeResultStore()
+    catalog = _FakeActiveConsoleResultSets({"rs-live"})
+    runner = WorkerRunner(
+        _FakeBackend([]),
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        active_console_resultsets=catalog,
+    )
+
+    assert runner.run_once() is False
+
+    assert catalog.calls == 1
+    assert result_store.gc_keep_calls == [frozenset({"rs-live"})]
+
+
+def test_worker_skips_gc_when_the_protected_set_cannot_be_computed() -> None:
+    """算不出保护集就不跑 GC:宁可这轮不回收,也不删别人正在读的结果集。"""
+
+    result_store = _FakeResultStore()
+    catalog = _FakeActiveConsoleResultSets(set(), fail=True)
+    runner = WorkerRunner(
+        _FakeBackend([]),
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        active_console_resultsets=catalog,
+    )
+
+    assert runner.run_once() is False
+
+    assert catalog.calls == 1
+    assert result_store.gc_calls == 0
+
+
+def test_worker_without_the_catalog_protects_nothing_but_still_collects() -> None:
+    """未注入(无会话部署 / 单测):保护集为空,GC 行为与 A5 之前一致。"""
+
+    result_store = _FakeResultStore()
+    runner = WorkerRunner(
+        _FakeBackend([]),
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is False
+
+    assert result_store.gc_keep_calls == [frozenset()]
+
+
 def test_cancel_check_throttled_to_every_n_rows() -> None:
     """F3: per-row cancel check is throttled to every 5000 rows."""
 
@@ -1447,6 +1517,8 @@ class _FakeResultStore:
         self.truncated_result_sets: set[str] = set()
         self.pagination_by_result_set: dict[str, dict[str, object]] = {}
         self.gc_calls = 0
+        # R3:每轮 GC 收到的豁免集(活跃会话语句的结果集)。
+        self.gc_keep_calls: list[frozenset[str]] = []
 
     def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]:
         return list(self.rows_by_result_set.get(result_set_id, [])[offset : offset + limit])
@@ -1513,8 +1585,9 @@ class _FakeResultStore:
         self.pagination_by_result_set.pop(result_set_id, None)
         return existed
 
-    def gc_expired(self) -> int:
+    def gc_expired(self, *, keep_result_set_ids: Collection[str] = ()) -> int:
         self.gc_calls += 1
+        self.gc_keep_calls.append(frozenset(keep_result_set_ids))
         return 0
 
 
@@ -1525,6 +1598,7 @@ class _CountingResultStore:
         self.deleted_spools: list[str] = []
         self.truncated_result_sets: set[str] = set()
         self.gc_calls = 0
+        self.gc_keep_calls: list[frozenset[str]] = []
 
     def fetch_range(self, result_set_id: str, offset: int, limit: int) -> list[Row]:
         del result_set_id, offset, limit
@@ -1585,8 +1659,9 @@ class _CountingResultStore:
         self.truncated_result_sets.discard(result_set_id)
         return existed
 
-    def gc_expired(self) -> int:
+    def gc_expired(self, *, keep_result_set_ids: Collection[str] = ()) -> int:
         self.gc_calls += 1
+        self.gc_keep_calls.append(frozenset(keep_result_set_ids))
         return 0
 
 

@@ -104,6 +104,60 @@ def test_gc_expired_removes_old_export_artifacts(tmp_path: Path) -> None:
         store.open_download(ref)
 
 
+def test_gc_expired_removes_stale_result_set_spools(tmp_path: Path) -> None:
+    """基线:过了 TTL 的结果集 spool 会被回收 —— 下面 R3 用例的对照组。"""
+
+    store = LocalFsResultStore(tmp_path, result_ttl_days=1)
+    store.append_spool("rs-stale", [Row(values=[1])])
+    _age_spool(tmp_path, "rs-stale")
+
+    assert store.gc_expired() == 1
+    assert store.spool_exists("rs-stale") is False
+
+
+def test_gc_expired_never_reclaims_a_protected_result_set(tmp_path: Path) -> None:
+    """★ 评审修订 R3(设计 §10-A5):活跃会话语句的结果集不得被 spool GC 回收。
+
+    会话结果集与 job 结果共用同一个 spool 目录,而 GC 只看 mtime;一条用户还在
+    翻页/导出的会话结果集,mtime 一过 TTL 就会被删掉(`result_ttl_days=0` 时
+    窗口甚至是"立刻")。判定权必须回到 catalog:调用方给保护集,GC 跳过。
+    """
+
+    store = LocalFsResultStore(tmp_path, result_ttl_days=0)
+    store.append_spool("rs-live", [Row(values=[1])])
+    store.append_spool("rs-dead", [Row(values=[2])])
+    _age_spool(tmp_path, "rs-live")
+    _age_spool(tmp_path, "rs-dead")
+
+    removed = store.gc_expired(keep_result_set_ids={"rs-live"})
+
+    assert removed == 1
+    assert store.spool_exists("rs-live") is True
+    assert store.fetch_range("rs-live", 0, 10) == [Row(values=[1])]
+    assert store.spool_exists("rs-dead") is False
+
+
+def test_protecting_a_result_set_does_not_protect_exports_or_runs(tmp_path: Path) -> None:
+    """保护集只作用于结果集目录:导出件与 run 件仍按各自 TTL 回收。"""
+
+    store = LocalFsResultStore(tmp_path, result_ttl_days=0, sql_export_ttl_hours=1)
+    store.put_export_artifact("rs-live", "out.csv", BytesIO(b"value\n1\n"))
+    export_dir = tmp_path / "exports" / "rs-live"
+    old = time.time() - 2 * 60 * 60
+    os.utime(export_dir, (old, old))
+
+    assert store.gc_expired(keep_result_set_ids={"rs-live"}) == 1
+    assert not export_dir.exists()
+
+
+def _age_spool(root: Path, result_set_id: str) -> None:
+    """把 spool 目录的 mtime 推到很久以前(GC 只认 mtime)。"""
+
+    spool_dir = root / "resultsets" / result_set_id
+    old = time.time() - 10 * 24 * 60 * 60
+    os.utime(spool_dir, (old, old))
+
+
 def test_no_cursor_held_after_append(result_store: ResultStore) -> None:
     """★ R6 配合:append_spool 写完不持 DB cursor,
     DB 资源由调用方(worker)管理,store 只管 spool 文件。

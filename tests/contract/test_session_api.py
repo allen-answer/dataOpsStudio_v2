@@ -14,6 +14,7 @@ import re
 import threading
 import time
 from collections.abc import Iterator
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -309,6 +310,15 @@ def _headers(user_id: str = "user-1") -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _strip_result_set(broker: SessionBroker, statement_id: str) -> None:
+    """把语句的 result_set_id 抹掉,模拟"结果集不存在"(spool 写失败/被淘汰)。"""
+
+    statement = broker.statement(statement_id)
+    session_id = statement.session_id
+    runtime = broker._sessions[session_id]
+    runtime.statements[statement_id] = replace(statement, result_set_id=None)
+
+
 def _broker(harness: _DriverHarness, *, start: bool = True) -> SessionBroker:
     broker = SessionBroker(
         MemoryBrokerStore(),
@@ -373,6 +383,8 @@ def test_session_route_surface_matches_design_section_3_1() -> None:
     assert ("GET", "/api/sql/statements/{statement_id}/progress") in routes
     assert ("GET", "/api/sql/statements/{statement_id}/result") in routes
     assert ("POST", "/api/sql/statements/{statement_id}/cancel") in routes
+    # A5 平价:导出复用既有导出模块与一次性 token(设计 §3.3)。
+    assert ("POST", "/api/sql/statements/{statement_id}/export") in routes
 
 
 # ── attach / observe ─────────────────────────────────────────────────────────
@@ -502,7 +514,9 @@ def test_submit_accepts_statement_and_returns_receipt() -> None:
         payload = response.json()
         assert payload["seq"] == 1
         assert payload["deduplicated"] is False
-        assert payload["result_set_id"] is None
+        # A5:结果集在**受理时**分配(job 路径同型),前端拿到回执即可开轮询。
+        assert isinstance(payload["result_set_id"], str)
+        assert payload["result_set_id"]
         _wait(lambda: harness.timeouts == [42])
     finally:
         broker.shutdown()
@@ -723,8 +737,12 @@ def test_progress_of_unknown_statement_is_404() -> None:
 # ── result ───────────────────────────────────────────────────────────────────
 
 
-def test_result_is_404_until_the_lane_spools() -> None:
-    """A4 的 lane 还不落 spool(A5 平价):如实 404,不编空结果页。"""
+def test_result_page_mirrors_the_job_result_shape() -> None:
+    """`GET .../result` 与 `GET /jobs/{id}/result` **同形**(设计 §3.1)。
+
+    本用例的 result_store 是空替身(spool 里没有行):断言的是形状与
+    `statement_state` 归属,不是行内容 —— 行内容平价在 `test_session_parity.py`。
+    """
 
     harness = _DriverHarness()
     broker = _broker(harness)
@@ -743,6 +761,40 @@ def test_result_is_404_until_the_lane_spools() -> None:
         ).json()
         statement_id = submitted["statement_id"]
         _wait(lambda: broker.statement(statement_id).state is ConsoleStatementState.SUCCEEDED)
+
+        response = client.get(f"/api/sql/statements/{statement_id}/result", headers=_headers())
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["statement_id"] == statement_id
+        assert payload["statement_state"] == ConsoleStatementState.SUCCEEDED.value
+        assert payload["result_set_id"] == submitted["result_set_id"]
+        assert payload["rows"] == []
+    finally:
+        broker.shutdown()
+
+
+def test_result_is_404_when_the_statement_has_no_result_set() -> None:
+    """没有结果集就如实 404,不编一个空结果页(设计 §3.1)。"""
+
+    harness = _DriverHarness()
+    broker = _broker(harness)
+    client, _ = _client(_FakeEngine(_attach_rows()), broker)
+    try:
+        session = _attach(client)
+        _wait(lambda: broker.observe(session["session_id"]).state is ConsoleSessionState.IDLE)
+        submitted = client.post(
+            f"/api/sql/sessions/{session['session_id']}/statements",
+            headers=_headers(),
+            json_body={
+                "epoch": session["epoch"],
+                "sql": "SELECT 1",
+                "client_request_id": "req-1",
+            },
+        ).json()
+        statement_id = submitted["statement_id"]
+        _wait(lambda: broker.statement(statement_id).state is ConsoleStatementState.SUCCEEDED)
+        _strip_result_set(broker, statement_id)
 
         response = client.get(f"/api/sql/statements/{statement_id}/result", headers=_headers())
 

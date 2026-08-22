@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import BinaryIO, Protocol
 
 from app.domain.result import Manifest, ResultRef
@@ -76,6 +77,10 @@ class ResultStore(Protocol):
         """删除一个 ResultSet spool,返回是否实际删除了文件。"""
         raise NotImplementedError
 
-    def gc_expired(self) -> int:
-        """按 result_ttl_days / resultset_spool_ttl_days / sql_export_ttl_hours 清理。"""
+    def gc_expired(self, *, keep_result_set_ids: Collection[str] = ()) -> int:
+        """按 result_ttl_days / resultset_spool_ttl_days / sql_export_ttl_hours 清理。
+
+        `keep_result_set_ids`(评审修订 R3):活跃会话语句的结果集无条件保留 ——
+        会话与 job 共用同一个 spool 目录,GC 只认 mtime 会误删还在被读的结果集。
+        """
         raise NotImplementedError

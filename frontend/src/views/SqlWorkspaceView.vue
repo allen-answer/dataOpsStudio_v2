@@ -2099,7 +2099,7 @@ function parseVariables(value: string): string[] {
         <div v-else class="flex-1 min-h-0 overflow-auto p-2 space-y-1">
           <button
             v-for="item in historyItems"
-            :key="item.job_id"
+            :key="item.sql_hash"
             type="button"
             class="w-full text-left rounded-card px-3 py-2 hover:chrome-bg-elevated"
             @click="applyHistory(item)"
