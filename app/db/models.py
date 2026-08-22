@@ -412,9 +412,151 @@ sql_consoles = Table(
     Column("name", String(128), nullable=False),
     Column("sql", Text(), nullable=False, server_default=""),
     Column("pinned", Boolean(), nullable=False, server_default=text("false")),
+    Column("session_epoch", BigInteger(), nullable=False, server_default=text("0")),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
     Index("ix_sql_consoles_owner_updated", "owner_user_id", "updated_at"),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# console_sessions —— Session Broker 会话恢复/审计锚点
+# ───────────────────────────────────────────────────────────────────────────
+_ACTIVE_CONSOLE_SESSION_STATES = "'connecting', 'idle', 'executing', 'cancelling', 'closing'"
+
+console_sessions = Table(
+    "console_sessions",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column(
+        "console_id",
+        String(36),
+        ForeignKey("sql_consoles.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "datasource_id",
+        String(36),
+        ForeignKey("datasources.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column(
+        "owner_user_id",
+        String(36),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    ),
+    Column("epoch", BigInteger(), nullable=False),
+    Column("state", Text(), nullable=False),
+    Column("broker_boot_id", String(36), nullable=False),
+    Column("db_session_marker", String(64), nullable=True),
+    Column("server_cancel", String(16), nullable=False, server_default="unknown"),
+    Column("autocommit", Boolean(), nullable=False, server_default=text("true")),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column(
+        "last_activity_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("now()"),
+    ),
+    Column("closed_at", DateTime(timezone=True), nullable=True),
+    Column("close_reason", String(64), nullable=True),
+    Column("error_code", String(64), nullable=True),
+    CheckConstraint(
+        "state IN ('connecting', 'idle', 'executing', 'cancelling', 'closing', "
+        "'closed', 'session_lost', 'connect_failed')",
+        name="state_is_supported",
+    ),
+    Index(
+        "uq_console_active_session",
+        "console_id",
+        unique=True,
+        postgresql_where=text(f"state IN ({_ACTIVE_CONSOLE_SESSION_STATES})"),
+    ),
+    Index(
+        "ix_console_sessions_boot",
+        "broker_boot_id",
+        postgresql_where=text(f"state IN ({_ACTIVE_CONSOLE_SESSION_STATES})"),
+    ),
+)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# console_statements —— 会话内逐语句状态与幂等回执
+# ────────────────────────────────────────────────────────────────────────────
+console_statements = Table(
+    "console_statements",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column(
+        "session_id",
+        String(36),
+        ForeignKey("console_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    # 冗余快照:历史查询不需要 join console_sessions。
+    Column("console_id", String(36), nullable=False),
+    Column("datasource_id", String(36), nullable=False),
+    Column("owner_user_id", String(36), nullable=False),
+    Column("epoch", BigInteger(), nullable=False),
+    Column("seq", Integer(), nullable=False),
+    Column("client_request_id", String(64), nullable=False),
+    Column("sql_text", Text(), nullable=False),
+    Column("sql_hash", String(64), nullable=False),
+    Column("sql_len", Integer(), nullable=False),
+    Column("statement_kind", String(16), nullable=False),
+    Column("is_write", Boolean(), nullable=False),
+    Column("state", Text(), nullable=False),
+    Column("cancel_requested", Boolean(), nullable=False, server_default=text("false")),
+    Column(
+        "result_set_id",
+        String(36),
+        ForeignKey("result_sets.id", ondelete="SET NULL"),
+        nullable=True,
+    ),
+    Column("rows_affected", BigInteger(), nullable=True),
+    Column("error_code", String(64), nullable=True),
+    Column("error_summary", Text(), nullable=True),
+    Column("timeout_seconds", Integer(), nullable=False),
+    Column("script_id", String(36), nullable=True),
+    Column("script_seq", Integer(), nullable=True),
+    Column("resolved_by", String(36), nullable=True),
+    Column("resolved_at", DateTime(timezone=True), nullable=True),
+    Column("resolution", Text(), nullable=True),
+    Column("submitted_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("started_at", DateTime(timezone=True), nullable=True),
+    Column("finished_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint(
+        "state IN ('accepted', 'executing', 'streaming', 'succeeded', 'failed', "
+        "'cancelled', 'timeout', 'outcome_unknown', 'skipped')",
+        name="state_is_supported",
+    ),
+    UniqueConstraint(
+        "session_id",
+        "client_request_id",
+        name="uq_console_statements_session_request",
+    ),
+)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# console_statement_events —— 语句事件流(取消阶梯逐级留痕)
+# ───────────────────────────────────────────────────────────────────────────
+console_statement_events = Table(
+    "console_statement_events",
+    metadata,
+    Column("id", BigInteger(), primary_key=True, autoincrement=True),
+    Column(
+        "statement_id",
+        String(36),
+        ForeignKey("console_statements.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("ts", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("event_type", String(64), nullable=False),
+    Column("message", Text(), nullable=True),
+    Column("detail", JSONB(), nullable=True),
+    Index("ix_console_statement_events_statement_ts", "statement_id", "ts"),
 )
 
 
@@ -973,6 +1115,9 @@ __all__ = [
     "ai_configs",
     "audit_logs",
     "compare_tasks",
+    "console_sessions",
+    "console_statement_events",
+    "console_statements",
     "datasources",
     "export_download_tokens",
     "job_events",

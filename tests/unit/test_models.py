@@ -131,10 +131,13 @@ def test_all_alembic_revision_ids_under_32_chars() -> None:
     assert not violations, f"revision ID 超 32 字符: {violations}"
 
 
-def test_metadata_has_26_tables() -> None:
+def test_metadata_has_30_tables() -> None:
     expected = {
         "ai_configs",
         "compare_tasks",
+        "console_sessions",
+        "console_statement_events",
+        "console_statements",
         "export_download_tokens",
         "users",
         "mfa_recovery_codes",
@@ -391,6 +394,7 @@ def test_sql_workspace_tables_support_console_and_templates() -> None:
         "name",
         "sql",
         "pinned",
+        "session_epoch",
         "created_at",
         "updated_at",
     }
