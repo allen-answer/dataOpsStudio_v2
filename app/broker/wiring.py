@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
 from app.broker.core import BrokerConfig, SessionBroker
+from app.broker.results import SpoolResultStore, SpoolStatementResults
 from app.broker.store import PostgresBrokerStore
 from app.db.models import datasources
 from app.dbclients.interactive import (
@@ -37,10 +38,17 @@ SESSION_CAPABLE_DB_TYPES: frozenset[DbType] = frozenset({DbType.MYSQL, DbType.DM
 def build_session_broker(
     engine: Engine,
     secret_store: SecretStore,
+    result_store: SpoolResultStore,
     *,
     config: BrokerConfig | None = None,
+    max_active_resultsets_per_console: int = 3,
 ) -> SessionBroker:
-    """构造(但不 start)API 进程内唯一的 broker。start/shutdown 归 app lifespan。"""
+    """构造(但不 start)API 进程内唯一的 broker。start/shutdown 归 app lifespan。
+
+    `result_store` 是**必填**:少了它 lane 就不落 spool,语句会"成功但没结果",
+    所以这里不给默认值,由调用方明确交出同一个 `LocalFsResultStore` 实例
+    (与 job 路径共用 spool 目录,设计 §3.2)。
+    """
 
     def connection_factory(session: ConsoleSession) -> InteractiveConnection:
         conn_info = load_datasource_conn_info(engine, session.datasource_id)
@@ -62,6 +70,11 @@ def build_session_broker(
         PostgresBrokerStore(engine),
         connection_factory=connection_factory,
         cancel_channel_factory=cancel_channel_factory,
+        results=SpoolStatementResults(
+            engine,
+            result_store,
+            max_active_resultsets_per_console=max_active_resultsets_per_console,
+        ),
         config=config,
     )
 

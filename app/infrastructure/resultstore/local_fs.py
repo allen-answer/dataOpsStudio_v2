@@ -4,6 +4,7 @@ import base64
 import json
 import shutil
 import time
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from datetime import time as dt_time
@@ -268,12 +269,22 @@ class LocalFsResultStore(ResultStore):
         shutil.rmtree(path)
         return True
 
-    def gc_expired(self) -> int:
+    def gc_expired(self, *, keep_result_set_ids: Collection[str] = ()) -> int:
+        """TTL 清理。`keep_result_set_ids` 里的 spool **无条件保留**。
+
+        评审修订 R3(Session Broker 设计 §10-A5):会话语句与 job 共用同一个
+        `result_sets` catalog 与同一个 spool 目录,而 GC 只看 mtime —— 一条
+        活跃会话的结果集(用户还在翻页/导出)只要 mtime 过了 TTL 就会被删掉,
+        且 `result_ttl_days=0` 时窗口是"立刻"。调用方(worker)把活跃会话语句的
+        result_set_id 传进来,GC 跳过它们;判定权在 catalog,不在文件时间。
+        """
+
+        keep = {_safe_segment(value) for value in keep_result_set_ids}
         removed = 0
         if self._result_ttl_days >= 0:
             cutoff = time.time() - (self._result_ttl_days * 24 * 60 * 60)
             removed += self._gc_children_older_than(self._runs_dir, cutoff)
-            removed += self._gc_children_older_than(self._resultsets_dir, cutoff)
+            removed += self._gc_children_older_than(self._resultsets_dir, cutoff, keep=keep)
         export_cutoff = time.time() - (self._sql_export_ttl_hours * 60 * 60)
         removed += self._gc_children_older_than(self._exports_dir, export_cutoff)
         upload_cutoff = time.time() - (self._upload_ttl_hours * 60 * 60)
@@ -361,11 +372,19 @@ class LocalFsResultStore(ResultStore):
         )
         temporary_path.replace(path)
 
-    def _gc_children_older_than(self, base: Path, cutoff: float) -> int:
+    def _gc_children_older_than(
+        self,
+        base: Path,
+        cutoff: float,
+        *,
+        keep: Collection[str] = (),
+    ) -> int:
         if not base.exists():
             return 0
         removed = 0
         for child in base.iterdir():
+            if child.name in keep:
+                continue
             if child.stat().st_mtime >= cutoff:
                 continue
             if child.is_dir():

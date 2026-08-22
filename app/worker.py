@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import zipfile
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -26,6 +26,8 @@ from sqlalchemy.exc import IntegrityError
 
 from app.config import Settings, load_settings
 from app.db.models import (
+    console_sessions,
+    console_statements,
     datasources,
     jobs,
     lineage_column_edges,
@@ -85,6 +87,7 @@ from app.domain.compare_sql import (
     legacy_generated_aliases,
     normalize_compare_sql,
 )
+from app.domain.console_session import ACTIVE_CONSOLE_SESSION_STATES
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.lineage import (
@@ -298,7 +301,17 @@ class ResultStoreLike(Protocol):
 
     def delete_spool(self, result_set_id: str) -> bool: ...
 
-    def gc_expired(self) -> int: ...
+    def gc_expired(self, *, keep_result_set_ids: Collection[str] = ()) -> int: ...
+
+
+class ActiveConsoleResultSetsLike(Protocol):
+    """活跃会话语句的结果集清单(Session Broker 评审修订 R3)。
+
+    会话语句与 job 共用 `result_sets` catalog 与同一个 spool 目录,而 spool GC
+    只认 mtime。没有这份清单,一条用户还在翻页/导出的会话结果集会被 TTL 删掉。
+    """
+
+    def active_result_set_ids(self) -> frozenset[str]: ...
 
 
 class DatabaseAdapterLike(Protocol):
@@ -479,6 +492,7 @@ class WorkerRunner:
         lineage_catalog: LineageCatalogLike | None = None,
         notify_reveal: RevealSecret | None = None,
         sensor_trigger_catalog: SensorTriggerCatalogLike | None = None,
+        active_console_resultsets: ActiveConsoleResultSetsLike | None = None,
     ) -> None:
         if config.sql_spool_batch_size <= 0:
             raise ValueError("sql_spool_batch_size must be positive")
@@ -504,6 +518,7 @@ class WorkerRunner:
         self._compare_run_catalog = compare_run_catalog
         self._lineage_catalog = lineage_catalog
         self._sensor_trigger_catalog = sensor_trigger_catalog
+        self._active_console_resultsets = active_console_resultsets
         # C-9:run 终态通知服务(注入 SecretStore.reveal_secret 作 RevealSecret DI)。
         # 未注入 reveal = 不通知(no-op),不影响 run 终态落定。
         self._notify_service = (
@@ -2143,7 +2158,19 @@ class WorkerRunner:
             return
         started_at = now
         try:
-            cleaned = self._result_store.gc_expired()
+            protected = self._protected_result_set_ids()
+        except Exception:
+            # R3:算不出保护集就**不跑 GC**。宁可这一轮不回收磁盘,也不能靠
+            # "假设没有活跃会话"去删别人正在读的结果集。下一轮再试。
+            logger.warning(
+                "worker result spool gc skipped: active console session lookup failed",
+                exc_info=True,
+                elapsed_seconds=_elapsed_seconds(started_at),
+            )
+            self._next_result_gc_at = now + self._config.result_gc_interval_seconds
+            return
+        try:
+            cleaned = self._result_store.gc_expired(keep_result_set_ids=protected)
         except Exception:
             logger.exception(
                 "worker result spool gc failed",
@@ -2153,10 +2180,18 @@ class WorkerRunner:
             logger.info(
                 "worker result spool gc complete",
                 cleaned=cleaned,
+                protected_resultsets=len(protected),
                 elapsed_seconds=_elapsed_seconds(started_at),
             )
         finally:
             self._next_result_gc_at = now + self._config.result_gc_interval_seconds
+
+    def _protected_result_set_ids(self) -> frozenset[str]:
+        """GC 豁免集(R3)。未注入 catalog(单元测试/无会话部署)= 空集。"""
+
+        if self._active_console_resultsets is None:
+            return frozenset()
+        return self._active_console_resultsets.active_result_set_ids()
 
 
 class PostgresDatasourceLoader:
@@ -2268,6 +2303,37 @@ class PostgresResultSetCatalog:
                 .where(result_sets.c.id == result_set_id)
                 .values(state=state, updated_at=datetime.now(UTC))
             )
+
+
+class PostgresActiveConsoleResultSets:
+    """活跃会话语句的结果集清单(Session Broker 评审修订 R3)。
+
+    "活跃"= 会话还在 `ACTIVE_CONSOLE_SESSION_STATES` 内(用户还能 observe /
+    翻页 / 导出这条语句的结果)。会话一旦 closed / session_lost,其结果集回到
+    普通 TTL 口径,与 job 结果一视同仁 —— 保护的是活人,不是永久豁免。
+    """
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def active_result_set_ids(self) -> frozenset[str]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(console_statements.c.result_set_id)
+                .select_from(
+                    console_statements.join(
+                        console_sessions,
+                        console_statements.c.session_id == console_sessions.c.id,
+                    )
+                )
+                .where(console_statements.c.result_set_id.is_not(None))
+                .where(
+                    console_sessions.c.state.in_(
+                        [state.value for state in ACTIVE_CONSOLE_SESSION_STATES]
+                    )
+                )
+            ).scalars()
+            return frozenset(str(value) for value in rows)
 
 
 class PostgresCompareRunCatalog:
@@ -2571,6 +2637,9 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
         notify_reveal=secret_store.reveal_secret,
         # C-10:sensor 命中触发的冷却期原子闸门(带守卫推进 + 入队 workflow_run)。
         sensor_trigger_catalog=PostgresSensorTriggerCatalog(engine),
+        # R3:spool GC 的会话豁免集。worker 不碰会话本体,只在删文件前问一句
+        # "这个结果集还属于活着的控制台会话吗"。
+        active_console_resultsets=PostgresActiveConsoleResultSets(engine),
     )
 
 

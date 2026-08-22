@@ -36,6 +36,11 @@ STATEMENT_TRANSITIONS: frozenset[tuple[ConsoleStatementState, ConsoleStatementSt
         (ConsoleStatementState.ACCEPTED, ConsoleStatementState.EXECUTING),
         (ConsoleStatementState.ACCEPTED, ConsoleStatementState.CANCELLED),
         (ConsoleStatementState.ACCEPTED, ConsoleStatementState.SKIPPED),
+        # A5:受理后、lane 取出前结果集就建不出来(spool 写失败 / PG 短暂不可用)。
+        # 设计 F9 规定这种情况语句归 failed(resultstore_error) 且会话续用 ——
+        # §2.2 的图只画到执行期错误,这条边是 F9 在受理期的同一条规则。
+        # 没有它,语句只能永远停在 accepted:前端白转圈,比失败更糟。
+        (ConsoleStatementState.ACCEPTED, ConsoleStatementState.FAILED),
         (ConsoleStatementState.EXECUTING, ConsoleStatementState.STREAMING),
         (ConsoleStatementState.EXECUTING, ConsoleStatementState.SUCCEEDED),
         (ConsoleStatementState.EXECUTING, ConsoleStatementState.FAILED),
