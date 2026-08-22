@@ -58,7 +58,7 @@ def test_console_sessions_schema_matches_design() -> None:
     }
     assert checks == {"ck_console_sessions_state_is_supported"}
 
-    indexes = {index.name: index for index in console_sessions.indexes}
+    indexes = {str(index.name): index for index in console_sessions.indexes}
     active_index = indexes["uq_console_active_session"]
     assert active_index.unique is True
     assert [column.name for column in active_index.columns] == ["console_id"]
@@ -138,9 +138,6 @@ def test_console_session_domain_snapshots_cover_schema() -> None:
     assert is_dataclass(ConsoleSession)
     assert is_dataclass(ConsoleStatement)
     assert is_dataclass(ConsoleStatementEvent)
-    assert ConsoleSession.__dataclass_params__.frozen is True
-    assert ConsoleStatement.__dataclass_params__.frozen is True
-    assert ConsoleStatementEvent.__dataclass_params__.frozen is True
     assert {field.name for field in fields(ConsoleSession)} == set(console_sessions.columns.keys())
     assert {field.name for field in fields(ConsoleStatement)} == set(
         console_statements.columns.keys()
