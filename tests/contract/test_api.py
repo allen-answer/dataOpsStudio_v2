@@ -133,6 +133,14 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("POST", "/api/admin/ai-config/test") in routes
     assert ("GET", "/api/admin/system-settings") in routes
     assert ("PUT", "/api/admin/system-settings") in routes
+    # SQL 控制台会话(Session Broker 设计 §3.1 端点全集)。
+    assert ("POST", "/api/sql/sessions/attach") in routes
+    assert ("GET", "/api/sql/sessions/{session_id}") in routes
+    assert ("POST", "/api/sql/sessions/{session_id}/statements") in routes
+    assert ("POST", "/api/sql/sessions/{session_id}/close") in routes
+    assert ("GET", "/api/sql/statements/{statement_id}/progress") in routes
+    assert ("GET", "/api/sql/statements/{statement_id}/result") in routes
+    assert ("POST", "/api/sql/statements/{statement_id}/cancel") in routes
 
 
 def test_version_is_public_and_reports_sanitized_build_identity(
