@@ -16,14 +16,18 @@ from app.broker.core import (
 )
 from app.broker.store import AttachRequest, MemoryBrokerStore
 from app.dbclients.interactive import (
+    CancelChannel,
     CancelChannelError,
     ClassifiedError,
     ErrorCategory,
+    ErrorClassifier,
+    InteractiveCapabilities,
+    InteractiveConnection,
     InteractiveExecuteError,
     ServerCancelSupport,
     StatementRequest,
 )
-from app.domain.console_session import ConsoleSessionState, ConsoleStatementState
+from app.domain.console_session import ConsoleSession, ConsoleSessionState, ConsoleStatementState
 from app.domain.datasource import DbType
 from app.domain.schema import Row
 
@@ -53,19 +57,19 @@ class DriverHarness:
     connections: list[FakeInteractiveConnection] = field(default_factory=list)
     channels: list[FakeCancelChannel] = field(default_factory=list)
 
-    def connection_factory(self, _session: object) -> FakeInteractiveConnection:
+    def connection_factory(self, _session: ConsoleSession) -> InteractiveConnection:
         connection = FakeInteractiveConnection(self, marker=str(100 + len(self.connections)))
         self.connections.append(connection)
         return connection
 
-    def channel_factory(self, _datasource_id: str) -> FakeCancelChannel:
+    def channel_factory(self, _datasource_id: str) -> CancelChannel:
         channel = FakeCancelChannel(self)
         self.channels.append(channel)
         return channel
 
 
 class FakeClassifier:
-    db_type = DbType.MYSQL
+    db_type: DbType = DbType.MYSQL
 
     def classify(self, _exc: BaseException) -> ClassifiedError:
         return ClassifiedError(ErrorCategory.UNKNOWN)
@@ -73,7 +77,12 @@ class FakeClassifier:
 
 class FakeInteractiveConnection:
     db_type = DbType.MYSQL
-    classifier = FakeClassifier()
+    classifier: ErrorClassifier = FakeClassifier()
+    capabilities = InteractiveCapabilities(
+        server_cancel=True,
+        server_statement_timeout=True,
+        session_streaming=True,
+    )
 
     def __init__(self, harness: DriverHarness, marker: str) -> None:
         self.harness = harness
@@ -139,7 +148,7 @@ class FakeInteractiveConnection:
 
 class FakeCancelChannel:
     db_type = DbType.MYSQL
-    classifier = FakeClassifier()
+    classifier: ErrorClassifier = FakeClassifier()
 
     def __init__(self, harness: DriverHarness) -> None:
         self.harness = harness
@@ -217,7 +226,9 @@ def _broker(
     return broker, store, harness
 
 
-def _request(console: str = "console-1", datasource: str = "ds-1", user: str = "user-1"):
+def _request(
+    console: str = "console-1", datasource: str = "ds-1", user: str = "user-1"
+) -> AttachRequest:
     return AttachRequest(console_id=console, datasource_id=datasource, owner_user_id=user)
 
 

@@ -16,7 +16,7 @@ from app.domain.console_session import ConsoleSessionState, ConsoleStatementStat
 
 @pytest.mark.parametrize(
     ("source", "target"),
-    sorted(SESSION_TRANSITIONS, key=lambda pair: (pair[0].value, pair[1].value)),
+    list(SESSION_TRANSITIONS),
 )
 def test_every_documented_session_transition_is_accepted(
     source: ConsoleSessionState, target: ConsoleSessionState
@@ -41,7 +41,7 @@ def test_every_undocumented_session_transition_is_rejected(
 
 @pytest.mark.parametrize(
     ("source", "target"),
-    sorted(STATEMENT_TRANSITIONS, key=lambda pair: (pair[0].value, pair[1].value)),
+    list(STATEMENT_TRANSITIONS),
 )
 def test_every_documented_statement_transition_is_accepted(
     source: ConsoleStatementState, target: ConsoleStatementState

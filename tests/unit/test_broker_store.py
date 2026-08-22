@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 from app.broker.store import AttachRequest, MemoryBrokerStore
 from app.domain.console_session import (
+    ConsoleSession,
     ConsoleSessionState,
     ConsoleStatementState,
 )
@@ -12,7 +13,7 @@ from app.domain.console_session import (
 NOW = datetime(2026, 8, 22, 9, 0, tzinfo=UTC)
 
 
-def _attach(store: MemoryBrokerStore, *, reuse_session_id: str | None = None):
+def _attach(store: MemoryBrokerStore, *, reuse_session_id: str | None = None) -> ConsoleSession:
     return store.attach_session(
         AttachRequest(console_id="console-1", datasource_id="ds-1", owner_user_id="user-1"),
         session_id="session-1",
