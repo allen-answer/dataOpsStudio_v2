@@ -275,27 +275,36 @@ def build_api_services(settings: Settings | None = None) -> ApiServices:
     )
     engine = _create_metadata_engine(actual_settings, bootstrap.get_pg_app_password())
     secret_store = LocalFileSecretStore(engine, bootstrap)
+    # 会话 lane 与 job worker **共用同一个 spool 目录与 result_sets catalog**
+    # (设计 §3.2 spool 复用),所以这里先造出唯一实例再交给 broker。
+    result_store = LocalFsResultStore(
+        actual_settings.result_store.local_root,
+        spool_max_rows=actual_settings.result_store.spool_max_rows,
+        spool_max_bytes=actual_settings.result_store.spool_max_bytes,
+        result_ttl_days=actual_settings.result_store.result_ttl_days,
+        sql_export_ttl_hours=actual_settings.result_store.sql_export_ttl_hours,
+        upload_ttl_hours=actual_settings.result_store.upload_ttl_hours,
+    )
+    max_active_resultsets_per_console = (
+        actual_settings.result_store.max_active_resultsets_per_console
+    )
     return ApiServices(
         engine=engine,
         job_backend=PostgresJobBackend(engine),
         secret_store=secret_store,
         session_broker=(
-            build_session_broker(engine, secret_store)
+            build_session_broker(
+                engine,
+                secret_store,
+                result_store,
+                max_active_resultsets_per_console=max_active_resultsets_per_console,
+            )
             if actual_settings.api.console_session_enabled
             else None
         ),
-        result_store=LocalFsResultStore(
-            actual_settings.result_store.local_root,
-            spool_max_rows=actual_settings.result_store.spool_max_rows,
-            spool_max_bytes=actual_settings.result_store.spool_max_bytes,
-            result_ttl_days=actual_settings.result_store.result_ttl_days,
-            sql_export_ttl_hours=actual_settings.result_store.sql_export_ttl_hours,
-            upload_ttl_hours=actual_settings.result_store.upload_ttl_hours,
-        ),
+        result_store=result_store,
         jwt_secret=bootstrap.get_jwt_secret(),
-        max_active_resultsets_per_console=(
-            actual_settings.result_store.max_active_resultsets_per_console
-        ),
+        max_active_resultsets_per_console=max_active_resultsets_per_console,
         metadata_probe_timeout_seconds=actual_settings.api.metadata_probe_timeout_seconds,
         export_per_user_per_hour=actual_settings.api.export_per_user_per_hour,
         download_url_ttl_seconds=actual_settings.api.download_url_ttl_seconds,

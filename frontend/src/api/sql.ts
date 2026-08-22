@@ -36,13 +36,22 @@ export interface SqlConsoleUpdateRequest {
   pinned?: boolean
 }
 
+/**
+ * SQL 历史条目。job 路径与会话语句(Session Broker)**合流**后按 sql_hash 去重:
+ * job 条目带 job_id,会话语句条目带 statement_id,`source` 明说来自哪条路径。
+ * `status` 统一成 job 状态词汇供状态徽标复用;会话独有的原始状态在
+ * `statement_state`(streaming / outcome_unknown / skipped)。
+ */
 export interface SqlHistoryItem {
-  job_id: string
+  job_id: string | null
+  statement_id: string | null
+  source: 'job' | 'console_statement'
   datasource_id: string | null
   datasource_name: string | null
   sql: string
   sql_hash: string
   status: string
+  statement_state: string | null
   created_at: string
   finished_at: string | null
   result_set_id: string | null

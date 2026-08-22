@@ -1155,7 +1155,8 @@ class StatementSubmitRequest(BaseModel):
 
 class StatementSubmitResponse(BaseModel):
     statement_id: str
-    # A4 的 lane 还不落 spool(spool 平价是 A5),故此处恒为 null。
+    # 受理即分配(job 路径同型):前端拿到回执就能按它开轮询,不必等 lane 排到。
+    # 幂等重发返回**原语句行的**同一个 result_set_id。
     result_set_id: str | None = None
     seq: int
     deduplicated: bool = False
@@ -1301,12 +1302,23 @@ class SqlConsoleResponse(BaseModel):
 
 
 class SqlHistoryItem(BaseModel):
-    job_id: str
+    """SQL 历史条目。**两条执行路径合流**(Session Broker 设计 §3.3 历史平价)。
+
+    job 路径条目带 `job_id`,会话语句条目带 `statement_id`;`source` 明说这条
+    来自哪条路径。`status` 统一成 job 状态词汇以便复用既有状态徽标,语句的
+    原始状态(会话独有的 streaming / outcome_unknown / skipped)另放
+    `statement_state` —— 映射是为了显示,不是为了掩盖差异。
+    """
+
+    job_id: str | None = None
+    statement_id: str | None = None
+    source: Literal["job", "console_statement"] = "job"
     datasource_id: str | None = None
     datasource_name: str | None = None
     sql: str
     sql_hash: str
     status: JobStatus
+    statement_state: ConsoleStatementState | None = None
     created_at: datetime
     finished_at: datetime | None = None
     result_set_id: str | None = None

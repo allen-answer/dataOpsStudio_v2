@@ -9,6 +9,13 @@ from app.broker.core import (
     SessionObservation,
     SubmitReceipt,
 )
+from app.broker.results import (
+    NullStatementResults,
+    SpoolStatementResults,
+    StatementMetrics,
+    StatementResults,
+    StatementSpool,
+)
 from app.broker.store import (
     AttachRequest,
     BrokerStore,
@@ -26,10 +33,15 @@ __all__ = [
     "BrokerStoreError",
     "CancelReceipt",
     "MemoryBrokerStore",
+    "NullStatementResults",
     "PostgresBrokerStore",
     "SessionBroker",
     "SessionLimits",
     "SessionObservation",
+    "SpoolStatementResults",
+    "StatementMetrics",
+    "StatementResults",
+    "StatementSpool",
     "SubmitReceipt",
     "SweepReport",
 ]

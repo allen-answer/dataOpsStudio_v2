@@ -165,6 +165,7 @@ from app.api.services import ApiServices, new_id
 from app.db.models import (
     ai_configs,
     compare_tasks,
+    console_statements,
     datasources,
     export_download_tokens,
     jobs,
@@ -236,6 +237,7 @@ from app.domain.compare_sql import (
     legacy_generated_aliases,
     normalize_compare_sql,
 )
+from app.domain.console_session import ConsoleStatementState
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.lineage import (
@@ -333,6 +335,19 @@ _METADATA_LEVEL_COLUMNS = "columns"
 _METADATA_LEVEL_INDEXES = "indexes"
 _MetadataCacheKey = tuple[str, str, str]
 _EXPORT_FORMATS = frozenset({"csv", "excel", "json", "sql"})
+# 会话语句状态 → job 状态词汇(SQL 历史合流的显示映射,设计 §3.3)。
+# 会话独有的状态一律**保守**落到不代表成功的那一格,原值另存 statement_state。
+_STATEMENT_STATE_TO_JOB_STATUS: dict[ConsoleStatementState, JobStatus] = {
+    ConsoleStatementState.ACCEPTED: JobStatus.PENDING,
+    ConsoleStatementState.EXECUTING: JobStatus.RUNNING,
+    ConsoleStatementState.STREAMING: JobStatus.RUNNING,
+    ConsoleStatementState.SUCCEEDED: JobStatus.SUCCESS,
+    ConsoleStatementState.FAILED: JobStatus.FAILED,
+    ConsoleStatementState.CANCELLED: JobStatus.CANCELLED,
+    ConsoleStatementState.TIMEOUT: JobStatus.TIMEOUT,
+    ConsoleStatementState.OUTCOME_UNKNOWN: JobStatus.FAILED,
+    ConsoleStatementState.SKIPPED: JobStatus.CANCELLED,
+}
 # 血缘导出同步生成(子图 depth<=5 数据量小),不复用 worker 的 export_limit_mb 配置;
 # 50MB 上限只是防御性护栏,正常子图导出远小于此。
 _LINEAGE_EXPORT_LIMIT_BYTES = 50 * 1024 * 1024
@@ -2168,6 +2183,12 @@ def list_sql_history(
     created_before: datetime | None = None,
     limit: int = Query(default=100, ge=1, le=100),
 ) -> list[SqlHistoryItem]:
+    """SQL 历史。job 路径与会话语句**合流**后按 sql_hash 去重(设计 §3.3)。
+
+    去重口径不变(仍按 sql_hash),排序仍是 created_at desc —— 合流后同一条
+    SQL 只留最近一次执行,不管它当时走的是哪条路径。
+    """
+
     services = services_from(request)
     user = current_user_from(request)
     filters = [jobs.c.owner_user_id == user.id, jobs.c.kind == JobKind.SQL_QUERY.value]
@@ -2177,6 +2198,13 @@ def list_sql_history(
         filters.append(jobs.c.created_at >= created_after)
     if created_before is not None:
         filters.append(jobs.c.created_at <= created_before)
+    statement_filters = [console_statements.c.owner_user_id == user.id]
+    if datasource_id is not None:
+        statement_filters.append(console_statements.c.datasource_id == datasource_id)
+    if created_after is not None:
+        statement_filters.append(console_statements.c.submitted_at >= created_after)
+    if created_before is not None:
+        statement_filters.append(console_statements.c.submitted_at <= created_before)
     with services.engine.connect() as conn:
         rows = (
             conn.execute(
@@ -2195,42 +2223,111 @@ def list_sql_history(
             .mappings()
             .all()
         )
+        statement_rows = (
+            conn.execute(
+                select(
+                    console_statements.c.id,
+                    console_statements.c.datasource_id,
+                    console_statements.c.sql_text,
+                    console_statements.c.sql_hash,
+                    console_statements.c.state,
+                    console_statements.c.result_set_id,
+                    console_statements.c.submitted_at,
+                    console_statements.c.finished_at,
+                )
+                .where(and_(*statement_filters))
+                .order_by(
+                    console_statements.c.submitted_at.desc(),
+                    console_statements.c.id.desc(),
+                )
+                .limit(500)
+            )
+            .mappings()
+            .all()
+        )
         datasource_ids = {
             item for row in rows for item in (row["datasource_ids"] or []) if isinstance(item, str)
         }
+        datasource_ids |= {
+            str(row["datasource_id"]) for row in statement_rows if row["datasource_id"] is not None
+        }
         datasource_names = _datasource_names(conn, datasource_ids)
+
+    candidates = [
+        *_job_history_candidates(rows),
+        *_statement_history_candidates(statement_rows),
+    ]
+    candidates.sort(key=lambda item: (_as_utc(item.created_at), item.sql_hash), reverse=True)
     out: list[SqlHistoryItem] = []
     seen: set[str] = set()
+    for item in candidates:
+        if item.sql_hash in seen:
+            continue
+        seen.add(item.sql_hash)
+        name = datasource_names.get(item.datasource_id) if item.datasource_id is not None else None
+        out.append(item.model_copy(update={"datasource_name": name}))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _job_history_candidates(rows: Sequence[RowMapping]) -> list[SqlHistoryItem]:
+    out: list[SqlHistoryItem] = []
     for row in rows:
         payload = row["payload"] if isinstance(row["payload"], dict) else {}
         sql = payload.get("sql")
         if not isinstance(sql, str) or not sql.strip():
             continue
         digest = payload.get("sql_hash")
-        sql_hash = digest if isinstance(digest, str) else _sql_hash(sql)
-        if sql_hash in seen:
-            continue
-        seen.add(sql_hash)
-        row_datasource_id = _history_datasource_id(row, payload)
-        row_datasource_name = (
-            datasource_names.get(row_datasource_id) if row_datasource_id is not None else None
-        )
         out.append(
             SqlHistoryItem(
                 job_id=str(row["id"]),
-                datasource_id=row_datasource_id,
-                datasource_name=row_datasource_name,
+                source="job",
+                datasource_id=_history_datasource_id(row, payload),
                 sql=sql,
-                sql_hash=sql_hash,
+                sql_hash=digest if isinstance(digest, str) else _sql_hash(sql),
                 status=JobStatus(str(row["status"])),
                 created_at=row["created_at"],
                 finished_at=row["finished_at"],
                 result_set_id=_result_set_id_from_payload(row),
             )
         )
-        if len(out) >= limit:
-            break
     return out
+
+
+def _statement_history_candidates(rows: Sequence[RowMapping]) -> list[SqlHistoryItem]:
+    out: list[SqlHistoryItem] = []
+    for row in rows:
+        sql = row["sql_text"]
+        if not isinstance(sql, str) or not sql.strip():
+            continue
+        state = ConsoleStatementState(str(row["state"]))
+        out.append(
+            SqlHistoryItem(
+                statement_id=str(row["id"]),
+                source="console_statement",
+                datasource_id=_optional_str(row["datasource_id"]),
+                sql=sql,
+                sql_hash=str(row["sql_hash"]),
+                status=_statement_state_as_job_status(state),
+                statement_state=state,
+                created_at=row["submitted_at"],
+                finished_at=row["finished_at"],
+                result_set_id=_optional_str(row["result_set_id"]),
+            )
+        )
+    return out
+
+
+def _statement_state_as_job_status(state: ConsoleStatementState) -> JobStatus:
+    """语句状态 → job 状态词汇(仅为复用历史列表的状态徽标)。
+
+    `outcome_unknown` 映射到 `failed` 是**显示口径**的保守选择(不显示成功);
+    真值仍在 `statement_state`,前端要区分就读那一列 —— 绝不反过来把
+    outcome_unknown 洗成 success。
+    """
+
+    return _STATEMENT_STATE_TO_JOB_STATUS[state]
 
 
 @router.get("/sql/templates", response_model=list[SqlTemplateResponse])
@@ -6464,7 +6561,9 @@ def get_job_progress(
         terminal=terminal,
         error="Job failed" if status in {JobStatus.FAILED, JobStatus.TIMEOUT} else None,
         error_code=error_code,
-        retry_after_ms=0 if terminal else (1000 if has_new_result else 2000),
+        # job 路径的调速规则一字不改(0/1000/2000);`queued` 快档是会话语句
+        # 独有的(排队在 lane mailbox 里,毫秒级就轮到)。
+        retry_after_ms=poll_retry_after_ms(terminal=terminal, fresh=has_new_result),
         has_new_result=has_new_result,
         truncated=_bool_from_manifest(manifest, "truncated"),
         has_more=_bool_from_manifest(manifest, "has_more"),
@@ -6854,6 +6953,22 @@ def _sql_hash(sql: str) -> str:
     return f"sha256:{digest}"
 
 
+def poll_retry_after_ms(*, terminal: bool, fresh: bool, queued: bool = False) -> int:
+    """轮询调速(Session Broker 设计 §3.2)。
+
+    **一份规则,两条路径共用** —— job progress 与语句 progress 各写一遍就是给
+    "两套轮询契约漂移"开门。终态 0(停轮询)、有新版本 1000(跟得上产出)、
+    没新版本 2000(退避)。`queued` 是会话语句独有的排队快档 500ms:语句排在
+    lane mailbox 里,毫秒级就会轮到,退避到 2s 会让"点了没反应"。
+    """
+
+    if terminal:
+        return 0
+    if queued:
+        return 500
+    return 1000 if fresh else 2000
+
+
 def _create_result_set_placeholder(
     services: ApiServices,
     *,
@@ -6924,6 +7039,31 @@ def _delete_closed_result_spools(services: ApiServices, result_set_ids: list[str
         deleted_spools=deleted,
         elapsed_seconds=round(time.monotonic() - started_at, 3),
     )
+
+
+def _result_set_row(services: ApiServices, result_set_id: str) -> RowMapping | None:
+    """result_sets 整行。会话语句的 `timings/execution` 存在 `storage_ref.metadata`
+    里(job 路径存在 `jobs.result_ref`),progress 镜像要从这里取。"""
+
+    with services.engine.connect() as conn:
+        return (
+            conn.execute(select(result_sets).where(result_sets.c.id == result_set_id))
+            .mappings()
+            .one_or_none()
+        )
+
+
+def _result_set_metadata_section(row: RowMapping | None, key: str) -> dict[str, Any]:
+    if row is None:
+        return {}
+    storage_ref = row["storage_ref"]
+    if not isinstance(storage_ref, dict):
+        return {}
+    metadata = storage_ref.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    section = metadata.get(key)
+    return section if isinstance(section, dict) else {}
 
 
 def _result_set_state(services: ApiServices, result_set_id: str) -> str | None:
@@ -9492,6 +9632,11 @@ def _dict_bool_or_payload(
     key: str,
 ) -> bool | None:
     value = values.get(key, payload.get(key))
+    return value if isinstance(value, bool) else None
+
+
+def _dict_bool(values: dict[str, Any], key: str) -> bool | None:
+    value = values.get(key)
     return value if isinstance(value, bool) else None
 
 
