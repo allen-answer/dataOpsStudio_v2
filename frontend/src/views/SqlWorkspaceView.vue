@@ -88,6 +88,20 @@ import {
   type MetadataTableItem,
 } from '../api/metadata'
 import { explainSql, preflightSql, type SqlPreflightFinding } from '../api/sql'
+import {
+  cancelStatement,
+  createStatementExport,
+  getStatementProgress,
+  getStatementResult,
+  submitStatement,
+  toJobProgress,
+  toJobResult,
+} from '../api/sessions'
+import {
+  useConsoleSessions,
+  type ConsoleSessionState,
+} from '../composables/useConsoleSessions'
+import ConsoleSessionBar from '../components/ConsoleSessionBar.vue'
 import { diagnoseSlowSql } from '../api/ai'
 import { ApiError, type DatasourceListItem, type ExportFormat, type JobStatus } from '../api/types'
 import { useThemeStore } from '../stores/theme'
@@ -137,6 +151,13 @@ interface ConsoleRuntime {
   statementCount: number
   jobId: string | null
   rootJobId: string | null
+  // 会话路径的语句身份(Session Broker)。与 jobId 互斥:一个 runtime 要么是
+  // 一条 job,要么是一条会话语句;`runtimeKey` 统一取身份键喂轮询机器。
+  statementId: string | null
+  // 幂等回执键:提交请求丢响应时可安全重发**提交**而不会二次执行(设计 §3.1)。
+  clientRequestId: string | null
+  // 提交时持有的 epoch;取消要带它,过期即 409 stale_session_epoch(M8)。
+  statementEpoch: number
   resultSetId: string | null
   status: JobStatus | null
   error: string | null
@@ -270,6 +291,12 @@ const renameConsoleDraft = ref('')
 const execError = ref<string | null>(null)
 const resultPanel = ref<HTMLElement | null>(null)
 
+// ── 控制台会话(Session Broker,设计 §3.3)──────────────────────────
+// 懒 attach:这里只持有绑定态,首次执行才建会话;方言不支持或部署开关关闭时
+// `ensureSession` 返回 null,整段执行路径原样回落到 job 路径。
+const consoleSessions = useConsoleSessions()
+const sessionBusy = ref(false)
+
 // ── 元数据浏览器(左侧第四 tab)─────────────────────────────────────
 const metadataDsId = ref('')
 const metadataSchemas = ref<MetadataSchemaNode[]>([])
@@ -341,11 +368,31 @@ const metadataToolsSupported = computed<boolean>(() => {
   const ds = metadataDs.value
   return Boolean(ds && SUPPORTED_TOOL_DB_TYPES.has(ds.db_type))
 })
-const exportableJobId = computed<string | null>(() => {
+/**
+ * 可导出源。job 路径仅 success(后端 _require_exportable_source 只认 SQL_QUERY 且
+ * success);会话路径追加 cancelled / timeout —— 取消保留的部分结果可读即可导出
+ * (设计 §2.2 / F6),这正是与 job 路径「取消即删 spool」的刻意差别。
+ */
+const EXPORTABLE_STATEMENT_STATUSES: ReadonlySet<JobStatus> = new Set<JobStatus>([
+  'success',
+  'cancelled',
+  'timeout',
+])
+const exportableSource = computed<{ kind: 'job' | 'statement'; id: string } | null>(() => {
   const rt = activeRuntime.value
-  // 仅成功的普通查询 job 可导出(后端 _require_exportable_source 仅 SQL_QUERY 且 success)。
-  return rt && rt.status === 'success' && rt.jobId ? rt.jobId : null
+  if (!rt || !rt.status) return null
+  if (rt.statementId) {
+    return EXPORTABLE_STATEMENT_STATUSES.has(rt.status) && rt.resultSetId
+      ? { kind: 'statement', id: rt.statementId }
+      : null
+  }
+  return rt.status === 'success' && rt.jobId ? { kind: 'job', id: rt.jobId } : null
 })
+
+// ── 会话状态条 / banner 的渲染判据 ──────────────────────────────
+const activeSession = computed(() => consoleSessions.sessionFor(activeConsoleId.value))
+const sessionTakenOver = computed(() => consoleSessions.isTakenOver(activeConsoleId.value))
+const sessionLost = computed(() => consoleSessions.isLost(activeConsoleId.value))
 const editorTheme = computed(() => {
   const v = variant.value
   return v === 'spotify-dark' || v === 'figma-dark' ? 'vs-dark' : 'vs'
@@ -389,6 +436,18 @@ const statusSummary = computed(() => {
   if (rt.status === 'cancelled') return t('sql.cancelled_hint')
   if (rt.status === 'timeout') return t('sql.timeout_hint')
   return rt.error || t('jobs.error.sql_failed')
+})
+/**
+ * 会话路径取消 / 超时会**保留已落 spool 的行**(设计 §2.2/§11-7,与 job 路径
+ * 「取消即删」刻意不同)。有行就明说「这是被打断前的部分结果」,不让用户把
+ * 半张表当成完整结果读。
+ */
+const sessionPartialHint = computed<string | null>(() => {
+  const rt = activeRuntime.value
+  if (!rt?.statementId || !rt.status) return null
+  if (rt.status !== 'cancelled' && rt.status !== 'timeout') return null
+  const rows = rt.result?.loaded_rows ?? rt.result?.rows.length ?? 0
+  return rows > 0 ? t('sql.session_partial_rows', { rows }) : null
 })
 const shouldShowResultTable = computed(() => {
   const rt = activeRuntime.value
@@ -511,6 +570,12 @@ watch(activeConsoleId, () => {
   preflightFindings.value = null
 })
 
+// 切 console → 会话只做**单次 observe**(设计 §3.3):空闲期不轮询,
+// 也不因为切过去看一眼就把会话建起来。没绑过会话的 console 什么都不发。
+watch(activeConsoleId, (current) => {
+  if (current) void consoleSessions.observe(current)
+})
+
 watch(selectedDsId, (value, previous) => {
   if (value !== previous) aiPanelOpen.value = false
   execError.value = null
@@ -560,7 +625,8 @@ onUnmounted(() => {
   for (const runtimeList of Object.values(runtimes)) {
     for (const runtime of runtimeList) {
       cancelResultRead(runtime)
-      if (runtime.jobId) releasePollLease(runtime.jobId)
+      const key = runtimeKey(runtime)
+      if (key) releasePollLease(key)
     }
   }
   progressChannel?.removeEventListener('message', onProgressBroadcast)
@@ -579,6 +645,9 @@ function createRuntime(statement = '', statementIndex = 0, statementCount = 1): 
     statementCount,
     jobId: null,
     rootJobId: null,
+    statementId: null,
+    clientRequestId: null,
+    statementEpoch: 0,
     resultSetId: null,
     status: null,
     error: null,
@@ -652,6 +721,10 @@ async function deleteConsole(consoleId: string): Promise<void> {
   consoleError.value = null
   try {
     await cancelConsoleQueries(consoleId)
+    // console 没了,会话的绑定锚点也就没了:先关会话再删,避免留一条
+    // 只能等空闲回收的连接。关不掉不阻塞删除 —— 空闲 Timer 会兜底。
+    await consoleSessions.close(consoleId).catch(() => {})
+    consoleSessions.forget(consoleId)
     await deleteSqlConsole(consoleId)
     consoles.value = consoles.value.filter((item) => item.id !== consoleId)
     stopConsolePoll(consoleId)
@@ -839,6 +912,21 @@ async function onExecute(): Promise<void> {
   const batchRuntimes = runtimesFor(consoleRow.id)
   scrollResultIntoView()
 
+  // 懒 attach:走到这里才建会话。返回 null = 该部署/方言没有会话,回落 job 路径。
+  let session: ConsoleSessionState | null = null
+  try {
+    session = await consoleSessions.ensureSession(consoleRow.id, selectedDs.value?.db_type ?? null)
+  } catch (e) {
+    // attach 本身失败(建连失败 / 会话数护栏)——不静默降级成 job 路径,
+    // 否则用户以为拿到的是会话语义,实际不是。
+    failBatch(batchRuntimes, errorMessage(e))
+    return
+  }
+  if (session) {
+    await submitSessionBatch(consoleRow.id, session, batchRuntimes, requestedMaxRows)
+    return
+  }
+
   await Promise.all(
     batchRuntimes.map(async (runtime, index) => {
       try {
@@ -864,22 +952,173 @@ async function onExecute(): Promise<void> {
   )
 }
 
+function failBatch(batchRuntimes: ConsoleRuntime[], message: string): void {
+  for (const runtime of batchRuntimes) {
+    runtime.status = null
+    runtime.error = message
+    runtime.finishedAt = Date.now()
+  }
+}
+
+/** 未提交出去的语句标成 cancelled + 「已跳过」——不留一排假的 pending。 */
+function skipRemaining(batchRuntimes: ConsoleRuntime[], fromIndex: number): void {
+  for (const runtime of batchRuntimes.slice(fromIndex)) {
+    runtime.status = 'cancelled'
+    runtime.message = t('sql.session_statement_skipped')
+    runtime.finishedAt = Date.now()
+  }
+}
+
+/**
+ * 同 console **按序提交**(设计 §3.3 行为变化)。
+ *
+ * 旧行为是 `Promise.all` 并行提交每条语句各起一个 job;会话模型下一条连接一个
+ * lane,同 console 语句天然串行(DataGrip 语义,也是会话连续性的前提)。
+ * 这里只保证**提交顺序**——lane 按 seq 顺序执行,不必等前一条终态再提交下一条,
+ * 于是 statement tab 条能立刻列全,逐条状态由各自轮询更新。
+ *
+ * 每条语句一个独立 `client_request_id`:提交响应丢了可安全重发提交请求,
+ * 服务端按 (session_id, client_request_id) 去重,永不重执行。
+ */
+async function submitSessionBatch(
+  consoleId: string,
+  session: ConsoleSessionState,
+  batchRuntimes: ConsoleRuntime[],
+  requestedMaxRows: number,
+): Promise<void> {
+  const sessionId = session.sessionId
+  if (!sessionId) return
+  for (const [index, runtime] of batchRuntimes.entries()) {
+    runtime.clientRequestId = newClientRequestId()
+    runtime.statementEpoch = session.epoch
+    try {
+      const response = await submitStatement(sessionId, {
+        epoch: session.epoch,
+        sql: runtime.statement,
+        client_request_id: runtime.clientRequestId,
+        page_size: runtime.pageSize,
+        max_result_rows: requestedMaxRows,
+      })
+      runtime.statementId = response.statement_id
+      runtime.resultSetId = response.result_set_id
+      startConsolePoll(consoleId, runtime)
+    } catch (e) {
+      handleSessionConflict(consoleId, e)
+      runtime.status = null
+      runtime.error = errorMessage(e)
+      runtime.finishedAt = Date.now()
+      // 前一条已经排进 lane 了,后面的不再提交:批次语义是「按序」,
+      // 中间断了就断了,不能跳过一条继续送后面的。
+      skipRemaining(batchRuntimes, index + 1)
+      return
+    }
+  }
+}
+
+function newClientRequestId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+/**
+ * 会话冲突 409 → 会话态。`stale_session_epoch` 随体带 current_epoch(M1),
+ * 直接渲染接管提示;`session_lost` / `session_not_active` 落 session_lost banner。
+ */
+function handleSessionConflict(consoleId: string, error: unknown): void {
+  if (!(error instanceof ApiError) || error.status !== 409) return
+  const code = error.code ?? ''
+  if (code === 'stale_session_epoch') {
+    consoleSessions.applyStaleEpoch(consoleId, error.body?.current_epoch)
+    return
+  }
+  if (code === 'session_lost' || code === 'session_not_active') {
+    consoleSessions.markLost(consoleId, code)
+  }
+}
+
 async function onCancel(): Promise<void> {
   if (writesBlocked.value) return
+  const consoleId = activeConsoleId.value
   const cancellable = activeRuntimes.value.filter(
-    (runtime) => runtime.jobId && runtime.status && ACTIVE.has(runtime.status) && !runtime.cancelling,
+    (runtime) =>
+      runtimeKey(runtime) && runtime.status && ACTIVE.has(runtime.status) && !runtime.cancelling,
   )
   await Promise.all(
     cancellable.map(async (runtime) => {
       runtime.cancelling = true
       try {
-        await cancelJob(runtime.jobId as string)
+        await cancelRuntime(runtime)
       } catch (e) {
         runtime.cancelling = false
+        if (consoleId) handleSessionConflict(consoleId, e)
         runtime.error = errorMessage(e)
       }
     }),
   )
+}
+
+/**
+ * 取消一条 runtime。会话路径带上提交时的 epoch —— 取消权随 epoch 移交(M8),
+ * 旧 tab 的 cancel 得 409,不允许「看不见结果的窗口杀掉别人正观察的查询」。
+ *
+ * 会话取消**不是**协作式软取消:排队中出队,执行中走控制连接硬取消阶梯
+ * (设计 §4.1)。`server_cancel=degraded` 的数据源会退化为断连兜底,
+ * 这一点由状态条如实告知,前端不在这里替用户做判断。
+ */
+function cancelRuntime(runtime: ConsoleRuntime): Promise<unknown> {
+  if (runtime.statementId) {
+    return cancelStatement(runtime.statementId, runtime.statementEpoch).then((receipt) => {
+      // 服务端说没受理(已终态)就别把按钮永远停在「取消中」。
+      if (!receipt.accepted) runtime.cancelling = false
+      return receipt
+    })
+  }
+  return cancelJob(runtime.jobId as string)
+}
+
+// ── 会话生命周期(懒 attach / 重连 / 关闭)─────────────────────────
+/** 「重新连接」:接管回持有权或重建丢失的会话,并清掉旧语句身份。 */
+async function onReconnectSession(): Promise<void> {
+  const consoleId = activeConsoleId.value
+  if (!consoleId || sessionBusy.value) return
+  sessionBusy.value = true
+  execError.value = null
+  try {
+    stopConsolePoll(consoleId)
+    for (const runtime of runtimes[consoleId] ?? []) {
+      // 旧会话的语句在新会话里没有身份,继续轮询只会一直 404。
+      if (runtime.status && !TERMINAL.has(runtime.status)) runtime.status = 'cancelled'
+      runtime.statementId = null
+    }
+    await consoleSessions.reattach(consoleId, selectedDs.value?.db_type ?? null)
+  } catch (e) {
+    execError.value = errorMessage(e)
+  } finally {
+    sessionBusy.value = false
+  }
+}
+
+/** 显式关闭会话(先取消在跑语句 → rollback → 断连,服务端做)。 */
+async function onCloseSession(): Promise<void> {
+  const consoleId = activeConsoleId.value
+  if (!consoleId || sessionBusy.value) return
+  sessionBusy.value = true
+  try {
+    stopConsolePoll(consoleId)
+    await consoleSessions.close(consoleId)
+  } catch (e) {
+    execError.value = errorMessage(e)
+  } finally {
+    sessionBusy.value = false
+  }
+}
+
+/**
+ * 轮询机器的身份键。job 路径是 job_id,会话路径是 statement_id —— 两者都只被
+ * 当作「这一格结果属于谁」的标识用(定时器 key / 跨 tab lease / 广播匹配),
+ * 于是整套自适应退避、lease、渐进读取一行不改地服务两条路径(设计 §3.2)。
+ */
+function runtimeKey(runtime: ConsoleRuntime): string | null {
+  return runtime.statementId ?? runtime.jobId
 }
 
 function startConsolePoll(consoleId: string, runtime: ConsoleRuntime): void {
@@ -904,13 +1143,14 @@ function stopConsolePoll(consoleId: string): void {
   }
   for (const runtime of runtimes[consoleId] ?? []) {
     cancelResultRead(runtime)
-    if (runtime.jobId) releasePollLease(runtime.jobId)
+    const key = runtimeKey(runtime)
+    if (key) releasePollLease(key)
   }
 }
 
 function resumeConsolePoll(consoleId: string): void {
   for (const runtime of runtimes[consoleId] ?? []) {
-    if (runtime.jobId && runtime.status && ACTIVE.has(runtime.status)) {
+    if (runtimeKey(runtime) && runtime.status && ACTIVE.has(runtime.status)) {
       startConsolePoll(consoleId, runtime)
     }
   }
@@ -919,23 +1159,23 @@ function resumeConsolePoll(consoleId: string): void {
 async function cancelConsoleQueries(consoleId?: string): Promise<void> {
   if (writesBlocked.value) return
   const consoleIds = consoleId ? [consoleId] : Object.keys(runtimes)
-  const activeJobs = consoleIds.flatMap((id) =>
-    (runtimes[id] ?? [])
-      .filter((runtime) => runtime.jobId && runtime.status && ACTIVE.has(runtime.status))
-      .map((runtime) => runtime.jobId as string),
+  const pending = consoleIds.flatMap((id) =>
+    (runtimes[id] ?? []).filter(
+      (runtime) => runtimeKey(runtime) && runtime.status && ACTIVE.has(runtime.status),
+    ),
   )
-  if (activeJobs.length === 0) return
-  await Promise.allSettled(activeJobs.map((jobId) => cancelJob(jobId)))
+  if (pending.length === 0) return
+  await Promise.allSettled(pending.map((runtime) => cancelRuntime(runtime)))
 }
 
 async function pollConsole(consoleId: string, runtime: ConsoleRuntime): Promise<void> {
-  if (!runtime.jobId) return
+  const key = runtimeKey(runtime)
+  if (!key) return
   if (!runtimes[consoleId]?.includes(runtime)) return
   if (activeConsoleId.value !== consoleId) return
-  const jobId = runtime.jobId
-  const pollKey = `query:${consoleId}:${jobId}`
+  const pollKey = `query:${consoleId}:${key}`
   pollTimers.delete(pollKey)
-  if (!tryAcquirePollLease(jobId)) {
+  if (!tryAcquirePollLease(key)) {
     scheduleConsolePoll(consoleId, runtime, POLL_MS)
     return
   }
@@ -945,12 +1185,12 @@ async function pollConsole(consoleId: string, runtime: ConsoleRuntime): Promise<
   const resultGeneration = runtime.resultGeneration
   let nextDelay = POLL_MS
   try {
-    const progress = await loadJobProgress(jobId, runtime, controller.signal)
-    if (runtime.jobId !== jobId || !runtimes[consoleId]?.includes(runtime)) return
+    const progress = await loadRuntimeProgress(consoleId, runtime, controller.signal)
+    if (runtimeKey(runtime) !== key || !runtimes[consoleId]?.includes(runtime)) return
     await consumeJobProgress(runtime, progress, controller.signal, resultGeneration)
     progressChannel?.postMessage({ source: pollingTabId, progress })
     if (progress.terminal) {
-      releasePollLease(jobId)
+      releasePollLease(key)
       return
     }
     nextDelay = nextQueryPollDelay(runtime, progress.retry_after_ms)
@@ -966,14 +1206,15 @@ async function pollConsole(consoleId: string, runtime: ConsoleRuntime): Promise<
   } finally {
     if (pollControllers.get(pollKey) === controller) pollControllers.delete(pollKey)
   }
-  if (runtime.jobId === jobId && runtime.status && !TERMINAL.has(runtime.status)) {
+  if (runtimeKey(runtime) === key && runtime.status && !TERMINAL.has(runtime.status)) {
     scheduleConsolePoll(consoleId, runtime, nextDelay)
   }
 }
 
 function scheduleConsolePoll(consoleId: string, runtime: ConsoleRuntime, delayMs: number): void {
-  if (!runtime.jobId || activeConsoleId.value !== consoleId) return
-  const pollKey = `query:${consoleId}:${runtime.jobId}`
+  const key = runtimeKey(runtime)
+  if (!key || activeConsoleId.value !== consoleId) return
+  const pollKey = `query:${consoleId}:${key}`
   const existing = pollTimers.get(pollKey)
   if (existing) clearTimeout(existing)
   pollTimers.set(
@@ -982,6 +1223,25 @@ function scheduleConsolePoll(consoleId: string, runtime: ConsoleRuntime, delayMs
       void pollConsole(consoleId, runtime)
     }, Math.max(POLL_MS, document.hidden ? QUERY_POLL_HIDDEN_MS : delayMs)),
   )
+}
+
+/**
+ * 一次轮询 = 一条 progress。会话路径读语句 progress 后转成 job progress 形状,
+ * 并把内嵌的 `session` 块喂给会话状态条 —— 执行期间只有这一条轮询循环,
+ * 语句与会话状态同时刷新(设计 §3.2),空闲期不轮询。
+ */
+async function loadRuntimeProgress(
+  consoleId: string,
+  runtime: ConsoleRuntime,
+  signal: AbortSignal,
+): Promise<JobProgressResponse> {
+  const statementId = runtime.statementId
+  if (statementId) {
+    const progress = await getStatementProgress(statementId, runtime.resultVersion, signal)
+    consoleSessions.applySessionBlock(consoleId, progress.session)
+    return toJobProgress(progress)
+  }
+  return loadJobProgress(runtime.jobId as string, runtime, signal)
 }
 
 async function loadJobProgress(
@@ -1097,19 +1357,33 @@ function applyJobProgress(runtime: ConsoleRuntime, progress: JobProgressResponse
   if (progress.terminal) runtime.cancelling = false
 }
 
+/** 结果页读取:会话语句读 spool 与 job 同形(设计 §3.1),只差端点。 */
+function readResultPage(
+  runtime: ConsoleRuntime,
+  offset: number,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<JobResultResponse> {
+  const statementId = runtime.statementId
+  if (statementId) {
+    return getStatementResult(statementId, offset, limit, signal).then(toJobResult)
+  }
+  return getJobResult(runtime.jobId as string, offset, limit, signal)
+}
+
 async function fetchResult(
   runtime: ConsoleRuntime,
   offset: number,
   showLoading: boolean = true,
   signal?: AbortSignal,
 ): Promise<ResultReadOutcome> {
-  if (!runtime.jobId) return { applied: false, generation: runtime.resultGeneration }
-  const jobId = runtime.jobId
+  const key = runtimeKey(runtime)
+  if (!key) return { applied: false, generation: runtime.resultGeneration }
   const generation = advanceResultGeneration(runtime)
   if (showLoading) runtime.resultLoading = true
   try {
-    const result = await getJobResult(jobId, offset, runtime.pageSize, signal)
-    if (signal?.aborted || runtime.jobId !== jobId || runtime.resultGeneration !== generation) {
+    const result = await readResultPage(runtime, offset, runtime.pageSize, signal)
+    if (signal?.aborted || runtimeKey(runtime) !== key || runtime.resultGeneration !== generation) {
       return { applied: false, generation }
     }
     runtime.result = result
@@ -1117,7 +1391,7 @@ async function fetchResult(
     return { applied: true, generation }
   } catch (e) {
     if (isAbortError(e)) throw e
-    if (runtime.jobId !== jobId || runtime.resultGeneration !== generation) {
+    if (runtimeKey(runtime) !== key || runtime.resultGeneration !== generation) {
       return { applied: false, generation }
     }
     if (isResultNotReady(e, runtime)) return { applied: false, generation }
@@ -1135,10 +1409,10 @@ async function fetchResult(
  * superseded request unable to contaminate the current page.
  */
 async function appendResultDelta(runtime: ConsoleRuntime, signal?: AbortSignal): Promise<ResultReadOutcome> {
-  if (!runtime.jobId || !runtime.result) {
+  const key = runtimeKey(runtime)
+  if (!key || !runtime.result) {
     return { applied: false, generation: runtime.resultGeneration }
   }
-  const jobId = runtime.jobId
   const current = runtime.result
   if (current.offset !== runtime.pageOffset || current.rows.length >= runtime.pageSize) {
     return { applied: true, generation: runtime.resultGeneration }
@@ -1148,10 +1422,10 @@ async function appendResultDelta(runtime: ConsoleRuntime, signal?: AbortSignal):
   if (limit <= 0) return { applied: true, generation: runtime.resultGeneration }
   const generation = advanceResultGeneration(runtime)
   try {
-    const delta = await getJobResult(jobId, offset, limit, signal)
+    const delta = await readResultPage(runtime, offset, limit, signal)
     if (
       signal?.aborted ||
-      runtime.jobId !== jobId ||
+      runtimeKey(runtime) !== key ||
       runtime.resultGeneration !== generation ||
       runtime.result !== current ||
       delta.offset !== offset
@@ -1180,7 +1454,7 @@ async function appendResultDelta(runtime: ConsoleRuntime, signal?: AbortSignal):
     return { applied: true, generation }
   } catch (e) {
     if (isAbortError(e)) throw e
-    if (runtime.jobId !== jobId || runtime.resultGeneration !== generation) {
+    if (runtimeKey(runtime) !== key || runtime.resultGeneration !== generation) {
       return { applied: false, generation }
     }
     if (isResultNotReady(e, runtime)) return { applied: false, generation }
@@ -1228,9 +1502,9 @@ function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === 'AbortError'
 }
 
-function tryAcquirePollLease(jobId: string): boolean {
+function tryAcquirePollLease(runtimeId: string): boolean {
   const now = Date.now()
-  const key = `${QUERY_POLL_LEASE_PREFIX}${jobId}`
+  const key = `${QUERY_POLL_LEASE_PREFIX}${runtimeId}`
   try {
     const current = JSON.parse(localStorage.getItem(key) ?? 'null') as {
       owner?: string
@@ -1248,8 +1522,8 @@ function tryAcquirePollLease(jobId: string): boolean {
   }
 }
 
-function releasePollLease(jobId: string): void {
-  const key = `${QUERY_POLL_LEASE_PREFIX}${jobId}`
+function releasePollLease(runtimeId: string): void {
+  const key = `${QUERY_POLL_LEASE_PREFIX}${runtimeId}`
   try {
     const current = JSON.parse(localStorage.getItem(key) ?? 'null') as { owner?: string } | null
     if (current?.owner === pollingTabId) localStorage.removeItem(key)
@@ -1264,17 +1538,17 @@ function onProgressBroadcast(event: MessageEvent<unknown>): void {
   const progress = message.progress
   for (const [consoleId, runtimeList] of Object.entries(runtimes)) {
     for (const runtime of runtimeList) {
-      if (runtime.jobId !== progress.job_id) continue
+      if (runtimeKey(runtime) !== progress.job_id) continue
       if (activeConsoleId.value !== consoleId) {
         applyJobProgress(runtime, progress)
         continue
       }
-      const broadcastJobId = runtime.jobId
+      const broadcastKey = runtimeKey(runtime)
       void consumeJobProgress(runtime, progress, undefined, runtime.resultGeneration).then((outcome) => {
         if (
           !outcome.accepted ||
           !isCurrentRuntime(consoleId, runtime) ||
-          runtime.jobId !== broadcastJobId ||
+          runtimeKey(runtime) !== broadcastKey ||
           runtime.resultGeneration !== outcome.resultGeneration
         ) {
           return
@@ -1296,15 +1570,16 @@ function stopRuntimePoll(
   runtime: ConsoleRuntime,
   options: { cancelResultRead?: boolean } = {},
 ): void {
-  if (!runtime.jobId) return
+  const key = runtimeKey(runtime)
+  if (!key) return
   if (options.cancelResultRead !== false) cancelResultRead(runtime)
-  const pollKey = `query:${consoleId}:${runtime.jobId}`
+  const pollKey = `query:${consoleId}:${key}`
   const timer = pollTimers.get(pollKey)
   if (timer) clearTimeout(timer)
   pollTimers.delete(pollKey)
   pollControllers.get(pollKey)?.abort()
   pollControllers.delete(pollKey)
-  releasePollLease(runtime.jobId)
+  releasePollLease(key)
 }
 
 function onVisibilityChange(): void {
@@ -1316,13 +1591,20 @@ function onVisibilityChange(): void {
 
 async function onChangePage(offset: number): Promise<void> {
   const runtime = activeRuntime.value
-  if (!runtime?.jobId || !runtime.result) return
+  if (!runtime || !runtimeKey(runtime) || !runtime.result) return
   const loadedRows = runtime.result.loaded_rows ?? 0
   if (offset < loadedRows) {
     await fetchResult(runtime, offset)
     return
   }
   if (!runtime.result.has_more) return
+  if (runtime.statementId) {
+    // 已落 spool 的行随便翻;越过它就得重查一次数据库,而语句路径没有
+    // job 的 `/jobs/{id}/pages` 那种无状态分页端点(阶段 A 范围线外)。
+    // 如实说明,不假装能翻。
+    runtime.error = t('sql.session_page_beyond_loaded')
+    return
+  }
   if (runtime.result.pagination_mode !== 'ordered_offset') {
     runtime.error = t('sql.pagination_order_required')
     return
@@ -1335,7 +1617,9 @@ async function onChangePage(offset: number): Promise<void> {
   if (!consoleId) return
   const originalJobId = runtime.jobId
   const originalRootJobId = runtime.rootJobId
+  // 会话语句已在上面提前返回,能走到这里的必然是 job 路径。
   const requestJobId = runtime.rootJobId ?? runtime.jobId
+  if (!requestJobId) return
   // Invalidate an in-flight progressive delta before changing the page/job.
   const requestGeneration = cancelResultRead(runtime)
   runtime.resultLoading = true
@@ -1807,13 +2091,16 @@ async function onCreateExport(format: ExportFormat): Promise<void> {
     exportError.value = t('license.writes_blocked')
     return
   }
-  const jobId = exportableJobId.value
+  const source = exportableSource.value
   exportMenuOpen.value = false
-  if (!jobId || exportBusy.value) return
+  if (!source || exportBusy.value) return
   resetExportState()
   exportBusy.value = true
   try {
-    const res = await createExport(jobId, format)
+    const res =
+      source.kind === 'statement'
+        ? await createStatementExport(source.id, format)
+        : await createExport(source.id, format)
     await pollExportJob(res.job_id, res.download_token, res.filename)
   } catch (e) {
     exportBusy.value = false
@@ -2403,6 +2690,7 @@ function parseVariables(value: string): string[] {
           v-if="!editorReadOnly"
           type="button"
           class="chrome-btn-primary"
+          data-testid="sql-execute"
           @click="onExecute"
           :disabled="writesBlocked || !activeConsole || !selectedDsId || !editorSql.trim() || !!unsupportedDb || queryMaxRows === null"
           :title="writesBlocked ? t('license.writes_blocked') : unsupportedDb ? t('sql.unsupported_db_error', { db: unsupportedDb }) : ''"
@@ -2414,14 +2702,30 @@ function parseVariables(value: string): string[] {
           v-else
           type="button"
           class="chrome-btn-secondary"
+          data-testid="sql-cancel"
           @click="onCancel"
           :disabled="writesBlocked || activeRuntime?.cancelling"
-          :title="writesBlocked ? t('license.writes_blocked') : ''"
+          :title="
+            writesBlocked
+              ? t('license.writes_blocked')
+              : activeSession?.serverCancel === 'degraded'
+                ? t('sql.session_cancel_degraded_hint')
+                : ''
+          "
         >
           <Square class="w-3.5 h-3.5" />
           {{ activeRuntime?.cancelling ? t('sql.cancelling') : t('sql.cancel') }}
         </button>
       </div>
+
+      <ConsoleSessionBar
+        :session="activeSession"
+        :taken-over="sessionTakenOver"
+        :lost="sessionLost"
+        :busy="sessionBusy"
+        @reconnect="onReconnectSession"
+        @close="onCloseSession"
+      />
 
       <div
         v-if="unsupportedDb"
@@ -2600,19 +2904,26 @@ function parseVariables(value: string): string[] {
             </div>
             <div class="flex items-center gap-3 min-w-0">
               <span class="chrome-text-muted truncate">{{ statusSummary }}</span>
+              <span
+                v-if="sessionPartialHint"
+                data-testid="sql-session-partial"
+                class="shrink-0 text-amber-700 dark:text-amber-300"
+              >
+                {{ sessionPartialHint }}
+              </span>
               <div class="relative">
                 <button
                   type="button"
                   class="chrome-btn-secondary"
-                  :disabled="writesBlocked || !exportableJobId || exportBusy"
-                  :title="writesBlocked ? t('license.writes_blocked') : !exportableJobId ? t('sql.export_needs_success') : t('sql.export')"
+                  :disabled="writesBlocked || !exportableSource || exportBusy"
+                  :title="writesBlocked ? t('license.writes_blocked') : !exportableSource ? t('sql.export_needs_success') : t('sql.export')"
                   @click="exportMenuOpen = !exportMenuOpen"
                 >
                   <Download class="w-3.5 h-3.5" />
                   {{ exportBusy ? t('sql.export_running') : t('sql.export') }}
                 </button>
                 <div
-                  v-if="exportMenuOpen && exportableJobId"
+                  v-if="exportMenuOpen && exportableSource"
                   class="absolute right-0 mt-1 z-20 w-32 rounded-card border chrome-border chrome-bg-panel shadow-lg py-1"
                 >
                   <button

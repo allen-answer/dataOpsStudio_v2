@@ -417,6 +417,11 @@ export interface ApiErrorBody {
   error?: string
   message?: string
   detail?: unknown
+  /**
+   * 409 `stale_session_epoch` 随体带的会话当前 epoch(Session Broker 设计 §2.3 M1)。
+   * 被接管的旧 tab 据此直接渲染「已被另一窗口接管」,不必再 observe 一次。
+   */
+  current_epoch?: number
 }
 
 export class ApiError extends Error {

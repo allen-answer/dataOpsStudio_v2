@@ -97,6 +97,14 @@ async function mockWorkspace(
   const jobFinishedAt = options.jobFinishedAt ?? now
 
   await mockLicense(page)
+  // 这些用例锚的是 **job 路径**:如实声明该部署没开控制台会话
+  // (409 console_session_disabled),前端据此整体回落 job 路径(设计 §3.3)。
+  await page.route('**/api/sql/sessions/attach', (r) =>
+    json(r, 409, {
+      error: 'console_session_disabled',
+      message: 'Console sessions are disabled on this deployment',
+    }),
+  )
   await page.route('**/api/version', (r) =>
     json(r, 200, { version: '2.0.1-test', commit: 'abcdef0123456789', image_version: 'test' }),
   )

@@ -3,3 +3,6 @@ dist
 .DS_Store
 *.log
 .vite
+
+# vue-tsc -b 增量构建产物(本地噪音,不进仓)
+*.tsbuildinfo
