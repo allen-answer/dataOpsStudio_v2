@@ -120,13 +120,15 @@ def test_max_execution_time_hint_returns_3024_timeout() -> None:
         owner.open()
         started = time.monotonic()
         with pytest.raises(InteractiveExecuteError) as timeout_error:
-            owner.execute(
-                StatementRequest(
-                    sql=(
-                        "SELECT /*+ MAX_EXECUTION_TIME(100) */ COUNT(*) "
-                        "FROM information_schema.tables WHERE SLEEP(2) = 0"
-                    ),
-                    timeout_seconds=0,
+            list(
+                owner.execute(
+                    StatementRequest(
+                        sql=(
+                            "SELECT /*+ MAX_EXECUTION_TIME(100) */ COUNT(*) "
+                            "FROM information_schema.tables WHERE SLEEP(2) = 0"
+                        ),
+                        timeout_seconds=0,
+                    )
                 )
             )
         elapsed = time.monotonic() - started
