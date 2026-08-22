@@ -61,6 +61,9 @@ app/
 │   └── middleware/          # RequestId / AuthN / License / RateLimit / Audit
 ├── services/                # 业务逻辑(★ 禁止 import 数据库驱动)
 ├── dbclients/               # DatabaseAdapter 实现(✓ 唯一可 import 数据库驱动处)
+│   └── interactive/         # InteractiveConnection 会话式新缝(见 §3.8),不扩展 DatabaseAdapter
+├── broker/                  # Session Broker(API 进程内组件,console 会话所有权;★ 禁止 import
+│                            #   数据库驱动,只 import dbclients seam。见 §3.8 / ADR-0023)
 ├── infrastructure/          # 基础设施实现
 │   ├── jobbackend/          # PostgresJobBackend / ThreadPoolJobBackend
 │   ├── resultstore/         # LocalFsResultStore / S3ResultStore
@@ -381,6 +384,68 @@ SUPPORTED_WORKFLOW_NODE_KINDS = {
   ZoneInfo key;缺省用 `tzlocal.get_localzone()` 解析服务器本地时区,显式非法值即使
   scheduler 禁用也必须拒绝启动。cron 按该进程级时区求值,fire point 转回 UTC 后
   才比较、入库、审计与构造 Job。修改配置需重启;不支持 per-workflow 时区或 backfill。
+
+### 3.8 InteractiveConnection(`app/dbclients/interactive/`)— console 会话式新缝
+
+> 会话式执行的**新 Protocol 新缝**,**不扩展 §3.2 DatabaseAdapter**:既有 adapter 与
+> `AdapterCapabilities` 一律不动(job 路径行为零变化)。调用方是 `app/broker/`(API 进程内
+> 组件)。决策、论证与取舍见 `docs/adr/0023-console-session-broker.md`(取代 ADR-0021)。
+
+```python
+class InteractiveCapabilities:          # 独立于 AdapterCapabilities,不合并
+    server_cancel: bool                 # 控制连接可硬取消:DM / MySQL True
+    server_statement_timeout: bool      # 服务端语句超时:MySQL True / DM False(客户端计时)
+    session_streaming: bool             # execute 不缓冲、fetch 分批:True
+
+class InteractiveConnection(Protocol):  # ★ threadsafety=1:只能由持有它的 lane 线程调用
+    capabilities: InteractiveCapabilities
+    session_marker: str                 # DM `SELECT SESSID()` / MySQL `CONNECTION_ID()`,数值标识非敏感
+
+    def execute(self, sql: str, params: dict) -> None: ...
+    def columns(self) -> list[Column]: ...                 # 类型映射沿用 §3.2-ColumnType
+    def fetch_batch(self, size: int) -> list[Row]: ...     # 流式;批间由调用方查软取消 flag
+    def set_statement_timeout(self, seconds: int | None) -> None: ...  # MySQL max_execution_time
+                                                           # 保险带;None/0=关闭;DM 侧 no-op
+    def rollback(self) -> None: ...
+    def ping(self) -> bool: ...
+    def close(self) -> None: ...
+
+class CancelChannel(Protocol):          # 每 datasource 一条常驻控制连接,由 control lane 独占
+    server_cancel: Literal["available", "degraded", "unknown"]
+
+    def probe(self) -> str: ...                            # 对自身 marker 试调一次;权限错 → degraded
+    def cancel(self, session_marker: str) -> None: ...     # SP_CANCEL_SESSION_OPERATION / KILL QUERY
+    def destroy(self, session_marker: str) -> None: ...    # SP_CLOSE_SESSION / KILL CONNECTION
+    def ping(self) -> bool: ...
+
+class InteractiveErrorClass(StrEnum):
+    STATEMENT_ERROR = "statement_error"    # 语句级错误,会话续用(DM -2104 / MySQL 1064,1146)
+    CANCELLED = "cancelled"                # server_confirmed(DM -6515 / MySQL 1317)
+    TIMEOUT = "timeout"                    # server_confirmed(MySQL 3024;DM 无,客户端计时归此)
+    CONNECTION_DEAD = "connection_dead"    # → session_lost(socket 类 / MySQL 2006,2013)
+    AUTH_FAILED = "auth_failed"            # 建连期(DM -2501 / MySQL 1045)
+    HOST_UNREACHABLE = "host_unreachable"  # 建连期(DM -70028 / MySQL 2003,2005)
+
+class ErrorClassifier(Protocol):
+    def classify(self, exc: BaseException) -> tuple[InteractiveErrorClass, str]: ...
+```
+
+**约束(实现与 review 必查)**:
+
+- ★ **只按数值错误码分类,永不按消息文本**——错误消息语言是生产环境配置项,文本匹配即误判。
+- ★ 一条 `InteractiveConnection` 终身归单一 lane 线程与单一 console/属主:不跨线程共享、
+  不跨 console 复用、**不入池**。连接不可续用即宣告 session_lost,不自动重连、不自动重放。
+- ★ 建连超时按驱动**真实属性**接线:DM `login_timeout`(毫秒)、MySQL `connect_timeout`(秒);
+  会话连接**不设** MySQL `read_timeout`(会误杀长查询)。旧 adapter 的错误接线在新缝内修正,
+  不回改 job 路径。
+- R1 不变:数据库驱动 import 仍只在 `app/dbclients/`;`app/broker/` 只 import 本 seam。
+- R2 不变:seam 只接受 `SecretRef` / `DatasourceConnInfo`,明文只在 connect 内部短暂存在,
+  无明文缓存;每次建连 reveal + 审计。
+- R5 不变:seam 与 broker 的日志事件只出现 `sql_hash` 与长度,不得出现 SQL 原文、绑定参数、
+  主机地址。
+- R6 不变:cursor 只活在 lane 栈上,`ResultSet` / `ResultRef` 不持有 cursor。
+- `CancelChannel.probe()` 结果缓存于控制 lane 生命周期;`degraded` 必须经 attach 响应如实
+  透出给前端,不得静默降级为“看起来取消成功”。
 
 ---
 
