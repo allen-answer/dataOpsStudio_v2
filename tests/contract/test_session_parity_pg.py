@@ -292,6 +292,9 @@ def test_finalize_stores_the_mirrored_timings_and_execution_metadata(
             fetch_ms=34,
             spool_ms=5,
             db_type="mysql",
+            query_shape="simple_select",
+            limit_pushdown=True,
+            limit_pushdown_reason="top_level_limit_can_stop_row_production",
             output_limit_applied=True,
         ),
     )
@@ -311,6 +314,9 @@ def test_finalize_stores_the_mirrored_timings_and_execution_metadata(
     assert execution["rows_returned"] == 2
     assert execution["max_rows"] == 500
     assert execution["page_size"] == 25
+    assert execution["query_shape"] == "simple_select"
+    assert execution["limit_pushdown"] is True
+    assert execution["limit_pushdown_reason"] == "top_level_limit_can_stop_row_production"
     assert row["storage_ref"]["metadata"]["timings"]["spool_ms"] == 5
 
 

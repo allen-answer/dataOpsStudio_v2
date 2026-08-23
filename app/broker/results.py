@@ -67,6 +67,9 @@ class StatementMetrics:
     fetch_ms: int = 0
     spool_ms: int = 0
     db_type: str | None = None
+    query_shape: str | None = None
+    limit_pushdown: bool = False
+    limit_pushdown_reason: str | None = None
     effective_sql_hash: str | None = None
     output_limit_applied: bool = False
 
@@ -85,10 +88,10 @@ class StatementMetrics:
                 "rows_returned": self.rows_returned,
                 "max_rows": spool.max_result_rows,
                 "page_size": spool.page_size,
-                # 会话路径不改写 SQL(不做 LIMIT 下推),截断是客户端取够就停。
-                "limit_pushdown": False,
-                "limit_pushdown_reason": "session_client_side_cap",
+                "limit_pushdown": self.limit_pushdown,
+                "limit_pushdown_reason": self.limit_pushdown_reason,
                 "output_limit_applied": self.output_limit_applied,
+                "query_shape": self.query_shape,
                 "effective_sql_hash": self.effective_sql_hash,
                 "db_type": self.db_type,
             },
