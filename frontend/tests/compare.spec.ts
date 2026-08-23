@@ -207,6 +207,29 @@ function expectNoConsoleErrors(): void {
   expect(consoleErrors, consoleErrors.join('\n')).toEqual([])
 }
 
+async function expectTableValue(
+  page: Page,
+  side: 'source' | 'target',
+  value: string,
+): Promise<void> {
+  await expect(page.getByTestId(`compare-${side}-table`)).toHaveAttribute('data-value', value)
+}
+
+async function selectTable(
+  page: Page,
+  side: 'source' | 'target',
+  value: string,
+): Promise<void> {
+  const testId = `compare-${side}-table`
+  await page.getByTestId(testId).click()
+  await page.getByTestId(`${testId}-search`).fill(value)
+  await page
+    .getByTestId(`${testId}-options`)
+    .getByRole('option', { name: value, exact: true })
+    .click()
+  await expectTableValue(page, side, value)
+}
+
 test('compare task list renders and editor loads from saved task', async ({ page }) => {
   await mockBase(page)
   await page.goto('/projects/project-1/compare')
@@ -248,7 +271,7 @@ test('result snapshot task reloads and saves without degrading to a table ref', 
     'input-snapshot-1',
   )
   await expect(page.getByTestId('compare-source-schema')).toHaveCount(0)
-  await expect(page.getByTestId('compare-target-table')).toHaveValue('orders_b')
+  await expectTableValue(page, 'target', 'orders_b')
   await page.getByRole('button', { name: 'Save task' }).click()
 
   await expect.poll(() => patchBody).not.toBeNull()
@@ -277,7 +300,7 @@ test('compare picker preserves saved schema and table values missing from curren
 
   await page.goto('/projects/project-1/compare')
   await expect(page.getByTestId('compare-source-schema')).toHaveValue('legacy_schema')
-  await expect(page.getByTestId('compare-source-table')).toHaveValue('legacy_table')
+  await expectTableValue(page, 'source', 'legacy_table')
   expectNoConsoleErrors()
 })
 
@@ -306,29 +329,30 @@ test('compare source and target pick schemas and tables from datasource metadata
   await expect(sourceSchema).toHaveValue('app')
   await sourceSchema.selectOption('SJCJ')
 
-  const sourceTable = page.getByTestId('compare-source-table')
-  await expect(sourceTable).toHaveValue('')
-  await sourceTable.selectOption('A_KS_CUST_BASE_INFO')
-  await expect(sourceTable).toHaveValue('A_KS_CUST_BASE_INFO')
+  await expectTableValue(page, 'source', '')
+  await selectTable(page, 'source', 'A_KS_CUST_BASE_INFO')
   expect(
     tableRequests.some(
       (url) => new URL(url).searchParams.get('schema') === 'SJCJ',
     ),
   ).toBe(true)
   await expect(page.getByTestId('compare-target-schema')).toHaveValue('app')
-  await expect(page.getByTestId('compare-target-table')).toHaveValue('orders_b')
+  await expectTableValue(page, 'target', 'orders_b')
   expectNoConsoleErrors()
 })
 
-test('table reference search filters thousands of options without losing the current value', async ({
-  page,
-}) => {
+test('table picker supports fuzzy and exact matching across thousands of options', async ({ page }) => {
   await mockBase(page)
   const tables = Array.from({ length: 6535 }, (_, index) => ({
     schema_name: 'app',
     name: `table_${String(index).padStart(4, '0')}`,
     table_type: 'BASE TABLE',
   }))
+  tables.push({
+    schema_name: 'app',
+    name: 'orders_a',
+    table_type: 'BASE TABLE',
+  })
   tables.push({
     schema_name: 'app',
     name: 'ZZ_NEEDLE_CUSTOMER',
@@ -339,16 +363,58 @@ test('table reference search filters thousands of options without losing the cur
   )
 
   await page.goto('/projects/project-1/compare')
-  const tableSelect = page.getByTestId('compare-source-table')
-  await expect(tableSelect).toHaveValue('orders_a')
-  await expect
-    .poll(() => tableSelect.locator('option:not([disabled])').count())
-    .toBeLessThanOrEqual(200)
+  const testId = 'compare-source-table'
+  await expectTableValue(page, 'source', 'orders_a')
+  await page.getByTestId(testId).click()
+  const options = page.getByTestId(`${testId}-options`)
+  const search = page.getByTestId(`${testId}-search`)
+  await expect(search).toBeFocused()
+  await expect(search).toHaveAttribute('role', 'combobox')
+  await expect(search).toHaveAttribute('aria-controls', `${testId}-options`)
+  await expect(search).toHaveAttribute('aria-activedescendant', `${testId}-option-0`)
+  await expect(options.getByRole('option')).toHaveCount(200)
+  await expect(options.getByRole('option').first()).toHaveText('orders_a')
+  await search.press('Enter')
+  await expectTableValue(page, 'source', 'orders_a')
+  await expect(page.getByTestId(testId)).toBeFocused()
 
-  await page.getByTestId('compare-source-table-search').fill('needle')
-  await expect(tableSelect.locator('option', { hasText: 'ZZ_NEEDLE_CUSTOMER' })).toHaveCount(1)
-  await tableSelect.selectOption('ZZ_NEEDLE_CUSTOMER')
-  await expect(tableSelect).toHaveValue('ZZ_NEEDLE_CUSTOMER')
+  await page.getByTestId(testId).click()
+  await search.fill('znc')
+  await expect(
+    options.getByRole('option', {
+      name: 'ZZ_NEEDLE_CUSTOMER',
+      exact: true,
+    }),
+  ).toBeVisible()
+
+  await page.getByTestId(`${testId}-mode-exact`).click()
+  await expect(page.getByText('No matching tables')).toBeVisible()
+  await expectTableValue(page, 'source', 'orders_a')
+  await page.getByTestId(`${testId}-mode-exact`).press('Tab')
+  await expect(options).toHaveCount(0)
+
+  await page.getByTestId(testId).click()
+  await search.fill('znc')
+  await page.getByTestId(`${testId}-mode-exact`).click()
+  await page.getByTestId(`${testId}-mode-exact`).press('Escape')
+  await expect(options).toHaveCount(0)
+  await expect(page.getByTestId(testId)).toBeFocused()
+
+  await page.getByTestId(testId).click()
+  await search.fill('zz_needle_customer')
+  await expect(
+    options.getByRole('option', {
+      name: 'ZZ_NEEDLE_CUSTOMER',
+      exact: true,
+    }),
+  ).toBeVisible()
+
+  await search.fill('needle')
+  await expect(page.getByText('No matching tables')).toBeVisible()
+  await page.getByTestId(`${testId}-mode-fuzzy`).click()
+  await options.getByRole('option', { name: 'ZZ_NEEDLE_CUSTOMER', exact: true }).click()
+  await expectTableValue(page, 'source', 'ZZ_NEEDLE_CUSTOMER')
+  await expect(page.getByTestId(testId)).toBeFocused()
   expectNoConsoleErrors()
 })
 
@@ -358,8 +424,8 @@ test('auto-infer shows PK candidates + mapping draft for confirmation', async ({
 
   await page.goto('/projects/project-1/compare')
   // 填表名后推断
-  await page.getByTestId('compare-source-table').selectOption('orders')
-  await page.getByTestId('compare-target-table').selectOption('orders')
+  await selectTable(page, 'source', 'orders')
+  await selectTable(page, 'target', 'orders')
   await page.getByRole('button', { name: 'Auto-infer' }).click()
 
   await expect(page.getByText('Primary key candidates')).toBeVisible()
@@ -383,8 +449,8 @@ test('needs_manual_pk blocks full run and surfaces a warning', async ({ page }) 
   )
 
   await page.goto('/projects/project-1/compare')
-  await page.getByTestId('compare-source-table').selectOption('orders')
-  await page.getByTestId('compare-target-table').selectOption('orders')
+  await selectTable(page, 'source', 'orders')
+  await selectTable(page, 'target', 'orders')
   await page.getByRole('button', { name: 'Auto-infer' }).click()
   await expect(page.getByText(/Could not infer a primary key/)).toBeVisible()
   expectNoConsoleErrors()
