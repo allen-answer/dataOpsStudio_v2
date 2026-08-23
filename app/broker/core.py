@@ -37,6 +37,7 @@ from app.dbclients.interactive import (
     SoftCancelledError,
     StatementRequest,
 )
+from app.dbclients.query_limit import analyze_database_row_limit, apply_database_row_limit
 from app.domain.console_session import (
     ACTIVE_CONSOLE_SESSION_STATES,
     ConsoleSession,
@@ -598,12 +599,27 @@ class SessionBroker:
         connection_lost = False
         spool = runtime.spools.get(statement.id)
         columns: list[Column] = []
+        execution_sql = statement.sql_text
         metrics = StatementMetrics(
             execute_started_at=now,
             db_type=runtime.connection.db_type.value,
-            effective_sql_hash=statement.sql_hash,
+            effective_sql_hash=sha256(execution_sql.encode("utf-8")).hexdigest(),
         )
         try:
+            if spool is not None:
+                execution_sql = apply_database_row_limit(
+                    statement.sql_text,
+                    runtime.connection.db_type,
+                    spool.max_result_rows + 1,
+                )
+                limit_analysis = analyze_database_row_limit(
+                    statement.sql_text,
+                    runtime.connection.db_type,
+                )
+                metrics.effective_sql_hash = sha256(execution_sql.encode("utf-8")).hexdigest()
+                metrics.query_shape = limit_analysis.query_shape
+                metrics.limit_pushdown = limit_analysis.limit_pushdown
+                metrics.limit_pushdown_reason = limit_analysis.limit_pushdown_reason
 
             def capture_columns(emitted: list[Column]) -> None:
                 columns.clear()
@@ -613,7 +629,7 @@ class SessionBroker:
 
             stream = runtime.connection.execute(
                 StatementRequest(
-                    sql=statement.sql_text,
+                    sql=execution_sql,
                     fetch_size=self._fetch_size(spool),
                     timeout_seconds=statement.timeout_seconds,
                     column_sink=capture_columns,
@@ -741,9 +757,10 @@ class SessionBroker:
     ) -> None:
         """取数循环:批量落 spool,取够 max_result_rows 就停并标 truncated。
 
-        截断是**客户端取够就停**(DataGrip 语义),不改写 SQL、不断连接 ——
-        会话与游标随后照常续用。异常(取消/超时/连接死亡)由调用方分类;
-        本函数只保证**已落的行不丢**:每批 append 后 catalog 同步一次。
+        数据库端已对输出应用 max_result_rows+1 窗口;这里仍保留客户端截断,
+        用多出的 1 行判断 has_more,并作为驱动/方言差异下的安全兜底。会话与
+        游标随后照常续用。异常(取消/超时/连接死亡)由调用方分类;本函数只保证
+        **已落的行不丢**:每批 append 后 catalog 同步一次。
         """
 
         batch: list[Row] = []
