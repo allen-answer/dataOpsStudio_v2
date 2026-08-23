@@ -449,6 +449,12 @@ const sessionPartialHint = computed<string | null>(() => {
   const rows = rt.result?.loaded_rows ?? rt.result?.rows.length ?? 0
   return rows > 0 ? t('sql.session_partial_rows', { rows }) : null
 })
+const resultPanelError = computed<string | null>(() => {
+  if (execError.value) return execError.value
+  const runtime = activeRuntime.value
+  if (!runtime || runtime.status === 'cancelled') return null
+  return runtime.error
+})
 const shouldShowResultTable = computed(() => {
   const rt = activeRuntime.value
   if (!rt?.result) return false
@@ -3004,12 +3010,12 @@ function parseVariables(value: string): string[] {
           <!-- Result tab -->
           <div v-show="(activeRuntime?.resultTab ?? 'result') === 'result'" class="flex-1 min-h-0 flex flex-col">
             <div
-              v-if="execError || activeRuntime?.error"
+              v-if="resultPanelError"
               class="flex items-start gap-2 px-5 py-3 border-b chrome-border-subtle text-sm"
               style="background-color: rgb(239 68 68 / 0.08); color: rgb(185 28 28);"
             >
               <AlertTriangle class="w-4 h-4 shrink-0 mt-0.5" />
-              <span class="font-mono whitespace-pre-wrap">{{ execError || activeRuntime?.error }}</span>
+              <span class="font-mono whitespace-pre-wrap">{{ resultPanelError }}</span>
             </div>
             <div class="flex-1 min-h-0">
               <ResultTable

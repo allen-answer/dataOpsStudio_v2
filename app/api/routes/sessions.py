@@ -671,8 +671,7 @@ def _statement_execution_metrics(
         limit_pushdown=_dict_bool(execution, "limit_pushdown"),
         limit_pushdown_reason=_dict_str(execution, "limit_pushdown_reason"),
         output_limit_applied=_dict_bool(execution, "output_limit_applied"),
-        # 会话不改写 SQL,没有"改写后形状"这个概念。
-        query_shape=None,
+        query_shape=_dict_str(execution, "query_shape"),
         effective_sql_hash=_dict_str(execution, "effective_sql_hash"),
         db_type=_dict_str(execution, "db_type"),
         # 语句不跑在 worker 上,它跑在 API 进程的 lane 线程上(设计 D1)。

@@ -27,6 +27,7 @@ from app.dbclients.interactive import (
     ServerCancelSupport,
     StatementRequest,
 )
+from app.dbclients.query_limit import apply_database_row_limit
 from app.domain.console_session import ConsoleSession, ConsoleSessionState, ConsoleStatementState
 from app.domain.datasource import DbType
 from app.domain.schema import Row
@@ -45,6 +46,7 @@ class FakeClock:
 
 @dataclass
 class DriverHarness:
+    db_type: DbType = DbType.MYSQL
     block_execute: bool = False
     cancel_causes_confirmation: bool = True
     block_cancel_return: bool = False
@@ -76,7 +78,7 @@ class FakeClassifier:
 
 
 class FakeInteractiveConnection:
-    db_type = DbType.MYSQL
+    db_type: DbType
     classifier: ErrorClassifier = FakeClassifier()
     capabilities = InteractiveCapabilities(
         server_cancel=True,
@@ -86,6 +88,7 @@ class FakeInteractiveConnection:
 
     def __init__(self, harness: DriverHarness, marker: str) -> None:
         self.harness = harness
+        self.db_type = harness.db_type
         self._marker = marker
         self._open = False
         self._soft_cancel = threading.Event()
@@ -242,6 +245,10 @@ def _wait(predicate: object, timeout: float = 3.0) -> None:
     raise AssertionError("condition did not become true")
 
 
+def _limited(sql: str, db_type: DbType = DbType.MYSQL, limit: int = 1001) -> str:
+    return apply_database_row_limit(sql, db_type, limit)
+
+
 def test_lane_owns_one_connection_and_executes_statements_serially() -> None:
     broker, store, harness = _broker()
     try:
@@ -254,12 +261,36 @@ def test_lane_owns_one_connection_and_executes_statements_serially() -> None:
         )
 
         assert [call for call in harness.calls if call[0] == "execute"] == [
-            ("execute", "SELECT 1"),
-            ("execute", "SELECT 2"),
+            ("execute", _limited("SELECT 1")),
+            ("execute", _limited("SELECT 2")),
         ]
         assert len(harness.connections) == 1
         assert len(set(harness.connections[0].thread_ids)) == 1
         assert store.statements[first.statement.id].state is ConsoleStatementState.SUCCEEDED
+    finally:
+        broker.shutdown()
+
+
+def test_dm_session_pushes_max_result_rows_into_execute_sql() -> None:
+    harness = DriverHarness(db_type=DbType.DM)
+    broker, store, _ = _broker(harness)
+    try:
+        session = broker.attach(_request())
+        _wait(lambda: broker.observe(session.id).state is ConsoleSessionState.IDLE)
+        receipt = broker.submit(
+            session.id,
+            session.epoch,
+            "SELECT * FROM SJCS.ACC_FUNDACCOUNT",
+            "request-limited",
+            max_result_rows=1000,
+        )
+        _wait(
+            lambda: store.statements[receipt.statement.id].state is ConsoleStatementState.SUCCEEDED
+        )
+
+        assert harness.connections[0].executed_sql == [
+            "SELECT * FROM SJCS.ACC_FUNDACCOUNT FETCH FIRST 1001 ROWS ONLY"
+        ]
     finally:
         broker.shutdown()
 
@@ -374,7 +405,7 @@ def test_m6_submit_wins_when_it_reaches_the_mailbox_before_close() -> None:
             ConsoleStatementState.CANCELLED,
             ConsoleStatementState.SUCCEEDED,
         )
-        assert harness.connections[0].executed_sql == ["SELECT first"]
+        assert harness.connections[0].executed_sql == [_limited("SELECT first")]
     finally:
         harness.execute_release.set()
         broker.shutdown()
@@ -399,14 +430,17 @@ def test_r1_cancel_fence_blocks_next_execute_until_control_lane_returns() -> Non
         harness.execute_release.set()
         _wait(lambda: store.statements[first.statement.id].state is ConsoleStatementState.SUCCEEDED)
         time.sleep(0.03)
-        assert harness.connections[0].executed_sql == ["SELECT first"]
+        assert harness.connections[0].executed_sql == [_limited("SELECT first")]
 
         harness.block_execute = False
         harness.cancel_release.set()
         _wait(
             lambda: store.statements[second.statement.id].state is ConsoleStatementState.SUCCEEDED
         )
-        assert harness.connections[0].executed_sql == ["SELECT first", "SELECT second"]
+        assert harness.connections[0].executed_sql == [
+            _limited("SELECT first"),
+            _limited("SELECT second"),
+        ]
         assert len(set(harness.channels[0].thread_ids)) == 1
     finally:
         harness.execute_release.set()
@@ -425,7 +459,7 @@ def test_idempotent_replay_returns_the_original_receipt_and_executes_once() -> N
 
         assert replay.deduplicated is True
         assert replay.statement.id == first.statement.id
-        assert harness.connections[0].executed_sql == ["SELECT 1"]
+        assert harness.connections[0].executed_sql == [_limited("SELECT 1")]
     finally:
         broker.shutdown()
 
