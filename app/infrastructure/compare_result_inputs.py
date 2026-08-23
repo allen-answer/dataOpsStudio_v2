@@ -69,6 +69,14 @@ class ResultNotComparable(CompareResultInputError):
     code = "result_not_comparable"
 
 
+class ResultPartialConfirmationRequired(ResultNotComparable):
+    code = "result_partial_confirmation_required"
+
+
+class ResultColumnsNotUnique(ResultNotComparable):
+    code = "result_columns_not_unique"
+
+
 class ResultGone(CompareResultInputError):
     code = "result_gone"
 
@@ -99,6 +107,7 @@ class _ResolvedOrigin:
     id: str
     result_set_id: str
     allow_failed_result_set: bool
+    partial: bool
 
 
 class CompareResultInputs:
@@ -126,6 +135,7 @@ class CompareResultInputs:
         origin: CompareResultOrigin,
         *,
         scope: ActorProject,
+        allow_partial: bool = False,
     ) -> CompareResultInputDescriptor:
         now = self._clock()
         with self._engine.connect() as conn:
@@ -147,6 +157,14 @@ class CompareResultInputs:
         if not snapshot.columns:
             self._discard_snapshot(input_id)
             raise ResultNotComparable("result has no columns")
+        column_names = [column.name for column in snapshot.columns]
+        if len(column_names) != len(set(column_names)):
+            self._discard_snapshot(input_id)
+            raise ResultColumnsNotUnique("result columns must be unique")
+        origin_partial = resolved.partial
+        if (origin_partial or snapshot.truncated or snapshot.has_more) and not allow_partial:
+            self._discard_snapshot(input_id)
+            raise ResultPartialConfirmationRequired("partial result requires confirmation")
 
         descriptor = CompareResultInputDescriptor(
             id=input_id,
@@ -155,8 +173,8 @@ class CompareResultInputs:
             origin_id=resolved.id,
             columns=snapshot.columns,
             loaded_rows=snapshot.loaded_rows,
-            total_rows=total_rows,
-            truncated=snapshot.truncated,
+            total_rows=None if origin_partial else total_rows,
+            truncated=snapshot.truncated or origin_partial,
             has_more=snapshot.has_more,
             state="ready",
             created_at=now,
@@ -351,12 +369,16 @@ class CompareResultInputs:
             raise ResultNotTerminal("statement result is not terminal")
         if state not in _SNAPSHOTABLE_STATEMENT_STATES or row["result_set_id"] is None:
             raise ResultNotComparable("statement result is not comparable")
+        partial = state in {
+            ConsoleStatementState.CANCELLED.value,
+            ConsoleStatementState.TIMEOUT.value,
+        }
         return _ResolvedOrigin(
             kind="statement",
             id=origin.statement_id,
             result_set_id=str(row["result_set_id"]),
-            allow_failed_result_set=state
-            in {ConsoleStatementState.CANCELLED.value, ConsoleStatementState.TIMEOUT.value},
+            allow_failed_result_set=partial,
+            partial=partial,
         )
 
     def _resolve_job(
@@ -386,6 +408,7 @@ class CompareResultInputs:
             id=origin.job_id,
             result_set_id=result_set_id,
             allow_failed_result_set=False,
+            partial=False,
         )
 
     def _require_stable_result_set(
@@ -522,8 +545,10 @@ __all__ = [
     "CompareResultInputLost",
     "CompareResultInputNotFound",
     "CompareResultInputs",
+    "ResultColumnsNotUnique",
     "ResultGone",
     "ResultNotComparable",
     "ResultNotTerminal",
     "ResultOriginNotFound",
+    "ResultPartialConfirmationRequired",
 ]

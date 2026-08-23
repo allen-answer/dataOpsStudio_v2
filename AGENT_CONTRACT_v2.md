@@ -274,7 +274,16 @@ class ResultStore(Protocol):
 Compare 结果输入纯追加 interface:`CompareDataRef.kind="result_snapshot"` 只接受
 `input_id` 与显式 `allow_partial`;该侧不绑定 datasource。创建/更新/运行均须通过
 `CompareResultInputs.open()` 校验 actor + project 并续租,worker 只读 snapshot,
-禁止重跑来源 SQL 或持有数据库 cursor。
+禁止重跑来源 SQL 或持有数据库 cursor。捕获请求的 `allow_partial` 默认为 false;
+发现 `truncated/has_more` 时必须在 catalog 写入前拒绝并清理临时 snapshot,
+只有显式 true 才能保留。取消/超时的 statement 即使底层 manifest 未标截断,
+也必须按部分结果拒绝并在 descriptor 固化 `truncated=true,total_rows=null`。结果
+列名必须唯一,否则同样在捕获边界拒绝并清理。
+
+SQL 工作区把已落盘结果送入 Compare 时,浏览器一次性 handoff 只携带
+`project_id`、`input_id` 与 `allow_partial`,不携带 SQL、结果行或数据库凭据;
+Compare 必须按当前 project 重新读取 result input 描述后再填充草稿。截断/部分结果
+必须由用户显式确认,且 handoff 与后续 `CompareDataRef` 均保留 `allow_partial=true`。
 
 ```python
 # domain/result.py —— ★ ResultSet 不持有 DbCursor

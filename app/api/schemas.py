@@ -282,6 +282,7 @@ CompareBucket = Literal["only_source", "only_target", "diff", "same"]
 class CompareResultInputCreateRequest(BaseModel):
     origin_kind: Literal["statement", "job"]
     origin_id: str = Field(min_length=1, max_length=36)
+    allow_partial: bool = False
 
 
 # 文件源对比支持的格式(C-1;Parquet 归次版,本域暂不含)。

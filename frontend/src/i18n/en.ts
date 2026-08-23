@@ -263,6 +263,12 @@ export default {
     schema_context_hint: 'Metadata and completion context; queries stay fully qualified',
     send_to_compare: 'Use in compare',
     send_to_compare_hint: 'Open the current SQL as the source of a new compare draft',
+    result_to_compare: 'Use result in compare',
+    result_to_compare_running: 'Creating snapshot…',
+    result_to_compare_hint: 'Freeze the current result and open it as a new compare source',
+    result_to_compare_needs_result: 'Run a query with readable results first',
+    result_to_compare_partial_confirm:
+      'This is a partial or truncated result. Compare only the rows currently stored?',
     handoff_invalid: 'The workspace handoff expired or was already used.',
     tab_consoles: 'Consoles',
     tab_history: 'History',
@@ -571,6 +577,8 @@ export default {
     ref_kind_sql: 'Custom SQL',
     ref_kind_file: 'File',
     ref_kind_result_snapshot: 'Result snapshot',
+    result_snapshot_duplicate_columns:
+      'This result contains duplicate column names. Add unique SQL aliases and run it again.',
     sql_placeholder: 'SELECT … (read-only query)',
     single_sql: 'Single SQL (both sides run the same statement)',
     infer_sql_disabled:

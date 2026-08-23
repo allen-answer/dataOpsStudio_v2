@@ -34,6 +34,8 @@ from app.domain.workflow import WorkflowSpec
 from app.infrastructure.compare_result_inputs import (
     CompareResultInputExpired,
     CompareResultInputNotFound,
+    ResultColumnsNotUnique,
+    ResultPartialConfirmationRequired,
 )
 from app.services.ai.default_gateway import DefaultAiGateway
 from app.services.ai.errors import (
@@ -156,6 +158,7 @@ def test_compare_result_input_capture_returns_opaque_snapshot_and_audits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     services = _Services(_FakeEngine([]))
+    allow_partial_values: list[bool] = []
     descriptor = CompareResultInputDescriptor(
         id="input-1",
         project_id="project-1",
@@ -172,8 +175,15 @@ def test_compare_result_input_capture_returns_opaque_snapshot_and_audits(
     )
 
     class _Module:
-        def capture(self, origin: object, *, scope: object) -> CompareResultInputDescriptor:
+        def capture(
+            self,
+            origin: object,
+            *,
+            scope: object,
+            allow_partial: bool = False,
+        ) -> CompareResultInputDescriptor:
             del origin, scope
+            allow_partial_values.append(allow_partial)
             return descriptor
 
     monkeypatch.setattr(compare_result_inputs_routes, "_module", lambda request: _Module())
@@ -182,7 +192,11 @@ def test_compare_result_input_capture_returns_opaque_snapshot_and_audits(
     response = AsgiClient(app).post(
         "/api/projects/project-1/compare/result-inputs",
         headers=_auth_headers(),
-        json_body={"origin_kind": "statement", "origin_id": "statement-1"},
+        json_body={
+            "origin_kind": "statement",
+            "origin_id": "statement-1",
+            "allow_partial": True,
+        },
     )
 
     assert response.status_code == 201
@@ -191,6 +205,7 @@ def test_compare_result_input_capture_returns_opaque_snapshot_and_audits(
     assert "result_set_id" not in payload
     assert "uri" not in payload
     assert "sql" not in payload
+    assert allow_partial_values == [True]
     assert any(audit["action"] == "compare_result_input_capture" for audit in services.audits)
 
 
@@ -221,6 +236,53 @@ def test_compare_result_input_get_maps_expiry_to_410(
 
     assert response.status_code == 410
     assert response.json()["error"] == "compare_input_expired"
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "message"),
+    [
+        (
+            ResultPartialConfirmationRequired("partial"),
+            "result_partial_confirmation_required",
+            "Result is partial; confirm before comparing saved rows",
+        ),
+        (
+            ResultColumnsNotUnique("duplicates"),
+            "result_columns_not_unique",
+            "Result columns must be unique; add SQL aliases and run again",
+        ),
+    ],
+)
+def test_compare_result_input_capture_maps_actionable_validation_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    code: str,
+    message: str,
+) -> None:
+    services = _Services(_FakeEngine([]))
+
+    class _Module:
+        def capture(
+            self,
+            origin: object,
+            *,
+            scope: object,
+            allow_partial: bool = False,
+        ) -> CompareResultInputDescriptor:
+            del origin, scope, allow_partial
+            raise error
+
+    monkeypatch.setattr(compare_result_inputs_routes, "_module", lambda request: _Module())
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/result-inputs",
+        headers=_auth_headers(),
+        json_body={"origin_kind": "statement", "origin_id": "statement-1"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"error": code, "message": message}
 
 
 def test_version_is_public_and_reports_sanitized_build_identity(

@@ -17,8 +17,10 @@ from app.infrastructure.compare_result_inputs import (
     CompareResultInputExpired,
     CompareResultInputNotFound,
     CompareResultInputs,
+    ResultColumnsNotUnique,
     ResultNotTerminal,
     ResultOriginNotFound,
+    ResultPartialConfirmationRequired,
 )
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
 
@@ -111,6 +113,94 @@ def test_capture_rejects_active_statement_without_creating_snapshot(tmp_path: Pa
             scope=ActorProject(actor_id="user-1", project_id="project-1"),
         )
 
+    assert _snapshot_ids(tmp_path) == []
+
+
+def test_capture_requires_partial_confirmation_without_leaving_snapshot(tmp_path: Path) -> None:
+    store = _source_store(tmp_path)
+    engine = _FakeEngine(
+        _scalar("project-1"),
+        _row(
+            {
+                "id": "statement-1",
+                "state": "cancelled",
+                "result_set_id": "rs-source",
+                "owner_user_id": "user-1",
+                "project_id": "project-1",
+            }
+        ),
+        _row({"state": "complete", "total_rows": 2}),
+    )
+    module = CompareResultInputs(cast(Engine, engine), store, clock=lambda: _NOW)
+
+    with pytest.raises(ResultPartialConfirmationRequired):
+        module.capture(
+            StatementResultOrigin("statement-1"),
+            scope=ActorProject(actor_id="user-1", project_id="project-1"),
+        )
+
+    assert engine.write_count == 0
+    assert _snapshot_ids(tmp_path) == []
+
+
+def test_capture_accepts_explicitly_confirmed_partial_result(tmp_path: Path) -> None:
+    store = _source_store(tmp_path)
+    engine = _FakeEngine(
+        _scalar("project-1"),
+        _row(
+            {
+                "id": "statement-1",
+                "state": "cancelled",
+                "result_set_id": "rs-source",
+                "owner_user_id": "user-1",
+                "project_id": "project-1",
+            }
+        ),
+        _row({"state": "complete", "total_rows": 2}),
+    )
+
+    descriptor = CompareResultInputs(cast(Engine, engine), store, clock=lambda: _NOW).capture(
+        StatementResultOrigin("statement-1"),
+        scope=ActorProject(actor_id="user-1", project_id="project-1"),
+        allow_partial=True,
+    )
+
+    assert descriptor.truncated is True
+    assert descriptor.has_more is False
+    assert descriptor.total_rows is None
+    assert engine.write_count == 1
+
+
+def test_capture_rejects_duplicate_column_names_without_leaving_snapshot(tmp_path: Path) -> None:
+    store = _source_store(tmp_path)
+    store.set_spool_columns(
+        "rs-source",
+        [
+            Column(name="id", type=ColumnType.INTEGER),
+            Column(name="id", type=ColumnType.STRING),
+        ],
+    )
+    engine = _FakeEngine(
+        _scalar("project-1"),
+        _row(
+            {
+                "id": "statement-1",
+                "state": "succeeded",
+                "result_set_id": "rs-source",
+                "owner_user_id": "user-1",
+                "project_id": "project-1",
+            }
+        ),
+        _row({"state": "complete", "total_rows": 2}),
+    )
+
+    with pytest.raises(ResultColumnsNotUnique):
+        CompareResultInputs(cast(Engine, engine), store, clock=lambda: _NOW).capture(
+            StatementResultOrigin("statement-1"),
+            scope=ActorProject(actor_id="user-1", project_id="project-1"),
+        )
+
+    assert engine.write_count == 0
     assert _snapshot_ids(tmp_path) == []
 
 

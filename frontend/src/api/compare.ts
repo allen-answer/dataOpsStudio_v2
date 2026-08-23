@@ -15,6 +15,8 @@
  *    POST   /projects/{pid}/compare/infer            -> CompareInferResponse
  *    GET    /projects/{pid}/compare/suggest-tasks    -> { suggestions }
  *    POST   /projects/{pid}/compare/draft-task       -> CompareTaskResponse (201)
+ *    POST   /projects/{pid}/compare/result-inputs     -> CompareResultInputDescriptor (201)
+ *    GET    /projects/{pid}/compare/result-inputs/{id}-> CompareResultInputDescriptor
  *    GET    /compare/tasks?project_id=               -> CompareTaskResponse[]
  *    POST   /compare/tasks                           -> CompareTaskResponse (201)
  *    GET    /compare/tasks/{id}                       -> CompareTaskResponse
@@ -64,6 +66,23 @@ export interface CompareDataRef {
   delimiter?: string | null // csv 分隔符
   input_id?: string | null // result_snapshot:opaque CompareResultInputs id
   allow_partial?: boolean // result_snapshot:显式确认部分/截断输入
+}
+
+export type CompareResultInputOriginKind = 'statement' | 'job'
+
+export interface CompareResultInputDescriptor {
+  id: string
+  project_id: string
+  origin_kind: CompareResultInputOriginKind
+  origin_id: string
+  columns: Column[]
+  loaded_rows: number
+  total_rows: number | null
+  truncated: boolean
+  has_more: boolean
+  state: 'ready' | 'deleted'
+  created_at: string
+  expires_at: string
 }
 
 export interface CompareRulesPayload {
@@ -459,6 +478,27 @@ export interface CompareExportCreateResponse {
 export function listCompareTasks(projectId?: string): Promise<CompareTaskResponse[]> {
   const qs = projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''
   return apiClient.get<CompareTaskResponse[]>(`/compare/tasks${qs}`)
+}
+
+export function captureCompareResultInput(
+  projectId: string,
+  originKind: CompareResultInputOriginKind,
+  originId: string,
+  allowPartial: boolean = false,
+): Promise<CompareResultInputDescriptor> {
+  return apiClient.post<CompareResultInputDescriptor>(
+    `/projects/${projectId}/compare/result-inputs`,
+    { origin_kind: originKind, origin_id: originId, allow_partial: allowPartial },
+  )
+}
+
+export function getCompareResultInput(
+  projectId: string,
+  inputId: string,
+): Promise<CompareResultInputDescriptor> {
+  return apiClient.get<CompareResultInputDescriptor>(
+    `/projects/${projectId}/compare/result-inputs/${encodeURIComponent(inputId)}`,
+  )
 }
 
 export function getCompareTask(taskId: string): Promise<CompareTaskResponse> {

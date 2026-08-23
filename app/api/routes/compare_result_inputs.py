@@ -21,10 +21,12 @@ from app.infrastructure.compare_result_inputs import (
     CompareResultInputLost,
     CompareResultInputNotFound,
     CompareResultInputs,
+    ResultColumnsNotUnique,
     ResultGone,
     ResultNotComparable,
     ResultNotTerminal,
     ResultOriginNotFound,
+    ResultPartialConfirmationRequired,
 )
 
 router = APIRouter()
@@ -52,6 +54,7 @@ def capture_compare_result_input(
         descriptor = module.capture(
             origin,
             scope=ActorProject(actor_id=user.id, project_id=project_id),
+            allow_partial=body.allow_partial,
         )
     except CompareResultInputError as exc:
         raise compare_result_input_api_error(exc) from exc
@@ -108,6 +111,14 @@ def _module(request: Request) -> CompareResultInputs:
 def compare_result_input_api_error(exc: CompareResultInputError) -> ApiError:
     if isinstance(exc, (ResultOriginNotFound, CompareResultInputNotFound)):
         return ApiError(404, exc.code, "Result input not found")
+    if isinstance(exc, ResultPartialConfirmationRequired):
+        return ApiError(409, exc.code, "Result is partial; confirm before comparing saved rows")
+    if isinstance(exc, ResultColumnsNotUnique):
+        return ApiError(
+            409,
+            exc.code,
+            "Result columns must be unique; add SQL aliases and run again",
+        )
     if isinstance(exc, (ResultNotTerminal, ResultNotComparable)):
         return ApiError(409, exc.code, "Result is not ready for comparison")
     if isinstance(
