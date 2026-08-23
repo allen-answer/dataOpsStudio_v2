@@ -446,7 +446,7 @@ class _FakeDMCursor:
 
     def execute(self, sql: str, params: object = None) -> None:
         normalized = " ".join(sql.lower().split())
-        if "all_users" in normalized:
+        if "from all_tables" in normalized and "from all_views" in normalized:
             self.description = (("name",),)
             self._rows = [("APP",)]
         elif "all_tab_columns" in normalized:
