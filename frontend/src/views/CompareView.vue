@@ -9,7 +9,7 @@
  * 字段全部锚 api/compare.ts(锚后端 schemas.py + 契约测试),不臆造。
  */
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useQuery } from '@tanstack/vue-query'
 import { storeToRefs } from 'pinia'
@@ -97,6 +97,10 @@ import { useMetadataObjectOptions } from '../composables/useMetadataObjectOption
 import { useToast } from '../composables/useToast'
 import { useThemeStore } from '../stores/theme'
 import { createUserErrorMessage } from '../utils/userErrorMessage'
+import {
+  consumeWorkspaceHandoff,
+  createWorkspaceHandoff,
+} from '../utils/workspaceHandoff'
 
 const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>([
   'success',
@@ -160,6 +164,7 @@ const errorMessage = createUserErrorMessage(t)
 const { writesBlocked } = useLicense()
 const toast = useToast()
 const route = useRoute()
+const router = useRouter()
 const themeStore = useThemeStore()
 const { variant } = storeToRefs(themeStore)
 const projectId = computed(() => (typeof route.params.id === 'string' ? route.params.id : ''))
@@ -1086,9 +1091,10 @@ function filePreviewErrorMessage(e: unknown): string {
 }
 
 // ── lifecycle ───────────────────────────────────────────────────────
-onMounted(() => {
-  void loadTasks()
+onMounted(async () => {
+  await loadTasks()
   void loadDashboard()
+  await applyIncomingWorkspaceHandoff()
 })
 onUnmounted(() => {
   stopRunPolling()
@@ -1137,6 +1143,25 @@ watch(targetSchemas, (schemas) => {
     ? preferred
     : schemas[0].name
 })
+
+async function applyIncomingWorkspaceHandoff(): Promise<void> {
+  const token = typeof route.query.handoff === 'string' ? route.query.handoff : ''
+  if (!token) return
+  const payload = consumeWorkspaceHandoff(token, projectId.value)
+  const query = { ...route.query }
+  delete query.handoff
+  await router.replace({ name: 'compare', params: { id: projectId.value }, query })
+  if (!payload || payload.kind !== 'sql_to_compare') {
+    editorError.value = t('compare.handoff_invalid')
+    return
+  }
+  startNewTask()
+  draft.sourceId = payload.datasourceId
+  draft.sourceKind = 'sql'
+  draft.sourceSql = payload.sql
+  draft.singleSql = false
+  rightTab.value = 'editor'
+}
 
 // ── tasks loading ───────────────────────────────────────────────────
 async function loadTasks(): Promise<void> {
@@ -1898,6 +1923,27 @@ async function copyDiffSql(side: 'source' | 'target'): Promise<void> {
     }, 1500)
   } catch {
     diffSqlError.value = t('compare.diff_sql_copy_failed')
+  }
+}
+
+async function openDiffSqlInWorkspace(side: 'source' | 'target'): Promise<void> {
+  const sql = side === 'source' ? diffSqlData.value?.source.sql : diffSqlData.value?.target.sql
+  const datasourceId = side === 'source' ? activeTask.value?.source_id : activeTask.value?.target_id
+  if (!sql || !datasourceId) {
+    diffSqlError.value = t('compare.diff_sql_reason_unknown_datasource')
+    return
+  }
+  try {
+    const token = createWorkspaceHandoff({
+      kind: 'compare_to_sql',
+      projectId: projectId.value,
+      datasourceId,
+      sql,
+      consoleName: `compare_${side}_${resultBucket.value}.sql`,
+    })
+    await router.push({ name: 'sql', params: { id: projectId.value }, query: { handoff: token } })
+  } catch (error) {
+    diffSqlError.value = errorMessage(error)
   }
 }
 
@@ -3847,6 +3893,16 @@ const missingTarget = computed(
               <div class="flex items-center gap-2 mb-1">
                 <span class="text-xs font-medium chrome-text-heading">{{ t(`compare.${side}`) }}</span>
                 <div class="flex-1" />
+                <button
+                  v-if="diffSqlData[side].available"
+                  type="button"
+                  class="chrome-btn-ghost text-[11px]"
+                  :data-testid="`compare-open-${side}-sql`"
+                  @click="openDiffSqlInWorkspace(side)"
+                >
+                  <ArrowRight class="w-3.5 h-3.5" />
+                  {{ t('compare.diff_sql_open_workspace') }}
+                </button>
                 <button
                   v-if="diffSqlData[side].available"
                   type="button"
