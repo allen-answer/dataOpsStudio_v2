@@ -117,6 +117,7 @@ def test_console_statements_schema_has_idempotency_key_and_history_fields() -> N
         if isinstance(constraint, CheckConstraint)
     }
     assert checks == {"ck_console_statements_state_is_supported"}
+    assert console_statements.c.sql_hash.type.length == len("sha256:") + 64
 
 
 def test_console_statement_events_follows_job_event_shape() -> None:
