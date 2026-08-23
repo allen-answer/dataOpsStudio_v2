@@ -14,8 +14,8 @@ if (-not (Test-Path -LiteralPath $VenvPy)) {
     & (Join-Path $PSScriptRoot 'install.ps1')
 }
 
-$masterKey = Join-Path $env:DATAOPS_HOME 'config\.secret_master.key'
-if (-not (Test-Path -LiteralPath $masterKey)) {
+$initializedMarker = Join-Path $env:DATAOPS_HOME 'config\.bundle-initialized'
+if (-not (Test-Path -LiteralPath $initializedMarker)) {
     Write-Step 'first run: generating bootstrap secrets'
     Invoke-Launcher bootstrap init
     Write-Step 'first run: starting metadata PostgreSQL'
@@ -24,13 +24,16 @@ if (-not (Test-Path -LiteralPath $masterKey)) {
     Invoke-Launcher alembic-up
     Write-Step "first run: creating admin user $($env:DATAOPS_ADMIN_USER)"
     if ($env:DATAOPS_ADMIN_PASSWORD) {
-        Invoke-Launcher admin create --username $env:DATAOPS_ADMIN_USER --password $env:DATAOPS_ADMIN_PASSWORD
+        Invoke-Launcher admin create --username $env:DATAOPS_ADMIN_USER --password $env:DATAOPS_ADMIN_PASSWORD --update-password
     }
     else {
-        Invoke-Launcher admin create --username $env:DATAOPS_ADMIN_USER
+        Invoke-Launcher admin create --username $env:DATAOPS_ADMIN_USER --update-password
     }
+    New-Item -ItemType File -Force -Path $initializedMarker | Out-Null
 }
 
+# The one-time password must not reach the long-lived launcher/API/worker tree.
+Remove-Item Env:DATAOPS_ADMIN_PASSWORD -ErrorAction SilentlyContinue
 Write-Step "launching DataOpsStudio on http://127.0.0.1:$($env:DATAOPS_API_PORT)/"
 Write-Step 'press Ctrl+C in this window to stop gracefully.'
 Invoke-Launcher up

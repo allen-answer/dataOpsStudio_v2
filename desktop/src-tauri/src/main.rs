@@ -162,7 +162,7 @@ fn check_state(app: AppHandle) -> String {
     }
     let installed = venv_python(&state_root(&app)).exists();
     let initialized = dataops_home(&app)
-        .join("config/.secret_master.key")
+        .join("config/.bundle-initialized")
         .exists();
     if installed && initialized {
         "installed".into()

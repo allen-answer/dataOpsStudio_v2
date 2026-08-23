@@ -51,6 +51,8 @@ function Assert-PostgresSocketPath {
 function Invoke-Launcher {
     & $VenvPy -m app.launcher --root $env:DATAOPS_HOME --pg-bin-dir $PgBin --uv $UvExe @args
     if ($LASTEXITCODE -ne 0) {
-        throw "launcher failed (exit $LASTEXITCODE): $($args -join ' ')"
+        # Never echo launcher arguments here: first-run admin creation carries
+        # a password argument and this exception is redirected to gui-start.log.
+        throw "launcher failed (exit $LASTEXITCODE)"
     }
 }

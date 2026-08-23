@@ -212,10 +212,18 @@ def prepare_uv(cache: Path) -> Path:
 
 def download_wheels(cache: Path, python_dir: Path, requirements: Path) -> Path:
     wheels = cache / "wheels"
-    if wheels.exists() and any(wheels.glob("*.whl")):
+    requirements_hash = sha256_file(requirements)
+    marker = cache / "wheels.requirements.sha256"
+    if (
+        wheels.exists()
+        and any(wheels.glob("*.whl"))
+        and marker.exists()
+        and marker.read_text(encoding="ascii").strip() == requirements_hash
+    ):
         log(f"wheels: reuse cached {wheels} ({len(list(wheels.glob('*.whl')))} files)")
         return wheels
-    wheels.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(wheels, ignore_errors=True)
+    wheels.mkdir(parents=True)
     log("wheels: pip download (cp312 win_amd64, --only-binary=:all:)")
     run(
         [
@@ -231,6 +239,7 @@ def download_wheels(cache: Path, python_dir: Path, requirements: Path) -> Path:
             str(wheels),
         ]
     )
+    marker.write_text(requirements_hash + "\n", encoding="ascii")
     return wheels
 
 

@@ -11,8 +11,8 @@ if [[ ! -x "$VENV_PY" ]]; then
     "$BUNDLE_ROOT/install.sh"
 fi
 
-master_key="$DATAOPS_HOME/config/.secret_master.key"
-if [[ ! -f "$master_key" ]]; then
+initialized_marker="$DATAOPS_HOME/config/.bundle-initialized"
+if [[ ! -f "$initialized_marker" ]]; then
     step 'first run: generating bootstrap secrets'
     invoke_launcher bootstrap init
     step 'first run: starting metadata PostgreSQL'
@@ -23,11 +23,14 @@ if [[ ! -f "$master_key" ]]; then
     if [[ -n "${DATAOPS_ADMIN_PASSWORD:-}" ]]; then
         invoke_launcher admin create \
             --username "$DATAOPS_ADMIN_USER" \
-            --password "$DATAOPS_ADMIN_PASSWORD"
+            --password "$DATAOPS_ADMIN_PASSWORD" \
+            --update-password
     else
-        invoke_launcher admin create --username "$DATAOPS_ADMIN_USER"
+        invoke_launcher admin create --username "$DATAOPS_ADMIN_USER" --update-password
     fi
+    touch -- "$initialized_marker"
 fi
 
+unset DATAOPS_ADMIN_PASSWORD
 step "launching DataOpsStudio on http://127.0.0.1:$DATAOPS_API_PORT/"
 invoke_launcher up

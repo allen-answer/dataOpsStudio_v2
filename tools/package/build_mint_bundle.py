@@ -81,6 +81,10 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def cache_marker_matches(marker: Path, expected_sha256: str) -> bool:
+    return marker.exists() and marker.read_text(encoding="ascii").strip() == expected_sha256
+
+
 def download(url: str, sha256: str, destination: Path) -> Path:
     if destination.exists() and sha256_file(destination) == sha256:
         log(f"download: reuse verified {destination.name}")
@@ -123,10 +127,12 @@ def project_version() -> str:
 def prepare_python(cache: Path) -> Path:
     destination = cache / "python"
     executable = destination / "bin/python3"
-    if executable.exists():
+    marker = cache / "python.source.sha256"
+    if executable.exists() and cache_marker_matches(marker, PYTHON_SHA256):
         log(f"python: reuse {destination}")
         slim_python(destination)
         return destination
+    shutil.rmtree(destination, ignore_errors=True)
     archive = download(PYTHON_URL, PYTHON_SHA256, cache / "downloads/python.tar.gz")
     temporary = cache / "python.extract"
     shutil.rmtree(temporary, ignore_errors=True)
@@ -138,6 +144,7 @@ def prepare_python(cache: Path) -> Path:
         raise SystemExit("python archive did not contain python/bin/python3")
     extracted.replace(destination)
     shutil.rmtree(temporary, ignore_errors=True)
+    marker.write_text(PYTHON_SHA256 + "\n", encoding="ascii")
     slim_python(destination)
     return destination
 
@@ -187,9 +194,11 @@ def slim_python(destination: Path) -> None:
 def prepare_uv(cache: Path) -> Path:
     destination = cache / "uv"
     executable = destination / "uv"
-    if executable.exists():
+    marker = cache / "uv.source.sha256"
+    if executable.exists() and cache_marker_matches(marker, UV_SHA256):
         log(f"uv: reuse {executable}")
         return executable
+    shutil.rmtree(destination, ignore_errors=True)
     archive = download(UV_URL, UV_SHA256, cache / "downloads/uv.tar.gz")
     temporary = cache / "uv.extract"
     shutil.rmtree(temporary, ignore_errors=True)
@@ -202,6 +211,7 @@ def prepare_uv(cache: Path) -> Path:
     shutil.copy2(candidates[0], executable)
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     shutil.rmtree(temporary, ignore_errors=True)
+    marker.write_text(UV_SHA256 + "\n", encoding="ascii")
     return executable
 
 
@@ -228,7 +238,8 @@ def export_requirements(cache: Path, uv: Path) -> Path:
 def prepare_wheels(cache: Path, python: Path, requirements: Path) -> Path:
     destination = cache / "wheels"
     marker = destination / ".complete"
-    if marker.exists() and any(destination.glob("*.whl")):
+    requirements_hash = sha256_file(requirements)
+    if cache_marker_matches(marker, requirements_hash) and any(destination.glob("*.whl")):
         log(f"wheels: reuse {destination} ({len(list(destination.glob('*.whl')))} files)")
         return destination
     shutil.rmtree(destination, ignore_errors=True)
@@ -247,13 +258,16 @@ def prepare_wheels(cache: Path, python: Path, requirements: Path) -> Path:
             str(destination),
         ]
     )
-    marker.write_text("verified\n", encoding="ascii")
+    marker.write_text(requirements_hash + "\n", encoding="ascii")
     return destination
 
 
 def prepare_postgres(cache: Path, jobs: int) -> Path:
     destination = cache / f"postgresql-{POSTGRES_VERSION}"
-    if all((destination / "bin" / name).exists() for name in PG_REQUIRED_BINS):
+    marker = cache / f"postgresql-{POSTGRES_VERSION}.source.sha256"
+    if cache_marker_matches(marker, POSTGRES_SHA256) and all(
+        (destination / "bin" / name).exists() for name in PG_REQUIRED_BINS
+    ):
         log(f"postgres: reuse {destination}")
         return destination
 
@@ -312,6 +326,7 @@ def prepare_postgres(cache: Path, jobs: int) -> Path:
     shutil.rmtree(source_parent, ignore_errors=True)
     shutil.rmtree(build, ignore_errors=True)
     shutil.rmtree(install, ignore_errors=True)
+    marker.write_text(POSTGRES_SHA256 + "\n", encoding="ascii")
     return destination
 
 
