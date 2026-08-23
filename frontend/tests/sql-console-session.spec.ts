@@ -313,7 +313,12 @@ test('one console submits statements serially, then cancel and re-run reuse the 
   const cancelledAfter = new Set<string>()
   const calls = await mockSessionWorkspace(page, {
     progress: (statementId, poll) => {
-      if (cancelledAfter.has(statementId)) return progressBody(statementId, 'cancelled')
+      if (cancelledAfter.has(statementId)) {
+        return progressBody(statementId, 'cancelled', {
+          error: 'interactive statement failed',
+          error_code: 'cancelled:-6515',
+        })
+      }
       // 第一条语句一直在跑,给取消留出窗口;第二条直接终态。
       if (statementId === 'stmt-1' && poll <= 6) return progressBody(statementId, 'executing')
       return progressBody(statementId, 'succeeded')
@@ -346,6 +351,7 @@ test('one console submits statements serially, then cancel and re-run reuse the 
 
   // 取消保留已落的行 —— 明示是部分结果,不冒充完整结果。
   await expect(page.getByTestId('sql-session-partial')).toBeVisible()
+  await expect(page.getByText('interactive statement failed')).toHaveCount(0)
 
   // 再执行:会话复用,不再 attach。
   await page.getByTestId('sql-execute').click()
