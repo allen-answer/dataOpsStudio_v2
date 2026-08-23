@@ -39,6 +39,7 @@ from app.dbclients.interactive import (
     ServerCancelSupport,
     StatementRequest,
 )
+from app.dbclients.query_limit import apply_database_row_limit
 from app.domain.console_session import ConsoleSession, ConsoleSessionState, ConsoleStatementState
 from app.domain.datasource import DbType
 from app.domain.schema import Row
@@ -543,8 +544,9 @@ def test_resubmitting_same_client_request_id_never_executes_twice() -> None:
 
         assert first.json()["statement_id"] == second.json()["statement_id"]
         assert second.json()["deduplicated"] is True
-        _wait(lambda: harness.executed == ["SELECT 1"])
-        assert harness.executed == ["SELECT 1"]
+        expected_sql = apply_database_row_limit("SELECT 1", DbType.MYSQL, 1001)
+        _wait(lambda: harness.executed == [expected_sql])
+        assert harness.executed == [expected_sql]
     finally:
         broker.shutdown()
 
