@@ -23,6 +23,7 @@ from app.api.app import create_app
 from app.api.security import create_access_token
 from app.api.services import ApiServices
 from app.broker.results import SpoolStatementResults, StatementMetrics, StatementSpool
+from app.broker.store import AttachRequest, PostgresBrokerStore
 from app.db.models import (
     console_sessions,
     console_statements,
@@ -172,6 +173,43 @@ def _statement(statement_id: str, *, seq: int = 1, sql: str = "SELECT 1") -> Con
         started_at=None,
         finished_at=None,
     )
+
+
+def test_postgres_broker_store_persists_statement_id_and_canonical_hash(engine: Engine) -> None:
+    canonical_hash = "sha256:" + ("a" * 64)
+    statement_id = str(uuid4())
+    store = PostgresBrokerStore(engine)
+    session = store.attach_session(
+        AttachRequest(
+            console_id=CONSOLE_ID,
+            datasource_id=DATASOURCE_ID,
+            owner_user_id=USER_ID,
+        ),
+        session_id=str(uuid4()),
+        broker_boot_id=str(uuid4()),
+        now=datetime.now(UTC),
+    )
+
+    statement, deduplicated = store.create_statement(
+        session,
+        statement_id=statement_id,
+        client_request_id=str(uuid4()),
+        sql="SELECT 1",
+        sql_hash=canonical_hash,
+        timeout_seconds=600,
+        now=datetime.now(UTC),
+    )
+
+    with engine.connect() as conn:
+        stored = (
+            conn.execute(select(console_statements).where(console_statements.c.id == statement_id))
+            .mappings()
+            .one()
+        )
+    assert deduplicated is False
+    assert statement.id == statement_id
+    assert stored["id"] == statement_id
+    assert stored["sql_hash"] == canonical_hash
 
 
 # ── result_sets catalog 平价 ─────────────────────────────────────────────────

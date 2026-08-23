@@ -502,7 +502,8 @@ console_statements = Table(
     Column("seq", Integer(), nullable=False),
     Column("client_request_id", String(64), nullable=False),
     Column("sql_text", Text(), nullable=False),
-    Column("sql_hash", String(64), nullable=False),
+    # Canonical form is ``sha256:`` + 64 hex characters.
+    Column("sql_hash", String(71), nullable=False),
     Column("sql_len", Integer(), nullable=False),
     Column("statement_kind", String(16), nullable=False),
     Column("is_write", Boolean(), nullable=False),

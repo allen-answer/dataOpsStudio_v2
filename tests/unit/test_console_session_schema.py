@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import fields, is_dataclass
 
-from sqlalchemy import CheckConstraint, ForeignKeyConstraint, Table, UniqueConstraint
+from sqlalchemy import CheckConstraint, ForeignKeyConstraint, String, Table, UniqueConstraint
 
 from app.db.models import console_sessions, console_statement_events, console_statements
 from app.domain.console_session import (
@@ -117,6 +117,9 @@ def test_console_statements_schema_has_idempotency_key_and_history_fields() -> N
         if isinstance(constraint, CheckConstraint)
     }
     assert checks == {"ck_console_statements_state_is_supported"}
+    sql_hash_type = console_statements.c.sql_hash.type
+    assert isinstance(sql_hash_type, String)
+    assert sql_hash_type.length == len("sha256:") + 64
 
 
 def test_console_statement_events_follows_job_event_shape() -> None:
