@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Collection
 from typing import BinaryIO, Protocol
 
-from app.domain.result import Manifest, ResultRef
+from app.domain.result import Manifest, ResultRef, SpoolSnapshotManifest
 from app.domain.schema import Row
 
 
@@ -65,6 +65,14 @@ class ResultStore(Protocol):
 
     def get_spool_manifest(self, result_set_id: str) -> dict[str, object]:
         """读取 ResultSet spool manifest。"""
+        raise NotImplementedError
+
+    def snapshot_spool(
+        self,
+        source_result_set_id: str,
+        snapshot_result_set_id: str,
+    ) -> SpoolSnapshotManifest:
+        """原子创建独立不可变 spool,源被删除后 snapshot 仍可读。"""
         raise NotImplementedError
 
     def open_download(self, ref: ResultRef) -> BinaryIO:

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import shutil
+import tempfile
 import time
 from collections.abc import Collection
 from dataclasses import dataclass, field
@@ -15,7 +17,7 @@ from typing import Any, BinaryIO, cast
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from app.domain.result import Manifest, ResultRef
+from app.domain.result import Manifest, ResultRef, SpoolSnapshotManifest
 from app.domain.schema import Column, Row
 from app.infrastructure.resultstore.protocol import ResultStore
 
@@ -42,6 +44,7 @@ class _SpoolManifest:
     columns: list[Column] = field(default_factory=list)
     loaded_rows: int = 0
     data_bytes: int = 0
+    sealed: bool = False
     truncated: bool = False
     has_more: bool = False
     pagination_mode: str | None = None
@@ -134,6 +137,7 @@ class LocalFsResultStore(ResultStore):
             return
 
         manifest = self._read_spool_manifest(result_set_id)
+        _require_mutable_spool(manifest)
         if manifest.truncated:
             return
 
@@ -191,6 +195,7 @@ class LocalFsResultStore(ResultStore):
 
     def mark_spool_truncated(self, result_set_id: str) -> None:
         manifest = self._read_spool_manifest(result_set_id)
+        _require_mutable_spool(manifest)
         if manifest.truncated and manifest.has_more:
             return
         manifest.truncated = True
@@ -207,6 +212,7 @@ class LocalFsResultStore(ResultStore):
         reason: str | None = None,
     ) -> None:
         manifest = self._read_spool_manifest(result_set_id)
+        _require_mutable_spool(manifest)
         manifest.has_more = has_more or manifest.truncated
         manifest.pagination_mode = mode
         manifest.pagination_reason = reason
@@ -215,6 +221,7 @@ class LocalFsResultStore(ResultStore):
 
     def set_spool_columns(self, result_set_id: str, columns: list[Column]) -> None:
         manifest = self._read_spool_manifest(result_set_id)
+        _require_mutable_spool(manifest)
         manifest.columns = [Column.model_validate(column.model_dump()) for column in columns]
         manifest.updated_at = time.time()
         self._write_spool_manifest(manifest)
@@ -300,6 +307,86 @@ class LocalFsResultStore(ResultStore):
     def get_spool_manifest(self, result_set_id: str) -> dict[str, Any]:
         return _spool_manifest_to_dict(self._read_spool_manifest(result_set_id))
 
+    def snapshot_spool(
+        self,
+        source_result_set_id: str,
+        snapshot_result_set_id: str,
+    ) -> SpoolSnapshotManifest:
+        """把终态 spool 原子封存为独立 snapshot。
+
+        Parquet part 写后不再原地修改,因此优先 hard-link;不支持 hard-link 的
+        文件系统自动回退 copy。manifest 始终独立重写,绝不引用 source 路径。
+        """
+
+        source_id = _safe_segment(source_result_set_id)
+        snapshot_id = _safe_segment(snapshot_result_set_id)
+        if source_id == snapshot_id:
+            raise ResultStoreError("snapshot result set id must differ from source")
+        source_dir = self._spool_dir(source_id)
+        source_manifest_path = source_dir / "manifest.json"
+        if not source_manifest_path.exists():
+            raise FileNotFoundError(source_manifest_path)
+        target_dir = self._spool_dir(snapshot_id)
+        if target_dir.exists():
+            raise ResultStoreError("snapshot result set already exists")
+
+        source_manifest = _spool_manifest_from_dict(
+            json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        )
+        temporary_dir = Path(tempfile.mkdtemp(prefix=".snapshot-", dir=self._resultsets_dir))
+        try:
+            temporary_parts = temporary_dir / "parts"
+            temporary_parts.mkdir(parents=True, exist_ok=True)
+            snapshot_parts: list[_PartInfo] = []
+            for part in source_manifest.parts:
+                source_part = self._path_from_ref(ResultRef(backend=_BACKEND, uri=part.path))
+                destination = temporary_parts / Path(part.path).name
+                try:
+                    os.link(source_part, destination)
+                except OSError:
+                    shutil.copy2(source_part, destination)
+                final_part = target_dir / "parts" / destination.name
+                snapshot_parts.append(
+                    _PartInfo(
+                        path=final_part.relative_to(self._root).as_posix(),
+                        rows=part.rows,
+                        bytes=destination.stat().st_size,
+                    )
+                )
+
+            now = time.time()
+            snapshot_manifest = _SpoolManifest(
+                result_set_id=snapshot_id,
+                parts=snapshot_parts,
+                columns=[
+                    Column.model_validate(column.model_dump()) for column in source_manifest.columns
+                ],
+                loaded_rows=source_manifest.loaded_rows,
+                data_bytes=sum(part.bytes for part in snapshot_parts),
+                sealed=True,
+                truncated=source_manifest.truncated,
+                has_more=source_manifest.has_more,
+                pagination_mode=source_manifest.pagination_mode,
+                pagination_reason=source_manifest.pagination_reason,
+                first_batch_at=source_manifest.first_batch_at,
+                created_at=now,
+                updated_at=now,
+            )
+            self._write_spool_manifest_file(snapshot_manifest, temporary_dir / "manifest.json")
+            temporary_dir.replace(target_dir)
+        except Exception:
+            shutil.rmtree(temporary_dir, ignore_errors=True)
+            raise
+
+        return SpoolSnapshotManifest(
+            result_set_id=snapshot_id,
+            columns=tuple(snapshot_manifest.columns),
+            loaded_rows=snapshot_manifest.loaded_rows,
+            data_bytes=snapshot_manifest.data_bytes,
+            truncated=snapshot_manifest.truncated,
+            has_more=snapshot_manifest.has_more or snapshot_manifest.truncated,
+        )
+
     @property
     def _runs_dir(self) -> Path:
         return self._root / "runs"
@@ -364,6 +451,10 @@ class LocalFsResultStore(ResultStore):
 
     def _write_spool_manifest(self, manifest: _SpoolManifest) -> None:
         path = self._spool_manifest_path(manifest.result_set_id)
+        self._write_spool_manifest_file(manifest, path)
+
+    def _write_spool_manifest_file(self, manifest: _SpoolManifest, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = path.with_suffix(".tmp")
         manifest.result_version += 1
         temporary_path.write_text(
@@ -511,6 +602,7 @@ def _spool_manifest_to_dict(manifest: _SpoolManifest) -> dict[str, Any]:
         "columns": [column.model_dump() for column in manifest.columns],
         "loaded_rows": manifest.loaded_rows,
         "data_bytes": manifest.data_bytes,
+        "sealed": manifest.sealed,
         "truncated": manifest.truncated,
         "has_more": manifest.has_more or manifest.truncated,
         "pagination_mode": manifest.pagination_mode,
@@ -544,6 +636,7 @@ def _spool_manifest_from_dict(payload: dict[str, Any]) -> _SpoolManifest:
         columns=[Column.model_validate(column) for column in payload.get("columns", [])],
         loaded_rows=loaded_rows,
         data_bytes=int(payload.get("data_bytes", 0)),
+        sealed=bool(payload.get("sealed", False)),
         truncated=bool(payload.get("truncated", False)),
         has_more=bool(payload.get("has_more", payload.get("truncated", False))),
         pagination_mode=(
@@ -567,6 +660,11 @@ def _safe_segment(value: str) -> str:
     if not value or "/" in value or "\\" in value or value in {".", ".."}:
         raise ValueError("Invalid path segment")
     return value
+
+
+def _require_mutable_spool(manifest: _SpoolManifest) -> None:
+    if manifest.sealed:
+        raise ResultStoreError("sealed snapshot spool is immutable")
 
 
 def _safe_artifact_name(value: str) -> str:

@@ -246,6 +246,11 @@ class SecretKind(Enum):
 class ResultStore(Protocol):
     def put_artifact(self, run_id: str, name: str, stream: BinaryIO) -> ResultRef: ...
     def append_spool(self, result_set_id: str, rows: list[Row]) -> None: ...  # 流式追加
+    def snapshot_spool(
+        self,
+        source_result_set_id: str,
+        snapshot_result_set_id: str,
+    ) -> SpoolSnapshotManifest: ...  # 不可变独立副本;源删除后仍可读
     def mark_spool_truncated(self, result_set_id: str) -> None: ...  # 主动限行后幂等标记截断
     def set_spool_pagination(
         self,

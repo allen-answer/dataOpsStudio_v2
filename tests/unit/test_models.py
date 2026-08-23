@@ -21,6 +21,7 @@ from app.db.models import (
     APPLICATION_SECRET_KINDS,
     ai_configs,
     audit_logs,
+    compare_result_inputs,
     compare_tasks,
     datasources,
     export_download_tokens,
@@ -131,9 +132,10 @@ def test_all_alembic_revision_ids_under_32_chars() -> None:
     assert not violations, f"revision ID 超 32 字符: {violations}"
 
 
-def test_metadata_has_30_tables() -> None:
+def test_metadata_has_31_tables() -> None:
     expected = {
         "ai_configs",
+        "compare_result_inputs",
         "compare_tasks",
         "console_sessions",
         "console_statement_events",
@@ -648,3 +650,28 @@ def test_result_sets_state_check_exists() -> None:
     """result_sets.state 限定 4 个值(streaming / complete / failed / closed)。"""
     check_names = {c.name for c in result_sets.constraints if c.name is not None}
     assert "ck_result_sets_state_is_valid" in check_names
+
+
+def test_compare_result_inputs_enforce_origin_and_state_values() -> None:
+    columns = set(compare_result_inputs.columns.keys())
+    assert {
+        "project_id",
+        "created_by",
+        "origin_kind",
+        "origin_id",
+        "source_result_set_id",
+        "columns",
+        "loaded_rows",
+        "total_rows",
+        "truncated",
+        "has_more",
+        "state",
+        "expires_at",
+    } <= columns
+    check_names = {
+        constraint.name
+        for constraint in compare_result_inputs.constraints
+        if constraint.name is not None
+    }
+    assert "ck_compare_result_inputs_origin_kind_is_supported" in check_names
+    assert "ck_compare_result_inputs_state_is_supported" in check_names

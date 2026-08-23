@@ -10,6 +10,7 @@ import pytest
 from fastapi.routing import APIRoute
 
 from app.api.app import create_app
+from app.api.routes import compare_result_inputs as compare_result_inputs_routes
 from app.api.routes import core as core_routes
 from app.api.schemas import SqlGenerateResponse
 from app.api.security import create_access_token, decode_access_token
@@ -18,6 +19,7 @@ from app.dbclients.protocol import AdapterConnectionError
 from app.domain.ai import AiContext, AiOptions, AiResponse, EgressLevel
 from app.domain.ai_copilot import MAX_TABLES
 from app.domain.compare_result import encode_compare_result_row
+from app.domain.compare_result_input import CompareResultInputDescriptor
 from app.domain.job import Job, JobKind
 from app.domain.license import LicenseMode
 from app.domain.result import (
@@ -28,6 +30,7 @@ from app.domain.result import (
 )
 from app.domain.schema import Column, ColumnType, Index, Row, Schema, Table
 from app.domain.workflow import WorkflowSpec
+from app.infrastructure.compare_result_inputs import CompareResultInputExpired
 from app.services.ai.default_gateway import DefaultAiGateway
 from app.services.ai.errors import (
     AiGatewayError,
@@ -89,6 +92,8 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("GET", "/api/projects/{project_id}/compare/suggest-tasks") in routes
     assert ("POST", "/api/projects/{project_id}/compare/draft-task") in routes
     assert ("GET", "/api/projects/{project_id}/compare/runs-dashboard") in routes
+    assert ("POST", "/api/projects/{project_id}/compare/result-inputs") in routes
+    assert ("GET", "/api/projects/{project_id}/compare/result-inputs/{input_id}") in routes
     assert ("POST", "/api/projects/{project_id}/lineage/analyze") in routes
     assert ("GET", "/api/projects/{project_id}/lineage/subgraph") in routes
     assert ("GET", "/api/projects/{project_id}/lineage/impact") in routes
@@ -141,6 +146,77 @@ def test_t4_api_route_surface_matches_contract() -> None:
     assert ("GET", "/api/sql/statements/{statement_id}/progress") in routes
     assert ("GET", "/api/sql/statements/{statement_id}/result") in routes
     assert ("POST", "/api/sql/statements/{statement_id}/cancel") in routes
+
+
+def test_compare_result_input_capture_returns_opaque_snapshot_and_audits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services = _Services(_FakeEngine([]))
+    descriptor = CompareResultInputDescriptor(
+        id="input-1",
+        project_id="project-1",
+        origin_kind="statement",
+        origin_id="statement-1",
+        columns=(Column(name="id", type=ColumnType.INTEGER),),
+        loaded_rows=2,
+        total_rows=2,
+        truncated=False,
+        has_more=False,
+        state="ready",
+        created_at=_dt(1),
+        expires_at=_dt(2),
+    )
+
+    class _Module:
+        def capture(self, origin: object, *, scope: object) -> CompareResultInputDescriptor:
+            del origin, scope
+            return descriptor
+
+    monkeypatch.setattr(compare_result_inputs_routes, "_module", lambda request: _Module())
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/compare/result-inputs",
+        headers=_auth_headers(),
+        json_body={"origin_kind": "statement", "origin_id": "statement-1"},
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["id"] == "input-1"
+    assert "result_set_id" not in payload
+    assert "uri" not in payload
+    assert "sql" not in payload
+    assert any(audit["action"] == "compare_result_input_capture" for audit in services.audits)
+
+
+def test_compare_result_input_get_maps_expiry_to_410(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services = _Services(_FakeEngine([]))
+
+    class _Module:
+        def open(
+            self,
+            input_id: str,
+            *,
+            scope: object,
+            batch_size: int,
+            retain_until: datetime,
+        ) -> object:
+            del input_id, scope, batch_size, retain_until
+            raise CompareResultInputExpired("expired")
+
+    monkeypatch.setattr(compare_result_inputs_routes, "_module", lambda request: _Module())
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/compare/result-inputs/input-1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 410
+    assert response.json()["error"] == "compare_input_expired"
 
 
 def test_version_is_public_and_reports_sanitized_build_identity(
