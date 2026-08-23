@@ -11,6 +11,7 @@ from app.dbclients.dm_types import (
     data_type_string_to_column_type,
     description_item_to_column_type,
 )
+from app.dbclients.interactive.errors import driver_error_code
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.query_timing import QueryTimingRecorder
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
@@ -547,20 +548,13 @@ def _optional_str(value: object) -> str | None:
 
 def _connection_error_summary(exc: Exception) -> str:
     parts = [type(exc).__name__]
-    code = _first_int_arg(exc)
+    code = driver_error_code(exc)
     if code is not None:
         parts.append(f"code={code}")
     message = _sanitize_error_text(str(exc))
     if message:
         parts.append(f"message={message}")
     return " ".join(parts)
-
-
-def _first_int_arg(exc: Exception) -> int | None:
-    for arg in getattr(exc, "args", ()):
-        if isinstance(arg, int):
-            return arg
-    return None
 
 
 def _sanitize_error_text(text: str) -> str:

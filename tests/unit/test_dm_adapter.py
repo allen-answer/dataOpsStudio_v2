@@ -21,6 +21,7 @@ from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.schema import Column, ColumnType, Row
 from app.domain.secret import HashedRef, RotationReport, SecretKind, SecretRef
 from app.infrastructure.secretstore.protocol import SecretStore
+from tests.unit._interactive_fakes import dm_connect_error, dm_error
 
 
 def test_requires_dm_db_type() -> None:
@@ -147,6 +148,28 @@ def test_test_connection_sanitizes_error_on_failure() -> None:
     assert "dm://user" not in adapter.last_connection_error
     assert "<redacted-url>" in adapter.last_connection_error
     assert "***REDACTED***" in adapter.last_connection_error
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (dm_error(-2501, "authentication failed"), -2501),
+        (dm_connect_error(-70028, "host unreachable"), -70028),
+    ],
+)
+def test_test_connection_extracts_real_dmpython_error_shapes(
+    error: Exception,
+    expected_code: int,
+) -> None:
+    adapter = DMAdapter(
+        _conn_info(),
+        cast(SecretStore, _SecretStore("pwd")),
+        dm_module=_FailingDM(error),
+    )
+
+    assert adapter.test_connection() is False
+    assert adapter.last_connection_error is not None
+    assert f"code={expected_code}" in adapter.last_connection_error
 
 
 def test_stream_select_preserves_connection_error_cause() -> None:
