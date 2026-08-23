@@ -167,15 +167,25 @@ class DMAdapter(DatabaseAdapter):
             _safe_close(conn)
 
     def list_schemas(self) -> list[Schema]:
+        # `ALL_USERS` 只表示数据库用户,不表示当前连接能看到哪些对象。schema 浏览器
+        # 应从可见对象字典推导 OWNER;同时把当前/default schema 补回,让空 schema
+        # 以及 SYSDBA 这类被系统过滤策略命中的当前 schema 仍可选择。
+        current_schema = self._conn_info.database or self._conn_info.username
         placeholders = ", ".join(["?"] * len(_SYSTEM_SCHEMAS))
         rows = self._query_dicts(
             f"""
-            SELECT USERNAME AS name
-            FROM ALL_USERS
-            WHERE USERNAME NOT IN ({placeholders})
-            ORDER BY USERNAME
+            SELECT name
+            FROM (
+                SELECT OWNER AS name FROM ALL_TABLES
+                UNION
+                SELECT OWNER AS name FROM ALL_VIEWS
+                UNION
+                SELECT UPPER(?) AS name FROM dual
+            ) visible_schemas
+            WHERE name NOT IN ({placeholders}) OR name = UPPER(?)
+            ORDER BY name
             """,
-            tuple(_SYSTEM_SCHEMAS),
+            (current_schema, *_SYSTEM_SCHEMAS, current_schema),
         )
         return [Schema(name=str(row["name"])) for row in rows]
 

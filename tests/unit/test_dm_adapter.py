@@ -18,7 +18,7 @@ from app.dbclients.dm_types import (
 )
 from app.dbclients.protocol import AdapterConnectionError
 from app.domain.datasource import DatasourceConnInfo, DbType
-from app.domain.schema import Column, ColumnType, Row
+from app.domain.schema import Column, ColumnType, Row, Schema
 from app.domain.secret import HashedRef, RotationReport, SecretKind, SecretRef
 from app.infrastructure.secretstore.protocol import SecretStore
 from tests.unit._interactive_fakes import dm_connect_error, dm_error
@@ -122,6 +122,33 @@ def test_list_columns_maps_data_type_and_keeps_driver_type() -> None:
     ]
     assert 'cc.COMMENTS AS "COMMENT"' in column_sql
     assert "as comment" not in column_sql.lower()
+
+
+def test_list_schemas_uses_visible_table_and_view_owners() -> None:
+    fake_dm = _FakeDM(schema_rows=[("APP",), ("GRANTED",)])
+    adapter = DMAdapter(_conn_info(), cast(SecretStore, _SecretStore("pwd")), dm_module=fake_dm)
+
+    schemas = adapter.list_schemas()
+    cursor = fake_dm.connections[0].cursors[0]
+
+    assert schemas == [Schema(name="APP"), Schema(name="GRANTED")]
+    assert "FROM ALL_TABLES" in cursor.executed_sql
+    assert "FROM ALL_VIEWS" in cursor.executed_sql
+    assert "FROM ALL_USERS" not in cursor.executed_sql
+
+
+def test_list_schemas_keeps_current_schema_even_when_it_is_system_or_empty() -> None:
+    fake_dm = _FakeDM(schema_rows=[("GRANTED",), ("SYSDBA",)])
+    conn_info = _conn_info().model_copy(update={"username": "SYSDBA", "database": "SYSDBA"})
+    adapter = DMAdapter(conn_info, cast(SecretStore, _SecretStore("pwd")), dm_module=fake_dm)
+
+    schemas = adapter.list_schemas()
+    cursor = fake_dm.connections[0].cursors[0]
+
+    assert schemas == [Schema(name="GRANTED"), Schema(name="SYSDBA")]
+    assert "FROM dual" in cursor.executed_sql
+    assert isinstance(cursor.executed_params, tuple)
+    assert cursor.executed_params[-1] == "SYSDBA"
 
 
 def test_test_connection_records_dm_server_version() -> None:
@@ -289,11 +316,12 @@ class _FakeDM:
     DATETIME = _DMTypeObject("DATETIME")
     BINARY = _DMTypeObject("BINARY")
 
-    def __init__(self) -> None:
+    def __init__(self, *, schema_rows: list[tuple[Any, ...]] | None = None) -> None:
         self.connections: list[_FakeConnection] = []
+        self.schema_rows = schema_rows
 
     def connect(self, **kwargs: Any) -> _FakeConnection:
-        conn = _FakeConnection(kwargs)
+        conn = _FakeConnection(kwargs, schema_rows=self.schema_rows)
         self.connections.append(conn)
         return conn
 
@@ -308,8 +336,14 @@ class _FailingDM(_FakeDM):
 
 
 class _FakeConnection:
-    def __init__(self, kwargs: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        kwargs: dict[str, Any],
+        *,
+        schema_rows: list[tuple[Any, ...]] | None = None,
+    ) -> None:
         self.kwargs = kwargs
+        self.schema_rows = schema_rows
         self.closed = False
         self.callTimeout: int | None = None
         self.cursors: list[_FakeCursor] = []
@@ -318,7 +352,7 @@ class _FakeConnection:
     def cursor(self, cursorclass: object | None = None) -> _FakeCursor:
         if cursorclass is not None:
             self.cursor_called_with_class = True
-        cursor = _FakeCursor()
+        cursor = _FakeCursor(schema_rows=self.schema_rows)
         self.cursors.append(cursor)
         return cursor
 
@@ -327,16 +361,19 @@ class _FakeConnection:
 
 
 class _FakeCursor:
-    def __init__(self) -> None:
+    def __init__(self, *, schema_rows: list[tuple[Any, ...]] | None = None) -> None:
         self.closed = False
+        self.schema_rows = schema_rows
         self.description: tuple[tuple[Any, ...], ...] = (("ok",),)
         self._rows: list[tuple[Any, ...]] = []
         self._offset = 0
         self.executed_sql = ""
+        self.executed_params: object = None
         self.fetchmany_sizes: list[int] = []
 
     def execute(self, sql: str, params: object = None) -> None:
         self.executed_sql = sql
+        self.executed_params = params
         normalized = " ".join(sql.lower().split())
         if "from dual" in normalized and "select 1 as ok" in normalized:
             self.description = (("ok",),)
@@ -356,6 +393,13 @@ class _FakeCursor:
         elif "all_constraints" in normalized:
             self.description = (("name",),)
             self._rows = []
+        elif (
+            self.schema_rows is not None
+            and "from all_tables" in normalized
+            and "from all_views" in normalized
+        ):
+            self.description = (("name",),)
+            self._rows = self.schema_rows
         elif "select n from t" in normalized:
             self.description = (("N", _FakeDM.NUMBER),)
             self._rows = [(1,), (2,)]
