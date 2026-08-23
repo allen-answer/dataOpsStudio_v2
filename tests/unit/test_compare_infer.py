@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+
+import app.domain.compare_infer as compare_infer
 from app.domain.compare_infer import (
     ConflictKind,
     MappingReason,
@@ -132,3 +135,23 @@ def test_table_pair_suggestions_match_exact_and_normalized_names() -> None:
     by_pair = {(item.source_table, item.target_table): item for item in suggestions}
     assert by_pair[("orders", "orders")].reason is TableSuggestionReason.EXACT
     assert by_pair[("src_customer", "customer")].reason is TableSuggestionReason.NORMALIZED
+
+
+def test_table_pair_suggestions_indexes_normalized_names_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = compare_infer._normalized_identifier
+    calls = 0
+
+    def counted(name: str) -> str:
+        nonlocal calls
+        calls += 1
+        return original(name)
+
+    monkeypatch.setattr(compare_infer, "_normalized_identifier", counted)
+    tables = [Table(schema_name="app", name=f"table_{index}") for index in range(500)]
+
+    suggestions = infer_table_pair_suggestions(tables, tables)
+
+    assert len(suggestions) == 100
+    assert calls <= len(tables) * 2 + 10

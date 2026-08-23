@@ -263,10 +263,15 @@ def infer_table_pair_suggestions(
     *,
     limit: int = 100,
 ) -> list[TablePairSuggestion]:
+    targets_by_normalized_name: dict[str, list[Table]] = {}
+    for target in target_tables:
+        normalized = _normalized_identifier(target.name)
+        targets_by_normalized_name.setdefault(normalized, []).append(target)
+
     suggestions: list[TablePairSuggestion] = []
     for source in source_tables:
         source_norm = _normalized_identifier(source.name)
-        for target in target_tables:
+        for target in targets_by_normalized_name.get(source_norm, []):
             reason: TableSuggestionReason | None = None
             confidence = 0.0
             if source.name == target.name or source.name.lower() == target.name.lower():
