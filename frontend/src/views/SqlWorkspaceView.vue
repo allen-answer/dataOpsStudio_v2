@@ -552,7 +552,15 @@ watch(activeConsoleId, (current, previous) => {
   const consoleRow = activeConsole.value
   suppressConsoleSave.value = true
   editorSql.value = consoleRow?.sql ?? 'SELECT 1 AS hello;'
-  selectedDsId.value = consoleRow?.datasource_id ?? datasources.value[0]?.id ?? ''
+  const datasourceId = consoleRow?.datasource_id ?? datasources.value[0]?.id ?? ''
+  selectedDsId.value = datasourceId
+  // The displayed default is a real console binding, not a visual fallback.
+  // This assignment happens while the generic watcher is suppressed, so persist
+  // it explicitly before lazy attach reads the console row from the API.
+  if (consoleRow && !consoleRow.datasource_id && datasourceId) {
+    patchLocalConsole(consoleRow.id, { datasource_id: datasourceId })
+    scheduleConsolePatch(consoleRow.id, { datasource_id: datasourceId })
+  }
   void nextTick(() => {
     suppressConsoleSave.value = false
     if (current) resumeConsolePoll(current)
