@@ -47,6 +47,7 @@ import {
 } from 'lucide-vue-next'
 import type * as monaco from 'monaco-editor/esm/vs/editor/editor.api'
 import { listDatasources } from '../api/datasources'
+import { captureCompareResultInput } from '../api/compare'
 import {
   createSqlConsole,
   createSqlTemplate,
@@ -334,6 +335,8 @@ const exportBusy = ref(false)
 const exportError = ref<string | null>(null)
 const exportReady = ref<{ token: string; filename: string } | null>(null)
 const exportPollTimers = new Set<ReturnType<typeof setTimeout>>()
+const resultCompareBusy = ref(false)
+const resultCompareError = ref<string | null>(null)
 
 const activeConsole = computed<SqlConsole | null>(
   () => consoles.value.find((item) => item.id === activeConsoleId.value) ?? null,
@@ -815,6 +818,53 @@ async function onSendToCompare(): Promise<void> {
     await router.push({ name: 'compare', params: { id: projectId.value }, query: { handoff: token } })
   } catch (error) {
     toolError.value = errorMessage(error)
+  }
+}
+
+async function onSendResultToCompare(): Promise<void> {
+  const source = exportableSource.value
+  const runtime = activeRuntime.value
+  if (!source || !runtime?.result || resultCompareBusy.value) return
+  const runtimePartial = Boolean(
+    runtime.result.truncated ||
+      runtime.result.has_more ||
+      runtime.status === 'cancelled' ||
+      runtime.status === 'timeout',
+  )
+  if (runtimePartial && !globalThis.confirm(t('sql.result_to_compare_partial_confirm'))) return
+
+  resultCompareBusy.value = true
+  resultCompareError.value = null
+  try {
+    let allowPartial = runtimePartial
+    let snapshot
+    try {
+      snapshot = await captureCompareResultInput(
+        projectId.value,
+        source.kind,
+        source.id,
+        allowPartial,
+      )
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.code !== 'result_partial_confirmation_required') {
+        throw error
+      }
+      if (!globalThis.confirm(t('sql.result_to_compare_partial_confirm'))) return
+      allowPartial = true
+      snapshot = await captureCompareResultInput(projectId.value, source.kind, source.id, true)
+    }
+    const snapshotPartial = snapshot.truncated || snapshot.has_more
+    const token = createWorkspaceHandoff({
+      kind: 'result_to_compare',
+      projectId: projectId.value,
+      inputId: snapshot.id,
+      allowPartial: allowPartial || snapshotPartial,
+    })
+    await router.push({ name: 'compare', params: { id: projectId.value }, query: { handoff: token } })
+  } catch (error) {
+    resultCompareError.value = errorMessage(error)
+  } finally {
+    resultCompareBusy.value = false
   }
 }
 
@@ -3049,6 +3099,17 @@ function parseVariables(value: string): string[] {
               >
                 {{ sessionPartialHint }}
               </span>
+              <button
+                type="button"
+                class="chrome-btn-secondary"
+                data-testid="sql-result-to-compare"
+                :disabled="writesBlocked || !exportableSource || !activeRuntime?.result || resultCompareBusy"
+                :title="writesBlocked ? t('license.writes_blocked') : !exportableSource || !activeRuntime?.result ? t('sql.result_to_compare_needs_result') : t('sql.result_to_compare_hint')"
+                @click="onSendResultToCompare"
+              >
+                <GitCompareArrows class="w-3.5 h-3.5" />
+                {{ resultCompareBusy ? t('sql.result_to_compare_running') : t('sql.result_to_compare') }}
+              </button>
               <div class="relative">
                 <button
                   type="button"
@@ -3097,6 +3158,14 @@ function parseVariables(value: string): string[] {
             </button>
           </div>
 
+          <div
+            v-if="resultCompareError"
+            class="flex items-center gap-2 px-5 py-2 border-b chrome-border-subtle text-xs"
+            style="background-color: rgb(239 68 68 / 0.08); color: rgb(185 28 28);"
+          >
+            <AlertTriangle class="w-3.5 h-3.5 shrink-0" />
+            <span class="flex-1">{{ resultCompareError }}</span>
+          </div>
           <div
             v-if="exportError"
             class="flex items-center gap-2 px-5 py-2 border-b chrome-border-subtle text-xs"
