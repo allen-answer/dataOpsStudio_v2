@@ -11,14 +11,22 @@ from __future__ import annotations
 import os
 import tempfile
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
+from app import worker as worker_module
 from app.domain.compare_result import decode_compare_result_row
+from app.domain.compare_result_input import (
+    CompareResultInputDescriptor,
+    OpenedCompareResultInput,
+)
 from app.domain.datasource import DatasourceConnInfo
 from app.domain.job import JobErrorCode, JobKind
-from app.domain.schema import Column, Row
+from app.domain.schema import Column, ColumnType, Row
+from app.infrastructure.compare_result_inputs import CompareResultInputExpired
 from app.worker import WorkerRunner, WorkerRunnerConfig
 from tests.unit.test_worker import (
     _ColumnSinkAdapter,
@@ -83,6 +91,8 @@ def _run_worker(
     payload: dict[str, object],
     downloads: dict[str, bytes],
     adapters: list[_FakeAdapter] | None = None,
+    compare_result_inputs: object | None = None,
+    datasource_loader: Callable[[str], DatasourceConnInfo] | None = None,
 ) -> tuple[_FakeBackend, _FakeResultStore, _FakeCompareRunCatalog, _FakeErrorCodeWriter]:
     job = _make_job(kind=JobKind.COMPARE_RUN, payload=payload)
     backend = _FakeBackend([job])
@@ -104,14 +114,71 @@ def _run_worker(
     runner = WorkerRunner(
         backend,
         result_store,
-        lambda datasource_id: _conn_info(datasource_id),
+        datasource_loader or (lambda datasource_id: _conn_info(datasource_id)),
         adapter_factory,
         WorkerRunnerConfig(worker_id="worker-1"),
         compare_run_catalog=compare_catalog,
         job_error_code_writer=error_writer,
+        compare_result_inputs=cast(Any, compare_result_inputs),
     )
     assert runner.run_once() is True
     return backend, result_store, compare_catalog, error_writer
+
+
+class _SnapshotInputs:
+    def __init__(
+        self,
+        rows: list[Row] | None = None,
+        *,
+        error: Exception | None = None,
+        partial: bool = False,
+    ) -> None:
+        self.rows = rows or []
+        self.error = error
+        self.partial = partial
+        self.calls: list[dict[str, object]] = []
+
+    def open(
+        self,
+        input_id: str,
+        *,
+        scope: object,
+        batch_size: int,
+        retain_until: datetime,
+        allow_expired: bool = False,
+    ) -> OpenedCompareResultInput:
+        self.calls.append(
+            {
+                "input_id": input_id,
+                "scope": scope,
+                "batch_size": batch_size,
+                "retain_until": retain_until,
+                "allow_expired": allow_expired,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+        now = datetime.now(UTC)
+        return OpenedCompareResultInput(
+            descriptor=CompareResultInputDescriptor(
+                id=input_id,
+                project_id="project-1",
+                origin_kind="statement",
+                origin_id="statement-1",
+                columns=(
+                    Column(name="id", type=ColumnType.INTEGER),
+                    Column(name="name", type=ColumnType.STRING),
+                ),
+                loaded_rows=len(self.rows),
+                total_rows=len(self.rows),
+                truncated=self.partial,
+                has_more=self.partial,
+                state="ready",
+                created_at=now,
+                expires_at=now + timedelta(days=1),
+            ),
+            batches=(tuple(self.rows),),
+        )
 
 
 def test_worker_compare_file_source_vs_db_target_detects_all_buckets() -> None:
@@ -157,6 +224,150 @@ def test_worker_compare_file_source_vs_db_target_detects_all_buckets() -> None:
     assert result_store.rows_by_result_set.get("rs-same", []) == []
     assert backend.completed and backend.completed[0][0] == "job-1"
     assert not backend.failed
+
+
+def test_worker_compare_result_snapshot_vs_db_never_loads_snapshot_datasource() -> None:
+    snapshot_inputs = _SnapshotInputs(
+        [
+            Row(values=[1, "same"]),
+            Row(values=[2, "left"]),
+            Row(values=[3, "old"]),
+        ]
+    )
+    db_adapter = _FakeAdapter(
+        [
+            Row(values=[1, 1, "same"]),
+            Row(values=[3, 3, "new"]),
+            Row(values=[4, 4, "right"]),
+        ]
+    )
+    loaded_datasources: list[str] = []
+
+    def load_datasource(datasource_id: str) -> DatasourceConnInfo:
+        loaded_datasources.append(datasource_id)
+        return _conn_info(datasource_id)
+
+    payload = _compare_payload(
+        source_id=None,
+        target_id="ds-target",
+        source_ref={"kind": "result_snapshot", "input_id": "input-1"},
+        target_ref={"kind": "table", "schema_name": "app", "table_name": "tgt"},
+    )
+    backend, result_store, compare_catalog, _ = _run_worker(
+        payload=payload,
+        downloads={},
+        adapters=[db_adapter],
+        compare_result_inputs=snapshot_inputs,
+        datasource_loader=load_datasource,
+    )
+
+    assert compare_catalog.completed[0]["bucket_counts"] == {
+        "only_source": 1,
+        "only_target": 1,
+        "diff": 1,
+        "same": 1,
+    }
+    assert loaded_datasources == ["ds-target"]
+    assert snapshot_inputs.calls[0]["input_id"] == "input-1"
+    assert decode_compare_result_row(result_store.rows_by_result_set["rs-diff"][0])["cells"] == [
+        {"column": "name", "source": "old", "target": "new"}
+    ]
+    assert backend.completed
+    assert not backend.failed
+
+
+def test_worker_compare_expired_result_snapshot_fails_without_sql_fallback() -> None:
+    snapshot_inputs = _SnapshotInputs(error=CompareResultInputExpired("expired"))
+    payload = _compare_payload(
+        source_id=None,
+        target_id=None,
+        source_ref={"kind": "result_snapshot", "input_id": "input-expired"},
+        target_ref={"kind": "result_snapshot", "input_id": "input-target"},
+    )
+    backend, _, compare_catalog, error_writer = _run_worker(
+        payload=payload,
+        downloads={},
+        adapters=[],
+        compare_result_inputs=snapshot_inputs,
+        datasource_loader=lambda datasource_id: pytest.fail(
+            f"unexpected datasource load: {datasource_id}"
+        ),
+    )
+
+    assert backend.failed == [("job-1", "compare_input_expired")]
+    assert error_writer.error_codes == [("job-1", JobErrorCode.SQL_FAILED)]
+    assert compare_catalog.terminal == [{"run_id": "run-1", "status": "failed"}]
+
+
+def test_worker_snapshot_vs_db_enforces_max_rows_on_database_side() -> None:
+    snapshot_inputs = _SnapshotInputs([Row(values=[1, "one"])])
+    db_adapter = _FakeAdapter(
+        [
+            Row(values=[1, 1, "one"]),
+            Row(values=[2, 2, "two"]),
+            Row(values=[3, 3, "three"]),
+        ]
+    )
+    payload = _compare_payload(
+        source_id=None,
+        target_id="ds-target",
+        source_ref={"kind": "result_snapshot", "input_id": "input-1"},
+        target_ref={"kind": "table", "schema_name": "app", "table_name": "tgt"},
+        max_rows=2,
+    )
+    backend, _, compare_catalog, error_writer = _run_worker(
+        payload=payload,
+        downloads={},
+        adapters=[db_adapter],
+        compare_result_inputs=snapshot_inputs,
+    )
+
+    assert backend.failed == [("job-1", "compare_limit_exceeded")]
+    assert error_writer.error_codes == [("job-1", JobErrorCode.COMPARE_LIMIT_EXCEEDED)]
+    assert compare_catalog.terminal == [{"run_id": "run-1", "status": "failed"}]
+
+
+def test_worker_rejects_partial_snapshot_without_confirmation() -> None:
+    snapshot_inputs = _SnapshotInputs([Row(values=[1, "one"])], partial=True)
+    payload = _compare_payload(
+        source_id=None,
+        target_id=None,
+        source_ref={"kind": "result_snapshot", "input_id": "input-partial"},
+        target_ref={"kind": "result_snapshot", "input_id": "input-target"},
+    )
+    backend, _, compare_catalog, error_writer = _run_worker(
+        payload=payload,
+        downloads={},
+        adapters=[],
+        compare_result_inputs=snapshot_inputs,
+    )
+
+    assert backend.failed == [("job-1", "result_not_comparable")]
+    assert error_writer.error_codes == [("job-1", JobErrorCode.SQL_FAILED)]
+    assert compare_catalog.terminal == [{"run_id": "run-1", "status": "failed"}]
+
+
+def test_worker_snapshot_materialization_enforces_byte_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(worker_module, "_COMPARE_RESULT_SNAPSHOT_MAX_BYTES", 8)
+    snapshot_inputs = _SnapshotInputs([Row(values=[1, "value-too-large"])])
+    payload = _compare_payload(
+        source_id=None,
+        target_id=None,
+        source_ref={"kind": "result_snapshot", "input_id": "input-large"},
+        target_ref={"kind": "result_snapshot", "input_id": "input-target"},
+    )
+    backend, _, compare_catalog, error_writer = _run_worker(
+        payload=payload,
+        downloads={},
+        adapters=[],
+        compare_result_inputs=snapshot_inputs,
+    )
+
+    assert backend.failed == [("job-1", "compare_limit_exceeded")]
+    assert error_writer.error_codes == [("job-1", JobErrorCode.COMPARE_LIMIT_EXCEEDED)]
+    assert compare_catalog.terminal == [{"run_id": "run-1", "status": "failed"}]
 
 
 def test_worker_compare_file_vs_file_detects_diff_and_only_rows() -> None:

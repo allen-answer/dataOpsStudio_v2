@@ -28,6 +28,7 @@ def test_side_expression_table_and_sql_and_file() -> None:
     )
 
     assert compare_side_expression(DbType.MYSQL, {"kind": "file"}) is None
+    assert compare_side_expression(DbType.MYSQL, {"kind": "result_snapshot"}) is None
     assert compare_side_expression(DbType.MYSQL, {"kind": "table"}) is None
 
 

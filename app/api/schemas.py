@@ -289,7 +289,7 @@ CompareFileFormat = Literal["csv", "excel"]
 
 
 class CompareDataRef(BaseModel):
-    kind: Literal["table", "sql", "file"] = "table"
+    kind: Literal["table", "sql", "file", "result_snapshot"] = "table"
     schema_name: str | None = None
     table_name: str | None = Field(default=None, min_length=1)
     sql: str | None = Field(default=None, min_length=1)
@@ -302,6 +302,10 @@ class CompareDataRef(BaseModel):
     header_row: int = Field(default=1, ge=1)  # 1-indexed 表头行(表头前导言行被跳过)
     encoding: str | None = None  # csv:空=utf-8-sig(解码失败自动 GBK 回退)
     delimiter: str | None = Field(default=None, min_length=1, max_length=4)  # csv 分隔符
+    # kind="result_snapshot":只保存 CompareResultInputs 生成的 opaque input id。
+    input_id: str | None = Field(default=None, min_length=1, max_length=36)
+    # 部分/截断 snapshot 必须由调用方显式确认,默认 fail closed。
+    allow_partial: bool = False
 
     @model_validator(mode="after")
     def _validate_ref(self) -> CompareDataRef:
@@ -314,6 +318,8 @@ class CompareDataRef(BaseModel):
                 raise ValueError("file ref requires upload_id")
             if self.file_format is None:
                 raise ValueError("file ref requires file_format")
+        if self.kind == "result_snapshot" and not self.input_id:
+            raise ValueError("result_snapshot ref requires input_id")
         return self
 
 
@@ -348,13 +354,17 @@ class CompareRunLimitsPayload(BaseModel):
 
 
 def _validate_compare_side(*, side: str, kind: str, datasource_id: str | None) -> None:
-    """每侧校验:DB 侧(table/sql)必须给 datasource_id;文件侧(file)不需要。
+    """每侧校验:DB 侧(table/sql)必须给 datasource_id;物化侧不需要。
 
     C-1 文件源对比:file kind 的一侧 source_id/target_id 可选(照抄 #115
     数据源可选范式)。DB 侧仍强制绑数据源,否则 worker 无从取数。
     """
 
     if kind == "file":
+        return
+    if kind == "result_snapshot":
+        if datasource_id:
+            raise ValueError(f"{side} result_snapshot must not define {side}_id")
         return
     if not datasource_id:
         raise ValueError(f"{side} ref kind={kind} requires {side}_id")

@@ -7,7 +7,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 import structlog
-from sqlalchemy import and_, insert, or_, select, update
+from sqlalchemy import and_, exists, insert, or_, select, union_all, update
 from sqlalchemy.engine import Connection, Engine, RowMapping
 
 from app.db.models import (
@@ -198,6 +198,7 @@ class CompareResultInputs:
         scope: ActorProject,
         batch_size: int,
         retain_until: datetime,
+        allow_expired: bool = False,
     ) -> OpenedCompareResultInput:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -225,7 +226,7 @@ class CompareResultInputs:
             if str(row["state"]) == "deleted":
                 raise CompareResultInputDeleted("compare result input was deleted")
             current_expiry = _aware_datetime(row["expires_at"])
-            if current_expiry <= now:
+            if current_expiry <= now and not allow_expired:
                 raise CompareResultInputExpired("compare result input expired")
             if not self._result_store.spool_exists(input_id):
                 raise CompareResultInputLost("compare result input spool is missing")
@@ -254,12 +255,20 @@ class CompareResultInputs:
         if limit <= 0:
             raise ValueError("limit must be positive")
         cutoff = now or self._clock()
+        active_job_refs = _active_compare_result_input_refs().subquery()
         with self._engine.begin() as conn:
             rows = list(
                 conn.execute(
                     select(compare_result_inputs.c.id)
                     .where(compare_result_inputs.c.state == "ready")
                     .where(compare_result_inputs.c.expires_at <= cutoff)
+                    .where(
+                        ~exists(
+                            select(active_job_refs.c.input_id).where(
+                                active_job_refs.c.input_id == compare_result_inputs.c.id
+                            )
+                        )
+                    )
                     .order_by(compare_result_inputs.c.expires_at)
                     .limit(limit)
                     .with_for_update(skip_locked=True)
@@ -468,6 +477,24 @@ def _descriptor_from_row(row: RowMapping) -> CompareResultInputDescriptor:
         state=cast(CompareResultInputState, str(row["state"])),
         created_at=_aware_datetime(row["created_at"]),
         expires_at=_aware_datetime(row["expires_at"]),
+    )
+
+
+def _active_compare_result_input_refs() -> Any:
+    active_statuses = [JobStatus.PENDING.value, JobStatus.RUNNING.value]
+    source_ref = jobs.c.payload["source_ref"]
+    target_ref = jobs.c.payload["target_ref"]
+    return union_all(
+        select(source_ref["input_id"].astext.label("input_id")).where(
+            jobs.c.kind == JobKind.COMPARE_RUN.value,
+            jobs.c.status.in_(active_statuses),
+            source_ref["kind"].astext == "result_snapshot",
+        ),
+        select(target_ref["input_id"].astext.label("input_id")).where(
+            jobs.c.kind == JobKind.COMPARE_RUN.value,
+            jobs.c.status.in_(active_statuses),
+            target_ref["kind"].astext == "result_snapshot",
+        ),
     )
 
 

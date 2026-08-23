@@ -15,9 +15,9 @@ from app.domain.datasource import DbType
 
 
 def compare_side_expression(db_type: DbType, ref: Mapping[str, object]) -> str | None:
-    """把 CompareDataRef(dict 形态)构造成 FROM 后的表达式;文件源 / 缺表返回 None。"""
+    """把 CompareDataRef 构造成 FROM 表达式;物化源 / 缺表返回 None。"""
     kind = str(ref.get("kind") or "table")
-    if kind == "file":
+    if kind in {"file", "result_snapshot"}:
         return None
     if kind == "sql":
         sql = str(ref.get("sql") or "").strip()

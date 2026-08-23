@@ -81,6 +81,7 @@ from app.domain.compare_result import (
     empty_bucket_counts,
     encode_compare_result_row,
 )
+from app.domain.compare_result_input import ActorProject
 from app.domain.compare_sql import (
     CompareSqlProjectionError,
     inspect_compare_sql,
@@ -128,7 +129,11 @@ from app.domain.workflow_interpolate import interpolate_payload
 from app.domain.workflow_outputs import extract_workflow_node_outputs
 from app.domain.workflow_when import builtin_when_variables, when_variables_from_payload
 from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
-from app.infrastructure.compare_result_inputs import CompareResultInputs
+from app.infrastructure.compare_result_inputs import (
+    CompareResultInputError,
+    CompareResultInputs,
+    ResultNotComparable,
+)
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.result_export import (
     ExportFormat,
@@ -154,6 +159,7 @@ _LINEAGE_BATCH_EXTENSIONS = (".sql", ".txt")
 # 文件源对比全量物化的行数硬顶(C-1):防大文件把 worker 撑爆内存。
 # 任务 run_limits.max_rows 若给出则以其为准,否则用本默认;超限直接 failed(不截断)。
 _FILE_COMPARE_DEFAULT_MAX_ROWS = 1_000_000
+_COMPARE_RESULT_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
 
 # Excel 单 sheet 硬上限 1,048,576 行(含表头);数据行上限 = 减去表头 1 行。
 # compare 结果导出每 sheet 必须 cap 到此值,否则运维调高 spool_max_rows 即产出非法 xlsx。
@@ -209,6 +215,10 @@ class UnsupportedJobKindError(RuntimeError):
 
 class OperationPolicyDeniedError(RuntimeError):
     """Datasource operation_policy denied this operation."""
+
+
+class CompareMaterializationLimitExceeded(RuntimeError):
+    """物化 Compare 输入超过安全内存预算。"""
 
 
 class DatasourceConnectionTestError(RuntimeError):
@@ -1074,9 +1084,10 @@ class WorkerRunner:
                 continue
             if legacy_generated_aliases(configured_names, projections):
                 raise CompareSqlProjectionError("stale_generated_aliases")
-        # 文件侧(C-1)天然走"客户端哈希 + 全量物化",不下推/不分段/不流式:
-        # 任一侧 file 即整体走内存全量 diff(也解决跨类型/无序问题)。
-        file_mode = source_ref.get("kind") == "file" or target_ref.get("kind") == "file"
+        # 文件 / result snapshot 天然走"客户端哈希 + 全量物化",不下推 DB hash。
+        materialized_mode = any(
+            ref.get("kind") in {"file", "result_snapshot"} for ref in (source_ref, target_ref)
+        )
         max_rows = limits.max_rows or _FILE_COMPARE_DEFAULT_MAX_ROWS
 
         source_reader = self._build_compare_reader(
@@ -1113,14 +1124,15 @@ class WorkerRunner:
         )
         started_at = time.monotonic()
         sample_result: dict[str, object] | None = None
-        if file_mode:
+        if materialized_mode:
             # 全量物化对比:两侧 fetch_all 后按归一化 key 对齐(跨类型/大小写等由
             # CompareRules 规范化吸收),不走 DB 下推的分段/采样路径。
             result = _diff_materialized_rows(
-                source_reader.fetch_all(),
-                target_reader.fetch_all(),
+                source_reader.fetch_all(max_rows=max_rows),
+                target_reader.fetch_all(max_rows=max_rows),
                 key_columns=key_columns,
                 rules=rules,
+                cancel_check=lambda: self._check_cancel(job.id),
             )
         elif limits.sample_quick_check:
             result, sample_result = _run_compare_sample_quick_check(
@@ -1250,7 +1262,7 @@ class WorkerRunner:
         rules: CompareRules,
         max_rows: int,
     ) -> _DatabaseCompareReader | _FileCompareReader:
-        """按 ref.kind 装配对比读取器:file → 全量物化内存读;table/sql → DB 读。"""
+        """按 ref.kind 装配 reader:物化源读内存,table/sql 走 DB。"""
 
         if data_ref.get("kind") == "file":
             rows = self._materialize_file_rows(data_ref, max_rows=max_rows)
@@ -1260,6 +1272,17 @@ class WorkerRunner:
                 select_key_names=select_key_names,
                 select_value_names=select_value_names,
                 rules=rules,
+                cancel_check=lambda: self._check_cancel(job.id),
+            )
+        if data_ref.get("kind") == "result_snapshot":
+            rows = self._materialize_result_snapshot(job, data_ref, max_rows=max_rows)
+            return _FileCompareReader(
+                rows=rows,
+                value_columns=value_columns,
+                select_key_names=select_key_names,
+                select_value_names=select_value_names,
+                rules=rules,
+                cancel_check=lambda: self._check_cancel(job.id),
             )
         if datasource_id is None:
             raise ValueError("compare db side requires a datasource id")
@@ -1281,6 +1304,51 @@ class WorkerRunner:
             select_value_names=select_value_names,
             rules=rules,
         )
+
+    def _materialize_result_snapshot(
+        self,
+        job: Job,
+        data_ref: dict[str, object],
+        *,
+        max_rows: int,
+    ) -> list[dict[str, Any]]:
+        if self._compare_result_inputs is None:
+            raise ValueError("result_snapshot compare requires CompareResultInputs")
+        input_id = data_ref.get("input_id")
+        if not isinstance(input_id, str) or not input_id:
+            raise ValueError("result_snapshot ref requires input_id")
+        opened = self._compare_result_inputs.open(
+            input_id,
+            scope=ActorProject(actor_id=job.owner_user_id, project_id=job.project_id),
+            batch_size=self._config.sql_spool_batch_size,
+            retain_until=datetime.now(UTC) + timedelta(seconds=job.timeout_seconds + 60),
+            allow_expired=True,
+        )
+        if (opened.descriptor.truncated or opened.descriptor.has_more) and data_ref.get(
+            "allow_partial"
+        ) is not True:
+            raise ResultNotComparable("partial result snapshot requires explicit confirmation")
+        if opened.descriptor.loaded_rows > max_rows:
+            raise MaxRowsExceededError(max_rows)
+        column_names = [column.name for column in opened.descriptor.columns]
+        if len(column_names) != len(set(column_names)):
+            raise ValueError("result_snapshot columns must be unique")
+        rows: list[dict[str, Any]] = []
+        materialized_bytes = 0
+        for batch in opened.batches:
+            self._check_cancel(job.id)
+            for row in batch:
+                if len(row.values) != len(column_names):
+                    raise ValueError("result_snapshot row shape does not match columns")
+                materialized_bytes += len(
+                    json.dumps(row.values, ensure_ascii=False, default=str).encode("utf-8")
+                )
+                if materialized_bytes > _COMPARE_RESULT_SNAPSHOT_MAX_BYTES:
+                    raise CompareMaterializationLimitExceeded(
+                        "result_snapshot exceeds materialization byte limit"
+                    )
+                rows.append(dict(zip(column_names, row.values, strict=True)))
+        return rows
 
     def _materialize_file_rows(
         self,
@@ -3193,8 +3261,13 @@ class _DatabaseCompareReader:
         for row in self._adapter.execute_select(sql, {}):
             yield self._row_to_compare(row)
 
-    def fetch_all(self) -> list[CompareRow]:
-        return list(self.fetch_rows(None))
+    def fetch_all(self, *, max_rows: int | None = None) -> list[CompareRow]:
+        rows: list[CompareRow] = []
+        for index, row in enumerate(self.fetch_rows(None)):
+            if max_rows is not None and index >= max_rows:
+                raise MaxRowsExceededError(max_rows)
+            rows.append(row)
+        return rows
 
     def fetch_first_at_or_after(self, anchor: int) -> CompareRow | None:
         if len(self._key_columns) != 1:
@@ -3542,7 +3615,7 @@ def _build_domain_file_reader(data_ref: dict[str, object], path: str) -> RowRead
 
 
 class _FileCompareReader:
-    """文件源对比读取器:把已物化的 dict 行按任务列映射成 CompareRow。
+    """物化源对比读取器:把 dict 行按任务列映射成 CompareRow。
 
     与 `_DatabaseCompareReader` 同 `fetch_all()` 契约,喂进内存全量 diff。pk 保留
     原始 key 值(供结果展示),值列走 `normalized_compare_identity` 规范化(跨源
@@ -3557,16 +3630,22 @@ class _FileCompareReader:
         select_key_names: list[str],
         select_value_names: list[str],
         rules: CompareRules,
+        cancel_check: Callable[[], None] | None = None,
     ) -> None:
         self._rows = rows
         self._value_columns = value_columns
         self._select_key_names = select_key_names
         self._select_value_names = select_value_names
         self._rules = rules
+        self._cancel_check = cancel_check
 
-    def fetch_all(self) -> list[CompareRow]:
+    def fetch_all(self, *, max_rows: int | None = None) -> list[CompareRow]:
+        if max_rows is not None and len(self._rows) > max_rows:
+            raise MaxRowsExceededError(max_rows)
         out: list[CompareRow] = []
-        for row in self._rows:
+        for index, row in enumerate(self._rows):
+            if self._cancel_check is not None and index % 1000 == 0:
+                self._cancel_check()
             key_raw = tuple(row.get(name) for name in self._select_key_names)
             value_raw = tuple(row.get(name) for name in self._select_value_names)
             out.append(
@@ -3586,6 +3665,7 @@ def _diff_materialized_rows(
     *,
     key_columns: list[CompareColumn],
     rules: CompareRules,
+    cancel_check: Callable[[], None] | None = None,
 ) -> HashdiffResult:
     """按归一化 key 对齐两侧全量行做 4 桶 diff(文件源路径)。
 
@@ -3597,10 +3677,20 @@ def _diff_materialized_rows(
     def _match_key(row: CompareRow) -> tuple[tuple[bool, str], ...]:
         return normalized_compare_identity(key_columns, row.pk, rules)
 
-    source_by_key = {_match_key(row): row for row in source_rows}
-    target_by_key = {_match_key(row): row for row in target_rows}
+    source_by_key: dict[tuple[tuple[bool, str], ...], CompareRow] = {}
+    for index, row in enumerate(source_rows):
+        if cancel_check is not None and index % 1000 == 0:
+            cancel_check()
+        source_by_key[_match_key(row)] = row
+    target_by_key: dict[tuple[tuple[bool, str], ...], CompareRow] = {}
+    for index, row in enumerate(target_rows):
+        if cancel_check is not None and index % 1000 == 0:
+            cancel_check()
+        target_by_key[_match_key(row)] = row
     events: list[CompareDiffEvent] = []
-    for key in sorted(source_by_key.keys() | target_by_key.keys()):
+    for index, key in enumerate(sorted(source_by_key.keys() | target_by_key.keys())):
+        if cancel_check is not None and index % 1000 == 0:
+            cancel_check()
         source = source_by_key.get(key)
         target = target_by_key.get(key)
         if source is None and target is not None:
@@ -3724,8 +3814,8 @@ def _payload_compare_data_ref(payload: dict[str, object], key: str) -> dict[str,
     if not isinstance(raw, dict):
         raise ValueError(f"compare_run payload {key} must be an object")
     kind = raw.get("kind", "table")
-    if kind not in {"table", "sql", "file"}:
-        raise ValueError("compare ref kind must be table, sql or file")
+    if kind not in {"table", "sql", "file", "result_snapshot"}:
+        raise ValueError("compare ref kind must be table, sql, file or result_snapshot")
     return dict(raw)
 
 
@@ -3846,6 +3936,8 @@ def _optional_int(value: object) -> int | None:
 
 
 def _public_error_message(exc: Exception, kind: JobKind) -> str:
+    if isinstance(exc, CompareResultInputError):
+        return exc.code
     if isinstance(exc, NotifyDeliveryError):
         return exc.code
     if isinstance(exc, DatasourceConnectionTestError):
@@ -3856,7 +3948,7 @@ def _public_error_message(exc: Exception, kind: JobKind) -> str:
         return "unsupported_db_type"
     if isinstance(exc, ExportSizeLimitExceeded):
         return "export_limit_exceeded"
-    if isinstance(exc, MaxRowsExceededError):
+    if isinstance(exc, (MaxRowsExceededError, CompareMaterializationLimitExceeded)):
         return "compare_limit_exceeded"
     if isinstance(exc, UnsupportedJobKindError):
         return "internal"
@@ -3880,7 +3972,7 @@ def _job_error_code(exc: Exception, kind: JobKind) -> JobErrorCode:
         return JobErrorCode.UNSUPPORTED_DB_TYPE
     if isinstance(exc, ExportSizeLimitExceeded):
         return JobErrorCode.EXPORT_LIMIT_EXCEEDED
-    if isinstance(exc, MaxRowsExceededError):
+    if isinstance(exc, (MaxRowsExceededError, CompareMaterializationLimitExceeded)):
         return JobErrorCode.COMPARE_LIMIT_EXCEEDED
     if _is_timeout_error(exc):
         return JobErrorCode.TIMEOUT

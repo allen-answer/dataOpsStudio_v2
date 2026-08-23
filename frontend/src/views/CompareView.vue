@@ -191,7 +191,7 @@ const activeTask = computed<CompareTaskResponse | null>(
 )
 
 // ── editor draft (a working copy of the active task) ────────────────
-type RefKind = 'table' | 'sql' | 'file'
+type RefKind = 'table' | 'sql' | 'file' | 'result_snapshot'
 
 interface EditorDraft {
   name: string
@@ -220,6 +220,10 @@ interface EditorDraft {
   targetHeaderRow: number
   targetEncoding: string
   targetDelimiter: string
+  sourceInputId: string
+  sourceAllowPartial: boolean
+  targetInputId: string
+  targetAllowPartial: boolean
   /** 单 SQL 便捷模式:同一段 SQL 同时填进 source_ref / target_ref(绑 sourceSql)。 */
   singleSql: boolean
   keyColumns: string[]
@@ -269,6 +273,10 @@ function emptyDraft(): EditorDraft {
     targetHeaderRow: 1,
     targetEncoding: '',
     targetDelimiter: '',
+    sourceInputId: '',
+    sourceAllowPartial: false,
+    targetInputId: '',
+    targetAllowPartial: false,
     singleSql: false,
     keyColumns: [],
     columnMappings: {},
@@ -303,7 +311,7 @@ const {
   schemasError: sourceSchemasError,
   tablesError: sourceTablesError,
 } = useMetadataObjectOptions(
-  () => (draft.sourceKind === 'file' ? '' : draft.sourceId),
+  () => (draft.sourceKind === 'file' || draft.sourceKind === 'result_snapshot' ? '' : draft.sourceId),
   () => draft.sourceSchema,
   () => draft.sourceTable,
 )
@@ -316,7 +324,7 @@ const {
   schemasError: targetSchemasError,
   tablesError: targetTablesError,
 } = useMetadataObjectOptions(
-  () => (draft.targetKind === 'file' ? '' : draft.targetId),
+  () => (draft.targetKind === 'file' || draft.targetKind === 'result_snapshot' ? '' : draft.targetId),
   () => draft.targetSchema,
   () => draft.targetTable,
 )
@@ -641,9 +649,17 @@ function refFileFormat(side: RefSide): CompareFileFormat {
   return side === 'source' ? draft.sourceFileFormat : draft.targetFileFormat
 }
 
+function refInputId(side: RefSide): string {
+  return side === 'source' ? draft.sourceInputId : draft.targetInputId
+}
+
+function refAllowPartial(side: RefSide): boolean {
+  return side === 'source' ? draft.sourceAllowPartial : draft.targetAllowPartial
+}
+
 /** 提交给后端的该侧 datasource id:file 侧无库(传 null);table/sql 侧传所选库。 */
 function refDatasourceId(side: RefSide): string | null {
-  if (refKind(side) === 'file') return null
+  if (refKind(side) === 'file' || refKind(side) === 'result_snapshot') return null
   return side === 'source' ? draft.sourceId : draft.targetId
 }
 
@@ -652,6 +668,7 @@ function refReady(side: RefSide): boolean {
   const kind = refKind(side)
   if (kind === 'sql') return refSql(side).trim().length > 0
   if (kind === 'file') return refUploadId(side).length > 0
+  if (kind === 'result_snapshot') return refInputId(side).length > 0
   return side === 'source' ? Boolean(draft.sourceTable) : Boolean(draft.targetTable)
 }
 
@@ -674,6 +691,13 @@ function buildDataRef(side: RefSide): CompareDataRef {
       header_row: isSource ? draft.sourceHeaderRow : draft.targetHeaderRow,
       encoding: format === 'csv' ? encoding || null : null,
       delimiter: format === 'csv' ? delimiter || null : null,
+    }
+  }
+  if (kind === 'result_snapshot') {
+    return {
+      kind: 'result_snapshot',
+      input_id: refInputId(side),
+      allow_partial: refAllowPartial(side),
     }
   }
   return side === 'source'
@@ -1206,6 +1230,10 @@ function loadDraftFromTask(task: CompareTaskResponse): void {
   draft.targetSql = task.target_ref.sql ?? ''
   loadFileRefIntoDraft('source', task.source_ref)
   loadFileRefIntoDraft('target', task.target_ref)
+  draft.sourceInputId = task.source_ref.input_id ?? ''
+  draft.sourceAllowPartial = task.source_ref.allow_partial ?? false
+  draft.targetInputId = task.target_ref.input_id ?? ''
+  draft.targetAllowPartial = task.target_ref.allow_partial ?? false
   draft.singleSql =
     task.source_ref.kind === 'sql' &&
     task.target_ref.kind === 'sql' &&
@@ -2102,6 +2130,7 @@ function datasourceName(id: string): string {
 function taskSideLabel(task: CompareTaskResponse, side: RefSide): string {
   const ref = side === 'source' ? task.source_ref : task.target_ref
   if (ref.kind === 'file') return t('compare.ref_kind_file')
+  if (ref.kind === 'result_snapshot') return t('compare.ref_kind_result_snapshot')
   const id = side === 'source' ? task.source_id : task.target_id
   return id ? datasourceName(id) : '—'
 }
@@ -2490,7 +2519,7 @@ const missingTarget = computed(
               <legend class="px-1 text-xs font-medium chrome-text-heading">{{ t('compare.source') }}</legend>
               <!-- file 侧无 datasource(#126 起后端可选):隐藏库下拉。 -->
               <select
-                v-if="draft.sourceKind !== 'file'"
+                v-if="draft.sourceKind !== 'file' && draft.sourceKind !== 'result_snapshot'"
                 v-model="draft.sourceId"
                 class="chrome-input w-full text-sm"
                 @change="onReferenceDatasourceChange('source')"
@@ -2523,7 +2552,7 @@ const missingTarget = computed(
                   {{ t('compare.ref_kind_file') }}
                 </button>
               </div>
-              <div v-if="draft.sourceKind !== 'file'" class="space-y-1">
+              <div v-if="draft.sourceKind === 'table' || draft.sourceKind === 'sql'" class="space-y-1">
                 <select
                   v-if="sourceSchemasLoading || sourceSchemaOptions.length > 0"
                   v-model="draft.sourceSchema"
@@ -2655,7 +2684,15 @@ const missingTarget = computed(
                   </template>
                 </template>
               </div>
-              <div>
+              <div
+                v-else-if="!draft.singleSql && draft.sourceKind === 'result_snapshot'"
+                data-testid="compare-source-result-snapshot"
+                class="rounded-card border chrome-border-subtle chrome-bg-elevated p-3 space-y-1"
+              >
+                <div class="text-xs font-medium chrome-text-heading">{{ t('compare.ref_kind_result_snapshot') }}</div>
+                <div class="text-[11px] font-mono chrome-text-muted break-all">{{ draft.sourceInputId }}</div>
+              </div>
+              <div v-if="draft.sourceKind !== 'result_snapshot'">
                 <button
                   type="button"
                   class="chrome-btn-secondary text-xs"
@@ -2732,7 +2769,7 @@ const missingTarget = computed(
               <legend class="px-1 text-xs font-medium chrome-text-heading">{{ t('compare.target') }}</legend>
               <!-- file 侧无 datasource(#126 起后端可选):隐藏库下拉。 -->
               <select
-                v-if="draft.targetKind !== 'file'"
+                v-if="draft.targetKind !== 'file' && draft.targetKind !== 'result_snapshot'"
                 v-model="draft.targetId"
                 class="chrome-input w-full text-sm"
                 @change="onReferenceDatasourceChange('target')"
@@ -2765,7 +2802,7 @@ const missingTarget = computed(
                   {{ t('compare.ref_kind_file') }}
                 </button>
               </div>
-              <div v-if="draft.targetKind !== 'file'" class="space-y-1">
+              <div v-if="draft.targetKind === 'table' || draft.targetKind === 'sql'" class="space-y-1">
                 <select
                   v-if="targetSchemasLoading || targetSchemaOptions.length > 0"
                   v-model="draft.targetSchema"
@@ -2897,7 +2934,15 @@ const missingTarget = computed(
                   </template>
                 </template>
               </div>
-              <div>
+              <div
+                v-else-if="!draft.singleSql && draft.targetKind === 'result_snapshot'"
+                data-testid="compare-target-result-snapshot"
+                class="rounded-card border chrome-border-subtle chrome-bg-elevated p-3 space-y-1"
+              >
+                <div class="text-xs font-medium chrome-text-heading">{{ t('compare.ref_kind_result_snapshot') }}</div>
+                <div class="text-[11px] font-mono chrome-text-muted break-all">{{ draft.targetInputId }}</div>
+              </div>
+              <div v-if="draft.targetKind !== 'result_snapshot'">
                 <button
                   type="button"
                   class="chrome-btn-secondary text-xs"

@@ -556,6 +556,7 @@ export default {
     ref_kind_table: '表引用',
     ref_kind_sql: '自定义 SQL',
     ref_kind_file: '文件',
+    ref_kind_result_snapshot: '结果快照',
     sql_placeholder: 'SELECT …(只读查询)',
     single_sql: '单 SQL(两侧执行同一段 SQL)',
     infer_sql_disabled: '自动推断仅支持表引用;SQL / 文件源请手动配置列与主键。',

@@ -27,6 +27,7 @@ from starlette.background import BackgroundTask
 from app.api.dependencies import current_user_from, request_id_from, services_from
 from app.api.errors import ApiError
 from app.api.routes.account import consume_recovery_code, verify_user_totp
+from app.api.routes.compare_result_inputs import compare_result_input_api_error
 from app.api.schemas import (
     CancelResponse,
     CompareAiAttributionResponse,
@@ -230,6 +231,7 @@ from app.domain.compare_result import (
     decode_compare_result_row,
     empty_bucket_counts,
 )
+from app.domain.compare_result_input import ActorProject, CompareResultInputDescriptor
 from app.domain.compare_sql import (
     CompareSqlProjection,
     CompareSqlProjectionError,
@@ -284,6 +286,7 @@ from app.domain.workflow_execution import (
 )
 from app.domain.workflow_outputs import NodeOutputValue, extract_workflow_node_outputs
 from app.domain.workflow_when import builtin_when_variables, when_variables_from_payload
+from app.infrastructure.compare_result_inputs import CompareResultInputError, CompareResultInputs
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.result_export import (
     ExportSizeLimitExceeded,
@@ -355,6 +358,7 @@ _COMPARE_BUCKET_QUERY = Query(default="diff")
 # UX-2 C-3:定位 SQL 最多列多少个主键(超过则截断并在响应标 truncated,防生成超长 SQL)。
 _RESULT_CELL_PREVIEW_MAX_CHARS = 4096
 _DIFF_SQL_PK_CAP = 500
+_COMPARE_RESULT_INPUT_QUEUE_LEASE_GRACE_SECONDS = 3600
 _UPLOAD_PURPOSE_QUERY = Query()
 _UPLOAD_FILENAME_QUERY = Query(min_length=1, max_length=255)
 _LINEAGE_FOCUS_QUERY = Query(min_length=1)
@@ -2898,6 +2902,15 @@ def _create_compare_task_record(
     _reject_stale_compare_aliases(request_columns, body.target_ref)
     now = datetime.now(UTC)
     task_id = new_id()
+    _validate_compare_result_snapshot_refs(
+        services,
+        project_id=body.project_id,
+        user_id=user_id,
+        refs=[body.source_ref, body.target_ref],
+        retain_until=now + timedelta(minutes=5),
+        columns=body.columns,
+        compare_rules=body.compare_rules.model_dump(mode="python"),
+    )
     with services.engine.begin() as conn:
         _validate_compare_task_datasources(
             conn,
@@ -3634,34 +3647,56 @@ def update_compare_task(
             raise ApiError(404, "not_found", "Compare task not found")
         project_id = str(row["project_id"])
         _require_project_access(conn, project_id, user.id)
-        source_id = body.source_id or str(row["source_id"])
-        target_id = body.target_id or str(row["target_id"])
-        if body.source_id is not None or body.target_id is not None:
-            _validate_compare_task_datasources(
-                conn,
-                project_id=project_id,
-                source_id=source_id,
-                target_id=target_id,
-                user_id=user.id,
-            )
-        changed_refs = [ref for ref in (body.source_ref, body.target_ref) if ref is not None]
-        if changed_refs:
-            _validate_compare_file_uploads(conn, project_id=project_id, refs=changed_refs)
+        fields_set = body.model_fields_set
+        current_source_id = _optional_str(row["source_id"])
+        current_target_id = _optional_str(row["target_id"])
+        effective_source_ref = body.source_ref or CompareDataRef.model_validate(row["source_ref"])
+        effective_target_ref = body.target_ref or CompareDataRef.model_validate(row["target_ref"])
+        source_id = body.source_id if "source_id" in fields_set else current_source_id
+        target_id = body.target_id if "target_id" in fields_set else current_target_id
+        if body.source_ref is not None and body.source_ref.kind == "result_snapshot":
+            source_id = None
+        if body.target_ref is not None and body.target_ref.kind == "result_snapshot":
+            target_id = None
+        _validate_compare_effective_side("source", effective_source_ref, source_id)
+        _validate_compare_effective_side("target", effective_target_ref, target_id)
+        _validate_compare_task_datasources(
+            conn,
+            project_id=project_id,
+            source_id=source_id,
+            target_id=target_id,
+            user_id=user.id,
+        )
+        _validate_compare_file_uploads(
+            conn,
+            project_id=project_id,
+            refs=[effective_source_ref, effective_target_ref],
+        )
         effective_columns = cast(
             list[object],
             list(body.columns) if body.columns is not None else list(row["columns"] or []),
         )
-        effective_source_ref: object = body.source_ref or row["source_ref"]
-        effective_target_ref: object = body.target_ref or row["target_ref"]
+        effective_rules = body.compare_rules or CompareRulesPayload.model_validate(
+            row["compare_rules"] or {}
+        )
+        _validate_compare_result_snapshot_refs(
+            services,
+            project_id=project_id,
+            user_id=user.id,
+            refs=[effective_source_ref, effective_target_ref],
+            retain_until=datetime.now(UTC) + timedelta(minutes=5),
+            columns=effective_columns,
+            compare_rules=effective_rules.model_dump(mode="python"),
+        )
         _reject_stale_compare_aliases(effective_columns, effective_source_ref)
         _reject_stale_compare_aliases(effective_columns, effective_target_ref)
         values: dict[str, object] = {}
         if body.name is not None:
             values["name"] = body.name
-        if body.source_id is not None:
-            values["source_id"] = body.source_id
-        if body.target_id is not None:
-            values["target_id"] = body.target_id
+        if "source_id" in fields_set or source_id != current_source_id:
+            values["source_id"] = source_id
+        if "target_id" in fields_set or target_id != current_target_id:
+            values["target_id"] = target_id
         if body.source_ref is not None:
             values["source_ref"] = body.source_ref.model_dump(mode="json")
         if body.target_ref is not None:
@@ -3749,6 +3784,17 @@ def run_compare_task(task_id: str, request: Request) -> CompareRunCreateResponse
     target_ref = dict(row["target_ref"] or {})
     _reject_stale_compare_aliases(cast(list[object], columns), source_ref)
     _reject_stale_compare_aliases(cast(list[object], columns), target_ref)
+    timeout_seconds = min(int(limits.get("query_timeout_seconds") or 1800), 3600)
+    _validate_compare_result_snapshot_refs(
+        services,
+        project_id=project_id,
+        user_id=user.id,
+        refs=[source_ref, target_ref],
+        retain_until=datetime.now(UTC)
+        + timedelta(seconds=timeout_seconds + _COMPARE_RESULT_INPUT_QUEUE_LEASE_GRACE_SECONDS),
+        columns=columns,
+        compare_rules=rules,
+    )
     # 文件侧:把 upload_id 解析成 storage_uri + filename 注入 ref(worker 回读用),
     # 与 lineage_batch 同范式(API 侧解析上传件,worker 不直连 uploads 表)。
     with services.engine.connect() as conn:
@@ -3758,7 +3804,6 @@ def run_compare_task(task_id: str, request: Request) -> CompareRunCreateResponse
     job_id = new_id()
     run_id = new_id()
     bucket_spools = {bucket: new_id() for bucket in COMPARE_BUCKETS}
-    timeout_seconds = min(int(limits.get("query_timeout_seconds") or 1800), 3600)
     datasource_ids = [ds_id for ds_id in (source_id, target_id) if ds_id is not None]
     job = Job(
         id=job_id,
@@ -3853,8 +3898,8 @@ def get_compare_run_results(
 def _compare_side_db_type(
     services: ApiServices, datasource_id: object, ref: dict[str, object]
 ) -> DbType | None:
-    """取某侧数据源方言;文件源 / 无 id / 未知类型返回 None(该侧不生成 SQL)。"""
-    if str(ref.get("kind") or "table") == "file":
+    """取某侧数据源方言;物化源 / 无 id / 未知类型返回 None。"""
+    if str(ref.get("kind") or "table") in {"file", "result_snapshot"}:
         return None
     ds_id = _optional_str(datasource_id)
     if not ds_id:
@@ -3879,8 +3924,11 @@ def _compare_diff_sql_side(
     columns: list[str],
     pk_rows: list[list[object]],
 ) -> CompareDiffSqlSide:
-    if str(ref.get("kind") or "table") == "file":
+    kind = str(ref.get("kind") or "table")
+    if kind == "file":
         return CompareDiffSqlSide(available=False, reason="file_source")
+    if kind == "result_snapshot":
+        return CompareDiffSqlSide(available=False, reason="result_snapshot")
     if db_type is None:
         return CompareDiffSqlSide(available=False, reason="unknown_datasource")
     if not pk_rows:
@@ -7921,6 +7969,127 @@ def _validate_compare_file_uploads(
             raise ApiError(404, "not_found", "Compare upload not found")
         if str(upload_row["purpose"]) != "compare_source":
             raise ApiError(400, "invalid_upload_purpose", "Upload purpose must be compare_source")
+
+
+def _validate_compare_result_snapshot_refs(
+    services: ApiServices,
+    *,
+    project_id: str,
+    user_id: str,
+    refs: Sequence[object],
+    retain_until: datetime,
+    columns: Sequence[object] = (),
+    compare_rules: Mapping[str, object] | None = None,
+) -> dict[str, CompareResultInputDescriptor]:
+    """验证 snapshot ref 的 actor/project/状态并续租,不读取业务行。"""
+
+    module = CompareResultInputs(
+        services.engine,
+        services.result_store,
+        ttl_days=services.result_ttl_days,
+    )
+    descriptors: dict[str, CompareResultInputDescriptor] = {}
+    for side_index, ref in enumerate(refs):
+        kind: object
+        if isinstance(ref, CompareDataRef):
+            kind = ref.kind
+            input_id = ref.input_id
+            allow_partial = ref.allow_partial
+        elif isinstance(ref, Mapping):
+            kind = ref.get("kind")
+            raw_input_id = ref.get("input_id")
+            input_id = raw_input_id if isinstance(raw_input_id, str) else None
+            allow_partial = ref.get("allow_partial") is True
+        else:
+            continue
+        if kind != "result_snapshot":
+            continue
+        if not input_id:
+            raise ApiError(400, "invalid_result_snapshot_ref", "result_snapshot requires input_id")
+        try:
+            opened = module.open(
+                input_id,
+                scope=ActorProject(actor_id=user_id, project_id=project_id),
+                batch_size=1,
+                retain_until=retain_until,
+            )
+        except CompareResultInputError as exc:
+            raise compare_result_input_api_error(exc) from exc
+        descriptor = opened.descriptor
+        if (descriptor.truncated or descriptor.has_more) and not allow_partial:
+            raise ApiError(
+                409,
+                "result_snapshot_incomplete",
+                "Partial result snapshot requires explicit confirmation",
+            )
+        _validate_result_snapshot_columns(
+            descriptor,
+            side_index=side_index,
+            columns=columns,
+            compare_rules=compare_rules or {},
+        )
+        descriptors[input_id] = descriptor
+    return descriptors
+
+
+def _validate_compare_effective_side(
+    side: str,
+    ref: CompareDataRef,
+    datasource_id: str | None,
+) -> None:
+    if ref.kind in {"table", "sql"} and datasource_id is None:
+        raise ApiError(
+            400,
+            "compare_datasource_required",
+            f"{side} {ref.kind} ref requires a datasource",
+        )
+    if ref.kind == "result_snapshot" and datasource_id is not None:
+        raise ApiError(
+            400,
+            "result_snapshot_datasource_forbidden",
+            f"{side} result_snapshot must not define a datasource",
+        )
+
+
+def _validate_result_snapshot_columns(
+    descriptor: CompareResultInputDescriptor,
+    *,
+    side_index: int,
+    columns: Sequence[object],
+    compare_rules: Mapping[str, object],
+) -> None:
+    configured: list[str] = []
+    for item in columns:
+        if isinstance(item, Column):
+            if item.name:
+                configured.append(item.name)
+            continue
+        if isinstance(item, Mapping):
+            name = item.get("name")
+            if isinstance(name, str) and name:
+                configured.append(name)
+    if not configured:
+        return
+    key_columns = compare_rules.get("key_columns")
+    keys = [str(value) for value in key_columns] if isinstance(key_columns, list) else []
+    ignore_columns = compare_rules.get("ignore_columns")
+    ignored = (
+        {str(value) for value in ignore_columns} if isinstance(ignore_columns, list) else set()
+    )
+    required = set(keys) | {name for name in configured if name not in ignored}
+    if side_index == 1:
+        raw_mappings = compare_rules.get("column_mappings")
+        mappings = raw_mappings if isinstance(raw_mappings, dict) else {}
+        required = {str(mappings.get(name, name)) for name in required}
+    available = {column.name for column in descriptor.columns}
+    missing = sorted(required - available)
+    if missing:
+        raise ApiError(
+            409,
+            "result_snapshot_columns_missing",
+            "Result snapshot does not contain all configured compare columns",
+            extra={"missing_columns": missing},
+        )
 
 
 def _resolve_compare_file_ref(
