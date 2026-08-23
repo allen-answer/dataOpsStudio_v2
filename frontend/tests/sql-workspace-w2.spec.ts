@@ -87,6 +87,10 @@ let consoleErrors: string[] = []
 test.beforeEach(async ({ page }) => {
   consoleErrors = trackConsoleErrors(page)
   await seedAdminAuth(page)
+  // SQL 顶栏会主动加载 schema picker；不关心元数据的用例给空列表，具体用例可覆盖。
+  await page.route(/\/api\/datasources\/[^/]+\/metadata\/schemas/, (route) =>
+    json(route, 200, []),
+  )
 })
 function expectNoConsoleErrors(): void {
   expect(consoleErrors, consoleErrors.join('\n')).toEqual([])
@@ -178,6 +182,44 @@ test('typing schema dot suggests tables from the selected datasource', async ({ 
   await input.press('.')
   await expect(suggestions.getByText('customers', { exact: true })).toBeVisible()
   expect(tableRequests).toHaveLength(1)
+  expectNoConsoleErrors()
+})
+
+test('schema picker changes the default completion context for one datasource', async ({
+  page,
+}) => {
+  await mockBase(page)
+  const columnRequests: string[] = []
+  await page.route(/\/api\/datasources\/ds-1\/metadata\/schemas/, (route) =>
+    json(route, 200, [{ name: 'app' }, { name: 'SJCJ' }]),
+  )
+  await page.route(/\/api\/datasources\/ds-1\/metadata\/columns/, (route) => {
+    columnRequests.push(route.request().url())
+    return json(route, 200, [
+      {
+        name: 'BRANCH_CODE',
+        type: 'string',
+        driver_type: 'VARCHAR',
+        nullable: true,
+        primary_key: false,
+        comment: null,
+      },
+    ])
+  })
+
+  await page.goto('/projects/project-1/sql')
+  const schemaSelect = page.getByTestId('sql-schema-select')
+  await expect(schemaSelect).toHaveValue('app')
+  await schemaSelect.selectOption('SJCJ')
+
+  const input = page.locator('.monaco-editor textarea.inputarea')
+  await input.press('Control+A')
+  await input.type('SELECT * FROM customers c WHERE c')
+  await input.press('.')
+
+  await expect.poll(() => columnRequests.length).toBe(1)
+  expect(new URL(columnRequests[0]).searchParams.get('schema')).toBe('SJCJ')
+  await expect(page.locator('.suggest-widget').getByText('BRANCH_CODE', { exact: true })).toBeVisible()
   expectNoConsoleErrors()
 })
 
