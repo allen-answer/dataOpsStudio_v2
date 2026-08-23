@@ -257,6 +257,8 @@ export default {
   sql: {
     workspace: 'SQL 工作区',
     datasource: '数据源',
+    schema_context: 'Schema',
+    schema_context_hint: '元数据与补全上下文；查询仍使用全限定对象名',
     tab_consoles: '控制台',
     tab_history: '历史',
     tab_templates: '模板',

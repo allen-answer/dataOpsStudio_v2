@@ -92,6 +92,7 @@ import JobStatusBadge from '../components/JobStatusBadge.vue'
 import CompareExpressionLabel from '../components/CompareExpressionLabel.vue'
 import SqlEditor from '../components/SqlEditor.vue'
 import { useLicense } from '../composables/useLicense'
+import { useMetadataObjectOptions } from '../composables/useMetadataObjectOptions'
 import { useToast } from '../composables/useToast'
 import { useThemeStore } from '../stores/theme'
 import { createUserErrorMessage } from '../utils/userErrorMessage'
@@ -287,6 +288,32 @@ function emptyDraft(): EditorDraft {
 const draft = reactive<EditorDraft>(emptyDraft())
 const sourceDatasource = computed(() => datasources.value.find((item) => item.id === draft.sourceId))
 const targetDatasource = computed(() => datasources.value.find((item) => item.id === draft.targetId))
+const {
+  schemas: sourceSchemas,
+  schemaOptions: sourceSchemaOptions,
+  tableOptions: sourceTableOptions,
+  schemasLoading: sourceSchemasLoading,
+  tablesLoading: sourceTablesLoading,
+  schemasError: sourceSchemasError,
+  tablesError: sourceTablesError,
+} = useMetadataObjectOptions(
+  () => (draft.sourceKind === 'file' ? '' : draft.sourceId),
+  () => draft.sourceSchema,
+  () => draft.sourceTable,
+)
+const {
+  schemas: targetSchemas,
+  schemaOptions: targetSchemaOptions,
+  tableOptions: targetTableOptions,
+  schemasLoading: targetSchemasLoading,
+  tablesLoading: targetTablesLoading,
+  schemasError: targetSchemasError,
+  tablesError: targetTablesError,
+} = useMetadataObjectOptions(
+  () => (draft.targetKind === 'file' ? '' : draft.targetId),
+  () => draft.targetSchema,
+  () => draft.targetTable,
+)
 const sqlEditorTheme = computed(() =>
   variant.value === 'spotify-dark' || variant.value === 'figma-dark' ? 'vs-dark' : 'vs',
 )
@@ -616,6 +643,26 @@ function onSingleSqlToggle(): void {
     draft.targetKind = 'sql'
     if (!draft.sourceSql && draft.targetSql) draft.sourceSql = draft.targetSql
   }
+}
+
+function onReferenceDatasourceChange(side: RefSide): void {
+  const datasource = side === 'source' ? sourceDatasource.value : targetDatasource.value
+  if (side === 'source') {
+    draft.sourceSchema = datasource?.database ?? ''
+    draft.sourceTable = ''
+  } else {
+    draft.targetSchema = datasource?.database ?? ''
+    draft.targetTable = ''
+  }
+}
+
+function onReferenceSchemaChange(side: RefSide): void {
+  if (side === 'source') draft.sourceTable = ''
+  else draft.targetTable = ''
+}
+
+function metadataPickerError(error: unknown): string {
+  return error ? errorMessage(error) : ''
 }
 
 const runBlockedReason = computed<string | null>(() => {
@@ -1026,6 +1073,21 @@ watch(datasources, (list) => {
   if (!suggestSourceId.value && list.length > 0) suggestSourceId.value = list[0].id
   if (!suggestTargetId.value && list.length > 0) suggestTargetId.value = list[0].id
 }, { immediate: true })
+
+watch(sourceSchemas, (schemas) => {
+  if (draft.sourceSchema || schemas.length === 0) return
+  const preferred = sourceDatasource.value?.database ?? ''
+  draft.sourceSchema = schemas.some((schema) => schema.name === preferred)
+    ? preferred
+    : schemas[0].name
+})
+watch(targetSchemas, (schemas) => {
+  if (draft.targetSchema || schemas.length === 0) return
+  const preferred = targetDatasource.value?.database ?? ''
+  draft.targetSchema = schemas.some((schema) => schema.name === preferred)
+    ? preferred
+    : schemas[0].name
+})
 
 // ── tasks loading ───────────────────────────────────────────────────
 async function loadTasks(): Promise<void> {
@@ -2328,7 +2390,12 @@ const missingTarget = computed(
             <fieldset class="space-y-2 rounded-card border chrome-border p-3 min-w-0">
               <legend class="px-1 text-xs font-medium chrome-text-heading">{{ t('compare.source') }}</legend>
               <!-- file 侧无 datasource(#126 起后端可选):隐藏库下拉。 -->
-              <select v-if="draft.sourceKind !== 'file'" v-model="draft.sourceId" class="chrome-input w-full text-sm">
+              <select
+                v-if="draft.sourceKind !== 'file'"
+                v-model="draft.sourceId"
+                class="chrome-input w-full text-sm"
+                @change="onReferenceDatasourceChange('source')"
+              >
                 <option v-for="ds in datasources" :key="ds.id" :value="ds.id">{{ ds.name }}</option>
               </select>
               <div v-if="!draft.singleSql" class="flex items-center gap-1">
@@ -2357,9 +2424,55 @@ const missingTarget = computed(
                   {{ t('compare.ref_kind_file') }}
                 </button>
               </div>
+              <div v-if="draft.sourceKind !== 'file'" class="space-y-1">
+                <select
+                  v-if="sourceSchemasLoading || sourceSchemaOptions.length > 0"
+                  v-model="draft.sourceSchema"
+                  data-testid="compare-source-schema"
+                  class="chrome-input w-full text-sm"
+                  :disabled="sourceSchemasLoading && sourceSchemaOptions.length === 0"
+                  @change="onReferenceSchemaChange('source')"
+                >
+                  <option v-if="!draft.sourceSchema" disabled value="">{{ t('compare.schema') }}</option>
+                  <option v-for="schema in sourceSchemaOptions" :key="schema.name" :value="schema.name">
+                    {{ schema.name }}
+                  </option>
+                </select>
+                <input
+                  v-else
+                  v-model="draft.sourceSchema"
+                  data-testid="compare-source-schema"
+                  class="chrome-input w-full text-sm"
+                  :placeholder="t('compare.schema')"
+                  @change="onReferenceSchemaChange('source')"
+                />
+                <p v-if="sourceSchemasError" class="text-[10px] text-amber-700 dark:text-amber-300">
+                  {{ metadataPickerError(sourceSchemasError) }}
+                </p>
+              </div>
               <template v-if="!draft.singleSql && draft.sourceKind === 'table'">
-                <input v-model="draft.sourceSchema" class="chrome-input w-full text-sm" :placeholder="t('compare.schema')" />
-                <input v-model="draft.sourceTable" class="chrome-input w-full text-sm" :placeholder="t('compare.table')" />
+                <select
+                  v-if="sourceTablesLoading || sourceTableOptions.length > 0"
+                  v-model="draft.sourceTable"
+                  data-testid="compare-source-table"
+                  class="chrome-input w-full text-sm"
+                  :disabled="!draft.sourceSchema || (sourceTablesLoading && sourceTableOptions.length === 0)"
+                >
+                  <option disabled value="">{{ t('compare.table') }}</option>
+                  <option v-for="table in sourceTableOptions" :key="table.name" :value="table.name">
+                    {{ table.name }}
+                  </option>
+                </select>
+                <input
+                  v-else
+                  v-model="draft.sourceTable"
+                  data-testid="compare-source-table"
+                  class="chrome-input w-full text-sm"
+                  :placeholder="t('compare.table')"
+                />
+                <p v-if="sourceTablesError" class="text-[10px] text-amber-700 dark:text-amber-300">
+                  {{ metadataPickerError(sourceTablesError) }}
+                </p>
               </template>
               <SqlEditor
                 :key="`${activeTaskId ?? 'new'}-source`"
@@ -2496,7 +2609,12 @@ const missingTarget = computed(
             <fieldset class="space-y-2 rounded-card border chrome-border p-3 min-w-0">
               <legend class="px-1 text-xs font-medium chrome-text-heading">{{ t('compare.target') }}</legend>
               <!-- file 侧无 datasource(#126 起后端可选):隐藏库下拉。 -->
-              <select v-if="draft.targetKind !== 'file'" v-model="draft.targetId" class="chrome-input w-full text-sm">
+              <select
+                v-if="draft.targetKind !== 'file'"
+                v-model="draft.targetId"
+                class="chrome-input w-full text-sm"
+                @change="onReferenceDatasourceChange('target')"
+              >
                 <option v-for="ds in datasources" :key="ds.id" :value="ds.id">{{ ds.name }}</option>
               </select>
               <div v-if="!draft.singleSql" class="flex items-center gap-1">
@@ -2525,9 +2643,55 @@ const missingTarget = computed(
                   {{ t('compare.ref_kind_file') }}
                 </button>
               </div>
+              <div v-if="draft.targetKind !== 'file'" class="space-y-1">
+                <select
+                  v-if="targetSchemasLoading || targetSchemaOptions.length > 0"
+                  v-model="draft.targetSchema"
+                  data-testid="compare-target-schema"
+                  class="chrome-input w-full text-sm"
+                  :disabled="targetSchemasLoading && targetSchemaOptions.length === 0"
+                  @change="onReferenceSchemaChange('target')"
+                >
+                  <option v-if="!draft.targetSchema" disabled value="">{{ t('compare.schema') }}</option>
+                  <option v-for="schema in targetSchemaOptions" :key="schema.name" :value="schema.name">
+                    {{ schema.name }}
+                  </option>
+                </select>
+                <input
+                  v-else
+                  v-model="draft.targetSchema"
+                  data-testid="compare-target-schema"
+                  class="chrome-input w-full text-sm"
+                  :placeholder="t('compare.schema')"
+                  @change="onReferenceSchemaChange('target')"
+                />
+                <p v-if="targetSchemasError" class="text-[10px] text-amber-700 dark:text-amber-300">
+                  {{ metadataPickerError(targetSchemasError) }}
+                </p>
+              </div>
               <template v-if="!draft.singleSql && draft.targetKind === 'table'">
-                <input v-model="draft.targetSchema" class="chrome-input w-full text-sm" :placeholder="t('compare.schema')" />
-                <input v-model="draft.targetTable" class="chrome-input w-full text-sm" :placeholder="t('compare.table')" />
+                <select
+                  v-if="targetTablesLoading || targetTableOptions.length > 0"
+                  v-model="draft.targetTable"
+                  data-testid="compare-target-table"
+                  class="chrome-input w-full text-sm"
+                  :disabled="!draft.targetSchema || (targetTablesLoading && targetTableOptions.length === 0)"
+                >
+                  <option disabled value="">{{ t('compare.table') }}</option>
+                  <option v-for="table in targetTableOptions" :key="table.name" :value="table.name">
+                    {{ table.name }}
+                  </option>
+                </select>
+                <input
+                  v-else
+                  v-model="draft.targetTable"
+                  data-testid="compare-target-table"
+                  class="chrome-input w-full text-sm"
+                  :placeholder="t('compare.table')"
+                />
+                <p v-if="targetTablesError" class="text-[10px] text-amber-700 dark:text-amber-300">
+                  {{ metadataPickerError(targetTablesError) }}
+                </p>
               </template>
               <SqlEditor
                 :key="`${activeTaskId ?? 'new'}-target`"

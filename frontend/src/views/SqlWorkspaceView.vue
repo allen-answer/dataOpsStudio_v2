@@ -113,6 +113,7 @@ import Modal from '../components/Modal.vue'
 import AiSqlAssistantPanel from '../components/AiSqlAssistantPanel.vue'
 import SqlEditor from '../components/SqlEditor.vue'
 import { useLicense } from '../composables/useLicense'
+import { useMetadataObjectOptions } from '../composables/useMetadataObjectOptions'
 import { clearSqlMetadataCache } from '../utils/sqlIntelligence'
 import { splitSqlStatements, statementAtOffset } from '../utils/sqlStatements'
 import { createUserErrorMessage } from '../utils/userErrorMessage'
@@ -244,6 +245,7 @@ const sidebarTab = ref<SidebarTab>('consoles')
 
 const editorSql = ref('SELECT 1 AS hello;')
 const selectedDsId = ref('')
+const schemaContexts = reactive<Record<string, string>>({})
 const pageSizeSelection = ref(DEFAULT_PAGE_SIZE)
 const maxRowsSelection = ref(String(DEFAULT_QUERY_MAX_ROWS))
 const customMaxRows = ref(DEFAULT_QUERY_MAX_ROWS)
@@ -340,6 +342,26 @@ const activeRuntime = computed<ConsoleRuntime | null>(() => {
 })
 const selectedDs = computed<DatasourceListItem | undefined>(() =>
   datasources.value.find((d) => d.id === selectedDsId.value),
+)
+const selectedSchema = computed<string>({
+  get: () => {
+    const consoleId = activeConsoleId.value
+    return (consoleId ? schemaContexts[consoleId] : '') || selectedDs.value?.database || ''
+  },
+  set: (value) => {
+    const consoleId = activeConsoleId.value
+    if (consoleId) schemaContexts[consoleId] = value
+  },
+})
+const {
+  schemas: sqlSchemas,
+  schemaOptions: sqlSchemaOptions,
+  schemasLoading: sqlSchemasLoading,
+} = useMetadataObjectOptions(
+  () => selectedDsId.value,
+  () => selectedSchema.value,
+  '',
+  false,
 )
 const unsupportedDb = computed<string | null>(() => {
   const ds = selectedDs.value
@@ -591,12 +613,22 @@ watch(activeConsoleId, (current) => {
 })
 
 watch(selectedDsId, (value, previous) => {
-  if (value !== previous) aiPanelOpen.value = false
+  if (value !== previous) {
+    aiPanelOpen.value = false
+    selectedSchema.value = selectedDs.value?.database ?? ''
+  }
   execError.value = null
   if (suppressConsoleSave.value || !activeConsole.value || editorReadOnly.value) return
   const datasourceId = value || null
   patchLocalConsole(activeConsole.value.id, { datasource_id: datasourceId })
   scheduleConsolePatch(activeConsole.value.id, { datasource_id: datasourceId })
+})
+watch(sqlSchemas, (schemas) => {
+  if (selectedSchema.value || schemas.length === 0) return
+  const preferred = selectedDs.value?.database ?? ''
+  selectedSchema.value = schemas.some((schema) => schema.name === preferred)
+    ? preferred
+    : schemas[0].name
 })
 
 watch(sidebarTab, (tab) => {
@@ -744,6 +776,7 @@ async function deleteConsole(consoleId: string): Promise<void> {
     stopConsolePoll(consoleId)
     delete runtimes[consoleId]
     delete activeRuntimeIndexes[consoleId]
+    delete schemaContexts[consoleId]
     if (activeConsoleId.value === consoleId) {
       activeConsoleId.value = sortedConsoles.value[0]?.id ?? null
     }
@@ -1907,6 +1940,7 @@ async function toggleTable(
 // 点表名:把 SELECT * FROM <schema>.<table> LIMIT 100 写进当前 console,并切到该数据源。
 function selectTableIntoConsole(schemaName: string, node: MetadataTableNode): void {
   const qualified = schemaName ? `${schemaName}.${node.table.name}` : node.table.name
+  selectedSchema.value = schemaName
   applySqlToActiveConsole(`SELECT * FROM ${qualified} LIMIT 100`, metadataDsId.value || null)
   sidebarTab.value = 'consoles'
 }
@@ -2656,6 +2690,29 @@ function parseVariables(value: string): string[] {
             {{ ds.name }} ({{ ds.db_type }} · {{ ds.environment }})
           </option>
         </select>
+        <div class="hidden xl:flex items-center gap-1.5 shrink-0">
+          <label for="sql-schema" class="text-xs chrome-text-muted whitespace-nowrap">
+            {{ t('sql.schema_context') }}
+          </label>
+          <select
+            id="sql-schema"
+            v-model="selectedSchema"
+            data-testid="sql-schema-select"
+            class="chrome-input min-w-[8rem] max-w-[12rem]"
+            :disabled="
+              writesBlocked ||
+              editorReadOnly ||
+              !selectedDsId ||
+              sqlSchemasLoading ||
+              sqlSchemaOptions.length === 0
+            "
+            :title="t('sql.schema_context_hint')"
+          >
+            <option v-for="schema in sqlSchemaOptions" :key="schema.name" :value="schema.name">
+              {{ schema.name }}
+            </option>
+          </select>
+        </div>
         <div class="flex items-center gap-1.5 shrink-0">
           <label for="sql-page-size" class="text-xs chrome-text-muted whitespace-nowrap">
             {{ t('sql.page_size') }}
@@ -2772,7 +2829,7 @@ function parseVariables(value: string): string[] {
             v-model="editorSql"
             :datasource-id="selectedDsId"
             :db-type="selectedDs?.db_type"
-            :default-schema="selectedDs?.database ?? undefined"
+            :default-schema="selectedSchema || selectedDs?.database || undefined"
             :path="`sql-console-${activeConsole.id}.sql`"
             :theme="editorTheme"
             :read-only="editorReadOnly || writesBlocked"

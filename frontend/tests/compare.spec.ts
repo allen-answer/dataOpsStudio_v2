@@ -182,6 +182,16 @@ async function mockBase(
   await page.route(/\/api\/datasources\?/, (r) =>
     json(r, 200, [datasource(), datasource({ id: 'ds-target', name: 'warehouse_b' })]),
   )
+  await page.route(/\/api\/datasources\/[^/]+\/metadata\/schemas/, (r) =>
+    json(r, 200, [{ name: 'app' }]),
+  )
+  await page.route(/\/api\/datasources\/[^/]+\/metadata\/tables/, (r) =>
+    json(r, 200, [
+      { schema_name: 'app', name: 'orders', table_type: 'BASE TABLE' },
+      { schema_name: 'app', name: 'orders_a', table_type: 'BASE TABLE' },
+      { schema_name: 'app', name: 'orders_b', table_type: 'BASE TABLE' },
+    ]),
+  )
   await page.route(/\/api\/compare\/tasks(\?|$)/, (r: Route) => {
     if (r.request().method() === 'GET') return json(r, 200, tasks)
     return r.fallback()
@@ -209,14 +219,72 @@ test('compare task list renders and editor loads from saved task', async ({ page
   expectNoConsoleErrors()
 })
 
+test('compare picker preserves saved schema and table values missing from current metadata', async ({
+  page,
+}) => {
+  await mockBase(page, [
+    compareTask({
+      source_ref: {
+        kind: 'table',
+        schema_name: 'legacy_schema',
+        table_name: 'legacy_table',
+      },
+    }),
+  ])
+
+  await page.goto('/projects/project-1/compare')
+  await expect(page.getByTestId('compare-source-schema')).toHaveValue('legacy_schema')
+  await expect(page.getByTestId('compare-source-table')).toHaveValue('legacy_table')
+  expectNoConsoleErrors()
+})
+
+test('compare source and target pick schemas and tables from datasource metadata', async ({
+  page,
+}) => {
+  await mockBase(page)
+  const tableRequests: string[] = []
+  await page.route(/\/api\/datasources\/ds-source\/metadata\/schemas/, (route) =>
+    json(route, 200, [{ name: 'app' }, { name: 'SJCJ' }]),
+  )
+  await page.route(/\/api\/datasources\/ds-source\/metadata\/tables/, (route) => {
+    tableRequests.push(route.request().url())
+    const schema = new URL(route.request().url()).searchParams.get('schema')
+    return json(
+      route,
+      200,
+      schema === 'SJCJ'
+        ? [{ schema_name: 'SJCJ', name: 'A_KS_CUST_BASE_INFO', table_type: 'TABLE' }]
+        : [{ schema_name: 'app', name: 'orders_a', table_type: 'BASE TABLE' }],
+    )
+  })
+
+  await page.goto('/projects/project-1/compare')
+  const sourceSchema = page.getByTestId('compare-source-schema')
+  await expect(sourceSchema).toHaveValue('app')
+  await sourceSchema.selectOption('SJCJ')
+
+  const sourceTable = page.getByTestId('compare-source-table')
+  await expect(sourceTable).toHaveValue('')
+  await sourceTable.selectOption('A_KS_CUST_BASE_INFO')
+  await expect(sourceTable).toHaveValue('A_KS_CUST_BASE_INFO')
+  expect(
+    tableRequests.some(
+      (url) => new URL(url).searchParams.get('schema') === 'SJCJ',
+    ),
+  ).toBe(true)
+  await expect(page.getByTestId('compare-target-schema')).toHaveValue('app')
+  await expect(page.getByTestId('compare-target-table')).toHaveValue('orders_b')
+  expectNoConsoleErrors()
+})
+
 test('auto-infer shows PK candidates + mapping draft for confirmation', async ({ page }) => {
   await mockBase(page)
   await page.route('**/api/projects/project-1/compare/infer', (r) => json(r, 200, inferResponse))
 
   await page.goto('/projects/project-1/compare')
   // 填表名后推断
-  await page.locator('input[placeholder="Table"]').first().fill('orders')
-  await page.locator('input[placeholder="Table"]').nth(1).fill('orders')
+  await page.getByTestId('compare-source-table').selectOption('orders')
+  await page.getByTestId('compare-target-table').selectOption('orders')
   await page.getByRole('button', { name: 'Auto-infer' }).click()
 
   await expect(page.getByText('Primary key candidates')).toBeVisible()
@@ -240,8 +308,8 @@ test('needs_manual_pk blocks full run and surfaces a warning', async ({ page }) 
   )
 
   await page.goto('/projects/project-1/compare')
-  await page.locator('input[placeholder="Table"]').first().fill('orders')
-  await page.locator('input[placeholder="Table"]').nth(1).fill('orders')
+  await page.getByTestId('compare-source-table').selectOption('orders')
+  await page.getByTestId('compare-target-table').selectOption('orders')
   await page.getByRole('button', { name: 'Auto-infer' }).click()
   await expect(page.getByText(/Could not infer a primary key/)).toBeVisible()
   expectNoConsoleErrors()
