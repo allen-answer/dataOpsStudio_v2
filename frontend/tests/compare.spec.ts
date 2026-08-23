@@ -219,6 +219,49 @@ test('compare task list renders and editor loads from saved task', async ({ page
   expectNoConsoleErrors()
 })
 
+test('result snapshot task reloads and saves without degrading to a table ref', async ({ page }) => {
+  const task = compareTask({
+    source_id: null,
+    source_ref: {
+      kind: 'result_snapshot',
+      input_id: 'input-snapshot-1',
+      allow_partial: true,
+    },
+  })
+  await mockBase(page, [task])
+  let targetTableRequests = 0
+  await page.route(/\/api\/datasources\/ds-target\/metadata\/tables/, (route) => {
+    targetTableRequests += 1
+    return json(route, 200, [
+      { schema_name: 'app', name: 'orders_b', table_type: 'BASE TABLE' },
+    ])
+  })
+  let patchBody: Record<string, unknown> | null = null
+  await page.route(/\/api\/compare\/tasks\/task-1$/, (route) => {
+    if (route.request().method() !== 'PATCH') return route.fallback()
+    patchBody = route.request().postDataJSON() as Record<string, unknown>
+    return json(route, 200, { ...task, ...patchBody, updated_at: now })
+  })
+
+  await page.goto('/projects/project-1/compare')
+  await expect(page.getByTestId('compare-source-result-snapshot')).toContainText(
+    'input-snapshot-1',
+  )
+  await expect(page.getByTestId('compare-source-schema')).toHaveCount(0)
+  await expect(page.getByTestId('compare-target-table')).toHaveValue('orders_b')
+  await page.getByRole('button', { name: 'Save task' }).click()
+
+  await expect.poll(() => patchBody).not.toBeNull()
+  expect(patchBody?.source_id).toBeNull()
+  expect(patchBody?.source_ref).toEqual({
+    kind: 'result_snapshot',
+    input_id: 'input-snapshot-1',
+    allow_partial: true,
+  })
+  await expect.poll(() => targetTableRequests).toBeGreaterThanOrEqual(2)
+  expectNoConsoleErrors()
+})
+
 test('compare picker preserves saved schema and table values missing from current metadata', async ({
   page,
 }) => {

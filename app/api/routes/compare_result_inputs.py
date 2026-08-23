@@ -54,7 +54,7 @@ def capture_compare_result_input(
             scope=ActorProject(actor_id=user.id, project_id=project_id),
         )
     except CompareResultInputError as exc:
-        raise _api_error(exc) from exc
+        raise compare_result_input_api_error(exc) from exc
     services.write_audit(
         user_id=user.id,
         project_id=project_id,
@@ -92,7 +92,7 @@ def get_compare_result_input(
             retain_until=datetime.now(UTC) + timedelta(minutes=5),
         )
     except CompareResultInputError as exc:
-        raise _api_error(exc) from exc
+        raise compare_result_input_api_error(exc) from exc
     return opened.descriptor
 
 
@@ -105,7 +105,7 @@ def _module(request: Request) -> CompareResultInputs:
     )
 
 
-def _api_error(exc: CompareResultInputError) -> ApiError:
+def compare_result_input_api_error(exc: CompareResultInputError) -> ApiError:
     if isinstance(exc, (ResultOriginNotFound, CompareResultInputNotFound)):
         return ApiError(404, exc.code, "Result input not found")
     if isinstance(exc, (ResultNotTerminal, ResultNotComparable)):
@@ -120,4 +120,4 @@ def _api_error(exc: CompareResultInputError) -> ApiError:
     return ApiError(500, exc.code, "Compare result input failed")
 
 
-__all__ = ["router"]
+__all__ = ["compare_result_input_api_error", "router"]
