@@ -24,6 +24,29 @@ import sys
 import tempfile
 import urllib.request
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tools.package.build_identity import (
+        BuildIdentity,
+        inject_build_identity,
+        render_shell_build_identity,
+        resolve_build_identity,
+    )
+elif __package__:
+    from .build_identity import (
+        BuildIdentity,
+        inject_build_identity,
+        render_shell_build_identity,
+        resolve_build_identity,
+    )
+else:
+    from build_identity import (
+        BuildIdentity,
+        inject_build_identity,
+        render_shell_build_identity,
+        resolve_build_identity,
+    )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DESKTOP_ROOT = REPO_ROOT / "desktop"
@@ -61,6 +84,7 @@ SOURCE_ITEMS = (
     ".python-version",
 )
 SCRIPT_ITEMS = ("_common.sh", "install.sh", "start.sh", "stop.sh", "README.md")
+BUILD_IDENTITY_MARKER = "# __DATAOPS_BUILD_IDENTITY__"
 PG_REQUIRED_BINS = {"initdb", "pg_ctl", "postgres"}
 # Exact last verified Mint package size (172.27 MiB rounded for display).
 MAX_DEB_BYTES = 180_636_606
@@ -335,19 +359,34 @@ def prepare_postgres(cache: Path, jobs: int) -> Path:
     return destination
 
 
-def build_frontend(skip: bool) -> Path:
+def build_frontend() -> Path:
     frontend = REPO_ROOT / "frontend"
     destination = frontend / "dist"
-    if skip:
-        if not (destination / "index.html").exists():
-            raise SystemExit("--skip-frontend-build requires frontend/dist/index.html")
-        log("frontend: reuse existing dist")
-        return destination
     run(["npm", "ci"], cwd=frontend)
     run(["npm", "run", "build"], cwd=frontend)
     if not (destination / "index.html").exists():
         raise SystemExit("frontend build did not produce frontend/dist/index.html")
     return destination
+
+
+def write_scripts(identity: BuildIdentity) -> None:
+    for name in SCRIPT_ITEMS:
+        source = SCRIPTS_ROOT / name
+        destination = BUNDLE_ROOT / name
+        if name == "_common.sh":
+            text = source.read_text(encoding="utf-8")
+            destination.write_text(
+                inject_build_identity(
+                    text,
+                    marker=BUILD_IDENTITY_MARKER,
+                    rendered_identity=render_shell_build_identity(identity),
+                    keep_shebang=True,
+                ),
+                encoding="utf-8",
+                newline="\n",
+            )
+        else:
+            shutil.copy2(source, destination)
 
 
 def assemble(
@@ -358,6 +397,7 @@ def assemble(
     postgres: Path,
     requirements: Path,
     frontend: Path,
+    identity: BuildIdentity,
 ) -> None:
     shutil.rmtree(BUNDLE_ROOT, ignore_errors=True)
     BUNDLE_ROOT.mkdir(parents=True)
@@ -374,8 +414,7 @@ def assemble(
         shutil.copy2(wheel, BUNDLE_ROOT / "runtime/wheels" / wheel.name)
     shutil.copy2(requirements, BUNDLE_ROOT / "runtime/requirements-frozen.txt")
     copytree(postgres, BUNDLE_ROOT / "pgsql")
-    for name in SCRIPT_ITEMS:
-        shutil.copy2(SCRIPTS_ROOT / name, BUNDLE_ROOT / name)
+    write_scripts(identity)
     for name in ("_common.sh", "install.sh", "start.sh", "stop.sh"):
         script = BUNDLE_ROOT / name
         script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -509,7 +548,12 @@ def repack_deb(source: Path, destination: Path) -> None:
             pending_path.unlink(missing_ok=True)
 
 
-def write_manifest(output_dir: Path, deb: Path, sizes: dict[str, int]) -> Path:
+def write_manifest(
+    output_dir: Path,
+    deb: Path,
+    sizes: dict[str, int],
+    identity: BuildIdentity,
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_deb = output_dir / f"dataops-studio-{project_version()}-mint21.3-amd64-offline.deb"
     log("deb: deterministic gzip-9 repack")
@@ -517,7 +561,9 @@ def write_manifest(output_dir: Path, deb: Path, sizes: dict[str, int]) -> Path:
     total = output_deb.stat().st_size
     lines = [
         "DataOpsStudio Linux Mint 21.3 x86_64 offline GUI bundle",
-        f"bundle_version: {project_version()}",
+        f"bundle_version: {identity.version}",
+        f"build_commit: {identity.commit}",
+        f"image_version: {identity.image_version}",
         "build_os: Linux Mint 21.3 (jammy, glibc 2.35, x86_64)",
         f"python: python-build-standalone {PYTHON_VERSION}+{PYTHON_RELEASE}",
         f"postgresql: {POSTGRES_VERSION} (official source, relocatable, slim)",
@@ -544,7 +590,10 @@ def write_manifest(output_dir: Path, deb: Path, sizes: dict[str, int]) -> Path:
 def validate_host() -> None:
     if sys.platform != "linux" or os.uname().machine != "x86_64":
         raise SystemExit("build_mint_bundle.py must run on Linux x86_64")
-    libc_name, libc_version = os.confstr("CS_GNU_LIBC_VERSION").split()
+    libc = os.confstr("CS_GNU_LIBC_VERSION")
+    if libc is None:
+        raise SystemExit("cannot determine build host glibc version")
+    libc_name, libc_version = libc.split()
     if libc_name != "glibc" or tuple(map(int, libc_version.split("."))) > (2, 35):
         raise SystemExit(
             f"build host is too new: {libc_name} {libc_version}; require <= glibc 2.35"
@@ -555,11 +604,21 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-dir", default=str(REPO_ROOT / "dist-mint/cache"))
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "dist-mint"))
-    parser.add_argument("--skip-frontend-build", action="store_true")
+    parser.add_argument(
+        "--build-commit",
+        default=None,
+        help="full Git object id; required when building from a source archive without .git",
+    )
     parser.add_argument("--jobs", type=int, default=max(1, os.cpu_count() or 1))
     args = parser.parse_args(argv)
 
     validate_host()
+    identity = resolve_build_identity(
+        REPO_ROOT,
+        explicit_commit=args.build_commit,
+        image_version=f"{project_version()}-mint21.3-amd64-offline",
+    )
+    log(f"build identity: version={identity.version} commit={identity.commit}")
     cache = Path(args.cache_dir).resolve()
     output_dir = Path(args.output_dir).resolve()
     cache.mkdir(parents=True, exist_ok=True)
@@ -569,7 +628,7 @@ def main(argv: list[str] | None = None) -> int:
     requirements = export_requirements(cache, uv)
     wheels = prepare_wheels(cache, python, requirements)
     postgres = prepare_postgres(cache, args.jobs)
-    frontend = build_frontend(args.skip_frontend_build)
+    frontend = build_frontend()
     assemble(
         python=python,
         uv=uv,
@@ -577,11 +636,12 @@ def main(argv: list[str] | None = None) -> int:
         postgres=postgres,
         requirements=requirements,
         frontend=frontend,
+        identity=identity,
     )
     sizes = component_sizes()
     run(["cargo", "tauri", "build", "--bundles", "deb"], cwd=DESKTOP_ROOT)
     deb = find_deb()
-    write_manifest(output_dir, deb, sizes)
+    write_manifest(output_dir, deb, sizes, identity)
     log("done")
     return 0
 

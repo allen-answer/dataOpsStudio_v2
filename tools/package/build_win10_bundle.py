@@ -32,7 +32,6 @@ Usage (build host needs network + uv + Node/npm)::
     uv run python tools/package/build_win10_bundle.py                  # offline
     uv run python tools/package/build_win10_bundle.py --gui            # offline GUI
     uv run python tools/package/build_win10_bundle.py --mode online    # online
-    uv run python tools/package/build_win10_bundle.py --skip-frontend-build
 
 Large artifacts land in ``dist-bundle/`` (git-ignored); the bundle itself never
 enters git.
@@ -49,6 +48,29 @@ import subprocess
 import tomllib
 import zipfile
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tools.package.build_identity import (
+        BuildIdentity,
+        inject_build_identity,
+        render_powershell_build_identity,
+        resolve_build_identity,
+    )
+elif __package__:
+    from .build_identity import (
+        BuildIdentity,
+        inject_build_identity,
+        render_powershell_build_identity,
+        resolve_build_identity,
+    )
+else:
+    from build_identity import (
+        BuildIdentity,
+        inject_build_identity,
+        render_powershell_build_identity,
+        resolve_build_identity,
+    )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
@@ -272,13 +294,8 @@ def _download_verified(url: str, sha256: str, dest: Path) -> Path:
 # ── assembly ──────────────────────────────────────────────────────────────────
 
 
-def build_frontend(skip: bool) -> Path:
+def build_frontend() -> Path:
     dist = REPO_ROOT / "frontend" / "dist"
-    if skip:
-        if not (dist / "index.html").exists():
-            raise SystemExit("--skip-frontend-build set but frontend/dist/index.html missing")
-        log(f"frontend: reuse existing {dist}")
-        return dist
     frontend = REPO_ROOT / "frontend"
     npm = shutil.which("npm") or "npm"
     run([npm, "ci"], cwd=frontend)
@@ -331,6 +348,7 @@ def assemble(
     wheels: Path | None = None,
     pg_zip: Path | None = None,
     desktop_executable: Path | None = None,
+    identity: BuildIdentity,
 ) -> None:
     if staging.exists():
         shutil.rmtree(staging)
@@ -371,7 +389,7 @@ def assemble(
         log("assemble: Tauri desktop shell")
         shutil.copy2(desktop_executable, staging / "DataOpsStudio.exe")
 
-    write_scripts(staging)
+    write_scripts(staging, identity)
     write_readme(staging)
 
 
@@ -422,19 +440,42 @@ SCRIPT_TEMPLATES = (
     "start.cmd",
     "stop.cmd",
 )
+BUILD_IDENTITY_MARKER = "# __DATAOPS_BUILD_IDENTITY__"
 
 
-def write_scripts(staging: Path) -> None:
+def write_scripts(staging: Path, identity: BuildIdentity) -> None:
     log("assemble: PowerShell scripts + .cmd shims")
     for name in SCRIPT_TEMPLATES:
-        _write_source(SCRIPTS_ROOT / name, staging / name, encoding="ascii")
+        source = SCRIPTS_ROOT / name
+        destination = staging / name
+        if name == "_common.ps1":
+            text = source.read_text(encoding="utf-8")
+            destination.write_text(
+                inject_build_identity(
+                    text,
+                    marker=BUILD_IDENTITY_MARKER,
+                    rendered_identity=render_powershell_build_identity(identity),
+                    keep_shebang=False,
+                ),
+                encoding="ascii",
+                newline="\r\n",
+            )
+        else:
+            _write_source(source, destination, encoding="ascii")
 
 
 def write_readme(staging: Path) -> None:
     _write_source(TEMPLATES_DIR / "README.md", staging / "README.md", encoding="utf-8")
 
 
-def write_manifest(staging_parent: Path, zip_path: Path, mode: str, *, gui: bool) -> None:
+def write_manifest(
+    staging_parent: Path,
+    zip_path: Path,
+    mode: str,
+    *,
+    gui: bool,
+    identity: BuildIdentity,
+) -> None:
     if mode == "offline":
         runtime_lines = [
             f"postgresql: {PG_VERSION} (EDB windows-x64 binaries, slim bin/lib/share, bundled)",
@@ -450,7 +491,9 @@ def write_manifest(staging_parent: Path, zip_path: Path, mode: str, *, gui: bool
         ]
     lines = [
         f"DataOpsStudio Win10 x64 {mode}{' GUI' if gui else ''} bundle",
-        f"bundle_version: {bundle_version()}",
+        f"bundle_version: {identity.version}",
+        f"build_commit: {identity.commit}",
+        f"image_version: {identity.image_version}",
         *runtime_lines,
         *(["gui: Tauri v2 desktop shell (WebView2 required)"] if gui else []),
         f"zip: {zip_path.name}",
@@ -490,12 +533,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "dist-bundle"))
     parser.add_argument("--cache-dir", default=str(REPO_ROOT / "dist-bundle" / "cache"))
-    parser.add_argument("--uv", default="uv", help="uv executable on the build host")
     parser.add_argument(
-        "--skip-frontend-build",
-        action="store_true",
-        help="reuse existing frontend/dist instead of running npm ci && npm run build",
+        "--build-commit",
+        default=None,
+        help="full Git object id; required when building from a source archive without .git",
     )
+    parser.add_argument("--uv", default="uv", help="uv executable on the build host")
     parser.add_argument(
         "--keep-staging",
         action="store_true",
@@ -523,9 +566,15 @@ def main(argv: list[str] | None = None) -> int:
         name = f"dataops-studio-{version}-win10-x64-{args.mode}-gui"
     else:
         name = f"dataops-studio-{version}-win10-x64-{args.mode}"
+    identity = resolve_build_identity(
+        REPO_ROOT,
+        explicit_commit=args.build_commit,
+        image_version=name.removeprefix("dataops-studio-"),
+    )
+    log(f"build identity: version={identity.version} commit={identity.commit}")
 
     requirements = export_requirements(cache, args.uv)
-    frontend_dist = build_frontend(args.skip_frontend_build)
+    frontend_dist = build_frontend()
     desktop_executable = build_desktop() if args.gui else None
 
     staging = output_dir / name
@@ -544,6 +593,7 @@ def main(argv: list[str] | None = None) -> int:
             wheels=wheels,
             pg_zip=pg_zip,
             desktop_executable=desktop_executable,
+            identity=identity,
         )
     else:
         assemble(
@@ -552,10 +602,11 @@ def main(argv: list[str] | None = None) -> int:
             requirements=requirements,
             frontend_dist=frontend_dist,
             desktop_executable=desktop_executable,
+            identity=identity,
         )
 
     zip_path = make_zip(staging, output_dir, name)
-    write_manifest(output_dir, zip_path, args.mode, gui=args.gui)
+    write_manifest(output_dir, zip_path, args.mode, gui=args.gui, identity=identity)
     if not args.keep_staging:
         shutil.rmtree(staging)
     log("done")

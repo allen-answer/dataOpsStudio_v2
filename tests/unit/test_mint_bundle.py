@@ -1,11 +1,61 @@
 from __future__ import annotations
 
 import gzip
+import os
+import shutil
+import subprocess
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from tools.package import build_mint_bundle as build
+from tools.package.build_identity import BuildIdentity
+
+
+def _identity() -> BuildIdentity:
+    return BuildIdentity(
+        version="2.0.1",
+        commit="a" * 40,
+        image_version="2.0.1-mint21.3-amd64-offline",
+    )
+
+
+@pytest.mark.skipif(os.name == "nt" or shutil.which("bash") is None, reason="requires Unix bash")
+def test_common_script_exports_packaged_build_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    monkeypatch.setattr(build, "BUNDLE_ROOT", bundle)
+    build.write_scripts(_identity())
+    common = bundle / "_common.sh"
+    assert build.BUILD_IDENTITY_MARKER not in common.read_text(encoding="utf-8")
+    assert common.stat().st_size <= (build.SCRIPTS_ROOT / "_common.sh").stat().st_size
+    env = os.environ.copy()
+    env["DATAOPS_BUILD_VERSION"] = "stale"
+    env["DATAOPS_BUILD_COMMIT"] = "b" * 40
+    env["DATAOPS_IMAGE_VERSION"] = "stale"
+    env["HOME"] = str(tmp_path / "home")
+    env["XDG_DATA_HOME"] = str(tmp_path / "xdg")
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; printf "%s|%s|%s" "$DATAOPS_BUILD_VERSION" '
+            '"$DATAOPS_BUILD_COMMIT" "$DATAOPS_IMAGE_VERSION"',
+            "build-identity-test",
+            str(common),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.stdout == f"2.0.1|{'a' * 40}|2.0.1-mint21.3-amd64-offline"
 
 
 def _gzip(payload: bytes, *, compresslevel: int, mtime: int) -> bytes:
