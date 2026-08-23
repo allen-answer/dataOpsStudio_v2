@@ -34,6 +34,19 @@ class Manifest(BaseModel):
     artifacts: list[ResultRef] = Field(default_factory=list)
 
 
+class SpoolSnapshotManifest(BaseModel):
+    """ResultSet spool 的不可变副本描述,不暴露底层 part 路径。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    result_set_id: str
+    columns: tuple[Column, ...] = ()
+    loaded_rows: int = 0
+    data_bytes: int = 0
+    truncated: bool = False
+    has_more: bool = False
+
+
 ResultSetState = Literal["streaming", "complete", "failed", "closed"]
 
 

@@ -128,6 +128,7 @@ from app.domain.workflow_interpolate import interpolate_payload
 from app.domain.workflow_outputs import extract_workflow_node_outputs
 from app.domain.workflow_when import builtin_when_variables, when_variables_from_payload
 from app.infrastructure.bootstrap.local_file import LocalFileBootstrapSecrets
+from app.infrastructure.compare_result_inputs import CompareResultInputs
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.result_export import (
     ExportFormat,
@@ -493,6 +494,7 @@ class WorkerRunner:
         notify_reveal: RevealSecret | None = None,
         sensor_trigger_catalog: SensorTriggerCatalogLike | None = None,
         active_console_resultsets: ActiveConsoleResultSetsLike | None = None,
+        compare_result_inputs: CompareResultInputs | None = None,
     ) -> None:
         if config.sql_spool_batch_size <= 0:
             raise ValueError("sql_spool_batch_size must be positive")
@@ -519,6 +521,7 @@ class WorkerRunner:
         self._lineage_catalog = lineage_catalog
         self._sensor_trigger_catalog = sensor_trigger_catalog
         self._active_console_resultsets = active_console_resultsets
+        self._compare_result_inputs = compare_result_inputs
         # C-9:run 终态通知服务(注入 SecretStore.reveal_secret 作 RevealSecret DI)。
         # 未注入 reveal = 不通知(no-op),不影响 run 终态落定。
         self._notify_service = (
@@ -2157,13 +2160,20 @@ class WorkerRunner:
         if now < self._next_result_gc_at:
             return
         started_at = now
+        snapshot_deleted = 0
+        snapshot_failed = 0
         try:
             protected = self._protected_result_set_ids()
+            if self._compare_result_inputs is not None:
+                snapshot_report = self._compare_result_inputs.collect_expired()
+                protected = protected | snapshot_report.protected_result_set_ids
+                snapshot_deleted = snapshot_report.deleted
+                snapshot_failed = snapshot_report.failed
         except Exception:
-            # R3:算不出保护集就**不跑 GC**。宁可这一轮不回收磁盘,也不能靠
-            # "假设没有活跃会话"去删别人正在读的结果集。下一轮再试。
+            # R3:算不出会话或 snapshot 保护集就**不跑 GC**。宁可这一轮不回收
+            # 磁盘,也不能靠"假设没有活跃读者"去删正在消费的结果集。
             logger.warning(
-                "worker result spool gc skipped: active console session lookup failed",
+                "worker result spool gc skipped: protected result lookup failed",
                 exc_info=True,
                 elapsed_seconds=_elapsed_seconds(started_at),
             )
@@ -2181,6 +2191,8 @@ class WorkerRunner:
                 "worker result spool gc complete",
                 cleaned=cleaned,
                 protected_resultsets=len(protected),
+                snapshot_deleted=snapshot_deleted,
+                snapshot_failed=snapshot_failed,
                 elapsed_seconds=_elapsed_seconds(started_at),
             )
         finally:
@@ -2640,6 +2652,12 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
         # R3:spool GC 的会话豁免集。worker 不碰会话本体,只在删文件前问一句
         # "这个结果集还属于活着的控制台会话吗"。
         active_console_resultsets=PostgresActiveConsoleResultSets(engine),
+        # 结果到 Compare 的 snapshot tombstone + GC 保护集。
+        compare_result_inputs=CompareResultInputs(
+            engine,
+            result_store,
+            ttl_days=actual_settings.result_store.result_ttl_days,
+        ),
     )
 
 
