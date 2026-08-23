@@ -72,6 +72,10 @@ dist-mint/dataops-studio-<version>-mint21.3-amd64-offline.deb
 dist-mint/dataops-studio-<version>-mint21.3-amd64-offline.deb.MANIFEST.txt
 ```
 
+After Tauri creates the Debian archive, the builder deterministically recompresses its control and
+data members with gzip level 9 and zero timestamps. Installed bytes are unchanged; the stable,
+maximum compression keeps rebuilds comparable against the no-growth package-size gate.
+
 Use `--skip-frontend-build` only with an already verified frontend build. The `.deb` keeps immutable
 resources under the application install directory and stores the generated virtual environment and
 instance home under `${XDG_DATA_HOME:-$HOME/.local/share}/dataops-studio/` by default.
