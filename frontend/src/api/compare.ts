@@ -50,7 +50,7 @@ export type CompareFileFormat = 'csv' | 'excel'
 
 // ── 数据引用 / 规则 / 限制(schemas.py)──────────────────────────────
 export interface CompareDataRef {
-  kind: 'table' | 'sql' | 'file'
+  kind: 'table' | 'sql' | 'file' | 'result_snapshot'
   schema_name?: string | null
   table_name?: string | null
   sql?: string | null
@@ -62,6 +62,8 @@ export interface CompareDataRef {
   header_row?: number // 1-indexed 表头行(默认 1)
   encoding?: string | null // csv:空=utf-8-sig(解码失败自动 GBK 回退)
   delimiter?: string | null // csv 分隔符
+  input_id?: string | null // result_snapshot:opaque CompareResultInputs id
+  allow_partial?: boolean // result_snapshot:显式确认部分/截断输入
 }
 
 export interface CompareRulesPayload {

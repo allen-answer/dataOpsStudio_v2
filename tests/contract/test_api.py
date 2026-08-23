@@ -10,9 +10,10 @@ import pytest
 from fastapi.routing import APIRoute
 
 from app.api.app import create_app
+from app.api.errors import ApiError
 from app.api.routes import compare_result_inputs as compare_result_inputs_routes
 from app.api.routes import core as core_routes
-from app.api.schemas import SqlGenerateResponse
+from app.api.schemas import CompareDataRef, SqlGenerateResponse
 from app.api.security import create_access_token, decode_access_token
 from app.api.services import ApiServices
 from app.dbclients.protocol import AdapterConnectionError
@@ -30,7 +31,10 @@ from app.domain.result import (
 )
 from app.domain.schema import Column, ColumnType, Index, Row, Schema, Table
 from app.domain.workflow import WorkflowSpec
-from app.infrastructure.compare_result_inputs import CompareResultInputExpired
+from app.infrastructure.compare_result_inputs import (
+    CompareResultInputExpired,
+    CompareResultInputNotFound,
+)
 from app.services.ai.default_gateway import DefaultAiGateway
 from app.services.ai.errors import (
     AiGatewayError,
@@ -1313,6 +1317,295 @@ def test_compare_task_create_persists_explicit_rules_contract() -> None:
     assert any(audit["action"] == "compare_task_create" for audit in services.audits)
 
 
+def test_compare_task_create_validates_result_snapshot_without_source_datasource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_row = _compare_task_row()
+    task_row["source_id"] = None
+    task_row["source_ref"] = {"kind": "result_snapshot", "input_id": "input-1"}
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            [{"id": "ds-target", "project_id": "project-1"}],
+            task_row,
+        ]
+    )
+    services = _Services(engine)
+    calls: list[dict[str, object]] = []
+
+    def validate(services_arg: object, **kwargs: object) -> None:
+        del services_arg
+        calls.append(kwargs)
+
+    monkeypatch.setattr(core_routes, "_validate_compare_result_snapshot_refs", validate)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/compare/tasks",
+        headers=_auth_headers(),
+        json_body={
+            "project_id": "project-1",
+            "name": "snapshot vs table",
+            "target_id": "ds-target",
+            "source_ref": {"kind": "result_snapshot", "input_id": "input-1"},
+            "target_ref": {"kind": "table", "schema_name": "app", "table_name": "orders"},
+            "columns": [{"name": "id", "type": "integer"}],
+            "compare_rules": {"key_columns": ["id"]},
+        },
+    )
+
+    assert response.status_code == 201
+    assert calls[0]["project_id"] == "project-1"
+    assert calls[0]["user_id"] == "user-1"
+    assert response.json()["source_ref"]["input_id"] == "input-1"
+
+
+def test_compare_result_snapshot_validation_hides_other_actors_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services = _Services(_FakeEngine([]))
+
+    class _Module:
+        def open(self, *args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise CompareResultInputNotFound("not found")
+
+    monkeypatch.setattr(
+        core_routes,
+        "CompareResultInputs",
+        lambda engine, result_store, ttl_days: _Module(),
+    )
+
+    with pytest.raises(ApiError) as excinfo:
+        core_routes._validate_compare_result_snapshot_refs(
+            cast(ApiServices, services),
+            project_id="project-1",
+            user_id="user-1",
+            refs=[{"kind": "result_snapshot", "input_id": "input-other"}],
+            retain_until=datetime.now(UTC) + timedelta(minutes=5),
+        )
+
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "compare_input_not_found"
+
+
+def test_compare_result_snapshot_rejects_partial_without_explicit_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = CompareResultInputDescriptor(
+        id="input-1",
+        project_id="project-1",
+        origin_kind="statement",
+        origin_id="statement-1",
+        columns=(Column(name="id", type=ColumnType.INTEGER),),
+        loaded_rows=100,
+        total_rows=None,
+        truncated=True,
+        has_more=True,
+        state="ready",
+        created_at=_dt(1),
+        expires_at=_dt(2),
+    )
+
+    class _Opened:
+        def __init__(self) -> None:
+            self.descriptor = descriptor
+
+    class _Module:
+        def open(self, *args: object, **kwargs: object) -> _Opened:
+            del args, kwargs
+            return _Opened()
+
+    monkeypatch.setattr(
+        core_routes,
+        "CompareResultInputs",
+        lambda engine, result_store, ttl_days: _Module(),
+    )
+
+    with pytest.raises(ApiError) as excinfo:
+        core_routes._validate_compare_result_snapshot_refs(
+            cast(ApiServices, _Services(_FakeEngine([]))),
+            project_id="project-1",
+            user_id="user-1",
+            refs=[{"kind": "result_snapshot", "input_id": "input-1"}],
+            retain_until=datetime.now(UTC) + timedelta(minutes=5),
+            columns=[{"name": "id", "type": "integer"}],
+            compare_rules={"key_columns": ["id"]},
+        )
+
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.code == "result_snapshot_incomplete"
+
+    accepted = core_routes._validate_compare_result_snapshot_refs(
+        cast(ApiServices, _Services(_FakeEngine([]))),
+        project_id="project-1",
+        user_id="user-1",
+        refs=[
+            {
+                "kind": "result_snapshot",
+                "input_id": "input-1",
+                "allow_partial": True,
+            }
+        ],
+        retain_until=datetime.now(UTC) + timedelta(minutes=5),
+        columns=[{"name": "id", "type": "integer"}],
+        compare_rules={"key_columns": ["id"]},
+    )
+    assert accepted["input-1"].truncated is True
+
+
+def test_compare_result_snapshot_rejects_missing_configured_columns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = CompareResultInputDescriptor(
+        id="input-1",
+        project_id="project-1",
+        origin_kind="statement",
+        origin_id="statement-1",
+        columns=(Column(name="id", type=ColumnType.INTEGER),),
+        loaded_rows=1,
+        total_rows=1,
+        truncated=False,
+        has_more=False,
+        state="ready",
+        created_at=_dt(1),
+        expires_at=_dt(2),
+    )
+
+    class _Opened:
+        def __init__(self) -> None:
+            self.descriptor = descriptor
+
+    class _Module:
+        def open(self, *args: object, **kwargs: object) -> _Opened:
+            del args, kwargs
+            return _Opened()
+
+    monkeypatch.setattr(
+        core_routes,
+        "CompareResultInputs",
+        lambda engine, result_store, ttl_days: _Module(),
+    )
+
+    with pytest.raises(ApiError) as excinfo:
+        core_routes._validate_compare_result_snapshot_refs(
+            cast(ApiServices, _Services(_FakeEngine([]))),
+            project_id="project-1",
+            user_id="user-1",
+            refs=[{"kind": "result_snapshot", "input_id": "input-1"}],
+            retain_until=datetime.now(UTC) + timedelta(minutes=5),
+            columns=[
+                {"name": "id", "type": "integer"},
+                {"name": "name", "type": "string"},
+            ],
+            compare_rules={"key_columns": ["id"]},
+        )
+
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.code == "result_snapshot_columns_missing"
+    assert excinfo.value.extra == {"missing_columns": ["name"]}
+
+
+def test_compare_task_update_revalidates_changed_result_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = _compare_task_row()
+    current["source_id"] = None
+    current["source_ref"] = {"kind": "result_snapshot", "input_id": "input-old"}
+    updated = dict(current)
+    updated["source_ref"] = {"kind": "result_snapshot", "input_id": "input-new"}
+    engine = _FakeEngine(
+        [
+            current,
+            {"id": "project-1"},
+            {"id": "project-1"},
+            [{"id": "ds-target", "project_id": "project-1"}],
+            updated,
+        ]
+    )
+    services = _Services(engine)
+    calls: list[dict[str, object]] = []
+
+    def validate(services_arg: object, **kwargs: object) -> None:
+        del services_arg
+        calls.append(kwargs)
+
+    monkeypatch.setattr(core_routes, "_validate_compare_result_snapshot_refs", validate)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).request(
+        "PATCH",
+        "/api/compare/tasks/task-1",
+        headers=_auth_headers(),
+        json_body={"source_ref": {"kind": "result_snapshot", "input_id": "input-new"}},
+    )
+
+    assert response.status_code == 200
+    refs = calls[0]["refs"]
+    assert isinstance(refs, list)
+    assert len(refs) == 2
+    assert isinstance(refs[0], CompareDataRef)
+    assert refs[0].input_id == "input-new"
+
+
+def test_compare_task_update_target_datasource_keeps_snapshot_source_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = _compare_task_row()
+    current["source_id"] = None
+    current["source_ref"] = {"kind": "result_snapshot", "input_id": "input-1"}
+    updated = dict(current)
+    updated["target_id"] = "ds-target-new"
+    engine = _FakeEngine(
+        [
+            current,
+            {"id": "project-1"},
+            {"id": "project-1"},
+            [{"id": "ds-target-new", "project_id": "project-1"}],
+            updated,
+        ]
+    )
+    monkeypatch.setattr(
+        core_routes,
+        "_validate_compare_result_snapshot_refs",
+        lambda services_arg, **kwargs: {},
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).request(
+        "PATCH",
+        "/api/compare/tasks/task-1",
+        headers=_auth_headers(),
+        json_body={"target_id": "ds-target-new"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["source_id"] is None
+    assert response.json()["target_id"] == "ds-target-new"
+
+
+def test_compare_task_update_snapshot_to_table_requires_new_datasource() -> None:
+    current = _compare_task_row()
+    current["source_id"] = None
+    current["source_ref"] = {"kind": "result_snapshot", "input_id": "input-1"}
+    app = create_app(
+        services=cast(
+            ApiServices,
+            _Services(_FakeEngine([current, {"id": "project-1"}])),
+        )
+    )
+
+    response = AsgiClient(app).request(
+        "PATCH",
+        "/api/compare/tasks/task-1",
+        headers=_auth_headers(),
+        json_body={"source_ref": {"kind": "table", "schema_name": "app", "table_name": "orders"}},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "compare_datasource_required"
+
+
 def test_compare_task_clone_copies_config_with_deduped_name() -> None:
     cloned_row = _compare_task_row()
     cloned_row["id"] = "task-2"
@@ -1722,6 +2015,53 @@ def test_compare_diff_sql_contract_builds_where_in_for_both_sides() -> None:
     }
 
 
+def test_compare_diff_sql_marks_result_snapshot_side_unavailable() -> None:
+    run_row = {
+        "run_id": "run-1",
+        "job_id": "job-1",
+        "project_id": "project-1",
+        "task_id": "task-1",
+        "bucket_spools": {"diff": "rs-diff"},
+    }
+    task_row = _compare_task_row()
+    task_row["source_id"] = None
+    task_row["source_ref"] = {"kind": "result_snapshot", "input_id": "input-1"}
+    result_store = _ResultStore(
+        rows=[
+            encode_compare_result_row(
+                pk={"id": 3},
+                source={"id": 3, "amount": "10.00"},
+                target={"id": 3, "amount": "11.00"},
+                cells=[{"column": "amount", "source": "10.00", "target": "11.00"}],
+            )
+        ]
+    )
+    engine = _FakeEngine(
+        [
+            run_row,
+            {"id": "project-1"},
+            task_row,
+            {"id": "project-1"},
+            {"db_type": "mysql"},  # target only;snapshot side never resolves a datasource
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine, result_store=result_store)))
+
+    response = AsgiClient(app).get(
+        "/api/compare/runs/run-1/diff-sql",
+        headers=_auth_headers(),
+        params={"bucket": "diff"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["source"] == {
+        "available": False,
+        "sql": None,
+        "reason": "result_snapshot",
+    }
+    assert response.json()["target"]["available"] is True
+
+
 def test_compare_infer_contract_returns_mapping_confidence_and_pk_draft() -> None:
     source_row = _datasource_row()
     source_row["id"] = "ds-source"
@@ -2003,6 +2343,41 @@ def test_compare_task_run_enqueues_compare_job_and_run_index() -> None:
     }
     assert any("INSERT INTO run_index" in statement for statement in engine.statements)
     assert any(audit["action"] == "compare_run" for audit in services.audits)
+
+
+def test_compare_task_run_leases_result_snapshot_and_enqueues_only_db_datasource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_row = _compare_task_row()
+    task_row["source_id"] = None
+    task_row["source_ref"] = {"kind": "result_snapshot", "input_id": "input-1"}
+    engine = _FakeEngine([task_row, {"id": "project-1"}])
+    job_backend = _JobBackend()
+    services = _Services(engine, job_backend=job_backend)
+    calls: list[dict[str, object]] = []
+
+    def validate(services_arg: object, **kwargs: object) -> None:
+        del services_arg
+        calls.append(kwargs)
+
+    monkeypatch.setattr(core_routes, "_validate_compare_result_snapshot_refs", validate)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/compare/tasks/task-1/run",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 202
+    job = job_backend.enqueued[0]
+    assert job.datasource_ids == ["ds-target"]
+    assert job.payload["source_ref"] == {
+        "kind": "result_snapshot",
+        "input_id": "input-1",
+    }
+    retain_until = calls[0]["retain_until"]
+    assert isinstance(retain_until, datetime)
+    assert retain_until > datetime.now(UTC) + timedelta(minutes=29)
 
 
 def test_compare_sql_task_response_includes_projection_details() -> None:
@@ -7687,6 +8062,7 @@ class _Services:
         export_per_user_per_hour: int = 10,
         download_url_ttl_seconds: int = 300,
         upload_max_mb: int = 100,
+        result_ttl_days: int = 7,
         workflow_node_default_max_retries: int = 0,
         access_token_ttl_seconds: int = 3600,
         license_enforcement_enabled: bool = True,
@@ -7700,6 +8076,7 @@ class _Services:
         self.export_per_user_per_hour = export_per_user_per_hour
         self.download_url_ttl_seconds = download_url_ttl_seconds
         self.upload_max_mb = upload_max_mb
+        self.result_ttl_days = result_ttl_days
         self.workflow_node_default_max_retries = workflow_node_default_max_retries
         self._access_token_ttl_seconds = access_token_ttl_seconds
         self._license_enforcement_enabled = license_enforcement_enabled

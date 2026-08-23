@@ -271,6 +271,11 @@ class ResultStore(Protocol):
 # (如 connection_test 的 server_version / latency_ms、SQL 分阶段耗时),不得放敏感值或 cursor。
 ```
 
+Compare 结果输入纯追加 interface:`CompareDataRef.kind="result_snapshot"` 只接受
+`input_id` 与显式 `allow_partial`;该侧不绑定 datasource。创建/更新/运行均须通过
+`CompareResultInputs.open()` 校验 actor + project 并续租,worker 只读 snapshot,
+禁止重跑来源 SQL 或持有数据库 cursor。
+
 ```python
 # domain/result.py —— ★ ResultSet 不持有 DbCursor
 class ResultSet:

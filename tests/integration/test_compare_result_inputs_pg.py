@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -23,14 +24,20 @@ from app.db.models import (
     sql_consoles,
     users,
 )
+from app.domain.compare_result import decode_compare_result_row
 from app.domain.compare_result_input import (
     ActorProject,
     JobResultOrigin,
     StatementResultOrigin,
 )
+from app.domain.job import Job, JobKind, JobStatus
+from app.domain.resource import ResourceProfile
 from app.domain.schema import Column, ColumnType, Row
 from app.infrastructure.compare_result_inputs import CompareResultInputs
+from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
+from app.worker import WorkerRunner, WorkerRunnerConfig
+from tests.unit.test_worker import _FakeCompareRunCatalog
 
 pytestmark = pytest.mark.integration
 
@@ -82,6 +89,83 @@ def test_statement_and_job_results_capture_to_independent_snapshots(tmp_path: Pa
             ).batches
             for row in batch
         ] == [Row(values=[1, "job"])]
+
+        bucket_spools = {
+            "only_source": str(uuid4()),
+            "only_target": str(uuid4()),
+            "diff": str(uuid4()),
+            "same": str(uuid4()),
+        }
+        compare_job = Job(
+            id=str(uuid4()),
+            kind=JobKind.COMPARE_RUN,
+            status=JobStatus.PENDING,
+            owner_user_id=ids.user,
+            project_id=ids.project,
+            priority=0,
+            timeout_seconds=300,
+            resource_profile=ResourceProfile(),
+            audit_id=str(uuid4()),
+            payload={
+                "run_id": str(uuid4()),
+                "task_id": str(uuid4()),
+                "source_id": None,
+                "target_id": None,
+                "source_ref": {
+                    "kind": "result_snapshot",
+                    "input_id": statement_input.id,
+                },
+                "target_ref": {"kind": "result_snapshot", "input_id": job_input.id},
+                "columns": [column.model_dump(mode="json") for column in columns],
+                "compare_rules": {"key_columns": ["id"]},
+                "run_limits": {"recursive_checksum": False},
+                "bucket_result_set_ids": bucket_spools,
+            },
+        )
+        expired_before_claim = datetime.now(UTC)
+        with engine.begin() as conn:
+            conn.execute(
+                update(compare_result_inputs)
+                .where(compare_result_inputs.c.id == statement_input.id)
+                .values(expires_at=expired_before_claim - timedelta(seconds=1))
+            )
+        backend = PostgresJobBackend(engine, worker_id="worker-result-snapshot")
+        backend.enqueue(compare_job)
+        compare_catalog = _FakeCompareRunCatalog()
+
+        def fail_dependency(*args: object, **kwargs: object) -> Any:
+            del args, kwargs
+            raise AssertionError("result snapshot compare must not load a datasource or adapter")
+
+        runner = WorkerRunner(
+            backend,
+            store,
+            cast(Any, fail_dependency),
+            cast(Any, fail_dependency),
+            WorkerRunnerConfig(worker_id="worker-result-snapshot"),
+            compare_run_catalog=compare_catalog,
+            compare_result_inputs=module,
+        )
+
+        assert runner.run_once() is True
+        with engine.connect() as conn:
+            compare_job_row = (
+                conn.execute(select(jobs).where(jobs.c.id == compare_job.id)).mappings().one()
+            )
+            renewed_expiry = conn.execute(
+                select(compare_result_inputs.c.expires_at).where(
+                    compare_result_inputs.c.id == statement_input.id
+                )
+            ).scalar_one()
+        assert str(compare_job_row["status"]) == "success"
+        assert renewed_expiry > expired_before_claim
+        bucket_counts = compare_catalog.completed[0]["bucket_counts"]
+        assert isinstance(bucket_counts, dict)
+        assert bucket_counts["diff"] == 1
+        diff_rows = store.fetch_range(bucket_spools["diff"], 0, 10)
+        assert decode_compare_result_row(diff_rows[0])["cells"] == [
+            {"column": "name", "source": "statement", "target": "job"}
+        ]
         with engine.connect() as conn:
             rows = conn.execute(
                 select(compare_result_inputs.c.origin_kind).where(
@@ -279,7 +363,7 @@ def _clear(engine: Engine, ids: _Ids) -> None:
                 result_sets.c.id.in_([ids.statement_result_set, ids.job_result_set])
             )
         )
-        conn.execute(delete(jobs).where(jobs.c.id == ids.job))
+        conn.execute(delete(jobs).where(jobs.c.project_id == ids.project))
         conn.execute(delete(sql_consoles).where(sql_consoles.c.id == ids.console))
         conn.execute(delete(datasources).where(datasources.c.id == ids.datasource))
         conn.execute(delete(projects).where(projects.c.id == ids.project))

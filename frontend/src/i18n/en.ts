@@ -570,6 +570,7 @@ export default {
     ref_kind_table: 'Table ref',
     ref_kind_sql: 'Custom SQL',
     ref_kind_file: 'File',
+    ref_kind_result_snapshot: 'Result snapshot',
     sql_placeholder: 'SELECT … (read-only query)',
     single_sql: 'Single SQL (both sides run the same statement)',
     infer_sql_disabled:
