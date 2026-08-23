@@ -117,6 +117,7 @@ class ApiServices:
     export_per_user_per_hour: int = 10
     download_url_ttl_seconds: int = 300
     upload_max_mb: int = 100
+    result_ttl_days: int = 7
     # workflow run 状态查询推进节点状态时,RetryPolicy=None 节点继承的默认重试次数。
     # 与 worker 推进器同源(Settings.worker.workflow_node_default_max_retries),
     # 避免状态展示与实际执行口径漂移。
@@ -309,6 +310,7 @@ def build_api_services(settings: Settings | None = None) -> ApiServices:
         export_per_user_per_hour=actual_settings.api.export_per_user_per_hour,
         download_url_ttl_seconds=actual_settings.api.download_url_ttl_seconds,
         upload_max_mb=actual_settings.result_store.upload_max_mb,
+        result_ttl_days=actual_settings.result_store.result_ttl_days,
         workflow_node_default_max_retries=(
             actual_settings.worker.workflow_node_default_max_retries
         ),

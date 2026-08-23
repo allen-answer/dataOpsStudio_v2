@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from app.domain.schema import Row
-from app.infrastructure.resultstore.local_fs import LocalFsResultStore
+from app.infrastructure.resultstore.local_fs import LocalFsResultStore, ResultStoreError
 from app.infrastructure.resultstore.protocol import ResultStore
 
 pytestmark = pytest.mark.contract
@@ -64,6 +64,56 @@ def test_spool_pagination_metadata_persists_without_cursor_state(
     assert manifest["pagination_mode"] == "ordered_offset"
     assert manifest["pagination_reason"] == "fresh_read_ordered_offset"
     assert "cursor" not in manifest
+
+
+def test_snapshot_spool_survives_source_deletion(result_store: ResultStore) -> None:
+    result_store.append_spool(
+        "rs-source",
+        [Row(values=[1, "a"]), Row(values=[2, "b"])],
+    )
+    result_store.set_spool_pagination(
+        "rs-source",
+        has_more=True,
+        mode="ordered_offset",
+    )
+
+    snapshot = result_store.snapshot_spool("rs-source", "rs-snapshot")
+
+    assert snapshot.result_set_id == "rs-snapshot"
+    assert snapshot.loaded_rows == 2
+    assert snapshot.has_more is True
+    assert result_store.delete_spool("rs-source") is True
+    assert result_store.fetch_range("rs-snapshot", 0, 10) == [
+        Row(values=[1, "a"]),
+        Row(values=[2, "b"]),
+    ]
+    manifest = result_store.get_spool_manifest("rs-snapshot")
+    assert manifest["result_set_id"] == "rs-snapshot"
+    assert manifest["sealed"] is True
+    parts = manifest["parts"]
+    assert isinstance(parts, list)
+    assert all(isinstance(part, dict) and "rs-snapshot" in part["path"] for part in parts)
+    with pytest.raises(ResultStoreError, match="immutable"):
+        result_store.append_spool("rs-snapshot", [Row(values=[3, "c"])])
+    with pytest.raises(ResultStoreError, match="immutable"):
+        result_store.mark_spool_truncated("rs-snapshot")
+    with pytest.raises(ResultStoreError, match="immutable"):
+        result_store.set_spool_pagination(
+            "rs-snapshot",
+            has_more=False,
+            mode="unavailable",
+        )
+    assert isinstance(result_store, LocalFsResultStore)
+    with pytest.raises(ResultStoreError, match="immutable"):
+        result_store.set_spool_columns("rs-snapshot", [])
+
+
+def test_snapshot_spool_never_overwrites_existing_snapshot(result_store: ResultStore) -> None:
+    result_store.append_spool("rs-source", [Row(values=[1])])
+    result_store.snapshot_spool("rs-source", "rs-snapshot")
+
+    with pytest.raises(ResultStoreError, match="already exists"):
+        result_store.snapshot_spool("rs-source", "rs-snapshot")
 
 
 def test_put_artifact_returns_result_ref(result_store: ResultStore) -> None:

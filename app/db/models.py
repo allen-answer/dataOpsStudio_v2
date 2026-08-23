@@ -1050,6 +1050,46 @@ result_sets = Table(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# compare_result_inputs —— SQL 结果到 Compare 的不可变 spool snapshot catalog
+# ─────────────────────────────────────────────────────────────────────────────
+compare_result_inputs = Table(
+    "compare_result_inputs",
+    metadata,
+    Column("id", String(36), primary_key=True),
+    Column(
+        "project_id",
+        String(36),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column(
+        "created_by",
+        String(36),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    ),
+    Column("origin_kind", String(16), nullable=False),
+    Column("origin_id", String(36), nullable=False),
+    # provenance 只作证据锚点;源 result_sets 行可先于 snapshot tombstone 被清理。
+    Column("source_result_set_id", String(36), nullable=False),
+    Column("columns", JSONB(), nullable=False, server_default=text("'[]'::jsonb")),
+    Column("loaded_rows", Integer(), nullable=False, server_default="0"),
+    Column("total_rows", Integer(), nullable=True),
+    Column("truncated", Boolean(), nullable=False, server_default=text("false")),
+    Column("has_more", Boolean(), nullable=False, server_default=text("false")),
+    Column("state", String(16), nullable=False, server_default="ready"),
+    Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("deleted_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint("origin_kind IN ('statement', 'job')", name="origin_kind_is_supported"),
+    CheckConstraint("state IN ('ready', 'deleted')", name="state_is_supported"),
+    Index("ix_compare_result_inputs_project_created", "project_id", "created_at"),
+    Index("ix_compare_result_inputs_expiry", "state", "expires_at"),
+    Index("ix_compare_result_inputs_origin", "origin_kind", "origin_id"),
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # license_state —— singleton(只一行 id=1)
 # ─────────────────────────────────────────────────────────────────────────────
 system_settings = Table(
@@ -1115,6 +1155,7 @@ __all__ = [
     "APPLICATION_SECRET_KINDS",
     "ai_configs",
     "audit_logs",
+    "compare_result_inputs",
     "compare_tasks",
     "console_sessions",
     "console_statement_events",

@@ -9,7 +9,7 @@ import zipfile
 from collections.abc import Callable, Collection, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, BinaryIO, Protocol
+from typing import Any, BinaryIO, Protocol, cast
 from unittest.mock import patch
 
 import pytest
@@ -31,6 +31,7 @@ from app.domain.compare_result import (
     decode_compare_result_row,
     encode_compare_result_row,
 )
+from app.domain.compare_result_input import CompareResultInputGcReport
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.lineage import LineageReport, schema_from_metadata_cache_rows
@@ -1261,6 +1262,23 @@ class _FakeActiveConsoleResultSets:
         return frozenset(self.ids)
 
 
+class _FakeCompareResultInputs:
+    def __init__(self, ids: set[str], *, fail: bool = False) -> None:
+        self.ids = ids
+        self.fail = fail
+        self.calls = 0
+
+    def collect_expired(self) -> CompareResultInputGcReport:
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("snapshot catalog is unavailable")
+        return CompareResultInputGcReport(
+            deleted=1,
+            failed=0,
+            protected_result_set_ids=frozenset(self.ids),
+        )
+
+
 def test_worker_gc_passes_active_console_result_sets_as_protected() -> None:
     """★ 评审修订 R3:GC 前先问 catalog "哪些结果集还属于活着的会话"。"""
 
@@ -1279,6 +1297,42 @@ def test_worker_gc_passes_active_console_result_sets_as_protected() -> None:
 
     assert catalog.calls == 1
     assert result_store.gc_keep_calls == [frozenset({"rs-live"})]
+
+
+def test_worker_gc_collects_snapshots_and_merges_their_protection_set() -> None:
+    result_store = _FakeResultStore()
+    sessions = _FakeActiveConsoleResultSets({"rs-live"})
+    snapshots = _FakeCompareResultInputs({"input-live"})
+    runner = WorkerRunner(
+        _FakeBackend([]),
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        active_console_resultsets=sessions,
+        compare_result_inputs=cast(Any, snapshots),
+    )
+
+    assert runner.run_once() is False
+
+    assert snapshots.calls == 1
+    assert result_store.gc_keep_calls == [frozenset({"rs-live", "input-live"})]
+
+
+def test_worker_skips_generic_gc_when_snapshot_catalog_fails() -> None:
+    result_store = _FakeResultStore()
+    snapshots = _FakeCompareResultInputs(set(), fail=True)
+    runner = WorkerRunner(
+        _FakeBackend([]),
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_result_inputs=cast(Any, snapshots),
+    )
+
+    assert runner.run_once() is False
+    assert result_store.gc_calls == 0
 
 
 def test_worker_skips_gc_when_the_protected_set_cannot_be_computed() -> None:
