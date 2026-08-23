@@ -37,11 +37,11 @@ function datasource(dbType = 'mysql') {
   }
 }
 
-function consoleRow() {
+function consoleRow(datasourceId: string | null = 'ds-1') {
   return {
     id: 'console-1',
     name: 'query_1.sql',
-    datasource_id: 'ds-1',
+    datasource_id: datasourceId,
     sql: 'SELECT id FROM users; SELECT id FROM orders',
     pinned: false,
     created_at: now,
@@ -56,6 +56,8 @@ interface SessionScript {
   progress?: (statementId: string, poll: number) => Record<string, unknown>
   submitStatus?: (call: number) => { status: number; body: unknown } | null
   dbType?: string
+  consoleDatasourceId?: string | null
+  enforcePersistedDatasource?: boolean
 }
 
 interface SessionCalls {
@@ -64,6 +66,7 @@ interface SessionCalls {
   cancels: { url: string; body: Record<string, unknown> }[]
   closes: number
   executes: Record<string, unknown>[]
+  consolePatches: Record<string, unknown>[]
   progressPolls: Record<string, number>
 }
 
@@ -152,24 +155,49 @@ async function mockSessionWorkspace(page: Page, script: SessionScript = {}): Pro
     cancels: [],
     closes: 0,
     executes: [],
+    consolePatches: [],
     progressPolls: {},
   }
+
+  let releaseDatasources: (() => void) | undefined
+  const datasourcesLoaded = new Promise<void>((resolve) => {
+    releaseDatasources = resolve
+  })
+  let persistedConsole = consoleRow(
+    script.consoleDatasourceId === undefined ? 'ds-1' : script.consoleDatasourceId,
+  )
 
   await mockLicense(page)
   await page.route('**/api/version', (r) =>
     json(r, 200, { version: '2.0.1-test', commit: 'abcdef0123456789', image_version: 'test' }),
   )
-  await page.route(/\/api\/datasources\?/, (r) => json(r, 200, [datasource(script.dbType)]))
+  await page.route(/\/api\/datasources\?/, (r) => {
+    releaseDatasources?.()
+    return json(r, 200, [datasource(script.dbType)])
+  })
   await page.route('**/api/datasources/ds-1/metadata/schemas', (r) => json(r, 200, []))
-  await page.route('**/api/sql/consoles', (r) => json(r, 200, [consoleRow()]))
-  await page.route('**/api/sql/consoles/console-1', (r) =>
-    r.request().method() === 'PATCH' ? json(r, 200, consoleRow()) : r.fallback(),
-  )
+  await page.route('**/api/sql/consoles', async (r) => {
+    await datasourcesLoaded
+    return json(r, 200, [persistedConsole])
+  })
+  await page.route('**/api/sql/consoles/console-1', (r) => {
+    if (r.request().method() !== 'PATCH') return r.fallback()
+    const patch = r.request().postDataJSON() as Record<string, unknown>
+    calls.consolePatches.push(patch)
+    persistedConsole = { ...persistedConsole, ...patch }
+    return json(r, 200, persistedConsole)
+  })
   await page.route(/\/api\/sql\/history\?/, (r) => json(r, 200, []))
   await page.route(/\/api\/sql\/templates/, (r) => json(r, 200, []))
 
   await page.route('**/api/sql/sessions/attach', (r: Route) => {
     calls.attach += 1
+    if (script.enforcePersistedDatasource && !persistedConsole.datasource_id) {
+      return json(r, 400, {
+        error: 'console_datasource_required',
+        message: 'SQL console has no datasource bound',
+      })
+    }
     const response = script.attach?.(calls.attach) ?? { status: 200, body: sessionBody() }
     return json(r, response.status, response.body)
   })
@@ -260,6 +288,22 @@ test('lazy attach: opening the workspace never claims a session', async ({ page 
 
   await expect(page.getByTestId('sql-session-bar')).toHaveCount(0)
   expect(calls.attach).toBe(0)
+  expect(consoleErrors, consoleErrors.join('\n')).toEqual([])
+})
+
+test('the displayed default datasource is persisted before lazy attach', async ({ page }) => {
+  const calls = await mockSessionWorkspace(page, {
+    consoleDatasourceId: null,
+    enforcePersistedDatasource: true,
+  })
+  const consoleErrors = await openWorkspace(page)
+
+  await expect(page.getByLabel('Datasource')).toHaveValue('ds-1')
+  await page.getByTestId('sql-execute').click()
+
+  await expect(page.getByText('SQL console has no datasource bound')).toHaveCount(0)
+  await expect.poll(() => calls.consolePatches).toContainEqual({ datasource_id: 'ds-1' })
+  await expect.poll(() => calls.submits.length).toBe(2)
   expect(consoleErrors, consoleErrors.join('\n')).toEqual([])
 })
 
