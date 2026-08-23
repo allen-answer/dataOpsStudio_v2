@@ -40,6 +40,14 @@ $env:DATAOPS_FORM = 'portable'
 $env:DATAOPS_FRONTEND_DIST = Join-Path $BundleRoot 'frontend\dist'
 $env:PATH = "$PgBin;$env:PATH"
 
+function Assert-PostgresSocketPath {
+    $socketPath = Join-Path $env:DATAOPS_HOME "data\pg-socket\.s.PGSQL.$($env:DATAOPS_PG_PORT)"
+    $socketBytes = [System.Text.Encoding]::UTF8.GetByteCount($socketPath)
+    if ($socketBytes -gt 107) {
+        throw "PostgreSQL Unix socket path is $socketBytes bytes (>107): $socketPath. Set DATAOPS_HOME to a shorter path."
+    }
+}
+
 function Invoke-Launcher {
     & $VenvPy -m app.launcher --root $env:DATAOPS_HOME --pg-bin-dir $PgBin --uv $UvExe @args
     if ($LASTEXITCODE -ne 0) {

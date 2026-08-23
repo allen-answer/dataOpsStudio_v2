@@ -13,6 +13,10 @@
 > 当前包形态见文件名:`...-win10-x64-offline.zip` 或 `...-win10-x64-online.zip`。
 > online 首次运行需要外网可达 GitHub(python-build-standalone / uv 发布页)、PyPI、EDB。
 
+若包内有 `DataOpsStudio.exe`(文件名含 `-gui`),优先双击它。桌面壳会在首启时收集
+管理员密码、等待 `/healthz` 最长 900 秒,并在关窗时先优雅停止、超时后有界强杀兜底。
+无 GUI 的脚本包仍从 `start.cmd` 启动。
+
 ## 系统要求
 
 - Windows 10 x64(或更高),自带 PowerShell 5.1 与 `tar.exe`(1803+)
