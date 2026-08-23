@@ -430,7 +430,7 @@ class PostgresBrokerStore(BrokerStore):
             row = (
                 conn.execute(
                     insert(console_statements)
-                    .values(**_statement_values(statement))
+                    .values(id=statement.id, **_statement_values(statement))
                     .returning(*console_statements.c)
                 )
                 .mappings()
