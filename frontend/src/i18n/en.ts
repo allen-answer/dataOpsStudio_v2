@@ -259,6 +259,8 @@ export default {
   sql: {
     workspace: 'SQL workspace',
     datasource: 'Datasource',
+    schema_context: 'Schema',
+    schema_context_hint: 'Metadata and completion context; queries stay fully qualified',
     tab_consoles: 'Consoles',
     tab_history: 'History',
     tab_templates: 'Templates',
