@@ -26,8 +26,11 @@ htmlcov/
 # ─── uv ───
 # 注意:uv.lock 必须进 git(portable 可复现构建依赖此 lockfile)
 
-# ─── Win10 离线部署包构建产物(zip / wheels / PG 二进制 / 缓存,一律不进 git) ───
+# ─── 桌面包构建产物(.deb/.zip/runtime/wheels/PG/缓存,一律不进 git) ───
 /dist-*/
+/desktop/bundle/
+/desktop/src-tauri/gen/
+/desktop/src-tauri/target/
 
 # ─── 前端 ───
 frontend/node_modules/

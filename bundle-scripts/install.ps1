@@ -13,6 +13,7 @@
 . (Join-Path $PSScriptRoot '_common.ps1')
 
 $ProgressPreference = 'SilentlyContinue'  # IWR is ~10x faster without the bar
+Assert-PostgresSocketPath
 
 function Write-Step { param([string]$Message) Write-Host "[install] $Message" }
 

@@ -79,6 +79,9 @@ app/
     └── migrations/          # Alembic
 
 frontend/                    # Vue 3 SPA
+desktop/                     # Win/Linux 共用 Tauri 壳(平台差异限 cfg(target_os))
+bundle-scripts/              # Win .ps1/.cmd + Linux .sh,同一离线运行契约
+tools/package/               # 两平台可复现构建器(下载必须 sha256 pin)
 tests/
 ├── e2e/                     # ★ 2.0.0 验收测试(见 §5)
 ├── contract/                # 接口契约测试

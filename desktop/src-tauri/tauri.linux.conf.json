@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "targets": ["deb"],
+    "icon": ["icons/icon.png"],
+    "resources": {
+      "../bundle/": ""
+    }
+  }
+}
