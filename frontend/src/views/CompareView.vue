@@ -55,6 +55,7 @@ import {
   getCompareRunProfile,
   getCompareRunResults,
   getCompareRunsDashboard,
+  getCompareResultInput,
   inferCompareTask,
   listCompareTaskRuns,
   listCompareTasks,
@@ -1175,7 +1176,42 @@ async function applyIncomingWorkspaceHandoff(): Promise<void> {
   const query = { ...route.query }
   delete query.handoff
   await router.replace({ name: 'compare', params: { id: projectId.value }, query })
-  if (!payload || payload.kind !== 'sql_to_compare') {
+  if (!payload) {
+    editorError.value = t('compare.handoff_invalid')
+    return
+  }
+  if (payload.kind === 'result_to_compare') {
+    try {
+      const snapshot = await getCompareResultInput(projectId.value, payload.inputId)
+      if ((snapshot.truncated || snapshot.has_more) && !payload.allowPartial) {
+        editorError.value = t('compare.handoff_invalid')
+        return
+      }
+      const columnNames = snapshot.columns.map((column) => column.name)
+      if (columnNames.length !== new Set(columnNames).size) {
+        editorError.value = t('compare.result_snapshot_duplicate_columns')
+        return
+      }
+      startNewTask()
+      draft.sourceId = ''
+      draft.sourceKind = 'result_snapshot'
+      draft.sourceInputId = snapshot.id
+      draft.sourceAllowPartial = payload.allowPartial
+      draft.columns = snapshot.columns.map((column) => ({
+        name: column.name,
+        type: column.type,
+      }))
+      draft.keyColumns = snapshot.columns
+        .filter((column) => column.primary_key)
+        .map((column) => column.name)
+      draft.singleSql = false
+      rightTab.value = 'editor'
+    } catch (error) {
+      editorError.value = errorMessage(error)
+    }
+    return
+  }
+  if (payload.kind !== 'sql_to_compare') {
     editorError.value = t('compare.handoff_invalid')
     return
   }
