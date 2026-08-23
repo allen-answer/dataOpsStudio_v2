@@ -13,6 +13,7 @@ kept below ``dist-mint/`` and ``desktop/bundle/``, both git-ignored.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import os
 import re
@@ -20,6 +21,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -62,6 +64,9 @@ SCRIPT_ITEMS = ("_common.sh", "install.sh", "start.sh", "stop.sh", "README.md")
 PG_REQUIRED_BINS = {"initdb", "pg_ctl", "postgres"}
 # Exact last verified Mint package size (172.27 MiB rounded for display).
 MAX_DEB_BYTES = 180_636_606
+DEB_MEMBER_NAMES = ("debian-binary", "control.tar.gz", "data.tar.gz")
+AR_MAGIC = b"!<arch>\n"
+AR_HEADER_SIZE = 60
 
 
 def log(message: str) -> None:
@@ -399,10 +404,116 @@ def find_deb() -> Path:
     return candidates[-1]
 
 
+def _extract_ar_members(source: Path, destination: Path) -> list[tuple[str, int]]:
+    members: list[tuple[str, int]] = []
+    with source.open("rb") as archive:
+        if archive.read(len(AR_MAGIC)) != AR_MAGIC:
+            raise SystemExit(f"invalid ar archive: {source}")
+        while header := archive.read(AR_HEADER_SIZE):
+            if len(header) != AR_HEADER_SIZE or header[58:60] != b"`\n":
+                raise SystemExit(f"invalid ar member header: {source}")
+            name = header[:16].decode("ascii").strip().removesuffix("/")
+            if name not in DEB_MEMBER_NAMES:
+                raise SystemExit(f"unexpected deb member: {name}")
+            size = int(header[48:58].decode("ascii").strip())
+            mode = int(header[40:48].decode("ascii").strip(), 8)
+            output = destination / name
+            remaining = size
+            with output.open("wb") as member:
+                while remaining:
+                    chunk = archive.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise SystemExit(f"truncated deb member: {name}")
+                    member.write(chunk)
+                    remaining -= len(chunk)
+            if size % 2 and archive.read(1) != b"\n":
+                raise SystemExit(f"invalid ar padding after: {name}")
+            members.append((name, mode))
+    if tuple(name for name, _mode in members) != DEB_MEMBER_NAMES:
+        raise SystemExit("deb members are missing or out of order")
+    return members
+
+
+def _recompress_gzip(path: Path) -> None:
+    replacement = path.with_name(path.name + ".new")
+    with (
+        gzip.open(path, "rb") as source,
+        replacement.open("wb") as raw_output,
+        gzip.GzipFile(
+            filename="",
+            mode="wb",
+            compresslevel=9,
+            fileobj=raw_output,
+            mtime=0,
+        ) as output,
+    ):
+        shutil.copyfileobj(source, output, length=1024 * 1024)
+    replacement.replace(path)
+
+
+def _write_ar_archive(
+    destination: Path,
+    source_dir: Path,
+    members: list[tuple[str, int]],
+) -> None:
+    with destination.open("wb") as archive:
+        archive.write(AR_MAGIC)
+        for name, mode in members:
+            payload = source_dir / name
+            size = payload.stat().st_size
+            name_field = f"{name}/".encode("ascii")
+            if len(name_field) > 16:
+                raise SystemExit(f"ar member name is too long: {name}")
+            header = b"".join(
+                (
+                    name_field.ljust(16),
+                    b"0".ljust(12),
+                    b"0".ljust(6),
+                    b"0".ljust(6),
+                    f"{mode:o}".encode("ascii").ljust(8),
+                    str(size).encode("ascii").ljust(10),
+                    b"`\n",
+                )
+            )
+            if len(header) != AR_HEADER_SIZE:
+                raise SystemExit(f"invalid ar header length for: {name}")
+            archive.write(header)
+            with payload.open("rb") as member:
+                shutil.copyfileobj(member, archive, length=1024 * 1024)
+            if size % 2:
+                archive.write(b"\n")
+
+
+def repack_deb(source: Path, destination: Path) -> None:
+    """Repack a Tauri deb with deterministic gzip-9 members and ar metadata."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="dataops-deb-") as temporary:
+        work = Path(temporary)
+        members = _extract_ar_members(source, work)
+        _recompress_gzip(work / "control.tar.gz")
+        _recompress_gzip(work / "data.tar.gz")
+        repacked = work / "repacked.deb"
+        _write_ar_archive(repacked, work, members)
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent,
+            prefix=destination.name + ".",
+            suffix=".part",
+            delete=False,
+        ) as pending:
+            pending_path = Path(pending.name)
+        try:
+            shutil.copy2(repacked, pending_path)
+            pending_path.replace(destination)
+        finally:
+            pending_path.unlink(missing_ok=True)
+
+
 def write_manifest(output_dir: Path, deb: Path, sizes: dict[str, int]) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_deb = output_dir / f"dataops-studio-{project_version()}-mint21.3-amd64-offline.deb"
-    shutil.copy2(deb, output_deb)
+    log("deb: deterministic gzip-9 repack")
+    repack_deb(deb, output_deb)
     total = output_deb.stat().st_size
     lines = [
         "DataOpsStudio Linux Mint 21.3 x86_64 offline GUI bundle",
@@ -413,6 +524,7 @@ def write_manifest(output_dir: Path, deb: Path, sizes: dict[str, int]) -> Path:
         f"uv: {UV_VERSION}",
         "wheels: locked default runtime dependencies (offline, --require-hashes)",
         "gui: Tauri v2 / webkit2gtk-4.1 / deb",
+        "deb_compression: deterministic gzip-9 (mtime=0)",
         f"deb: {output_deb.name}",
         f"deb_sha256: {sha256_file(output_deb)}",
         f"deb_size_bytes: {total}",
