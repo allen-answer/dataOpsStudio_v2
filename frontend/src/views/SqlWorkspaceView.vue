@@ -9,7 +9,7 @@
  * - running 状态轮询 ResultSet,展示已 spool 行
  */
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useQuery } from '@tanstack/vue-query'
 import { storeToRefs } from 'pinia'
@@ -24,6 +24,7 @@ import {
   Download,
   FileText,
   Gauge,
+  GitCompareArrows,
   History,
   Info,
   Key,
@@ -117,6 +118,10 @@ import { useMetadataObjectOptions } from '../composables/useMetadataObjectOption
 import { clearSqlMetadataCache } from '../utils/sqlIntelligence'
 import { splitSqlStatements, statementAtOffset } from '../utils/sqlStatements'
 import { createUserErrorMessage } from '../utils/userErrorMessage'
+import {
+  consumeWorkspaceHandoff,
+  createWorkspaceHandoff,
+} from '../utils/workspaceHandoff'
 
 const TERMINAL: ReadonlySet<JobStatus> = new Set<JobStatus>([
   'success',
@@ -220,6 +225,7 @@ interface TemplateForm {
 const { t, te } = useI18n()
 const errorMessage = createUserErrorMessage(t)
 const route = useRoute()
+const router = useRouter()
 const { writesBlocked } = useLicense()
 const themeStore = useThemeStore()
 const authStore = useAuthStore()
@@ -661,6 +667,7 @@ onMounted(async () => {
     nowMs.value = Date.now()
   }, 500)
   await loadConsoles()
+  await applyIncomingWorkspaceHandoff()
 })
 
 onUnmounted(() => {
@@ -759,6 +766,55 @@ async function createConsole(): Promise<void> {
     sidebarTab.value = 'consoles'
   } catch (e) {
     consoleError.value = errorMessage(e)
+  }
+}
+
+async function applyIncomingWorkspaceHandoff(): Promise<void> {
+  const token = typeof route.query.handoff === 'string' ? route.query.handoff : ''
+  if (!token) return
+  const payload = consumeWorkspaceHandoff(token, projectId.value)
+  const query = { ...route.query }
+  delete query.handoff
+  await router.replace({ name: 'sql', params: { id: projectId.value }, query })
+  if (!payload || payload.kind !== 'compare_to_sql') {
+    consoleError.value = t('sql.handoff_invalid')
+    return
+  }
+  if (writesBlocked.value) {
+    consoleError.value = t('license.writes_blocked')
+    return
+  }
+  consoleError.value = null
+  try {
+    await flushAllConsolePatches()
+    const created = await createSqlConsole({
+      name: payload.consoleName,
+      datasource_id: payload.datasourceId,
+      sql: payload.sql,
+    })
+    consoles.value = [created, ...consoles.value]
+    activeConsoleId.value = created.id
+    sidebarTab.value = 'consoles'
+  } catch (error) {
+    consoleError.value = errorMessage(error)
+  }
+}
+
+async function onSendToCompare(): Promise<void> {
+  const target = editorSqlTarget()
+  if (!target?.sql.trim() || !selectedDsId.value) return
+  toolError.value = null
+  try {
+    const token = createWorkspaceHandoff({
+      kind: 'sql_to_compare',
+      side: 'source',
+      projectId: projectId.value,
+      datasourceId: selectedDsId.value,
+      sql: target.sql,
+    })
+    await router.push({ name: 'compare', params: { id: projectId.value }, query: { handoff: token } })
+  } catch (error) {
+    toolError.value = errorMessage(error)
   }
 }
 
@@ -2896,6 +2952,17 @@ function parseVariables(value: string): string[] {
           >
             <ShieldCheck class="w-3.5 h-3.5" />
             {{ toolBusy === 'preflight' ? t('common.submitting') : t('sql.tool_preflight') }}
+          </button>
+          <button
+            type="button"
+            class="chrome-btn-secondary"
+            data-testid="sql-send-to-compare"
+            :disabled="writesBlocked || !editorSql.trim() || !selectedDsId || editorReadOnly"
+            :title="writesBlocked ? t('license.writes_blocked') : t('sql.send_to_compare_hint')"
+            @click="onSendToCompare"
+          >
+            <GitCompareArrows class="w-3.5 h-3.5" />
+            {{ t('sql.send_to_compare') }}
           </button>
           <div class="flex-1" />
           <span
