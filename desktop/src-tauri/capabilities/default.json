@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "splash window talks to the shell commands and events",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

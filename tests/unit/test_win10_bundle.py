@@ -35,6 +35,19 @@ def test_start_script_delegates_install_then_first_run_then_up(tmp_path: Path) -
     assert "Invoke-Launcher up" in start
 
 
+def test_first_run_is_retryable_and_drops_admin_password_before_up(tmp_path: Path) -> None:
+    build.write_scripts(tmp_path)
+
+    common = (tmp_path / "_common.ps1").read_text(encoding="ascii")
+    start = (tmp_path / "start.ps1").read_text(encoding="ascii")
+
+    assert "$($args -join ' ')" not in common
+    assert ".bundle-initialized" in start
+    assert "--update-password" in start
+    assert "Remove-Item Env:DATAOPS_ADMIN_PASSWORD" in start
+    assert start.index("Remove-Item Env:DATAOPS_ADMIN_PASSWORD") < start.index("Invoke-Launcher up")
+
+
 def test_install_script_covers_offline_and_online(tmp_path: Path) -> None:
     build.write_scripts(tmp_path)
 
@@ -106,3 +119,29 @@ def test_extract_pg_keeps_only_server_runtime_and_license(tmp_path: Path) -> Non
     assert (staging / "pgsql" / "server_license.txt").read_bytes() == b"license"
     assert not (staging / "pgsql" / "doc").exists()
     assert not (staging / "pgsql" / "include").exists()
+
+
+def test_wheel_cache_is_bound_to_current_requirements(tmp_path: Path, monkeypatch: object) -> None:
+    cache = tmp_path / "cache"
+    wheels = cache / "wheels"
+    wheels.mkdir(parents=True)
+    (wheels / "stale.whl").write_bytes(b"stale")
+    (cache / "wheels.requirements.sha256").write_text("old\n", encoding="ascii")
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("example==1 --hash=sha256:abc\n", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], *, cwd: Path | None = None) -> None:
+        del cwd
+        calls.append(command)
+        (wheels / "current.whl").write_bytes(b"current")
+
+    monkeypatch.setattr(build, "run", fake_run)  # type: ignore[attr-defined]
+    result = build.download_wheels(cache, tmp_path / "python", requirements)
+
+    assert calls
+    assert result == wheels
+    assert not (wheels / "stale.whl").exists()
+    assert (cache / "wheels.requirements.sha256").read_text(encoding="ascii").strip() == (
+        build.sha256_file(requirements)
+    )

@@ -30,6 +30,7 @@ client install, see docs/deployment/win10-offline-bundle.md.
 Usage (build host needs network + uv + Node/npm)::
 
     uv run python tools/package/build_win10_bundle.py                  # offline
+    uv run python tools/package/build_win10_bundle.py --gui            # offline GUI
     uv run python tools/package/build_win10_bundle.py --mode online    # online
     uv run python tools/package/build_win10_bundle.py --skip-frontend-build
 
@@ -51,16 +52,19 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+SCRIPTS_ROOT = REPO_ROOT / "bundle-scripts"
+DESKTOP_ROOT = REPO_ROOT / "desktop"
 
 # Pinned downstream artifacts. Recorded (not silently trusted): the script
 # prints the sha256 it actually saw so a reviewer can compare across rebuilds.
 PG_VERSION = "16.14-1"
 PG_URL = f"https://get.enterprisedb.com/postgresql/postgresql-{PG_VERSION}-windows-x64-binaries.zip"
 PG_SHA256 = "98af1417ba6a8dc30543e560e5407833a3b9e7cc7ed20e73b2006f3aa2f04663"
-PYTHON_VERSION = "3.12"
 # PG components to keep (server-only slim set). pgAdmin (~670MB), StackBuilder,
 # doc and include are dropped — the launcher only needs initdb/pg_ctl/postgres.
 PG_KEEP_DIRS = ("bin", "lib", "share")
+# Exact last verified Win10 GUI package size (189 MiB rounded for display).
+MAX_GUI_ZIP_BYTES = 198_142_107
 
 # ── online-mode download pins ────────────────────────────────────────────────
 # The online bundle ships no runtime; install.ps1 downloads these on the target
@@ -150,74 +154,76 @@ def export_requirements(cache: Path, uv: str) -> Path:
     return target
 
 
-def prepare_python(cache: Path, uv: str) -> Path:
-    """Return a relocatable standalone CPython 3.12 dir, cached in the bundle cache.
-
-    Uses uv to fetch/locate a python-build-standalone interpreter (the same
-    relocatable build uv ships), then snapshots it into the cache so the build
-    is stable even if the uv-managed copy later changes.
-    """
+def prepare_python(cache: Path) -> Path:
+    """Return the checksum-pinned relocatable CPython runtime."""
 
     dest = cache / "python"
-    if (dest / "python.exe").exists():
+    marker = cache / "python.source.sha256"
+    if (
+        (dest / "python.exe").exists()
+        and marker.exists()
+        and marker.read_text(encoding="ascii").strip() == PYTHON_STANDALONE_SHA256
+    ):
         log(f"python: reuse cached {dest}")
         return dest
-    run([uv, "python", "install", PYTHON_VERSION])
-    managed = _find_standalone_python(uv)
-    log(f"python: snapshot standalone interpreter from {managed}")
-    _copytree(managed, dest)
+    shutil.rmtree(dest, ignore_errors=True)
+    archive = _download_verified(
+        PYTHON_STANDALONE_URL,
+        PYTHON_STANDALONE_SHA256,
+        cache / "downloads" / "python.tar.gz",
+    )
+    extracted = cache / "python.extract"
+    shutil.rmtree(extracted, ignore_errors=True)
+    extracted.mkdir(parents=True)
+    run(["tar.exe", "-xzf", str(archive), "-C", str(extracted)])
+    runtime = extracted / "python"
+    if not (runtime / "python.exe").exists():
+        raise SystemExit("python archive did not contain python/python.exe")
+    runtime.replace(dest)
+    shutil.rmtree(extracted, ignore_errors=True)
+    marker.write_text(PYTHON_STANDALONE_SHA256 + "\n", encoding="ascii")
     return dest
 
 
-def _find_standalone_python(uv: str) -> Path:
-    """Locate a standalone (relocatable) CPython install dir from uv's inventory.
-
-    `uv python find` prefers a project/active venv, which is not relocatable and
-    lacks a full base install; parse `uv python list` and pick a real managed
-    install instead (has python.exe + Lib/ at its root, and is not a venv).
-    """
-
-    output = subprocess.run(
-        [uv, "python", "list", "--only-installed"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) < 2 or not parts[0].startswith(f"cpython-{PYTHON_VERSION}"):
-            continue
-        exe = Path(parts[-1])
-        root = exe.parent
-        if "venv" in {p.lower() for p in exe.parts} or root.name.lower() == "scripts":
-            continue
-        if exe.name.lower() == "python.exe" and (root / "Lib").is_dir():
-            return root
-    raise SystemExit(
-        f"no standalone CPython {PYTHON_VERSION} install found; run "
-        f"`uv python install {PYTHON_VERSION}` and retry"
-    )
-
-
-def prepare_uv(cache: Path, uv: str) -> Path:
+def prepare_uv(cache: Path) -> Path:
     dest = cache / "uv"
-    dest.mkdir(parents=True, exist_ok=True)
     target = dest / "uv.exe"
-    source = shutil.which(uv)
-    if source is None:
-        raise SystemExit(f"cannot locate uv executable on PATH: {uv}")
-    if not target.exists():
-        log(f"uv: copy {source} -> {target}")
-        shutil.copy2(source, target)
+    marker = cache / "uv.source.sha256"
+    if (
+        target.exists()
+        and marker.exists()
+        and marker.read_text(encoding="ascii").strip() == UV_SHA256
+    ):
+        log(f"uv: reuse cached {target}")
+        return dest
+    shutil.rmtree(dest, ignore_errors=True)
+    archive = _download_verified(UV_URL, UV_SHA256, cache / "downloads" / "uv.zip")
+    dest.mkdir(parents=True)
+    with zipfile.ZipFile(archive) as source:
+        source.extractall(dest)
+    candidates = list(dest.rglob("uv.exe"))
+    if not candidates:
+        raise SystemExit("uv archive did not contain uv.exe")
+    if candidates[0] != target:
+        shutil.copy2(candidates[0], target)
+    marker.write_text(UV_SHA256 + "\n", encoding="ascii")
     return dest
 
 
 def download_wheels(cache: Path, python_dir: Path, requirements: Path) -> Path:
     wheels = cache / "wheels"
-    if wheels.exists() and any(wheels.glob("*.whl")):
+    requirements_hash = sha256_file(requirements)
+    marker = cache / "wheels.requirements.sha256"
+    if (
+        wheels.exists()
+        and any(wheels.glob("*.whl"))
+        and marker.exists()
+        and marker.read_text(encoding="ascii").strip() == requirements_hash
+    ):
         log(f"wheels: reuse cached {wheels} ({len(list(wheels.glob('*.whl')))} files)")
         return wheels
-    wheels.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(wheels, ignore_errors=True)
+    wheels.mkdir(parents=True)
     log("wheels: pip download (cp312 win_amd64, --only-binary=:all:)")
     run(
         [
@@ -233,30 +239,34 @@ def download_wheels(cache: Path, python_dir: Path, requirements: Path) -> Path:
             str(wheels),
         ]
     )
+    marker.write_text(requirements_hash + "\n", encoding="ascii")
     return wheels
 
 
 def download_pg(cache: Path) -> Path:
-    zip_path = cache / "pg16.zip"
-    if not zip_path.exists():
-        log(f"pg: download {PG_URL}")
-        _download(PG_URL, zip_path)
-    digest = sha256_file(zip_path)
-    log(f"pg: sha256={digest}")
-    if digest != PG_SHA256:
-        log(f"WARNING: PG zip sha256 mismatch (expected {PG_SHA256})")
-    return zip_path
+    return _download_verified(PG_URL, PG_SHA256, cache / "downloads" / "pg16.zip")
 
 
-def _download(url: str, dest: Path) -> None:
+def _download_verified(url: str, sha256: str, dest: Path) -> Path:
     import urllib.request
 
+    if dest.exists() and sha256_file(dest) == sha256:
+        log(f"download: reuse verified {dest.name}")
+        return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
+    tmp.unlink(missing_ok=True)
+    log(f"download: {url}")
     with urllib.request.urlopen(url) as response:
         with tmp.open("wb") as handle:
             shutil.copyfileobj(response, handle)
+    actual = sha256_file(tmp)
+    if actual != sha256:
+        tmp.unlink(missing_ok=True)
+        raise SystemExit(f"sha256 mismatch for {dest.name}: expected={sha256} actual={actual}")
     tmp.replace(dest)
+    log(f"download: verified sha256={actual}")
+    return dest
 
 
 # ── assembly ──────────────────────────────────────────────────────────────────
@@ -276,6 +286,15 @@ def build_frontend(skip: bool) -> Path:
     if not (dist / "index.html").exists():
         raise SystemExit("frontend build did not produce dist/index.html")
     return dist
+
+
+def build_desktop() -> Path:
+    log("desktop: build shared Tauri shell (release, locked)")
+    run(["cargo", "build", "--release", "--locked"], cwd=DESKTOP_ROOT / "src-tauri")
+    executable = DESKTOP_ROOT / "src-tauri/target/release/dataops-studio-desktop.exe"
+    if not executable.exists():
+        raise SystemExit(f"desktop build did not produce {executable}")
+    return executable
 
 
 def extract_pg(zip_path: Path, staging: Path) -> None:
@@ -311,6 +330,7 @@ def assemble(
     uv_dir: Path | None = None,
     wheels: Path | None = None,
     pg_zip: Path | None = None,
+    desktop_executable: Path | None = None,
 ) -> None:
     if staging.exists():
         shutil.rmtree(staging)
@@ -346,6 +366,10 @@ def assemble(
     else:
         log("assemble: online download-manifest.json (python/uv/pg pins)")
         write_download_manifest(staging)
+
+    if desktop_executable is not None:
+        log("assemble: Tauri desktop shell")
+        shutil.copy2(desktop_executable, staging / "DataOpsStudio.exe")
 
     write_scripts(staging)
     write_readme(staging)
@@ -384,8 +408,8 @@ def write_download_manifest(staging: Path) -> None:
     )
 
 
-def _write_template(name: str, dest: Path, *, encoding: str) -> None:
-    text = (TEMPLATES_DIR / name).read_text(encoding="utf-8")
+def _write_source(source: Path, dest: Path, *, encoding: str) -> None:
+    text = source.read_text(encoding="utf-8")
     dest.write_text(text, encoding=encoding, newline="\r\n")
 
 
@@ -403,14 +427,14 @@ SCRIPT_TEMPLATES = (
 def write_scripts(staging: Path) -> None:
     log("assemble: PowerShell scripts + .cmd shims")
     for name in SCRIPT_TEMPLATES:
-        _write_template(name, staging / name, encoding="ascii")
+        _write_source(SCRIPTS_ROOT / name, staging / name, encoding="ascii")
 
 
 def write_readme(staging: Path) -> None:
-    _write_template("README.md", staging / "README.md", encoding="utf-8")
+    _write_source(TEMPLATES_DIR / "README.md", staging / "README.md", encoding="utf-8")
 
 
-def write_manifest(staging_parent: Path, zip_path: Path, mode: str) -> None:
+def write_manifest(staging_parent: Path, zip_path: Path, mode: str, *, gui: bool) -> None:
     if mode == "offline":
         runtime_lines = [
             f"postgresql: {PG_VERSION} (EDB windows-x64 binaries, slim bin/lib/share, bundled)",
@@ -425,9 +449,10 @@ def write_manifest(staging_parent: Path, zip_path: Path, mode: str) -> None:
             "wheels: downloaded from PyPI on first run (--require-hashes)",
         ]
     lines = [
-        f"DataOpsStudio Win10 x64 {mode} bundle",
+        f"DataOpsStudio Win10 x64 {mode}{' GUI' if gui else ''} bundle",
         f"bundle_version: {bundle_version()}",
         *runtime_lines,
+        *(["gui: Tauri v2 desktop shell (WebView2 required)"] if gui else []),
         f"zip: {zip_path.name}",
         f"zip_sha256: {sha256_file(zip_path)}",
         f"zip_size_mb: {zip_path.stat().st_size / 1024 / 1024:.1f}",
@@ -437,6 +462,10 @@ def write_manifest(staging_parent: Path, zip_path: Path, mode: str) -> None:
     )
     for line in lines:
         log(line)
+    if gui and mode == "offline" and zip_path.stat().st_size > MAX_GUI_ZIP_BYTES:
+        raise SystemExit(
+            f"size gate failed: {zip_path.stat().st_size / 1024 / 1024:.2f} MiB exceeds 189 MiB"
+        )
 
 
 def make_zip(staging: Path, output_dir: Path, name: str) -> Path:
@@ -472,6 +501,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="keep the uncompressed staging directory after zipping",
     )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="build the shared Tauri shell and include DataOpsStudio.exe",
+    )
     args = parser.parse_args(argv)
 
     if os.name != "nt":
@@ -483,15 +517,21 @@ def main(argv: list[str] | None = None) -> int:
     cache.mkdir(parents=True, exist_ok=True)
 
     version = bundle_version()
-    name = f"dataops-studio-{version}-win10-x64-{args.mode}"
+    if args.gui and args.mode == "offline":
+        name = f"dataops-studio-{version}-win10-x64-gui"
+    elif args.gui:
+        name = f"dataops-studio-{version}-win10-x64-{args.mode}-gui"
+    else:
+        name = f"dataops-studio-{version}-win10-x64-{args.mode}"
 
     requirements = export_requirements(cache, args.uv)
     frontend_dist = build_frontend(args.skip_frontend_build)
+    desktop_executable = build_desktop() if args.gui else None
 
     staging = output_dir / name
     if args.mode == "offline":
-        python_dir = prepare_python(cache, args.uv)
-        uv_dir = prepare_uv(cache, args.uv)
+        python_dir = prepare_python(cache)
+        uv_dir = prepare_uv(cache)
         wheels = download_wheels(cache, python_dir, requirements)
         pg_zip = download_pg(cache)
         assemble(
@@ -503,6 +543,7 @@ def main(argv: list[str] | None = None) -> int:
             uv_dir=uv_dir,
             wheels=wheels,
             pg_zip=pg_zip,
+            desktop_executable=desktop_executable,
         )
     else:
         assemble(
@@ -510,10 +551,11 @@ def main(argv: list[str] | None = None) -> int:
             mode="online",
             requirements=requirements,
             frontend_dist=frontend_dist,
+            desktop_executable=desktop_executable,
         )
 
     zip_path = make_zip(staging, output_dir, name)
-    write_manifest(output_dir, zip_path, args.mode)
+    write_manifest(output_dir, zip_path, args.mode, gui=args.gui)
     if not args.keep_staging:
         shutil.rmtree(staging)
     log("done")

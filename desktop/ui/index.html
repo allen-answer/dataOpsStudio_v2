@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>DataOps Studio</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, "Segoe UI", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+    background: #F8FAFC; color: #1E293B;
+    display: flex; align-items: center; justify-content: center;
+    height: 100vh;
+  }
+  .card {
+    width: 420px; padding: 28px; text-align: center; background: #fff;
+    border: 1px solid #E2E8F0; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.08);
+  }
+  h1 { font-size: 22px; font-weight: 600; margin-bottom: 6px; letter-spacing: .5px; }
+  p.sub { color: #64748B; font-size: 13px; margin-bottom: 28px; }
+  .spinner {
+    width: 34px; height: 34px; margin: 0 auto 18px;
+    border: 3px solid #E2E8F0; border-top-color: #0EA5E9; border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #status { font-size: 13px; color: #64748B; min-height: 20px; }
+  #error { color: #EF4444; font-size: 13px; margin-top: 12px; white-space: pre-wrap; display: none; }
+  form { text-align: left; display: none; }
+  label { font-size: 13px; color: #64748B; display: block; margin: 14px 0 6px; }
+  input {
+    width: 100%; padding: 9px 12px; border-radius: 6px; font-size: 14px;
+    border: 1px solid #E2E8F0; background: #fff; color: #1E293B; outline: none;
+  }
+  input:focus { border-color: #0EA5E9; }
+  button {
+    margin-top: 22px; width: 100%; padding: 10px; border: 0; border-radius: 6px;
+    background: #0EA5E9; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button:hover { background: #0284C7; }
+  button:disabled { background: #E2E8F0; color: #64748B; cursor: default; }
+  .hint { font-size: 12px; color: #64748B; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>DataOps Studio</h1>
+  <p class="sub">本地数据运维工作台</p>
+  <div id="boot">
+    <div class="spinner"></div>
+    <div id="status">正在检查运行环境…</div>
+    <div id="error"></div>
+  </div>
+  <form id="setup">
+    <div style="text-align:center; font-size:14px; color:#1E293B; margin-bottom:4px;">首次运行 · 创建管理员账号</div>
+    <label for="pwd">管理员（admin）密码</label>
+    <input id="pwd" type="password" autocomplete="new-password" minlength="8" required>
+    <label for="pwd2">再次输入确认</label>
+    <input id="pwd2" type="password" autocomplete="new-password" minlength="8" required>
+    <button id="go" type="submit">初始化并启动</button>
+    <div class="hint">首次初始化包含建库与迁移，通常需要 1–3 分钟。</div>
+  </form>
+</div>
+<script>
+const invoke = window.__TAURI__.core.invoke;
+const listen = window.__TAURI__.event.listen;
+const boot = document.getElementById('boot');
+const setup = document.getElementById('setup');
+const statusEl = document.getElementById('status');
+const errorEl = document.getElementById('error');
+
+function fmt(sec) {
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m > 0 ? `${m} 分 ${s} 秒` : `${s} 秒`;
+}
+async function armListeners() {
+  await listen('backend-ready', (event) => { location.replace(event.payload); });
+  await listen('backend-progress', (event) => {
+    statusEl.textContent = `正在启动服务…（已等待 ${fmt(event.payload)}）`;
+  });
+  await listen('backend-failed', (event) => {
+    statusEl.textContent = '启动失败';
+    errorEl.textContent = event.payload;
+    errorEl.style.display = 'block';
+  });
+}
+async function start(password) {
+  setup.style.display = 'none';
+  boot.style.display = 'block';
+  statusEl.textContent = '正在启动服务…';
+  try {
+    await invoke('start_backend', { adminPassword: password ?? null });
+  } catch (error) {
+    statusEl.textContent = '启动失败';
+    errorEl.textContent = String(error);
+    errorEl.style.display = 'block';
+  }
+}
+setup.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const first = document.getElementById('pwd').value;
+  const second = document.getElementById('pwd2').value;
+  if (first !== second) { alert('两次输入的密码不一致'); return; }
+  document.getElementById('go').disabled = true;
+  start(first);
+});
+(async function main() {
+  await armListeners();
+  const state = await invoke('check_state');
+  if (state === 'running') { location.replace('http://127.0.0.1:8020/'); return; }
+  if (state === 'first-run') {
+    boot.style.display = 'none';
+    setup.style.display = 'block';
+  } else {
+    start(null);
+  }
+})();
+</script>
+</body>
+</html>
