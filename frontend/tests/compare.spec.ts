@@ -277,6 +277,38 @@ test('compare source and target pick schemas and tables from datasource metadata
   expectNoConsoleErrors()
 })
 
+test('table reference search filters thousands of options without losing the current value', async ({
+  page,
+}) => {
+  await mockBase(page)
+  const tables = Array.from({ length: 6535 }, (_, index) => ({
+    schema_name: 'app',
+    name: `table_${String(index).padStart(4, '0')}`,
+    table_type: 'BASE TABLE',
+  }))
+  tables.push({
+    schema_name: 'app',
+    name: 'ZZ_NEEDLE_CUSTOMER',
+    table_type: 'BASE TABLE',
+  })
+  await page.route(/\/api\/datasources\/ds-source\/metadata\/tables/, (route) =>
+    json(route, 200, tables),
+  )
+
+  await page.goto('/projects/project-1/compare')
+  const tableSelect = page.getByTestId('compare-source-table')
+  await expect(tableSelect).toHaveValue('orders_a')
+  await expect
+    .poll(() => tableSelect.locator('option:not([disabled])').count())
+    .toBeLessThanOrEqual(200)
+
+  await page.getByTestId('compare-source-table-search').fill('needle')
+  await expect(tableSelect.locator('option', { hasText: 'ZZ_NEEDLE_CUSTOMER' })).toHaveCount(1)
+  await tableSelect.selectOption('ZZ_NEEDLE_CUSTOMER')
+  await expect(tableSelect).toHaveValue('ZZ_NEEDLE_CUSTOMER')
+  expectNoConsoleErrors()
+})
+
 test('auto-infer shows PK candidates + mapping draft for confirmation', async ({ page }) => {
   await mockBase(page)
   await page.route('**/api/projects/project-1/compare/infer', (r) => json(r, 200, inferResponse))

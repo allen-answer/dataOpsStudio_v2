@@ -39,6 +39,7 @@ import {
   X,
 } from 'lucide-vue-next'
 import { listDatasources } from '../api/datasources'
+import type { MetadataTableItem } from '../api/metadata'
 import { uploadFile } from '../api/uploads'
 import {
   COMPARE_BUCKETS,
@@ -313,6 +314,47 @@ const {
   () => (draft.targetKind === 'file' ? '' : draft.targetId),
   () => draft.targetSchema,
   () => draft.targetTable,
+)
+const TABLE_OPTION_RENDER_LIMIT = 200
+const sourceTableSearch = ref('')
+const targetTableSearch = ref('')
+
+function filterTableOptions(
+  options: readonly MetadataTableItem[],
+  search: string,
+  current: string,
+): MetadataTableItem[] {
+  const query = search.trim().toLocaleLowerCase()
+  const matches = query
+    ? options.filter((option) => option.name.toLocaleLowerCase().includes(query))
+    : options
+  const currentOption = current
+    ? options.find((option) => option.name === current) ?? {
+        schema_name: '',
+        name: current,
+        table_type: null,
+      }
+    : null
+  const visible: MetadataTableItem[] = []
+  const visibleNames = new Set<string>()
+  if (currentOption) {
+    visible.push(currentOption)
+    visibleNames.add(currentOption.name)
+  }
+  for (const option of matches) {
+    if (visibleNames.has(option.name)) continue
+    if (visible.length >= TABLE_OPTION_RENDER_LIMIT) break
+    visible.push(option)
+    visibleNames.add(option.name)
+  }
+  return visible
+}
+
+const visibleSourceTableOptions = computed(() =>
+  filterTableOptions(sourceTableOptions.value, sourceTableSearch.value, draft.sourceTable),
+)
+const visibleTargetTableOptions = computed(() =>
+  filterTableOptions(targetTableOptions.value, targetTableSearch.value, draft.targetTable),
 )
 const sqlEditorTheme = computed(() =>
   variant.value === 'spotify-dark' || variant.value === 'figma-dark' ? 'vs-dark' : 'vs',
@@ -648,17 +690,24 @@ function onSingleSqlToggle(): void {
 function onReferenceDatasourceChange(side: RefSide): void {
   const datasource = side === 'source' ? sourceDatasource.value : targetDatasource.value
   if (side === 'source') {
+    sourceTableSearch.value = ''
     draft.sourceSchema = datasource?.database ?? ''
     draft.sourceTable = ''
   } else {
+    targetTableSearch.value = ''
     draft.targetSchema = datasource?.database ?? ''
     draft.targetTable = ''
   }
 }
 
 function onReferenceSchemaChange(side: RefSide): void {
-  if (side === 'source') draft.sourceTable = ''
-  else draft.targetTable = ''
+  if (side === 'source') {
+    sourceTableSearch.value = ''
+    draft.sourceTable = ''
+  } else {
+    targetTableSearch.value = ''
+    draft.targetTable = ''
+  }
 }
 
 function metadataPickerError(error: unknown): string {
@@ -1115,6 +1164,8 @@ async function loadDashboard(): Promise<void> {
 }
 
 function loadDraftFromTask(task: CompareTaskResponse): void {
+  sourceTableSearch.value = ''
+  targetTableSearch.value = ''
   Object.assign(draft, emptyDraft())
   draft.name = task.name
   // file 侧任务 source_id/target_id 为 null;回填空串,库侧下拉默认第一项(隐藏时不影响提交)。
@@ -1163,6 +1214,8 @@ function startNewTask(): void {
   activeTaskId.value = null
   isNewTask.value = true
   Object.assign(draft, emptyDraft())
+  sourceTableSearch.value = ''
+  targetTableSearch.value = ''
   draft.sourceId = datasources.value[0]?.id ?? ''
   draft.targetId = datasources.value[0]?.id ?? ''
   draft.name = ''
@@ -2451,6 +2504,14 @@ const missingTarget = computed(
                 </p>
               </div>
               <template v-if="!draft.singleSql && draft.sourceKind === 'table'">
+                <input
+                  v-if="sourceTablesLoading || sourceTableOptions.length > 0"
+                  v-model="sourceTableSearch"
+                  data-testid="compare-source-table-search"
+                  class="chrome-input w-full text-sm"
+                  :placeholder="t('compare.table_search')"
+                  :title="t('compare.table_search_hint', { limit: TABLE_OPTION_RENDER_LIMIT })"
+                />
                 <select
                   v-if="sourceTablesLoading || sourceTableOptions.length > 0"
                   v-model="draft.sourceTable"
@@ -2459,7 +2520,11 @@ const missingTarget = computed(
                   :disabled="!draft.sourceSchema || (sourceTablesLoading && sourceTableOptions.length === 0)"
                 >
                   <option disabled value="">{{ t('compare.table') }}</option>
-                  <option v-for="table in sourceTableOptions" :key="table.name" :value="table.name">
+                  <option
+                    v-for="table in visibleSourceTableOptions"
+                    :key="table.name"
+                    :value="table.name"
+                  >
                     {{ table.name }}
                   </option>
                 </select>
@@ -2470,6 +2535,17 @@ const missingTarget = computed(
                   class="chrome-input w-full text-sm"
                   :placeholder="t('compare.table')"
                 />
+                <p
+                  v-if="sourceTableOptions.length > TABLE_OPTION_RENDER_LIMIT"
+                  class="text-[10px] chrome-text-muted"
+                >
+                  {{
+                    t('compare.table_search_count', {
+                      shown: visibleSourceTableOptions.length,
+                      total: sourceTableOptions.length,
+                    })
+                  }}
+                </p>
                 <p v-if="sourceTablesError" class="text-[10px] text-amber-700 dark:text-amber-300">
                   {{ metadataPickerError(sourceTablesError) }}
                 </p>
@@ -2670,6 +2746,14 @@ const missingTarget = computed(
                 </p>
               </div>
               <template v-if="!draft.singleSql && draft.targetKind === 'table'">
+                <input
+                  v-if="targetTablesLoading || targetTableOptions.length > 0"
+                  v-model="targetTableSearch"
+                  data-testid="compare-target-table-search"
+                  class="chrome-input w-full text-sm"
+                  :placeholder="t('compare.table_search')"
+                  :title="t('compare.table_search_hint', { limit: TABLE_OPTION_RENDER_LIMIT })"
+                />
                 <select
                   v-if="targetTablesLoading || targetTableOptions.length > 0"
                   v-model="draft.targetTable"
@@ -2678,7 +2762,11 @@ const missingTarget = computed(
                   :disabled="!draft.targetSchema || (targetTablesLoading && targetTableOptions.length === 0)"
                 >
                   <option disabled value="">{{ t('compare.table') }}</option>
-                  <option v-for="table in targetTableOptions" :key="table.name" :value="table.name">
+                  <option
+                    v-for="table in visibleTargetTableOptions"
+                    :key="table.name"
+                    :value="table.name"
+                  >
                     {{ table.name }}
                   </option>
                 </select>
@@ -2689,6 +2777,17 @@ const missingTarget = computed(
                   class="chrome-input w-full text-sm"
                   :placeholder="t('compare.table')"
                 />
+                <p
+                  v-if="targetTableOptions.length > TABLE_OPTION_RENDER_LIMIT"
+                  class="text-[10px] chrome-text-muted"
+                >
+                  {{
+                    t('compare.table_search_count', {
+                      shown: visibleTargetTableOptions.length,
+                      total: targetTableOptions.length,
+                    })
+                  }}
+                </p>
                 <p v-if="targetTablesError" class="text-[10px] text-amber-700 dark:text-amber-300">
                   {{ metadataPickerError(targetTablesError) }}
                 </p>
