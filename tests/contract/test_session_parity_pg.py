@@ -177,7 +177,11 @@ def _statement(statement_id: str, *, seq: int = 1, sql: str = "SELECT 1") -> Con
 def test_console_statement_accepts_canonical_tagged_sha256(engine: Engine) -> None:
     canonical_hash = "sha256:" + ("a" * 64)
 
-    result_set_id = _insert_session_with_statement(engine, sql_hash=canonical_hash)
+    result_set_id = _insert_session_with_statement(
+        engine,
+        state=ConsoleSessionState.IDLE,
+        sql_hash=canonical_hash,
+    )
 
     with engine.connect() as conn:
         stored = conn.execute(
