@@ -2738,10 +2738,17 @@ def main() -> None:
         del frame
         runner.request_stop()
 
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
+    for signal_number in _worker_stop_signals():
+        signal.signal(signal_number, handle_signal)
     runner.run_forever()
     logger.info("worker stopped")
+
+
+def _worker_stop_signals() -> tuple[int, ...]:
+    stop_signals = [signal.SIGTERM, signal.SIGINT]
+    if os.name == "nt":
+        stop_signals.append(cast(Any, signal).SIGBREAK)
+    return tuple(stop_signals)
 
 
 def _create_metadata_engine(settings: Settings, password: str) -> Engine:

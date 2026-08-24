@@ -80,6 +80,7 @@ app/
 
 frontend/                    # Vue 3 SPA
 desktop/                     # Win/Linux 共用 Tauri 壳(平台差异限 cfg(target_os))
+updater/                     # 完整包内稳定 payload updater(app/frontend 签名增量包)
 bundle-scripts/              # Win .ps1/.cmd + Linux .sh,同一离线运行契约
 tools/package/               # 两平台可复现构建器(下载必须 sha256 pin)
 tests/
@@ -468,6 +469,31 @@ class ErrorClassifier(Protocol):
 - R6 不变:cursor 只活在 lane 栈上,`ResultSet` / `ResultRef` 不持有 cursor。
 - `CancelChannel.probe()` 结果缓存于控制 lane 生命周期;`degraded` 必须经 attach 响应如实
   透出给前端,不得静默降级为“看起来取消成功”。
+
+### 3.9 PayloadUpdater(`updater/`)— 桌面载荷增量更新第一阶段新缝
+
+```python
+class PayloadUpdater:
+    def install(self, *, package: Path, trust_store: Path) -> UpdateReceipt: ...
+    def complete(self, *, success: bool) -> RuntimeSelection: ...
+    def rollback(self) -> RuntimeSelection: ...
+    def resolve_active(self) -> RuntimeSelection: ...
+```
+
+- 增量包只允许 `app/` 与 `frontend/dist/`;完整包内的 `updater/` 本身不随 payload 更新。
+- release 系统对 canonical `manifest.json` 做 Ed25519 detached signature;私钥、生产 URL
+  与 trust store 不进仓库。运行侧先按 owner-provisioned trust store 验签,再逐文件校验
+  size + sha256,拒绝重复路径、越界路径、symlink、未列入 manifest 的文件与压缩炸弹。
+- 完整包写入 `runtime/update-compatibility.json`;Python/uv/PostgreSQL artifact、冻结依赖、
+  Tauri、bundle scripts、迁移、打包器或 updater 任一指纹不一致时必须拒绝增量并要求整包。
+  第一阶段不自动执行 schema migration,迁移指纹变化同样走整包。
+- payload 解到 `DATAOPS_STATE_ROOT/updates/versions/`,同文件系统原子 rename 后只原子替换
+  active pointer。`complete(success=False)` 必须恢复前一 pointer;健康通过后只保留一份可消费
+  rollback pointer。`home/`、PG data、bootstrap secrets 与 venv 均不进入 payload、不参与切换。
+- Linux `.deb` 的 `/usr/lib` 资源保持只读;active payload 一律位于用户可写 state root。
+  Windows 默认 state root 仍为 bundle root,也可显式外置。
+- 在线检查端点、Tauri UI/健康探测编排、trust-store 公钥投放、Tauri 壳自更新与迁移升级
+  不在第一阶段接口内;这些决策未定前不得内联 URL、公钥或私钥。
 
 ---
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import signal
 import threading
 import time
 import zipfile
@@ -51,8 +52,18 @@ from app.worker import (
     _build_workflow_child_job,
     _compare_export_row_cap,
     _DatabaseCompareReader,
+    _worker_stop_signals,
     _workflow_children_snapshots,
 )
+
+
+def test_worker_handles_windows_ctrl_break_as_graceful_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.worker.os.name", "nt")
+    monkeypatch.setattr("app.worker.signal.SIGBREAK", 21, raising=False)
+
+    assert _worker_stop_signals() == (signal.SIGTERM, signal.SIGINT, 21)
 
 
 def test_worker_runs_sql_query_to_spool_and_completes() -> None:

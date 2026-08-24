@@ -61,13 +61,13 @@ jobs:
 
       # R1 / R3:driver/crypto import 越界(ruff TID251 banned-api)
       - name: ruff check (R1/R3 banned-api)
-        run: uv run ruff check app tests tools
+        run: uv run ruff check app updater tests tools
 
       - name: ruff format check
-        run: uv run ruff format --check app tests tools
+        run: uv run ruff format --check app updater tests tools
 
       - name: mypy strict
-        run: uv run mypy app tests
+        run: uv run mypy app updater tests
 
       # R2 / R6:AST 模式红线(密码字段访问 / cursor 字段)
       # severity: error 的规则命中后 ast-grep 自动 exit 1

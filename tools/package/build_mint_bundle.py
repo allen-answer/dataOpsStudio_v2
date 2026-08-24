@@ -48,6 +48,21 @@ else:
         resolve_build_identity,
     )
 
+if __package__:
+    from .update_compatibility import (
+        build_update_compatibility,
+    )
+    from .update_compatibility import (
+        write_update_metadata as write_shared_update_metadata,
+    )
+else:
+    from update_compatibility import (  # type: ignore[no-redef]
+        build_update_compatibility,
+    )
+    from update_compatibility import (
+        write_update_metadata as write_shared_update_metadata,
+    )
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DESKTOP_ROOT = REPO_ROOT / "desktop"
 BUNDLE_ROOT = DESKTOP_ROOT / "bundle"
@@ -78,6 +93,7 @@ POSTGRES_SHA256 = "c1575341fa7bd40f5274ea465b34390f4dc64cdd0770af327005caaeb9f6b
 
 SOURCE_ITEMS = (
     "app",
+    "updater",
     "alembic.ini",
     "pyproject.toml",
     "uv.lock",
@@ -254,6 +270,7 @@ def export_requirements(cache: Path, uv: Path) -> Path:
             "--frozen",
             "--no-dev",
             "--no-emit-project",
+            "--no-header",
             "--format",
             "requirements-txt",
             "-o",
@@ -389,6 +406,28 @@ def write_scripts(identity: BuildIdentity) -> None:
             shutil.copy2(source, destination)
 
 
+def write_update_metadata(
+    staging: Path,
+    requirements: Path,
+    identity: BuildIdentity,
+) -> None:
+    compatibility = build_update_compatibility(
+        repo_root=REPO_ROOT,
+        platform="mint21.3-x86_64",
+        requirements=requirements,
+        python={"version": PYTHON_VERSION, "sha256": PYTHON_SHA256},
+        uv={"version": UV_VERSION, "sha256": UV_SHA256},
+        postgres={"version": POSTGRES_VERSION, "sha256": POSTGRES_SHA256},
+    )
+    write_shared_update_metadata(
+        runtime_dir=staging / "runtime",
+        compatibility=compatibility,
+        version=identity.version,
+        commit=identity.commit,
+        image_version=identity.image_version,
+    )
+
+
 def assemble(
     *,
     python: Path,
@@ -413,6 +452,7 @@ def assemble(
     for wheel in wheels.glob("*.whl"):
         shutil.copy2(wheel, BUNDLE_ROOT / "runtime/wheels" / wheel.name)
     shutil.copy2(requirements, BUNDLE_ROOT / "runtime/requirements-frozen.txt")
+    write_update_metadata(BUNDLE_ROOT, requirements, identity)
     copytree(postgres, BUNDLE_ROOT / "pgsql")
     write_scripts(identity)
     for name in ("_common.sh", "install.sh", "start.sh", "stop.sh"):

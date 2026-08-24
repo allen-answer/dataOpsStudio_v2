@@ -33,7 +33,6 @@ export UV_FROZEN=1
 export UV_PYTHON_DOWNLOADS=0
 export UV_PROJECT_ENVIRONMENT="$VENV"
 export DATAOPS_FORM=portable
-export DATAOPS_FRONTEND_DIST="$BUNDLE_ROOT/frontend/dist"
 export PATH="$PG_BIN:$PATH"
 export LD_LIBRARY_PATH="$BUNDLE_ROOT/pgsql/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
@@ -41,9 +40,12 @@ mkdir -p -- "$DATAOPS_STATE_ROOT"
 cd -- "$BUNDLE_ROOT"
 
 invoke_launcher() {
-    "$VENV_PY" -m app.launcher \
-        --root "$DATAOPS_HOME" \
+    "$VENV_PY" -m updater run \
+        --bundle-root "$BUNDLE_ROOT" \
+        --state-root "$DATAOPS_STATE_ROOT" \
+        --python "$VENV_PY" \
+        --home "$DATAOPS_HOME" \
         --pg-bin-dir "$PG_BIN" \
-        --uv "$UV" \
+        --uv "$UV" -- \
         "$@"
 }

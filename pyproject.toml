@@ -8,29 +8,29 @@ authors = [{ name = "allen-answer" }]
 
 dependencies = [
     # Web
-    "fastapi>=0.115",
+    "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.32",
     # Data validation & config
-    "pydantic>=2.9",
+    "pydantic>=2.9,<3",
     "pydantic-settings>=2.6",
     # Metadata DB (PostgreSQL only — see contract §1 R9)
     "sqlalchemy>=2.0,<3",
     "alembic>=1.13",
-    "psycopg[binary]>=3.2",
+    "psycopg[binary]>=3.2,<4",
     # Observability
     "structlog>=24.4",
     "prometheus-client>=0.21",
     # SQL & data
     "sqlglot>=25.0",
-    "pyarrow>=18",
+    "pyarrow>=18,<25",
     "numpy>=1.26.0",
     # File-source readers — C-1 file compare(app/domain/readers/,非 DB 驱动)
     "openpyxl>=3.1",
     # Secret crypto — import allowed ONLY in app/infrastructure/secretstore/ (R3)
-    "cryptography>=43",
-    "bcrypt>=4.2",
+    "cryptography>=43,<49",
+    "bcrypt>=4.2,<6",
     # License signature verification — Ed25519
-    "pynacl>=1.5",
+    "pynacl>=1.5,<2",
     "pymysql>=1.1",
     # DM(达梦)driver — import 仅允许在 app/dbclients/(R1)。
     # cp312 manylinux + win_amd64 wheel 齐全(可 uv/pip 装,无需本地 DM 客户端)。
