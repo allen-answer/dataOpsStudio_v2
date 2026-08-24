@@ -123,7 +123,8 @@ def test_non_gate_step_conditions_are_preserved() -> None:
 def test_release_candidate_is_manual_artifact_only_and_read_only() -> None:
     workflow = _release_candidate_workflow()
     # PyYAML 1.1 parses the unquoted YAML key `on` as boolean True.
-    triggers = workflow.get("on", workflow.get(True))
+    yaml_mapping = cast(dict[Any, Any], workflow)
+    triggers = yaml_mapping.get("on", yaml_mapping.get(True))
     assert triggers == {"workflow_dispatch": None}
     assert workflow["permissions"] == {"contents": "read"}
 
@@ -241,3 +242,11 @@ def test_release_candidate_cache_paths_exclude_outputs_staging_and_secrets() -> 
             assert "dist-" not in cache_path
             assert "desktop/bundle" not in cache_path
             assert "secret" not in cache_path
+
+
+def test_static_checks_include_stable_payload_updater() -> None:
+    workflow = _WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    assert "ruff check app updater tests tools" in workflow
+    assert "ruff format --check app updater tests tools" in workflow
+    assert "mypy app updater tests" in workflow

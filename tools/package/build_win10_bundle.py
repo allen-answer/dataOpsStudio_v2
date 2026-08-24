@@ -72,6 +72,21 @@ else:
         resolve_build_identity,
     )
 
+if __package__:
+    from .update_compatibility import (
+        build_update_compatibility,
+    )
+    from .update_compatibility import (
+        write_update_metadata as write_shared_update_metadata,
+    )
+else:
+    from update_compatibility import (  # type: ignore[no-redef]
+        build_update_compatibility,
+    )
+    from update_compatibility import (
+        write_update_metadata as write_shared_update_metadata,
+    )
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 SCRIPTS_ROOT = REPO_ROOT / "bundle-scripts"
@@ -112,6 +127,7 @@ UV_SHA256 = "02ad29f07e674d68726ba3bb1ff25b335d83515756e2b1a194bb56c3cc30e07c"
 # `alembic upgrade head` need at runtime, cwd = bundle root).
 SOURCE_ITEMS = (
     "app",
+    "updater",
     "alembic.ini",
     "pyproject.toml",
     "uv.lock",
@@ -369,6 +385,7 @@ def assemble(
     runtime = staging / "runtime"
     runtime.mkdir(parents=True)
     shutil.copy2(requirements, runtime / "requirements-frozen.txt")
+    write_update_metadata(staging, requirements, identity)
 
     if mode == "offline":
         assert python_dir and uv_dir and wheels and pg_zip
@@ -423,6 +440,28 @@ def write_download_manifest(staging: Path) -> None:
     runtime.mkdir(parents=True, exist_ok=True)
     (runtime / "download-manifest.json").write_text(
         json.dumps(download_manifest(), indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def write_update_metadata(
+    staging: Path,
+    requirements: Path,
+    identity: BuildIdentity,
+) -> None:
+    compatibility = build_update_compatibility(
+        repo_root=REPO_ROOT,
+        platform="win10-x64",
+        requirements=requirements,
+        python={"version": PYTHON_FULL_VERSION, "sha256": PYTHON_STANDALONE_SHA256},
+        uv={"version": UV_VERSION, "sha256": UV_SHA256},
+        postgres={"version": PG_VERSION, "sha256": PG_SHA256},
+    )
+    write_shared_update_metadata(
+        runtime_dir=staging / "runtime",
+        compatibility=compatibility,
+        version=identity.version,
+        commit=identity.commit,
+        image_version=identity.image_version,
     )
 
 

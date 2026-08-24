@@ -111,6 +111,99 @@ The desktop shell and scripts must preserve the following behaviors together:
 - the first-run password exists only in the child process environment;
 - window close performs graceful stop, bounded wait and platform-specific force-kill fallback.
 
+## Signed payload updates (stage 1)
+
+Stage 1 provides a platform-neutral, offline-verifiable update seam for the high-frequency
+application payload. It intentionally does **not** download from a production endpoint and does not
+embed a release public key or private key. Online discovery, the Tauri import/check-update UI and
+health-probe orchestration are later stages after the owner chooses the endpoint and trust-key
+distribution policy.
+
+Every newly built full desktop package contains two non-secret files:
+
+```text
+runtime/update-compatibility.json  exact runtime/non-payload compatibility baseline
+runtime/build-identity.json        base full-package version, commit and image identity
+```
+
+The compatibility baseline binds the platform, Python/uv/PostgreSQL artifacts, frozen dependency
+set, Tauri source, bundle scripts, migrations, package tooling and the stable updater. A payload
+release is allowed only when its freshly exported requirements and all non-payload fingerprints
+equal that base document. A wheel/dependency, PostgreSQL, Python/uv, Tauri, migration, startup
+contract or updater change fails closed with an instruction to ship a full package.
+
+The payload builder has a two-step release interface so private signing material never enters the
+repository or the builder process. First prepare `app/`, a freshly built `frontend/dist/`, and the
+canonical manifest using the exact compatibility document from the intended base full package:
+
+```bash
+uv run python tools/package/build_payload_update.py prepare \
+  --platform <win10-x64-or-mint21.3-x86_64> \
+  --base-compatibility <base-package>/runtime/update-compatibility.json
+```
+
+The release signer signs the emitted `manifest.json` bytes outside the repository and writes only
+the base64 detached Ed25519 signature to a file. Finalization attaches that signature and its
+owner-assigned key id; it never accepts a private key:
+
+```bash
+uv run python tools/package/build_payload_update.py finalize \
+  --work-dir <prepared-work-dir> \
+  --key-id <owner-assigned-key-id> \
+  --signature-file <base64-detached-signature-file> \
+  --output <release>.dupdate
+```
+
+The trust store is owner-provisioned JSON; public keys are raw 32-byte Ed25519 keys encoded as
+strict base64. The repository intentionally contains no default release key:
+
+```json
+{
+  "schema_version": 1,
+  "keys": [
+    {
+      "key_id": "<owner-assigned-key-id>",
+      "algorithm": "ed25519",
+      "public_key": "<base64-raw-ed25519-public-key>"
+    }
+  ]
+}
+```
+
+On an installed package, `python -m updater` is the stable interface used by scripts and, in the
+next stage, by Tauri. `install` requires an owner-provisioned trust-store path, verifies the manifest
+signature before trusting hashes, verifies every file while extracting, then atomically selects the
+new payload under `DATAOPS_STATE_ROOT/updates/versions/`. The caller starts the selected version and
+reports the real health result with `complete --result healthy|failed`; `failed` automatically
+restores the previous pointer, while `healthy` retains one explicit manual rollback. `home/`, the PG
+data directory, bootstrap secrets, the venv and the read-only base runtime are never moved.
+
+This pointer design is also the Linux `.deb` path: `/usr/lib` remains immutable and updates live in
+the normal user's state directory. The selected payload receives the signed release version/commit
+through `DATAOPS_BUILD_*`, so `/api/version` continues to identify the code actually running.
+
+The current offline acceptance sequence is deliberately explicit:
+
+Run these commands with the full package root as the current directory so its stable `updater/`
+module is the one imported:
+
+```text
+<venv-python> -m updater install --bundle-root <bundle> --state-root <state> \
+  --package <release>.dupdate --trust-store <trusted-update-keys.json>
+<start the application and probe /healthz>
+<venv-python> -m updater complete --bundle-root <bundle> --state-root <state> \
+  --result healthy
+```
+
+Use `--result failed` instead of `healthy` when startup or health verification fails; that command
+atomically restores the previous pointer. After a healthy completion, `python -m updater rollback`
+consumes the one retained manual rollback.
+
+Stage 1 is independently testable through the builder and updater CLIs, but it is not yet a
+one-click in-app feature. Do not publish a payload until the owner has supplied the trust-store/key
+rotation policy and the release coordinator has exercised stop → install → start → health →
+complete plus forced-failure rollback on each target OS.
+
 ## Verification expectations
 
 For a release candidate, record the builder command, full build commit, generated manifest,

@@ -16,7 +16,8 @@ $ErrorActionPreference = 'Stop'
 $BundleRoot = $PSScriptRoot
 # __DATAOPS_BUILD_IDENTITY__
 
-if (-not $env:DATAOPS_HOME)       { $env:DATAOPS_HOME = Join-Path $BundleRoot 'home' }
+if (-not $env:DATAOPS_STATE_ROOT) { $env:DATAOPS_STATE_ROOT = $BundleRoot }
+if (-not $env:DATAOPS_HOME)       { $env:DATAOPS_HOME = Join-Path $env:DATAOPS_STATE_ROOT 'home' }
 if (-not $env:DATAOPS_API_PORT)   { $env:DATAOPS_API_PORT = '8020' }
 if (-not $env:DATAOPS_PG_PORT)    { $env:DATAOPS_PG_PORT = '15432' }
 if (-not $env:DATAOPS_ADMIN_USER) { $env:DATAOPS_ADMIN_USER = 'admin' }
@@ -24,7 +25,7 @@ if (-not $env:DATAOPS_ADMIN_USER) { $env:DATAOPS_ADMIN_USER = 'admin' }
 $PyDir    = Join-Path $BundleRoot 'runtime\python'
 $UvDir    = Join-Path $BundleRoot 'runtime\uv'
 $UvExe    = Join-Path $UvDir 'uv.exe'
-$Venv     = Join-Path $BundleRoot '.venv'
+$Venv     = Join-Path $env:DATAOPS_STATE_ROOT '.venv'
 $VenvPy   = Join-Path $Venv 'Scripts\python.exe'
 $PgBin    = Join-Path $BundleRoot 'pgsql\bin'
 $Wheels   = Join-Path $BundleRoot 'runtime\wheels'
@@ -37,12 +38,12 @@ $env:UV_OFFLINE = '1'
 $env:UV_NO_SYNC = '1'
 $env:UV_FROZEN = '1'
 $env:UV_PYTHON_DOWNLOADS = '0'
+$env:UV_PROJECT_ENVIRONMENT = $Venv
 $env:DATAOPS_FORM = 'portable'
-$env:DATAOPS_FRONTEND_DIST = Join-Path $BundleRoot 'frontend\dist'
 $env:PATH = "$PgBin;$env:PATH"
 
 function Invoke-Launcher {
-    & $VenvPy -m app.launcher --root $env:DATAOPS_HOME --pg-bin-dir $PgBin --uv $UvExe @args
+    & $VenvPy -m updater run --bundle-root $BundleRoot --state-root $env:DATAOPS_STATE_ROOT --python $VenvPy --home $env:DATAOPS_HOME --pg-bin-dir $PgBin --uv $UvExe -- @args
     if ($LASTEXITCODE -ne 0) {
         # Never echo launcher arguments here: first-run admin creation carries
         # a password argument and this exception is redirected to gui-start.log.

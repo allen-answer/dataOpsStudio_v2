@@ -107,10 +107,17 @@ Windows 内置 PostgreSQL 只监听 loopback TCP,launcher 不传 Unix-only `-k` 
 
 ## 6. 升级
 
-用新版包替换 `app/`、`frontend/dist/`、`runtime/requirements-frozen.txt`
-(offline 另换 `runtime/wheels/`;online 另换 `runtime/download-manifest.json`),
-删除旧 `.venv/`(下次 `start` 重建),保留 `home/`(实例数据),再运行 `start`
-(自动跑新迁移)。**升级前备份 `home/`。**
+新完整包会带 `runtime/update-compatibility.json` 与稳定 `updater/`。当发布方提供经过
+Ed25519 签名的 `.dupdate`、匹配的 owner-provisioned trust store 和操作指引时,可只更新
+`app/ + frontend/dist/`:updater 验签并逐文件校验 sha256,解到 state root 的版本目录,
+原子切 active pointer;真实健康探测失败时用 `complete --result failed` 自动恢复旧 pointer。
+`home/`、PG data、bootstrap secrets、`.venv/` 都不移动。第一阶段尚未提供 Tauri 内按钮
+或在线检查,详见 `docs/packaging.md`。
+
+只要 wheels/冻结依赖、Python/uv、PostgreSQL、Tauri、bundle scripts、迁移或 updater
+任一指纹变化,增量包必须拒绝并改发完整包。完整包升级仍需停止应用、备份 `home/`,再按
+发布方说明替换整个不可变 bundle;不要手工混换 `app/`、runtime 与 `.venv/`,否则构建身份
+和兼容基线不可验证。
 
 ## 7. 安全
 

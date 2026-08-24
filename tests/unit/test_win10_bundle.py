@@ -23,11 +23,13 @@ def test_launcher_invoked_via_call_operator_without_batch_quotes(tmp_path: Path)
     build.write_scripts(tmp_path, _identity())
 
     common = (tmp_path / "_common.ps1").read_text(encoding="ascii")
-    # The launcher is invoked with the call operator and single-variable paths -
-    # no nested-quote string to get wrong (the batch quote-hell this replaces).
-    assert (
-        "& $VenvPy -m app.launcher --root $env:DATAOPS_HOME --pg-bin-dir $PgBin --uv $UvExe @args"
-    ) in common
+    # The stable full-package updater selects the active signed app/frontend
+    # payload before it delegates to app.launcher. Paths remain separate args.
+    assert "& $VenvPy -m updater run" in common
+    assert "--bundle-root $BundleRoot" in common
+    assert "--state-root $env:DATAOPS_STATE_ROOT" in common
+    assert "--pg-bin-dir $PgBin --uv $UvExe -- @args" in common
+    assert "$env:UV_PROJECT_ENVIRONMENT = $Venv" in common
 
     for name in PS_SCRIPTS:
         text = (tmp_path / name).read_text(encoding="ascii")
@@ -130,6 +132,34 @@ def test_download_manifest_pins_url_and_sha256_for_each_artifact(tmp_path: Path)
         assert manifest[key]["url"].startswith("https://")
         assert len(manifest[key]["sha256"]) == 64
     assert manifest["postgres"]["keep"] == ["bin", "lib", "share"]
+
+
+def test_full_bundle_writes_payload_update_compatibility_and_base_identity(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements-frozen.txt"
+    requirements.write_text("example==1 --hash=sha256:abc\n", encoding="utf-8")
+
+    build.write_update_metadata(tmp_path, requirements, _identity())
+
+    compatibility = json.loads(
+        (tmp_path / "runtime/update-compatibility.json").read_text(encoding="utf-8")
+    )
+    identity = json.loads((tmp_path / "runtime/build-identity.json").read_text(encoding="utf-8"))
+    assert compatibility["platform"] == "win10-x64"
+    assert compatibility["python"] == {
+        "version": build.PYTHON_FULL_VERSION,
+        "sha256": build.PYTHON_STANDALONE_SHA256,
+    }
+    assert compatibility["postgres"] == {
+        "version": build.PG_VERSION,
+        "sha256": build.PG_SHA256,
+    }
+    assert identity == {
+        "version": "2.0.1",
+        "commit": "a" * 40,
+        "image_version": "2.0.1-win10-x64-gui",
+    }
 
 
 def test_extract_pg_keeps_only_server_runtime_and_license(tmp_path: Path) -> None:

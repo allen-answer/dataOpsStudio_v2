@@ -24,4 +24,13 @@ socket directory, so spaces and deep paths in `DATAOPS_HOME` do not enter Postgr
 Both stop scripts call the launcher's graceful stop path; the Tauri shell adds a bounded wait and
 platform-specific process tree/group kill only if graceful shutdown does not finish.
 
+After the venv exists, both script families invoke the launcher through the stable top-level
+`updater` module. With no active payload this resolves to the immutable full-package `app/` and
+`frontend/dist/`. With a verified payload it resolves both paths and `DATAOPS_BUILD_*` from the same
+atomic active pointer. The scripts never parse or evaluate update manifest values themselves.
+
+Payload installation, health completion and rollback commands are documented in
+[`docs/packaging.md`](../docs/packaging.md). Stage 1 requires an owner-provisioned trust store and is
+not yet exposed as a Tauri button or an online check.
+
 Build and package instructions live in [`docs/packaging.md`](../docs/packaging.md).
