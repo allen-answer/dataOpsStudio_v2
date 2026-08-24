@@ -23,7 +23,7 @@ dependencies = [
     # SQL & data
     "sqlglot>=25.0",
     "pyyaml>=6.0,<7",
-    "pyarrow>=18,<25",
+    "pyarrow>=18,<26",
     "numpy>=1.26.0",
     # File-source readers — C-1 file compare(app/domain/readers/,非 DB 驱动)
     "openpyxl>=3.1",
