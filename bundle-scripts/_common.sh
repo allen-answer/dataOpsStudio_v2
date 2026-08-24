@@ -4,6 +4,7 @@
 set -Eeuo pipefail
 
 BUNDLE_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# __DATAOPS_BUILD_IDENTITY__
 
 # Debian installs application resources below /usr/lib, which is intentionally
 # read-only for normal users. Keep the immutable bundle there and place the

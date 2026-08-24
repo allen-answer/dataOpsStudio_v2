@@ -28,6 +28,9 @@ From the repository root:
 uv run python tools/package/build_win10_bundle.py --gui
 ```
 
+The builder records the full Git commit automatically. When building from an exported source
+archive without `.git`, pass the trusted full object id with `--build-commit <40-or-64-hex>`.
+
 The default GUI command builds the Vue frontend and the shared Tauri shell, assembles the offline
 runtime, and writes these ignored artifacts:
 
@@ -36,9 +39,10 @@ dist-bundle/dataops-studio-<version>-win10-x64-gui.zip
 dist-bundle/dataops-studio-<version>-win10-x64-gui.MANIFEST.txt
 ```
 
-Use `--skip-frontend-build` only when a verified `frontend/dist/index.html` already exists. The
-existing script-only offline and online packages remain available by omitting `--gui` and by using
-`--mode online`, respectively. A GUI online package can be built with `--mode online --gui`.
+The frontend is always rebuilt with `npm ci` and `npm run build`; release identity must never point
+at an ignored or stale `frontend/dist`. The existing script-only offline and online packages remain
+available by omitting `--gui` and by using `--mode online`, respectively. A GUI online package can
+be built with `--mode online --gui`.
 
 The target needs the Microsoft WebView2 runtime. On first launch `DataOpsStudio.exe` shows the admin
 password form, injects `DATAOPS_ADMIN_PASSWORD` only into `start.ps1`, and polls
@@ -64,6 +68,9 @@ From the repository root:
 uv run python tools/package/build_mint_bundle.py
 ```
 
+The builder records the full Git commit automatically. When building from an exported source
+archive without `.git`, pass the trusted full object id with `--build-commit <40-or-64-hex>`.
+
 The builder creates ignored cache/staging data below `dist-mint/` and `desktop/bundle/`, invokes
 `cargo tauri build --bundles deb`, and writes:
 
@@ -76,7 +83,7 @@ After Tauri creates the Debian archive, the builder deterministically recompress
 data members with gzip level 9 and zero timestamps. Installed bytes are unchanged; the stable,
 maximum compression keeps rebuilds comparable against the no-growth package-size gate.
 
-Use `--skip-frontend-build` only with an already verified frontend build. The `.deb` keeps immutable
+The frontend is always rebuilt from the current source and lockfile. The `.deb` keeps immutable
 resources under the application install directory and stores the generated virtual environment and
 instance home under `${XDG_DATA_HOME:-$HOME/.local/share}/dataops-studio/` by default.
 
@@ -90,6 +97,12 @@ Both honor `DATAOPS_HOME`, force `UV_OFFLINE`, `UV_NO_SYNC` and `UV_FROZEN`, and
 Before creating the virtual environment, both installers calculate the UTF-8 byte length of
 `<DATAOPS_HOME>/data/pg-socket/.s.PGSQL.15432` and reject paths longer than 107 bytes.
 
+Both builders validate the package version, full Git object id and platform image version, then
+inject the three non-secret `DATAOPS_BUILD_*` exports into the existing shared startup script.
+The checked-in marker never ships in a built package. A dirty Git worktree, a commit mismatch, an
+unknown/unsafe value, or an archive build without explicit `--build-commit` fails before assembly
+instead of producing a package that renders `VUNKNOWN` or misstates its source.
+
 The desktop shell and scripts must preserve the following behaviors together:
 
 - readiness is the `/healthz` HTTP status, not merely a listening process;
@@ -99,7 +112,8 @@ The desktop shell and scripts must preserve the following behaviors together:
 
 ## Verification expectations
 
-For a release candidate, record the builder command, generated manifest, SHA-256, exact byte size,
-first-run `/healthz` result, GUI launch result, and graceful-close residue check on the target OS.
+For a release candidate, record the builder command, full build commit, generated manifest,
+SHA-256, exact byte size, `/api/version` response, first-run `/healthz` result, GUI launch result,
+and graceful-close residue check on the target OS.
 Static checks or a cross-platform Rust compile do not replace that target smoke test. If a platform
 build or smoke test was not run, report it explicitly as unverified.
