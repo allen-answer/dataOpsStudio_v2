@@ -3276,6 +3276,14 @@ class _DatabaseCompareReader:
             rows.append(row)
         return rows
 
+    def enforce_max_rows(self, max_rows: int) -> None:
+        table_expr = _compare_table_expression(self._datasource.db_type, self._data_ref)
+        limit_sql = _limit_clause(self._datasource.db_type, max_rows + 1)
+        sql = f"SELECT 1 FROM {table_expr}{limit_sql}"
+        for index, _ in enumerate(self._adapter.execute_select(sql, {})):
+            if index >= max_rows:
+                raise MaxRowsExceededError(max_rows)
+
     def fetch_first_at_or_after(self, anchor: int) -> CompareRow | None:
         if len(self._key_columns) != 1:
             return None
@@ -3396,7 +3404,13 @@ def _run_compare_hashdiff(
     limits: RunLimits,
 ) -> HashdiffResult:
     if len(key_columns) != 1 or key_columns[0].type is not ColumnType.INTEGER:
-        return _diff_all_rows(source_reader.fetch_all(), target_reader.fetch_all())
+        return _diff_all_rows(
+            source_reader.fetch_all(max_rows=limits.max_rows),
+            target_reader.fetch_all(max_rows=limits.max_rows),
+        )
+    if limits.max_rows is not None:
+        source_reader.enforce_max_rows(limits.max_rows)
+        target_reader.enforce_max_rows(limits.max_rows)
     source_min, source_max = source_reader.bounds()
     target_min, target_max = target_reader.bounds()
     bounds = [
