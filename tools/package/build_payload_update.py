@@ -212,6 +212,7 @@ def _export_requirements(repo_root: Path, *, uv: str, platform: str, output: Pat
         "--frozen",
         "--no-dev",
         "--no-emit-project",
+        "--no-header",
         "--format",
         "requirements-txt",
     ]

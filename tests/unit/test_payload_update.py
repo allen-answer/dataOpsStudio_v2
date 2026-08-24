@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: TID251
 )
 
 import updater.core as updater_core
+from tools.package import build_mint_bundle, build_payload_update, build_win10_bundle
 from tools.package.build_identity import BuildIdentity
 from tools.package.build_payload_update import finalize_payload_update, prepare_payload_update
 from tools.package.update_compatibility import build_update_compatibility
@@ -61,6 +62,40 @@ def _write_compatibility_sources(repo: Path) -> None:
         'oracle = ["oracledb>=2"]\n',
         encoding="utf-8",
     )
+
+
+def test_requirement_exports_omit_path_dependent_uv_header(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        build_win10_bundle,
+        "run",
+        lambda command, *, cwd: commands.append(command),
+    )
+    monkeypatch.setattr(
+        build_mint_bundle,
+        "run",
+        lambda command, *, cwd: commands.append(command),
+    )
+    monkeypatch.setattr(
+        build_payload_update,
+        "_run",
+        lambda command, *, cwd: commands.append(command),
+    )
+
+    build_win10_bundle.export_requirements(tmp_path / "win", "uv")
+    build_mint_bundle.export_requirements(tmp_path / "mint", tmp_path / "uv")
+    build_payload_update._export_requirements(
+        tmp_path,
+        uv="uv",
+        platform="win10-x64",
+        output=tmp_path / "payload.txt",
+    )
+
+    assert len(commands) == 3
+    assert all("--no-header" in command for command in commands)
 
 
 def _compatibility(repo: Path, requirements: Path) -> dict[str, object]:

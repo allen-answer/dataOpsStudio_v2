@@ -270,6 +270,7 @@ def export_requirements(cache: Path, uv: Path) -> Path:
             "--frozen",
             "--no-dev",
             "--no-emit-project",
+            "--no-header",
             "--format",
             "requirements-txt",
             "-o",

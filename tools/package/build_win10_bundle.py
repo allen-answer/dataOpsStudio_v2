@@ -178,6 +178,7 @@ def export_requirements(cache: Path, uv: str) -> Path:
             "--frozen",
             "--no-dev",
             "--no-emit-project",
+            "--no-header",
             "--extra",
             "oracle",
             "--extra",
