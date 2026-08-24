@@ -1333,6 +1333,12 @@ def test_sql_explain_rejects_params_instead_of_ignoring_them() -> None:
 
 
 def test_compare_task_create_persists_explicit_rules_contract() -> None:
+    stored_task = _compare_task_row()
+    stored_task["compare_rules"] = {
+        "key_columns": ["id"],
+        "numeric_scale": 4,
+        "schema_policy": "strict",
+    }
     engine = _FakeEngine(
         [
             {"id": "project-1"},
@@ -1340,7 +1346,7 @@ def test_compare_task_create_persists_explicit_rules_contract() -> None:
                 {"id": "ds-source", "project_id": "project-1"},
                 {"id": "ds-target", "project_id": "project-1"},
             ],
-            _compare_task_row(),
+            stored_task,
         ]
     )
     services = _Services(engine)
@@ -1363,6 +1369,7 @@ def test_compare_task_create_persists_explicit_rules_contract() -> None:
             "compare_rules": {
                 "key_columns": ["id"],
                 "numeric_tolerance": 0.01,
+                "numeric_scale": 4,
                 "schema_policy": "strict",
             },
             "run_limits": {"recursive_checksum": True, "bisection_factor": 8},
@@ -1373,9 +1380,13 @@ def test_compare_task_create_persists_explicit_rules_contract() -> None:
     payload = response.json()
     assert payload["id"] == "task-1"
     assert payload["compare_rules"]["key_columns"] == ["id"]
+    assert payload["compare_rules"]["numeric_scale"] == 4
     assert payload["compare_rules"]["schema_policy"] == "strict"
     assert payload["run_limits"]["bisection_factor"] == 8
-    assert any("INSERT INTO compare_tasks" in statement for statement in engine.statements)
+    inserted = next(
+        statement for statement in engine.executed if "INSERT INTO compare_tasks" in str(statement)
+    )
+    assert inserted.compile().params["compare_rules"]["numeric_scale"] == 4
     assert any(audit["action"] == "compare_task_create" for audit in services.audits)
 
 
