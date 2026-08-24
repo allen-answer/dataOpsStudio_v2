@@ -14,6 +14,7 @@ $ErrorActionPreference = 'Stop'
 # $PSScriptRoot inside a dot-sourced file resolves to that file's own directory,
 # which is the bundle root (all scripts live at the bundle top level).
 $BundleRoot = $PSScriptRoot
+# __DATAOPS_BUILD_IDENTITY__
 
 if (-not $env:DATAOPS_HOME)       { $env:DATAOPS_HOME = Join-Path $BundleRoot 'home' }
 if (-not $env:DATAOPS_API_PORT)   { $env:DATAOPS_API_PORT = '8020' }

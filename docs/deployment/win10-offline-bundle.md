@@ -69,7 +69,6 @@ URL + sha256 在脚本内 pin(`PG_*` / `PYTHON_STANDALONE_*` / `UV_*` 常量),
 
 常用选项:
 
-- `--skip-frontend-build` 复用现有 `frontend/dist`,不跑 npm。
 - `--keep-staging` 保留解压态的 staging 目录。
 - `--cache-dir` / `--output-dir` 自定义缓存与产物位置。
 
