@@ -26,7 +26,7 @@ jobs:
     name: Lint & Format & Type & AST Red Lines
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.2.0
@@ -80,7 +80,7 @@ jobs:
     name: Secret Scan (R8)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0  # gitleaks 需要全 history
 
@@ -116,7 +116,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.2.0
@@ -194,7 +194,7 @@ jobs:
           --health-retries 20
           --health-start-period 30s
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.2.0
@@ -258,7 +258,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.2.0
@@ -330,7 +330,7 @@ jobs:
           --health-retries 20
           --health-start-period 30s
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.2.0
@@ -400,7 +400,7 @@ jobs:
           --health-retries 20
           --health-start-period 30s
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install uv
         uses: astral-sh/setup-uv@v8.2.0
@@ -535,7 +535,7 @@ jobs:
       DATAOPS_BUILD_COMMIT: ${{ github.sha }}
       DATAOPS_IMAGE_VERSION: 2.0.1-ci-${{ github.run_id }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Build stack image
         run: docker compose -f docker/compose.dataops.yml build
@@ -597,7 +597,7 @@ jobs:
     name: Frontend Build (T7)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup Node 22
         uses: actions/setup-node@v6
@@ -629,7 +629,7 @@ jobs:
     name: Agents Doc Sync (AGENTS.md == CLAUDE.md)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: diff AGENTS.md vs CLAUDE.md (skip first line title)
         run: |
