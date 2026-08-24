@@ -1250,3 +1250,217 @@ test('in-grace mode disables the primary compare write entry', async ({ page }) 
   expect(draftWrites).toBe(0)
   expectNoConsoleErrors()
 })
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * 方案 A:Compare 横向铺满 + source/target/single SQL 放大还原
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** 旧 max-w-4xl = 56rem = 896px;铺满后正文必须显著超过它。 */
+const LEGACY_MAX_W_4XL = 896
+
+async function sourceCustomSql(page: Page): Promise<void> {
+  await page
+    .getByTestId('compare-source-fieldset')
+    .getByRole('button', { name: 'Custom SQL', exact: true })
+    .click()
+}
+
+async function targetCustomSql(page: Page): Promise<void> {
+  await page
+    .getByTestId('compare-target-fieldset')
+    .getByRole('button', { name: 'Custom SQL', exact: true })
+    .click()
+}
+
+test('compare editor body fills the container and keeps source/target on one row', async ({
+  page,
+}) => {
+  await mockBase(page)
+  await page.setViewportSize({ width: 1600, height: 960 })
+  await page.goto('/projects/project-1/compare')
+
+  const body = page.getByTestId('compare-editor-body')
+  await expect(body).toBeVisible()
+  const bodyBox = await body.boundingBox()
+  const containerWidth = await body.evaluate((el) => (el.parentElement as HTMLElement).clientWidth)
+  expect(bodyBox!.width).toBeGreaterThan(LEGACY_MAX_W_4XL)
+  expect(bodyBox!.width).toBeGreaterThanOrEqual(containerWidth - 1)
+
+  // 源 / 目标仍是同一行的双栏,大屏不得堆叠。
+  const sourceBox = await page.getByTestId('compare-source-fieldset').boundingBox()
+  const targetBox = await page.getByTestId('compare-target-fieldset').boundingBox()
+  expect(targetBox!.x).toBeGreaterThan(sourceBox!.x + sourceBox!.width - 1)
+  expect(Math.abs(targetBox!.y - sourceBox!.y)).toBeLessThan(4)
+  expectNoConsoleErrors()
+})
+
+test('source and target previews stay inside their own column', async ({ page }) => {
+  await mockBase(page)
+  await page.route('**/api/projects/project-1/compare/preview', (r) =>
+    json(r, 200, {
+      columns: ['CUST_NO'],
+      column_details: [
+        { name: 'CUST_NO', generated: false, projection_index: 1, expression: null },
+      ],
+      rows: [['C1']],
+      row_count: 1,
+      truncated: false,
+    }),
+  )
+  await page.setViewportSize({ width: 1600, height: 960 })
+  await page.goto('/projects/project-1/compare')
+
+  const sourceCol = page.getByTestId('compare-source-fieldset')
+  const targetCol = page.getByTestId('compare-target-fieldset')
+
+  await sourceCol.getByRole('button', { name: 'Preview', exact: true }).click()
+  const sourcePreview = page.getByTestId('compare-source-preview')
+  await expect(sourcePreview).toBeVisible()
+  await expect(sourceCol.getByTestId('compare-source-preview')).toHaveCount(1)
+  await expect(targetCol.getByTestId('compare-source-preview')).toHaveCount(0)
+
+  await targetCol.getByRole('button', { name: 'Preview', exact: true }).click()
+  const targetPreview = page.getByTestId('compare-target-preview')
+  await expect(targetPreview).toBeVisible()
+  await expect(targetCol.getByTestId('compare-target-preview')).toHaveCount(1)
+  await expect(sourceCol.getByTestId('compare-target-preview')).toHaveCount(0)
+
+  // 两个预览仍在各自列内,且左右分列(不是整行铺开)。
+  const sourcePreviewBox = await sourcePreview.boundingBox()
+  const targetPreviewBox = await targetPreview.boundingBox()
+  const sourceColBox = await sourceCol.boundingBox()
+  const targetColBox = await targetCol.boundingBox()
+  expect(sourcePreviewBox!.x).toBeGreaterThanOrEqual(sourceColBox!.x - 1)
+  expect(sourcePreviewBox!.x + sourcePreviewBox!.width).toBeLessThanOrEqual(
+    sourceColBox!.x + sourceColBox!.width + 1,
+  )
+  expect(targetPreviewBox!.x).toBeGreaterThanOrEqual(targetColBox!.x - 1)
+  expect(targetPreviewBox!.x).toBeGreaterThan(sourcePreviewBox!.x)
+
+  // 关闭预览的交互保留。
+  await sourcePreview.getByTitle('Close preview').click()
+  await expect(sourcePreview).toHaveCount(0)
+  expectNoConsoleErrors()
+})
+
+test('source SQL expands to a modal Monaco and restores the same content', async ({ page }) => {
+  await mockBase(page, [
+    compareTask({
+      source_ref: { kind: 'sql', sql: 'SELECT 1 FROM INLINE_HISTORY' },
+    }),
+  ])
+  await page.setViewportSize({ width: 1600, height: 960 })
+  await page.goto('/projects/project-1/compare')
+
+  const inline = page.getByTestId('compare-source-fieldset').locator('.monaco-editor').first()
+  await expect(inline).toBeVisible()
+  const inlineTextarea = inline.locator('textarea').first()
+  await expect(inline.locator('.view-lines')).toContainText('INLINE_HISTORY')
+
+  await page.getByTestId('compare-source-sql-expand').click()
+  const modal = page.getByTestId('compare-source-sql-expand-modal')
+  await expect(modal).toBeVisible()
+  await expect(modal).toHaveAttribute('aria-modal', 'true')
+  await expect(modal).toHaveAttribute('aria-label', 'Source SQL — expanded editor')
+  await expect(modal.locator('.monaco-editor').first()).toBeVisible()
+
+  // 模态键盘焦点不得越过遮罩落到背景页面。
+  const collapse = page.getByTestId('compare-source-sql-collapse')
+  await collapse.focus()
+  await page.keyboard.press('Shift+Tab')
+  await expect
+    .poll(() => modal.evaluate((element) => element.contains(document.activeElement)))
+    .toBe(true)
+
+  // 放大层几乎铺满视口。
+  const modalBox = await modal.boundingBox()
+  expect(modalBox!.width).toBeGreaterThan(1400)
+  expect(modalBox!.height).toBeGreaterThan(800)
+
+  const modalTextarea = modal.locator('textarea').first()
+  await modalTextarea.focus()
+  await page.keyboard.press('Control+a')
+  await page.keyboard.insertText('SELECT 1 FROM SRC_EXPANDED')
+  await page.getByTestId('compare-source-sql-collapse').click()
+  await expect(modal).not.toBeVisible()
+  await expect(page.getByTestId('compare-source-sql-expand')).toBeFocused()
+
+  // 同一个 v-model:还原后原编辑器内容一致。
+  const inlineLines = inline.locator('.view-lines')
+  await expect(inlineLines).toContainText('SRC_EXPANDED')
+  await inlineTextarea.focus()
+  for (let undo = 0; undo < 12; undo += 1) {
+    if ((await inlineLines.innerText()).includes('INLINE_HISTORY')) break
+    await page.keyboard.press('Control+z')
+  }
+  await expect(inlineLines).toContainText('INLINE_HISTORY')
+  expectNoConsoleErrors()
+})
+
+test('target SQL expands and restores', async ({ page }) => {
+  await mockBase(page)
+  await page.setViewportSize({ width: 1600, height: 960 })
+  await page.goto('/projects/project-1/compare')
+  await targetCustomSql(page)
+
+  const inline = page.getByTestId('compare-target-fieldset').locator('.monaco-editor').first()
+  await expect(inline).toBeVisible()
+
+  await page.getByTestId('compare-target-sql-expand').click()
+  const modal = page.getByTestId('compare-target-sql-expand-modal')
+  await expect(modal).toBeVisible()
+  await expect(modal).toHaveAttribute('aria-label', 'Target SQL — expanded editor')
+
+  await modal.locator('textarea').first().fill('SELECT 1 FROM TGT_EXPANDED')
+  await page.getByTestId('compare-target-sql-collapse').click()
+  await expect(modal).not.toBeVisible()
+  await expect(inline.locator('.view-lines')).toContainText('TGT_EXPANDED')
+  expectNoConsoleErrors()
+})
+
+test('single SQL mode expands and restores', async ({ page }) => {
+  await mockBase(page)
+  await page.setViewportSize({ width: 1600, height: 960 })
+  await page.goto('/projects/project-1/compare')
+  await page
+    .getByText('Single SQL (both sides run the same statement)')
+    .locator('input[type="checkbox"]')
+    .check()
+
+  await expect(page.getByTestId('compare-single-sql-expand')).toBeVisible()
+  await page.getByTestId('compare-single-sql-expand').click()
+  const modal = page.getByTestId('compare-single-sql-expand-modal')
+  await expect(modal).toBeVisible()
+  await expect(modal).toHaveAttribute('aria-label', 'Shared SQL — expanded editor')
+
+  await modal.locator('textarea').first().fill('SELECT 1 FROM SHARED_EXPANDED')
+  await page.getByTestId('compare-single-sql-collapse').click()
+  await expect(modal).not.toBeVisible()
+  await expect(page.locator('.monaco-editor').first().locator('.view-lines')).toContainText(
+    'SHARED_EXPANDED',
+  )
+  expectNoConsoleErrors()
+})
+
+test('Escape closes the expanded SQL editor', async ({ page }) => {
+  await mockBase(page)
+  await page.setViewportSize({ width: 1600, height: 960 })
+  await page.goto('/projects/project-1/compare')
+  await sourceCustomSql(page)
+
+  await page.getByTestId('compare-source-sql-expand').click()
+  const modal = page.getByTestId('compare-source-sql-expand-modal')
+  await expect(modal).toBeVisible()
+  await modal.locator('textarea').first().fill('SELECT 1 FROM ESC_EXPANDED')
+
+  await page.keyboard.press('Escape')
+  await expect(modal).not.toBeVisible()
+  await expect(
+    page
+      .getByTestId('compare-source-fieldset')
+      .locator('.monaco-editor')
+      .first()
+      .locator('.view-lines'),
+  ).toContainText('ESC_EXPANDED')
+  expectNoConsoleErrors()
+})

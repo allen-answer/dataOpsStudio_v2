@@ -1352,7 +1352,7 @@ onBeforeUnmount(stopBatchPolling)
       </div>
 
       <!-- ============ 影响分析 tab ============ -->
-      <div v-show="tab === 'impact'" class="p-4 space-y-3 max-w-4xl">
+      <div v-show="tab === 'impact'" data-testid="lineage-impact-body" class="p-4 space-y-3 w-full">
         <div class="flex flex-wrap items-end gap-3">
           <label class="block flex-1 min-w-[16rem]">
             <span class="block text-xs chrome-text-muted mb-1">{{ t('lineage.impact_focus') }}</span>
@@ -1507,7 +1507,7 @@ onBeforeUnmount(stopBatchPolling)
       </div>
 
       <!-- ============ SQL 解析 tab ============ -->
-      <div v-show="tab === 'analyze'" class="p-4 space-y-4 max-w-3xl">
+      <div v-show="tab === 'analyze'" data-testid="lineage-analyze-body" class="p-4 space-y-4 w-full">
         <div v-if="datasources.length === 0" class="text-sm chrome-text-muted">
           {{ t('lineage.no_datasource') }}
         </div>
@@ -1711,7 +1711,7 @@ onBeforeUnmount(stopBatchPolling)
       </div>
 
       <!-- ============ 批量分析 tab(L-2:ZIP → job → 报告)============ -->
-      <div v-show="tab === 'batch'" class="p-4 space-y-4 max-w-4xl">
+      <div v-show="tab === 'batch'" data-testid="lineage-batch-body" class="p-4 space-y-4 w-full">
         <p class="text-xs chrome-text-muted">{{ t('lineage.batch_hint') }}</p>
           <div class="grid grid-cols-2 gap-4">
             <label class="block">
