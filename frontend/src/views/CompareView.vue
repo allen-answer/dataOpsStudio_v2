@@ -2484,7 +2484,7 @@ const missingTarget = computed(
 
       <div class="flex-1 min-h-0 overflow-auto">
         <!-- ============ 编辑 tab ============ -->
-        <div v-show="rightTab === 'editor'" class="p-4 space-y-4 max-w-4xl">
+        <div v-show="rightTab === 'editor'" data-testid="compare-editor-body" class="p-4 space-y-4 w-full">
           <div v-if="runBlockedReason" class="flex items-center gap-2 text-xs text-amber-700 dark:text-amber-300">
             <AlertTriangle class="w-4 h-4" /> {{ runBlockedReason }}
           </div>
@@ -2502,7 +2502,7 @@ const missingTarget = computed(
               {{ t('compare.single_sql') }}
             </label>
 
-            <fieldset class="space-y-2 rounded-card border chrome-border p-3 min-w-0">
+            <fieldset data-testid="compare-source-fieldset" class="space-y-2 rounded-card border chrome-border p-3 min-w-0">
               <legend class="px-1 text-xs font-medium chrome-text-heading">{{ t('compare.source') }}</legend>
               <!-- file 侧无 datasource(#126 起后端可选):隐藏库下拉。 -->
               <select
@@ -2597,6 +2597,11 @@ const missingTarget = computed(
                 :path="`compare-${activeTaskId ?? 'new'}-source.sql`"
                 :placeholder="t('compare.sql_placeholder')"
                 height="9rem"
+                expandable
+                testid="compare-source-sql"
+                :expand-label="t('sql.editor_expand')"
+                :collapse-label="t('sql.editor_collapse')"
+                :expanded-title="t('sql.editor_expanded_source')"
                 class="w-full rounded-card border chrome-border"
                 @execute="onPreview('source')"
               />
@@ -2665,7 +2670,7 @@ const missingTarget = computed(
                 </button>
               </div>
               <!-- 预览折叠面板(源) -->
-              <div v-if="previews.source.open" class="rounded-card border chrome-border-subtle p-2 space-y-1">
+              <div v-if="previews.source.open" data-testid="compare-source-preview" class="rounded-card border chrome-border-subtle p-2 space-y-1">
                 <div class="flex items-center justify-between gap-2">
                   <span class="text-[11px] chrome-text-muted">
                     {{ refKind('source') === 'sql' ? t('compare.preview_sql_note') : refKind('source') === 'file' ? t('compare.file_preview_note') : t('compare.preview') }}
@@ -2726,7 +2731,7 @@ const missingTarget = computed(
               </div>
             </fieldset>
 
-            <fieldset class="space-y-2 rounded-card border chrome-border p-3 min-w-0">
+            <fieldset data-testid="compare-target-fieldset" class="space-y-2 rounded-card border chrome-border p-3 min-w-0">
               <legend class="px-1 text-xs font-medium chrome-text-heading">{{ t('compare.target') }}</legend>
               <!-- file 侧无 datasource(#126 起后端可选):隐藏库下拉。 -->
               <select
@@ -2821,6 +2826,11 @@ const missingTarget = computed(
                 :path="`compare-${activeTaskId ?? 'new'}-target.sql`"
                 :placeholder="t('compare.sql_placeholder')"
                 height="9rem"
+                expandable
+                testid="compare-target-sql"
+                :expand-label="t('sql.editor_expand')"
+                :collapse-label="t('sql.editor_collapse')"
+                :expanded-title="t('sql.editor_expanded_target')"
                 class="w-full rounded-card border chrome-border"
                 @execute="onPreview('target')"
               />
@@ -2889,7 +2899,7 @@ const missingTarget = computed(
                 </button>
               </div>
               <!-- 预览折叠面板(目标) -->
-              <div v-if="previews.target.open" class="rounded-card border chrome-border-subtle p-2 space-y-1">
+              <div v-if="previews.target.open" data-testid="compare-target-preview" class="rounded-card border chrome-border-subtle p-2 space-y-1">
                 <div class="flex items-center justify-between gap-2">
                   <span class="text-[11px] chrome-text-muted">
                     {{ refKind('target') === 'sql' ? t('compare.preview_sql_note') : refKind('target') === 'file' ? t('compare.file_preview_note') : t('compare.preview') }}
@@ -2963,6 +2973,11 @@ const missingTarget = computed(
                 :path="`compare-${activeTaskId ?? 'new'}-shared.sql`"
                 :placeholder="t('compare.sql_placeholder')"
                 height="10rem"
+                expandable
+                testid="compare-single-sql"
+                :expand-label="t('sql.editor_expand')"
+                :collapse-label="t('sql.editor_collapse')"
+                :expanded-title="t('sql.editor_expanded_single')"
                 class="w-full rounded-card border chrome-border"
                 @execute="onPreview('source')"
               />
@@ -3696,7 +3711,7 @@ const missingTarget = computed(
         </div>
 
         <!-- ============ 画像 tab ============ -->
-        <div v-show="rightTab === 'profile'" class="p-4 space-y-5 max-w-3xl">
+        <div v-show="rightTab === 'profile'" data-testid="compare-profile-body" class="p-4 space-y-5 w-full">
           <div v-if="profileError" class="text-xs text-red-600 dark:text-red-400">{{ profileError }}</div>
           <div v-else-if="profileLoading" class="chrome-text-muted text-sm"><LoadingDots /></div>
           <div v-else-if="!diffProfile.generated && profileColumns.length === 0" class="chrome-text-muted text-sm">
@@ -3781,7 +3796,7 @@ const missingTarget = computed(
         </div>
 
         <!-- ============ 历史 tab ============ -->
-        <div v-show="rightTab === 'history'" class="p-4 space-y-2 max-w-4xl">
+        <div v-show="rightTab === 'history'" data-testid="compare-history-body" class="p-4 space-y-2 w-full">
           <div v-if="historyError" class="text-xs text-red-600 dark:text-red-400">{{ historyError }}</div>
           <div v-if="historyLoading && historyRuns.length === 0" class="chrome-text-muted text-sm"><LoadingDots /></div>
           <div v-else-if="historyRuns.length === 0" class="chrome-text-muted text-sm">

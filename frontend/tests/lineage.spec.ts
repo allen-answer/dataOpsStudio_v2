@@ -108,3 +108,58 @@ test('repair mode keeps lineage reads available while disabling SQL analysis', a
   )
   expectNoConsoleErrors()
 })
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * 方案 A:Lineage impact / analyze / batch 横向铺满
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** 旧限制:impact/batch = max-w-4xl(896px),analyze = max-w-3xl(768px)。 */
+const LEGACY_MAX_W_3XL = 768
+const LEGACY_MAX_W_4XL = 896
+
+async function expectFullWidthBody(page: Page, testId: string, legacyCap: number): Promise<void> {
+  const body = page.getByTestId(testId)
+  await expect(body).toBeVisible()
+  const cls = (await body.getAttribute('class')) ?? ''
+  expect(cls).not.toMatch(/max-w-(3xl|4xl)/)
+  const box = await body.boundingBox()
+  const containerWidth = await body.evaluate((el) => (el.parentElement as HTMLElement).clientWidth)
+  expect(box!.width).toBeGreaterThan(legacyCap)
+  expect(box!.width).toBeGreaterThanOrEqual(containerWidth - 1)
+}
+
+test('lineage impact / analyze / batch bodies use the full available width', async ({ page }) => {
+  await mockBase(page)
+  // analyze tab 的 Analyze 按钮需要至少一个数据源。
+  await page.route(/\/api\/datasources\?/, (route) =>
+    json(route, 200, [
+      {
+        id: 'ds-1',
+        name: 'warehouse',
+        db_type: 'mysql',
+        host: 'db.local',
+        port: 3306,
+        environment: 'sandbox',
+        environment_verified: false,
+        database: 'app',
+        operation_policy: { allow_select: true },
+        created_at: now,
+      },
+    ]),
+  )
+  await page.setViewportSize({ width: 1600, height: 960 })
+  await page.goto('/projects/project-1/lineage')
+
+  await page.getByRole('button', { name: 'Impact analysis', exact: true }).click()
+  await expectFullWidthBody(page, 'lineage-impact-body', LEGACY_MAX_W_4XL)
+
+  await page.getByRole('button', { name: 'SQL analyze', exact: true }).click()
+  await expectFullWidthBody(page, 'lineage-analyze-body', LEGACY_MAX_W_3XL)
+  await expect(page.getByRole('button', { name: 'Analyze', exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: 'Batch', exact: true }).click()
+  await expectFullWidthBody(page, 'lineage-batch-body', LEGACY_MAX_W_4XL)
+  await expect(page.locator('input[type="file"]')).toHaveCount(1)
+
+  expectNoConsoleErrors()
+})
