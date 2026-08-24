@@ -138,7 +138,7 @@ jobs:
           --cache-dir "$env:RUNNER_TEMP/dataops-win-cache"
 
       - name: Upload Windows candidate artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unverified-dataops-windows-gui-${{ github.sha }}
           path: |
@@ -212,7 +212,7 @@ jobs:
           --cache-dir "$RUNNER_TEMP/dataops-mint-cache"
 
       - name: Upload Mint candidate artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unverified-dataops-mint-${{ github.sha }}
           path: |
