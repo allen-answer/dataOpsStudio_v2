@@ -85,6 +85,15 @@ def test_install_script_covers_offline_and_online(tmp_path: Path) -> None:
     assert "--require-hashes" in install
 
 
+def test_windows_install_does_not_enforce_unix_socket_path(tmp_path: Path) -> None:
+    build.write_scripts(tmp_path, _identity())
+
+    common = (tmp_path / "_common.ps1").read_text(encoding="ascii")
+    install = (tmp_path / "install.ps1").read_text(encoding="ascii")
+    assert "Assert-PostgresSocketPath" not in common
+    assert "Assert-PostgresSocketPath" not in install
+
+
 def test_cmd_shims_are_one_line_powershell_launchers(tmp_path: Path) -> None:
     build.write_scripts(tmp_path, _identity())
 

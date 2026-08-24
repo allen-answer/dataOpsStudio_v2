@@ -93,9 +93,8 @@ URL + sha256 在脚本内 pin(`PG_*` / `PYTHON_STANDALONE_*` / `UV_*` 常量),
 `DATAOPS_HOME`(默认 `<包>\home`)、`DATAOPS_ADMIN_USER`、`DATAOPS_ADMIN_PASSWORD`
 (设置则非交互创建管理员)。停止用 `stop.cmd`(`--force` 为紧急停止)。
 
-**路径长度注意(短路径)**:内置 PG 的本地 socket 路径(`<DATAOPS_HOME>\data\pg-socket\...`)
-有 107 字节上限;解压/实例路径过深会让 `pg_ctl start` 失败(initdb 正常,pg.log
-报 Unix socket 路径过长)。建议解压到短路径(如 `D:\dataops\`)。
+Windows 内置 PostgreSQL 只监听 loopback TCP,launcher 不传 Unix-only `-k` socket 参数;
+因此 `DATAOPS_HOME` 可包含空格或较深路径。Linux Mint 仍受 Unix socket 107 字节上限约束。
 
 ## 5. 达梦(DM)注记
 

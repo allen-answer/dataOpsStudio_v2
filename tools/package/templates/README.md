@@ -82,11 +82,10 @@ dataops-studio-<ver>-win10-x64-<mode>/
 | `DATAOPS_ADMIN_USER` | `admin` | 首次创建的管理员用户名 |
 | `DATAOPS_ADMIN_PASSWORD` | (交互输入) | 设置后非交互创建管理员(自动化用) |
 
-### 路径注意(短路径)
+### 实例路径
 
-解压路径 + `DATAOPS_HOME` 不要太深:内置 PostgreSQL 的本地 socket 路径
-(`<DATAOPS_HOME>\data\pg-socket\...`)有 107 字节上限,路径过长会导致 PG 启动失败
-(pg.log 报 Unix socket 路径过长)。建议解压到较短路径,如 `D:\dataops\`。
+Windows 内置 PostgreSQL 只监听 loopback TCP,不使用 Unix socket;`DATAOPS_HOME` 可包含空格
+或较深路径。Linux Mint 包仍会在安装时检查 Unix socket 的 107 字节路径上限。
 
 ## 停止
 

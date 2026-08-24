@@ -94,8 +94,9 @@ if the `.deb` grows beyond that value. Package size may decrease, not increase.
 
 Both script families default to API port `8020`, PostgreSQL port `15432`, and admin user `admin`.
 Both honor `DATAOPS_HOME`, force `UV_OFFLINE`, `UV_NO_SYNC` and `UV_FROZEN`, and are idempotent.
-Before creating the virtual environment, both installers calculate the UTF-8 byte length of
-`<DATAOPS_HOME>/data/pg-socket/.s.PGSQL.15432` and reject paths longer than 107 bytes.
+Before creating the virtual environment, the Mint installer calculates the UTF-8 byte length of
+`<DATAOPS_HOME>/data/pg-socket/.s.PGSQL.15432` and rejects paths longer than 107 bytes. Windows
+PostgreSQL uses loopback TCP only; its launcher omits the Unix-only `-k` option.
 
 Both builders validate the package version, full Git object id and platform image version, then
 inject the three non-secret `DATAOPS_BUILD_*` exports into the existing shared startup script.

@@ -17,11 +17,15 @@ from app.launcher import (
     LauncherError,
     _child_env,
     _pg_ctl_start,
+    _pid_alive,
     _sync_license_state,
+    _terminate_process,
     _which,
     command_bootstrap_init,
     command_doctor,
     command_pg_up,
+    command_stop,
+    command_up,
 )
 
 
@@ -160,6 +164,7 @@ def test_pg_ctl_start_uses_runtime_socket_dir(
         "app.launcher._find_pg_binary",
         lambda unused_context, name, required=True: Path(f"/pg/bin/{name}"),
     )
+    monkeypatch.setattr("app.launcher._is_windows", lambda: False)
     monkeypatch.setattr(
         "app.launcher._run",
         lambda command, *, cwd, env: commands.append(command),
@@ -170,6 +175,31 @@ def test_pg_ctl_start_uses_runtime_socket_dir(
     assert commands
     options = commands[0][commands[0].index("-o") + 1]
     assert f"-k {context.data_dir / 'pg-socket'}" in options
+
+
+def test_pg_ctl_start_omits_unix_socket_on_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path)
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "app.launcher._find_pg_binary",
+        lambda unused_context, name, required=True: Path(f"C:/pg/bin/{name}.exe"),
+    )
+    monkeypatch.setattr("app.launcher._is_windows", lambda: True)
+    monkeypatch.setattr(
+        "app.launcher._run",
+        lambda command, *, cwd, env: commands.append(command),
+    )
+
+    _pg_ctl_start(context)
+
+    assert commands
+    options = commands[0][commands[0].index("-o") + 1]
+    assert " -k " not in options
+    assert not (context.data_dir / "pg-socket").exists()
 
 
 def test_which_falls_back_to_common_uv_install_dirs(
@@ -238,6 +268,177 @@ def test_pg_ctl_start_prints_pg_log_tail_on_failure(
     assert "last 5 lines" in stderr
     assert "line2" in stderr
     assert "line6" in stderr
+
+
+def test_pid_alive_uses_windows_process_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.launcher._is_windows", lambda: True, raising=False)
+    monkeypatch.setattr("app.launcher._windows_pid_alive", lambda pid: pid == 123, raising=False)
+
+    def fail_posix_probe(pid: int, signal_number: int) -> None:
+        del pid, signal_number
+        raise AssertionError("Windows liveness must not use os.kill(pid, 0)")
+
+    monkeypatch.setattr("app.launcher.os.kill", fail_posix_probe)
+
+    assert _pid_alive(123) is True
+
+
+def test_command_stop_windows_requests_supervisor_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path)
+    context.data_dir.mkdir(parents=True)
+    (context.data_dir / "launcher.pid").write_text("4321\n", encoding="utf-8")
+    liveness_checks = 0
+
+    def fake_pid_alive(pid: int) -> bool:
+        nonlocal liveness_checks
+        assert pid == 4321
+        liveness_checks += 1
+        if liveness_checks == 1:
+            return True
+        assert (context.data_dir / "launcher.stop").is_file()
+        return False
+
+    monkeypatch.setattr("app.launcher._is_windows", lambda: True, raising=False)
+    monkeypatch.setattr("app.launcher._pid_alive", fake_pid_alive)
+    monkeypatch.setattr("app.launcher.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        "app.launcher._terminate_pid",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Windows stop must let the supervisor drain its own children")
+        ),
+    )
+
+    assert command_stop(context, Namespace(force=False, grace_seconds=1.0)) == 0
+
+    assert liveness_checks == 2
+    assert not (context.data_dir / "launcher.stop").exists()
+    assert not (context.data_dir / "launcher.pid").exists()
+
+
+def test_command_up_honors_cross_process_stop_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path)
+    stop_calls: list[tuple[bool, float]] = []
+    pg_stop_calls: list[bool] = []
+
+    class RunningChild:
+        def poll(self) -> None:
+            return None
+
+    def fake_start_child(
+        unused_context: LauncherContext,
+        name: str,
+        command: list[str],
+    ) -> RunningChild:
+        del unused_context, command
+        if name == "worker":
+            (context.data_dir / "launcher.stop").write_text("stop\n", encoding="utf-8")
+        return RunningChild()
+
+    monkeypatch.setattr("app.launcher.command_pg_up", lambda *args: 0)
+    monkeypatch.setattr("app.launcher.command_alembic_up", lambda *args: 0)
+    monkeypatch.setattr("app.launcher._is_windows", lambda: True)
+    monkeypatch.setattr("app.launcher._start_child", fake_start_child)
+    monkeypatch.setattr(
+        "app.launcher._stop_children",
+        lambda children, *, force, grace_seconds: stop_calls.append((force, grace_seconds)),
+    )
+
+    def fake_pg_stop(unused_context: LauncherContext, args: Namespace) -> int:
+        del unused_context
+        pg_stop_calls.append(bool(args.force))
+        return 0
+
+    monkeypatch.setattr("app.launcher.command_pg_stop", fake_pg_stop)
+    monkeypatch.setattr(
+        "app.launcher.time.sleep",
+        lambda seconds: (_ for _ in ()).throw(
+            AssertionError("supervisor ignored the cross-process stop request")
+        ),
+    )
+
+    assert command_up(context, Namespace(grace_seconds=7.0)) == 0
+
+    assert stop_calls == [(False, 7.0)]
+    assert pg_stop_calls == [False]
+    assert not (context.data_dir / "launcher.stop").exists()
+    assert not (context.data_dir / "launcher.pid").exists()
+
+
+def test_command_up_honors_stop_request_during_pg_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path)
+    pg_stop_calls: list[bool] = []
+
+    def fake_pg_up(unused_context: LauncherContext, unused_args: Namespace) -> int:
+        del unused_context, unused_args
+        (context.data_dir / "launcher.stop").write_text("stop\n", encoding="ascii")
+        return 0
+
+    def fake_pg_stop(unused_context: LauncherContext, args: Namespace) -> int:
+        del unused_context
+        pg_stop_calls.append(bool(args.force))
+        return 0
+
+    monkeypatch.setattr("app.launcher._is_windows", lambda: True)
+    monkeypatch.setattr("app.launcher.command_pg_up", fake_pg_up)
+    monkeypatch.setattr(
+        "app.launcher.command_alembic_up",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("stop requested during PG startup must cancel later startup phases")
+        ),
+    )
+    monkeypatch.setattr(
+        "app.launcher._start_child",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("stop requested during PG startup must not launch children")
+        ),
+    )
+    monkeypatch.setattr("app.launcher.command_pg_stop", fake_pg_stop)
+
+    assert command_up(context, Namespace(grace_seconds=7.0)) == 0
+
+    assert pg_stop_calls == [False]
+    assert not (context.data_dir / "launcher.stop").exists()
+    assert not (context.data_dir / "launcher.pid").exists()
+
+
+def test_windows_child_stop_uses_cooperative_console_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sent_signals: list[int] = []
+
+    class RunningChild:
+        pid = 4321
+
+        def poll(self) -> None:
+            return None
+
+        def send_signal(self, signal_number: int) -> None:
+            sent_signals.append(signal_number)
+
+        def terminate(self) -> None:
+            raise AssertionError("Windows graceful stop must not call TerminateProcess")
+
+        def wait(self, timeout: float) -> int:
+            assert timeout == 7.0
+            return 0
+
+    monkeypatch.setattr("app.launcher._is_windows", lambda: True)
+    monkeypatch.setattr("app.launcher.signal.CTRL_BREAK_EVENT", 21, raising=False)
+
+    _terminate_process(RunningChild(), "worker", grace_seconds=7.0, force=False)  # type: ignore[arg-type]
+
+    assert sent_signals == [21]
 
 
 def _context(root: Path) -> LauncherContext:

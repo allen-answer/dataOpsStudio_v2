@@ -18,9 +18,10 @@ PostgreSQL, migrations and the admin user. `DATAOPS_ADMIN_PASSWORD`, when suppli
 first-run form or an operator, is passed only to `app.launcher admin create`; it is never written to
 a script or package file. Later starts call the launcher `up` path directly.
 
-Both installers reject a PostgreSQL Unix socket path longer than 107 UTF-8 bytes before building
-the environment. Shorten `DATAOPS_HOME` if this preflight fails. Both stop scripts call the
-launcher's graceful stop path; the Tauri shell adds a bounded wait and platform-specific process
-tree/group kill only if graceful shutdown does not finish.
+The Mint installer rejects a PostgreSQL Unix socket path longer than 107 UTF-8 bytes before
+building the environment. Windows PostgreSQL uses loopback TCP only and does not configure a Unix
+socket directory, so spaces and deep paths in `DATAOPS_HOME` do not enter PostgreSQL's `-k` option.
+Both stop scripts call the launcher's graceful stop path; the Tauri shell adds a bounded wait and
+platform-specific process tree/group kill only if graceful shutdown does not finish.
 
 Build and package instructions live in [`docs/packaging.md`](../docs/packaging.md).
