@@ -50,7 +50,7 @@ jobs:
       # Cache 只优化分析过程；下面的 ruff/mypy 命令无条件完整执行。
       # 主 key 同时固定 Python、工具版本、uv.lock 和 pyproject.toml，避免跨环境陈旧复用。
       - name: Restore mypy and ruff analysis caches
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             .mypy_cache

@@ -121,7 +121,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Restore verified runtime download cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/dataops-win-cache
           key: >-
@@ -186,7 +186,7 @@ jobs:
 
       - name: Restore Tauri CLI cache
         id: tauri-cli-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/cargo-tauri
           key: tauri-cli-${{ runner.os }}-${{ runner.arch }}-${{ env.TAURI_CLI_VERSION }}
@@ -196,7 +196,7 @@ jobs:
         run: cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
 
       - name: Restore verified runtime download cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/dataops-mint-cache
           key: >-
