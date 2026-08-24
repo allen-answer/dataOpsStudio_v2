@@ -14,7 +14,7 @@
     "@antv/g6": "^5.1.1",
     "@guolao/vue-monaco-editor": "^1.6.0",
     "@tanstack/vue-query": "^5.100.14",
-    "lucide-vue-next": "^0.469.0",
+    "lucide-vue-next": "^1.0.0",
     "monaco-editor": "^0.52.2",
     "pinia": "^2.3.1",
     "qrcode": "^1.5.4",
