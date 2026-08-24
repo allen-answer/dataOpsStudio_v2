@@ -714,6 +714,119 @@ def test_worker_runs_compare_run_to_four_bucket_spools() -> None:
     assert result_ref.metadata["diff_profile"] == diff_profile
 
 
+def test_worker_db_compare_fallback_fails_when_source_exceeds_max_rows() -> None:
+    job = _make_job(
+        kind=JobKind.COMPARE_RUN,
+        payload={
+            "run_id": "run-max-rows-fallback",
+            "task_id": "task-1",
+            "source_id": "ds-source",
+            "target_id": "ds-target",
+            "source_ref": {"kind": "table", "schema_name": "app", "table_name": "src"},
+            "target_ref": {"kind": "table", "schema_name": "app", "table_name": "tgt"},
+            "columns": [
+                {"name": "id", "type": "string"},
+                {"name": "name", "type": "string"},
+            ],
+            "compare_rules": {"key_columns": ["id"]},
+            "run_limits": {"max_rows": 2, "recursive_checksum": True},
+            "bucket_result_set_ids": {
+                "only_source": "rs-only-source",
+                "only_target": "rs-only-target",
+                "diff": "rs-diff",
+                "same": "rs-same",
+            },
+        },
+    )
+    backend = _FakeBackend([job])
+    compare_catalog = _FakeCompareRunCatalog()
+    error_writer = _FakeErrorCodeWriter()
+    adapters = [
+        _FakeAdapter(
+            [
+                Row(values=["1", "1", "one"]),
+                Row(values=["2", "2", "two"]),
+                Row(values=["3", "3", "three"]),
+            ]
+        ),
+        _FakeAdapter([Row(values=["1", "1", "one"])]),
+    ]
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size: adapters.pop(0),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=compare_catalog,
+        job_error_code_writer=error_writer,
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.failed == [("job-1", "compare_limit_exceeded")]
+    assert error_writer.error_codes == [("job-1", JobErrorCode.COMPARE_LIMIT_EXCEEDED)]
+    assert compare_catalog.terminal == [{"run_id": "run-max-rows-fallback", "status": "failed"}]
+
+
+def test_worker_db_compare_recursive_fails_when_source_exceeds_max_rows() -> None:
+    job = _make_job(
+        kind=JobKind.COMPARE_RUN,
+        payload={
+            "run_id": "run-max-rows-recursive",
+            "task_id": "task-1",
+            "source_id": "ds-source",
+            "target_id": "ds-target",
+            "source_ref": {"kind": "table", "schema_name": "app", "table_name": "src"},
+            "target_ref": {"kind": "table", "schema_name": "app", "table_name": "tgt"},
+            "columns": [
+                {"name": "id", "type": "integer"},
+                {"name": "name", "type": "string"},
+            ],
+            "compare_rules": {"key_columns": ["id"]},
+            "run_limits": {
+                "max_rows": 2,
+                "recursive_checksum": True,
+                "bisection_threshold": 1,
+            },
+            "bucket_result_set_ids": {
+                "only_source": "rs-only-source",
+                "only_target": "rs-only-target",
+                "diff": "rs-diff",
+                "same": "rs-same",
+            },
+        },
+    )
+    backend = _FakeBackend([job])
+    compare_catalog = _FakeCompareRunCatalog()
+    error_writer = _FakeErrorCodeWriter()
+    adapters = [
+        _FakeAdapter(
+            [
+                Row(values=[1, 1, "one"]),
+                Row(values=[2, 2, "two"]),
+                Row(values=[3, 3, "three"]),
+            ],
+            bounds=(1, 3),
+        ),
+        _FakeAdapter([Row(values=[1, 1, "one"])], bounds=(1, 1)),
+    ]
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size: adapters.pop(0),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=compare_catalog,
+        job_error_code_writer=error_writer,
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.failed == [("job-1", "compare_limit_exceeded")]
+    assert error_writer.error_codes == [("job-1", JobErrorCode.COMPARE_LIMIT_EXCEEDED)]
+    assert compare_catalog.terminal == [{"run_id": "run-max-rows-recursive", "status": "failed"}]
+
+
 @pytest.mark.parametrize("error_type", [QueryCancelledError, QueryTimeoutError])
 def test_compare_db_hash_cancel_or_timeout_propagates_without_client_fallback(
     error_type: type[RuntimeError],
