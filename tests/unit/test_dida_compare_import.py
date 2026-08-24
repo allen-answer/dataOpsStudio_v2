@@ -2,13 +2,567 @@
 
 from __future__ import annotations
 
+import io
 import json
+import urllib.request
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import yaml  # type: ignore[import-untyped]
 
+from app.domain.workflow import WorkflowSpec
 from tools import dida_compare_import
+
+
+class _RecordingApi:
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict[str, object] | None = None,
+    ) -> Any:
+        self.calls.append((method, path, body))
+        return self.responses.pop(0)
+
+
+def _inference_response() -> dict[str, object]:
+    return {
+        "columns": [
+            {"name": "AMOUNT", "type": "decimal"},
+            {"name": "INDICES_OPT", "type": "datetime"},
+        ],
+        "mappings": [
+            {
+                "source_column": "BELT_ORG",
+                "target_column": "BELT_ORG",
+                "source_type": "string",
+            },
+            {
+                "source_column": "INDICES_DT",
+                "target_column": "INDICES_DT",
+                "source_type": "string",
+            },
+            {
+                "source_column": "AMOUNT",
+                "target_column": "AMOUNT",
+                "source_type": "decimal",
+            },
+            {
+                "source_column": "INDICES_OPT",
+                "target_column": "INDICES_OPT",
+                "source_type": "datetime",
+            },
+        ],
+        "compare_rules": {
+            "key_columns": [],
+            "ignore_columns": [],
+            "column_mappings": {
+                "BELT_ORG": "BELT_ORG",
+                "INDICES_DT": "INDICES_DT",
+                "AMOUNT": "AMOUNT",
+                "INDICES_OPT": "INDICES_OPT",
+            },
+            "numeric_scale": 6,
+        },
+    }
+
+
+def _expected_task_columns() -> list[dict[str, object]]:
+    return [
+        {"name": "BELT_ORG", "type": "string", "primary_key": True},
+        {"name": "INDICES_DT", "type": "string", "primary_key": True},
+        {"name": "AMOUNT", "type": "decimal"},
+        {"name": "INDICES_OPT", "type": "datetime"},
+    ]
+
+
+def _inference_with_different_auto_key() -> dict[str, object]:
+    inference = _inference_response()
+    columns = _expected_task_columns()
+    for column in columns:
+        column.pop("primary_key", None)
+    inference["columns"] = columns
+    mappings = list(cast(list[dict[str, object]], inference["mappings"]))
+    mappings.append(
+        {
+            "source_column": "AUTO_ID",
+            "target_column": "AUTO_ID",
+            "source_type": "integer",
+        }
+    )
+    inference["mappings"] = mappings
+    rules = dict(cast(dict[str, object], inference["compare_rules"]))
+    rules["key_columns"] = ["AUTO_ID"]
+    column_mappings = dict(cast(dict[str, str], rules["column_mappings"]))
+    column_mappings["AUTO_ID"] = "AUTO_ID"
+    rules["column_mappings"] = column_mappings
+    inference["compare_rules"] = rules
+    return inference
+
+
+def _created_task_response() -> dict[str, object]:
+    return {
+        "id": "task-1",
+        "source_id": "source-ds",
+        "target_id": "target-ds",
+        "source_ref": {
+            "kind": "sql",
+            "sql": "select * from MART.DWS_SAMPLE_MONTHLY where period_code = ${period}",
+        },
+        "target_ref": {
+            "kind": "sql",
+            "sql": "select * from MART.DWS_SAMPLE_MONTHLY where period_code = ${period}",
+        },
+        "columns": _expected_task_columns(),
+        "compare_rules": {
+            "key_columns": ["BELT_ORG", "INDICES_DT"],
+            "ignore_columns": ["INDICES_OPT"],
+            "column_mappings": {
+                "BELT_ORG": "BELT_ORG",
+                "INDICES_DT": "INDICES_DT",
+                "AMOUNT": "AMOUNT",
+                "INDICES_OPT": "INDICES_OPT",
+            },
+            "numeric_scale": 6,
+            "empty_as_null": True,
+            "trim_strings": True,
+            "schema_policy": "warn",
+        },
+        "run_limits": {"max_rows": 250, "query_timeout_seconds": 1800},
+    }
+
+
+def _apply_table(
+    table: str = "MART.DWS_SAMPLE_MONTHLY",
+    *,
+    status: str = "ok",
+) -> dict[str, object]:
+    return {
+        "table": table,
+        "layer": "dws",
+        "period_predicate": "period_code = ${period}",
+        "key": ["belt_org", "indices_dt"],
+        "status": status,
+    }
+
+
+def _apply_manifest_fixture(*tables: dict[str, object]) -> dict[str, object]:
+    return {
+        "flow_id": "flow-alpha",
+        "tables": list(tables) or [_apply_table()],
+        "skipped": [],
+    }
+
+
+def _notification_spec() -> dict[str, object]:
+    return {
+        "nodes": [{"id": "old", "job_kind": "sleep", "payload": {"duration_seconds": 1}}],
+        "edges": [],
+        "notifications": [
+            {
+                "id": "ops",
+                "channel": "webhook",
+                "url_secret_ref": "ref-synthetic",
+                "events": ["all"],
+                "enabled": True,
+            }
+        ],
+    }
+
+
+def test_apply_creates_runnable_task_and_parallel_workflow() -> None:
+    api = _RecordingApi(
+        [
+            [],
+            [],
+            _inference_response(),
+            _created_task_response(),
+            {"id": "workflow-1"},
+        ]
+    )
+    manifest = _apply_manifest_fixture(
+        _apply_table(),
+        _apply_table("MART.DWS_REVIEW_ONLY", status="needs_review"),
+    )
+
+    report = dida_compare_import.apply_manifest(
+        manifest,
+        project_id="project-1",
+        source_id="source-ds",
+        target_id="target-ds",
+        prefix="monthly",
+        notify_target=None,
+        max_rows=250,
+        api=api,
+    )
+
+    assert report.tasks_created == 1
+    assert report.tasks_updated == 0
+    assert report.needs_review_skipped == 1
+    assert report.workflow_created is True
+    infer_body = api.calls[2][2]
+    assert infer_body == {
+        "source_id": "source-ds",
+        "target_id": "target-ds",
+        "source_table": {"schema_name": "MART", "table_name": "DWS_SAMPLE_MONTHLY"},
+        "target_table": {"schema_name": "MART", "table_name": "DWS_SAMPLE_MONTHLY"},
+    }
+    task_body = api.calls[3][2]
+    assert task_body is not None
+    assert task_body["name"] == "monthly|MART.DWS_SAMPLE_MONTHLY"
+    assert task_body["source_ref"] == {
+        "kind": "sql",
+        "sql": "select * from MART.DWS_SAMPLE_MONTHLY where period_code = ${period}",
+    }
+    assert task_body["columns"] == _expected_task_columns()
+    assert task_body["compare_rules"] == _created_task_response()["compare_rules"]
+    assert task_body["run_limits"] == {"max_rows": 250}
+    workflow_body = api.calls[4][2]
+    assert workflow_body is not None
+    assert workflow_body["name"] == "monthly|flow-alpha"
+    spec = workflow_body["spec"]
+    assert isinstance(spec, dict)
+    assert spec["edges"] == []
+    assert spec["nodes"] == [
+        {
+            "id": "c0",
+            "job_kind": "compare_run",
+            "payload": {
+                "task_id": "task-1",
+                "source_id": "source-ds",
+                "target_id": "target-ds",
+                "source_ref": _created_task_response()["source_ref"],
+                "target_ref": _created_task_response()["target_ref"],
+                "columns": _created_task_response()["columns"],
+                "compare_rules": _created_task_response()["compare_rules"],
+                "run_limits": _created_task_response()["run_limits"],
+            },
+            "timeout_seconds": 1800,
+        }
+    ]
+
+
+def test_apply_updates_existing_task_and_workflow_without_duplicates() -> None:
+    existing_spec = {
+        "nodes": [{"id": "old", "job_kind": "sleep", "payload": {"duration_seconds": 1}}],
+        "edges": [],
+        "schedule": {"cron": "0 3 * * *", "enabled": True},
+        "variables": {"period": "202601"},
+        "notifications": [
+            {
+                "id": "ops",
+                "channel": "webhook",
+                "url_secret_ref": "ref-synthetic",
+                "events": ["all"],
+                "enabled": True,
+            }
+        ],
+    }
+    api = _RecordingApi(
+        [
+            [{"id": "task-1", "name": "monthly|MART.DWS_SAMPLE_MONTHLY"}],
+            [{"id": "workflow-1", "name": "monthly|flow-alpha", "enabled": False}],
+            _inference_response(),
+            _created_task_response(),
+            {"id": "workflow-1", "name": "monthly|flow-alpha", "spec": existing_spec},
+            {"id": "workflow-1"},
+        ]
+    )
+    manifest = _apply_manifest_fixture()
+
+    report = dida_compare_import.apply_manifest(
+        manifest,
+        project_id="project-1",
+        source_id="source-ds",
+        target_id="target-ds",
+        prefix="monthly",
+        notify_target=None,
+        max_rows=250,
+        api=api,
+    )
+
+    assert report.tasks_created == 0
+    assert report.tasks_updated == 1
+    assert report.workflow_created is False
+    assert report.workflow_updated is True
+    assert [method for method, _path, _body in api.calls] == [
+        "GET",
+        "GET",
+        "POST",
+        "PATCH",
+        "GET",
+        "PUT",
+    ]
+    task_patch = api.calls[3][2]
+    assert task_patch is not None
+    assert "project_id" not in task_patch
+    assert task_patch["name"] == "monthly|MART.DWS_SAMPLE_MONTHLY"
+    workflow_put = api.calls[5][2]
+    assert workflow_put is not None
+    assert "enabled" not in workflow_put
+    updated_spec = workflow_put["spec"]
+    assert isinstance(updated_spec, dict)
+    assert updated_spec["schedule"] == existing_spec["schedule"]
+    assert "variables" not in updated_spec
+    assert "notifications" not in updated_spec
+    assert updated_spec["nodes"][0]["id"] == "c0"
+
+
+def test_apply_validates_all_inference_results_before_writing_tasks() -> None:
+    invalid_inference = _inference_response()
+    invalid_inference["columns"] = [{"name": "OTHER_KEY", "type": "string"}]
+    invalid_inference["mappings"] = []
+    api = _RecordingApi([[], [], _inference_response(), invalid_inference])
+    manifest = _apply_manifest_fixture(
+        _apply_table("MART.DWS_SAMPLE_ONE"),
+        _apply_table("MART.DWS_SAMPLE_TWO"),
+    )
+
+    with pytest.raises(ValueError, match="missing inferred key column"):
+        dida_compare_import.apply_manifest(
+            manifest,
+            project_id="project-1",
+            source_id="source-ds",
+            target_id="target-ds",
+            prefix="monthly",
+            notify_target=None,
+            max_rows=250,
+            api=api,
+        )
+
+    assert [method for method, _path, _body in api.calls] == ["GET", "GET", "POST", "POST"]
+
+
+def test_apply_keeps_inferred_auto_key_when_manifest_selects_different_keys() -> None:
+    task_response = _created_task_response()
+    task_response["columns"] = [
+        *_expected_task_columns(),
+        {"name": "AUTO_ID", "type": "integer"},
+    ]
+    api = _RecordingApi(
+        [[], [], _inference_with_different_auto_key(), task_response, {"id": "workflow-1"}]
+    )
+    manifest = _apply_manifest_fixture()
+
+    dida_compare_import.apply_manifest(
+        manifest,
+        project_id="project-1",
+        source_id="source-ds",
+        target_id="target-ds",
+        prefix="monthly",
+        notify_target=None,
+        max_rows=250,
+        api=api,
+    )
+
+    task_body = api.calls[3][2]
+    assert task_body is not None
+    columns = task_body["columns"]
+    assert isinstance(columns, list)
+    assert [column["name"] for column in columns] == [
+        "BELT_ORG",
+        "INDICES_DT",
+        "AMOUNT",
+        "INDICES_OPT",
+        "AUTO_ID",
+    ]
+
+
+def test_apply_groups_diff_conditions_into_branch_notify_routes() -> None:
+    existing_spec = _notification_spec()
+    api = _RecordingApi(
+        [
+            [],
+            [{"id": "workflow-1", "name": "monthly|flow-alpha"}],
+            {"id": "workflow-1", "name": "monthly|flow-alpha", "spec": existing_spec},
+            _inference_response(),
+            _created_task_response(),
+            {"id": "workflow-1"},
+        ]
+    )
+    manifest = _apply_manifest_fixture()
+
+    report = dida_compare_import.apply_manifest(
+        manifest,
+        project_id="project-1",
+        source_id="source-ds",
+        target_id="target-ds",
+        prefix="monthly",
+        notify_target="ops",
+        max_rows=250,
+        api=api,
+    )
+
+    assert report.workflow_updated is True
+    workflow_put = api.calls[-1][2]
+    assert workflow_put is not None
+    spec = workflow_put["spec"]
+    assert isinstance(spec, dict)
+    assert "notifications" not in spec
+    assert [node["job_kind"] for node in spec["nodes"]] == [
+        "compare_run",
+        "branch",
+        "notify",
+        "sleep",
+    ]
+    assert spec["edges"] == [
+        {"source": "c0", "target": "branch"},
+        {
+            "source": "branch",
+            "target": "notify0",
+            "when": (
+                "${nodes.c0.diff_count}>0||${nodes.c0.only_source_count}>0"
+                "||${nodes.c0.only_target_count}>0"
+            ),
+        },
+        {"source": "branch", "target": "no_diff", "is_default": True},
+    ]
+    assert (
+        WorkflowSpec.model_validate({**spec, "notifications": existing_spec["notifications"]})
+        .nodes[-1]
+        .id
+        == "no_diff"
+    )
+
+
+def test_apply_rejects_new_workflow_notify_target_before_task_writes() -> None:
+    api = _RecordingApi([[], []])
+    manifest = _apply_manifest_fixture()
+
+    with pytest.raises(ValueError, match="existing workflow notification target"):
+        dida_compare_import.apply_manifest(
+            manifest,
+            project_id="project-1",
+            source_id="source-ds",
+            target_id="target-ds",
+            prefix="monthly",
+            notify_target="ops",
+            max_rows=250,
+            api=api,
+        )
+
+    assert [method for method, _path, _body in api.calls] == ["GET", "GET"]
+
+
+def test_apply_rejects_45_table_notify_workflow_before_task_writes() -> None:
+    existing_spec = _notification_spec()
+    api = _RecordingApi(
+        [
+            [],
+            [{"id": "workflow-1", "name": "monthly|flow-alpha"}],
+            {"id": "workflow-1", "name": "monthly|flow-alpha", "spec": existing_spec},
+        ]
+    )
+    manifest = _apply_manifest_fixture(
+        *[_apply_table(f"MART.DWS_SAMPLE_{index:02d}") for index in range(45)]
+    )
+
+    with pytest.raises(ValueError, match="exceeds MAX_WORKFLOW_NODES"):
+        dida_compare_import.apply_manifest(
+            manifest,
+            project_id="project-1",
+            source_id="source-ds",
+            target_id="target-ds",
+            prefix="monthly",
+            notify_target="ops",
+            max_rows=250,
+            api=api,
+        )
+
+    assert api.calls == []
+
+
+def test_apply_rejects_more_than_50_parallel_tables_before_task_writes() -> None:
+    api = _RecordingApi([[], []])
+    manifest = _apply_manifest_fixture(
+        *[_apply_table(f"MART.DWS_SAMPLE_{index:02d}") for index in range(51)]
+    )
+
+    with pytest.raises(ValueError, match="exceeds MAX_WORKFLOW_NODES"):
+        dida_compare_import.apply_manifest(
+            manifest,
+            project_id="project-1",
+            source_id="source-ds",
+            target_id="target-ds",
+            prefix="monthly",
+            notify_target=None,
+            max_rows=250,
+            api=api,
+        )
+
+    assert api.calls == []
+
+
+def test_apply_cli_uses_environment_api_credentials_without_echoing_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        yaml.safe_dump(_apply_manifest_fixture(), sort_keys=False),
+        encoding="utf-8",
+    )
+    responses = [
+        [],
+        [],
+        _inference_response(),
+        _created_task_response(),
+        {"id": "workflow-1"},
+    ]
+    requests: list[urllib.request.Request] = []
+
+    def fake_urlopen(request: urllib.request.Request, timeout: int) -> io.BytesIO:
+        assert timeout == 30
+        requests.append(request)
+        return io.BytesIO(json.dumps(responses.pop(0)).encode("utf-8"))
+
+    credential_placeholder = "<DATAOPS_API_TOKEN>"
+    monkeypatch.setenv("DATAOPS_API_URL", "https://api.invalid")
+    monkeypatch.setenv("DATAOPS_API_TOKEN", credential_placeholder)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    assert (
+        dida_compare_import.main(
+            [
+                "apply",
+                "--manifest",
+                str(manifest_path),
+                "--project",
+                "project-1",
+                "--source-ds",
+                "source-ds",
+                "--target-ds",
+                "target-ds",
+                "--prefix",
+                "monthly",
+                "--max-rows",
+                "250",
+            ]
+        )
+        == 0
+    )
+
+    assert requests[0].full_url.startswith("https://api.invalid/api/compare/tasks?")
+    assert all(
+        request.get_header("Authorization") == f"Bearer {credential_placeholder}"
+        for request in requests
+    )
+    stdout = capsys.readouterr().out
+    assert json.loads(stdout) == {
+        "needs_review_skipped": 0,
+        "tasks_created": 1,
+        "tasks_updated": 0,
+        "workflow_created": True,
+        "workflow_updated": False,
+    }
+    assert credential_placeholder not in stdout
 
 
 def _make_flow_dir(
