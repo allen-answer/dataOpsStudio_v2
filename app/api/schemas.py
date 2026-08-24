@@ -329,6 +329,7 @@ class CompareRulesPayload(BaseModel):
     ignore_columns: list[str] = Field(default_factory=list)
     column_mappings: dict[str, str] = Field(default_factory=dict)
     numeric_tolerance: float | None = None
+    numeric_scale: int = Field(default=6, ge=0, le=18)
     trim_strings: bool = False
     case_insensitive: bool = False
     empty_as_null: bool = False
