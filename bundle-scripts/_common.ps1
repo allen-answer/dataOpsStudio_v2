@@ -43,10 +43,18 @@ $env:DATAOPS_FORM = 'portable'
 $env:PATH = "$PgBin;$env:PATH"
 
 function Invoke-Launcher {
-    & $VenvPy -m updater run --bundle-root $BundleRoot --state-root $env:DATAOPS_STATE_ROOT --python $VenvPy --home $env:DATAOPS_HOME --pg-bin-dir $PgBin --uv $UvExe -- @args
-    if ($LASTEXITCODE -ne 0) {
+    $launcherExit = 0
+    Push-Location -LiteralPath $BundleRoot
+    try {
+        & $VenvPy -m updater run --bundle-root $BundleRoot --state-root $env:DATAOPS_STATE_ROOT --python $VenvPy --home $env:DATAOPS_HOME --pg-bin-dir $PgBin --uv $UvExe -- @args
+        $launcherExit = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+    if ($launcherExit -ne 0) {
         # Never echo launcher arguments here: first-run admin creation carries
         # a password argument and this exception is redirected to gui-start.log.
-        throw "launcher failed (exit $LASTEXITCODE)"
+        throw "launcher failed (exit $launcherExit)"
     }
 }

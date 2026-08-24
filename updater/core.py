@@ -147,7 +147,7 @@ def _atomic_write(path: Path, value: object) -> None:
 
 
 @contextmanager
-def _file_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
+def _file_lock(path: Path) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+b")
     if handle.seek(0, os.SEEK_END) == 0:
@@ -159,12 +159,10 @@ def _file_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
     try:
         if os.name == "nt":
             module = importlib.import_module("msvcrt")
-            mode = module.LK_NBLCK if exclusive else module.LK_NBRLCK
-            module.locking(handle.fileno(), mode, 1)
+            module.locking(handle.fileno(), module.LK_NBLCK, 1)
         else:
             module = importlib.import_module("fcntl")
-            mode = module.LOCK_EX if exclusive else module.LOCK_SH
-            module.flock(handle.fileno(), mode | module.LOCK_NB)
+            module.flock(handle.fileno(), module.LOCK_EX | module.LOCK_NB)
     except OSError as exc:
         handle.close()
         raise ValueError("another update transaction is active") from exc
@@ -420,7 +418,7 @@ class PayloadUpdater:
         return self._selection(self._current_record())
 
     def resolve_active(self) -> RuntimeSelection:
-        with _file_lock(self.transaction_lock_path, exclusive=False):
+        with _file_lock(self.transaction_lock_path):
             return self._resolve_active_unlocked()
 
     def _launcher_environment(
@@ -451,7 +449,7 @@ class PayloadUpdater:
     def launcher_environment(self, base: dict[str, str] | None = None) -> dict[str, str]:
         """Return one coherent snapshot of the selected app/frontend identity."""
 
-        with _file_lock(self.transaction_lock_path, exclusive=False):
+        with _file_lock(self.transaction_lock_path):
             selected = self._resolve_active_unlocked()
             return self._launcher_environment(selected, base)
 
@@ -466,33 +464,63 @@ class PayloadUpdater:
     ) -> int:
         """Run app.launcher from the selected payload without shell interpolation."""
 
-        with _file_lock(self.runtime_lock_path, exclusive=False):
-            with _file_lock(self.transaction_lock_path, exclusive=False):
-                selected = self._resolve_active_unlocked()
-                environment = self._launcher_environment(selected, None)
-            command = [
-                str(python),
-                "-m",
-                "app.launcher",
-                "--root",
-                str(home),
-                "--pg-bin-dir",
-                str(pg_bin_dir),
-                "--uv",
-                str(uv),
-                *arguments,
-            ]
-            result = subprocess.run(
-                command,
-                cwd=selected.root,
-                env=environment,
-                check=False,
+        concurrent_runtime_command = bool(arguments) and arguments[0] in {
+            "pg-status",
+            "status",
+            "stop",
+        }
+        if concurrent_runtime_command:
+            return self._run_launcher_unlocked(
+                python=python,
+                home=home,
+                pg_bin_dir=pg_bin_dir,
+                uv=uv,
+                arguments=arguments,
             )
-            return result.returncode
+        with _file_lock(self.runtime_lock_path):
+            return self._run_launcher_unlocked(
+                python=python,
+                home=home,
+                pg_bin_dir=pg_bin_dir,
+                uv=uv,
+                arguments=arguments,
+            )
+
+    def _run_launcher_unlocked(
+        self,
+        *,
+        python: Path,
+        home: Path,
+        pg_bin_dir: Path,
+        uv: Path,
+        arguments: list[str],
+    ) -> int:
+        with _file_lock(self.transaction_lock_path):
+            selected = self._resolve_active_unlocked()
+            environment = self._launcher_environment(selected, None)
+        command = [
+            str(python),
+            "-m",
+            "app.launcher",
+            "--root",
+            str(home),
+            "--pg-bin-dir",
+            str(pg_bin_dir),
+            "--uv",
+            str(uv),
+            *arguments,
+        ]
+        result = subprocess.run(
+            command,
+            cwd=selected.root,
+            env=environment,
+            check=False,
+        )
+        return result.returncode
 
     def install(self, *, package: Path, trust_store: Path) -> UpdateReceipt:
-        with _file_lock(self.runtime_lock_path, exclusive=True):
-            with _file_lock(self.transaction_lock_path, exclusive=True):
+        with _file_lock(self.runtime_lock_path):
+            with _file_lock(self.transaction_lock_path):
                 return self._install_unlocked(package=package, trust_store=trust_store)
 
     def _install_unlocked(self, *, package: Path, trust_store: Path) -> UpdateReceipt:
@@ -585,10 +613,10 @@ class PayloadUpdater:
         """Commit a healthy activation or automatically restore its predecessor."""
 
         if success:
-            with _file_lock(self.transaction_lock_path, exclusive=True):
+            with _file_lock(self.transaction_lock_path):
                 return self._complete_unlocked(success=True)
-        with _file_lock(self.runtime_lock_path, exclusive=True):
-            with _file_lock(self.transaction_lock_path, exclusive=True):
+        with _file_lock(self.runtime_lock_path):
+            with _file_lock(self.transaction_lock_path):
                 return self._complete_unlocked(success=False)
 
     def _complete_unlocked(self, *, success: bool) -> RuntimeSelection:
@@ -629,8 +657,8 @@ class PayloadUpdater:
     def rollback(self) -> RuntimeSelection:
         """Consume the single retained rollback pointer after a committed update."""
 
-        with _file_lock(self.runtime_lock_path, exclusive=True):
-            with _file_lock(self.transaction_lock_path, exclusive=True):
+        with _file_lock(self.runtime_lock_path):
+            with _file_lock(self.transaction_lock_path):
                 return self._rollback_unlocked()
 
     def _rollback_unlocked(self) -> RuntimeSelection:

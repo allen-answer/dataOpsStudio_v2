@@ -37,6 +37,17 @@ def test_launcher_invoked_via_call_operator_without_batch_quotes(tmp_path: Path)
         assert "setlocal" not in text
 
 
+def test_launcher_always_imports_stable_updater_from_bundle_root(tmp_path: Path) -> None:
+    build.write_scripts(tmp_path, _identity())
+
+    common = (tmp_path / "_common.ps1").read_text(encoding="ascii")
+    assert "Push-Location -LiteralPath $BundleRoot" in common
+    assert "Pop-Location" in common
+    assert common.index("Push-Location -LiteralPath $BundleRoot") < common.index(
+        "& $VenvPy -m updater run"
+    )
+
+
 def test_common_script_loads_validated_packaged_build_identity(tmp_path: Path) -> None:
     build.write_scripts(tmp_path, _identity())
 

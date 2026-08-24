@@ -459,7 +459,7 @@ def test_running_launcher_holds_update_transaction_and_one_selection(
             home=tmp_path / "home",
             pg_bin_dir=tmp_path / "pgsql/bin",
             uv=tmp_path / "uv",
-            arguments=["status"],
+            arguments=["up"],
         )
         == 0
     )
@@ -502,6 +502,53 @@ def test_healthy_completion_is_allowed_while_selected_launcher_runs(
     )
     assert not updater.pending_path.exists()
     assert updater.rollback_path.exists()
+
+
+def test_stop_runner_can_join_active_runtime_without_unlocking_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    updater, package, trust_store, _bundle, _compatibility_value = _signed_update(tmp_path)
+    commands: list[str] = []
+
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, env, check
+        verb = command[-1]
+        commands.append(verb)
+        if verb == "up":
+            assert (
+                updater.run_launcher(
+                    python=Path(sys.executable),
+                    home=tmp_path / "home",
+                    pg_bin_dir=tmp_path / "pgsql/bin",
+                    uv=tmp_path / "uv",
+                    arguments=["stop"],
+                )
+                == 0
+            )
+            with pytest.raises(ValueError, match="another update transaction"):
+                updater.install(package=package, trust_store=trust_store)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("updater.core.subprocess.run", fake_run)
+
+    assert (
+        updater.run_launcher(
+            python=Path(sys.executable),
+            home=tmp_path / "home",
+            pg_bin_dir=tmp_path / "pgsql/bin",
+            uv=tmp_path / "uv",
+            arguments=["up"],
+        )
+        == 0
+    )
+    assert commands == ["up", "stop"]
 
 
 @pytest.mark.parametrize(
