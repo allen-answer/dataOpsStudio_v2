@@ -323,7 +323,6 @@ def command_admin_create(context: LauncherContext, args: argparse.Namespace) -> 
 def command_up(context: LauncherContext, args: argparse.Namespace) -> int:
     stop_request = context.data_dir / "launcher.stop" if _is_windows() else None
     if stop_request is not None:
-        _unlink_if_exists(stop_request)
         _write_pid(context.data_dir / "launcher.pid", os.getpid())
     try:
         command_pg_up(context, args)
@@ -339,8 +338,8 @@ def command_up(context: LauncherContext, args: argparse.Namespace) -> int:
         raise
     if stop_request is None:
         _write_pid(context.data_dir / "launcher.pid", os.getpid())
-    api = _start_child(context, "api", [context.uv, "run", "python", "-m", "app.main"])
-    worker = _start_child(context, "worker", [context.uv, "run", "python", "-m", "app.worker"])
+    api = _start_child(context, "api", [sys.executable, "-m", "app.main"])
+    worker = _start_child(context, "worker", [sys.executable, "-m", "app.worker"])
     children = {"api": api, "worker": worker}
     stop_requested = False
 

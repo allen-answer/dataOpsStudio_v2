@@ -3,10 +3,13 @@ from __future__ import annotations
 import os
 import socket
 import stat
+import subprocess
+import sys
+import time
 from argparse import Namespace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -327,6 +330,7 @@ def test_command_up_honors_cross_process_stop_request(
     context = _context(tmp_path)
     stop_calls: list[tuple[bool, float]] = []
     pg_stop_calls: list[bool] = []
+    child_commands: dict[str, list[str]] = {}
 
     class RunningChild:
         def poll(self) -> None:
@@ -337,7 +341,8 @@ def test_command_up_honors_cross_process_stop_request(
         name: str,
         command: list[str],
     ) -> RunningChild:
-        del unused_context, command
+        del unused_context
+        child_commands[name] = command
         if name == "worker":
             (context.data_dir / "launcher.stop").write_text("stop\n", encoding="utf-8")
         return RunningChild()
@@ -368,6 +373,10 @@ def test_command_up_honors_cross_process_stop_request(
 
     assert stop_calls == [(False, 7.0)]
     assert pg_stop_calls == [False]
+    assert child_commands == {
+        "api": [sys.executable, "-m", "app.main"],
+        "worker": [sys.executable, "-m", "app.worker"],
+    }
     assert not (context.data_dir / "launcher.stop").exists()
     assert not (context.data_dir / "launcher.pid").exists()
 
@@ -412,6 +421,38 @@ def test_command_up_honors_stop_request_during_pg_startup(
     assert not (context.data_dir / "launcher.pid").exists()
 
 
+def test_command_up_preserves_stop_request_that_arrived_before_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path)
+    context.data_dir.mkdir(parents=True)
+    (context.data_dir / "launcher.stop").write_text("stop\n", encoding="ascii")
+    pg_stop_calls: list[bool] = []
+
+    monkeypatch.setattr("app.launcher._is_windows", lambda: True)
+    monkeypatch.setattr("app.launcher.command_pg_up", lambda *args: 0)
+    monkeypatch.setattr(
+        "app.launcher.command_alembic_up",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("an existing stop request must cancel later startup phases")
+        ),
+    )
+
+    def fake_pg_stop(unused_context: LauncherContext, args: Namespace) -> int:
+        del unused_context
+        pg_stop_calls.append(bool(args.force))
+        return 0
+
+    monkeypatch.setattr("app.launcher.command_pg_stop", fake_pg_stop)
+
+    assert command_up(context, Namespace(grace_seconds=7.0)) == 0
+
+    assert pg_stop_calls == [False]
+    assert not (context.data_dir / "launcher.stop").exists()
+    assert not (context.data_dir / "launcher.pid").exists()
+
+
 def test_windows_child_stop_uses_cooperative_console_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -439,6 +480,50 @@ def test_windows_child_stop_uses_cooperative_console_signal(
     _terminate_process(RunningChild(), "worker", grace_seconds=7.0, force=False)  # type: ignore[arg-type]
 
     assert sent_signals == [21]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows console process groups")
+def test_windows_child_stop_waits_for_real_python_process() -> None:
+    child_code = """
+import signal
+import sys
+import time
+
+def stop(signum, frame):
+    del signum, frame
+    time.sleep(0.5)
+    raise SystemExit(0)
+
+signal.signal(signal.SIGBREAK, stop)
+print('ready', flush=True)
+while True:
+    time.sleep(0.1)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", child_code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        creationflags=cast(Any, subprocess).CREATE_NEW_PROCESS_GROUP,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "ready"
+        started = time.monotonic()
+
+        _terminate_process(
+            cast(subprocess.Popen[bytes], process),
+            "worker",
+            grace_seconds=5.0,
+            force=False,
+        )
+
+        assert time.monotonic() - started >= 0.4
+        assert process.returncode == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
 
 def _context(root: Path) -> LauncherContext:
