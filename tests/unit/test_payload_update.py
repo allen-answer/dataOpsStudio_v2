@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 import sys
 import zipfile
+from hashlib import sha256
 from pathlib import Path
 from typing import cast
 
@@ -15,10 +17,23 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: TID251
     Ed25519PrivateKey,
 )
 
+import updater.core as updater_core
 from tools.package.build_identity import BuildIdentity
 from tools.package.build_payload_update import finalize_payload_update, prepare_payload_update
 from tools.package.update_compatibility import build_update_compatibility
 from updater import PayloadUpdater
+
+
+def _canonical_json(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
 
 
 def _write_compatibility_sources(repo: Path) -> None:
@@ -61,6 +76,9 @@ def _compatibility(repo: Path, requirements: Path) -> dict[str, object]:
 
 def _signed_update(
     tmp_path: Path,
+    *,
+    version: str = "2.0.2",
+    commit: str = "d" * 40,
 ) -> tuple[PayloadUpdater, Path, Path, Path, dict[str, object]]:
     repo = tmp_path / "repo"
     _write_compatibility_sources(repo)
@@ -95,9 +113,9 @@ def _signed_update(
         requirements=requirements,
         base_compatibility=compatibility,
         identity=BuildIdentity(
-            version="2.0.2",
-            commit="d" * 40,
-            image_version="2.0.2-win10-x64-payload",
+            version=version,
+            commit=commit,
+            image_version=f"{version}-win10-x64-payload",
         ),
         work_dir=work,
     )
@@ -131,6 +149,61 @@ def _signed_update(
     )
     updater = PayloadUpdater(bundle_root=bundle, state_root=tmp_path / "state")
     return updater, package, trust_store, bundle, compatibility
+
+
+def _add_signed_payload_path(
+    package: Path,
+    trust_store: Path,
+    *,
+    path: str,
+    content: bytes,
+) -> None:
+    with zipfile.ZipFile(package) as source:
+        manifest = json.loads(source.read("manifest.json"))
+        payload_entries = {
+            item.filename: source.read(item.filename)
+            for item in source.infolist()
+            if item.filename.startswith("payload/") and not item.is_dir()
+        }
+    manifest["files"].append(
+        {
+            "path": path,
+            "sha256": sha256(content).hexdigest(),
+            "size": len(content),
+        }
+    )
+    manifest_bytes = _canonical_json(manifest)
+    private_key = Ed25519PrivateKey.generate()
+    signature = {
+        "schema_version": 1,
+        "algorithm": "ed25519",
+        "key_id": "test-release",
+        "signature": base64.b64encode(private_key.sign(manifest_bytes)).decode("ascii"),
+    }
+    replacement = package.with_suffix(".replacement")
+    with zipfile.ZipFile(replacement, "w", zipfile.ZIP_DEFLATED) as target:
+        target.writestr("manifest.json", manifest_bytes)
+        target.writestr("signature.json", _canonical_json(signature))
+        for name, data in payload_entries.items():
+            target.writestr(name, data)
+        target.writestr(f"payload/{path}", content)
+    os.replace(replacement, package)
+    public_bytes = private_key.public_key().public_bytes_raw()
+    trust_store.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "keys": [
+                    {
+                        "key_id": "test-release",
+                        "algorithm": "ed25519",
+                        "public_key": base64.b64encode(public_bytes).decode("ascii"),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_update_compatibility_binds_runtime_and_non_payload_sources(tmp_path: Path) -> None:
@@ -210,6 +283,32 @@ def test_bad_signature_and_unmanifested_path_never_switch_active_payload(tmp_pat
     assert not (tmp_path / "extra/outside.txt").exists()
 
 
+def test_signed_payload_rejects_windows_drive_path_before_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    updater, package, trust_store, bundle, _compatibility_value = _signed_update(tmp_path)
+    _add_signed_payload_path(
+        package,
+        trust_store,
+        path="app/Z:/escape.txt",
+        content=b"must stay in staging",
+    )
+    original_mkdir = Path.mkdir
+
+    def guarded_mkdir(path: Path, *args: object, **kwargs: object) -> None:
+        if path.drive.casefold() == "z:":
+            raise AssertionError("payload escaped the staging filesystem boundary")
+        original_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "mkdir", guarded_mkdir)
+
+    with pytest.raises(ValueError, match="unsafe update path"):
+        updater.install(package=package, trust_store=trust_store)
+
+    assert updater.resolve_active().root == bundle.resolve()
+
+
 def test_successful_health_completion_keeps_one_manual_rollback(tmp_path: Path) -> None:
     updater, package, trust_store, bundle, _compatibility_value = _signed_update(tmp_path)
     receipt = updater.install(package=package, trust_store=trust_store)
@@ -225,6 +324,75 @@ def test_successful_health_completion_keeps_one_manual_rollback(tmp_path: Path) 
     assert restored.root == bundle.resolve()
     assert restored.release is None
     assert not updater.rollback_path.exists()
+
+
+@pytest.mark.parametrize("failed_pointer", ["pending", "current"])
+def test_interrupted_pointer_write_leaves_release_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_pointer: str,
+) -> None:
+    updater, package, trust_store, bundle, _compatibility_value = _signed_update(tmp_path)
+    original_atomic_write = updater_core._atomic_write
+    failed_path = updater.pending_path if failed_pointer == "pending" else updater.current_path
+
+    def fail_once(path: Path, value: object) -> None:
+        if path == failed_path:
+            raise OSError(f"simulated {failed_pointer} pointer write failure")
+        original_atomic_write(path, value)
+
+    monkeypatch.setattr(updater_core, "_atomic_write", fail_once)
+
+    with pytest.raises(OSError, match=f"simulated {failed_pointer}"):
+        updater.install(package=package, trust_store=trust_store)
+
+    assert updater.resolve_active().root == bundle.resolve()
+    assert not updater.pending_path.exists()
+    assert not list(updater.versions_root.glob("*"))
+
+    monkeypatch.setattr(updater_core, "_atomic_write", original_atomic_write)
+    receipt = updater.install(package=package, trust_store=trust_store)
+    assert receipt.release.commit == "d" * 40
+
+
+@pytest.mark.parametrize("pending_survived", [False, True])
+def test_restart_recovers_unreferenced_signed_target_after_power_loss(
+    tmp_path: Path,
+    pending_survived: bool,
+) -> None:
+    updater, package, trust_store, _bundle, _compatibility_value = _signed_update(tmp_path)
+    updater.install(package=package, trust_store=trust_store)
+    stranded_targets = list(updater.versions_root.glob("*"))
+    assert len(stranded_targets) == 1
+    updater.current_path.unlink()
+    if not pending_survived:
+        updater.pending_path.unlink()
+
+    receipt = updater.install(package=package, trust_store=trust_store)
+
+    assert receipt.release.commit == "d" * 40
+    assert updater.resolve_active().release == receipt.release
+
+
+def test_pending_recovery_preserves_stranded_release_for_different_signed_package(
+    tmp_path: Path,
+) -> None:
+    updater, package_a, trust_a, _bundle, _compatibility_value = _signed_update(tmp_path / "a")
+    updater.install(package=package_a, trust_store=trust_a)
+    updater.current_path.unlink()
+    pending_before = updater.pending_path.read_bytes()
+    targets_before = {path.name for path in updater.versions_root.iterdir()}
+    _other_updater, package_b, trust_b, _other_bundle, _other_compatibility = _signed_update(
+        tmp_path / "b",
+        version="2.0.3",
+        commit="e" * 40,
+    )
+
+    with pytest.raises(ValueError, match="different signed release"):
+        updater.install(package=package_b, trust_store=trust_b)
+
+    assert updater.pending_path.read_bytes() == pending_before
+    assert {path.name for path in updater.versions_root.iterdir()} == targets_before
 
 
 def test_launcher_environment_uses_selected_payload_identity_and_paths(tmp_path: Path) -> None:
@@ -262,6 +430,78 @@ def test_launcher_runner_executes_the_selected_signed_app(
 
     assert return_code == 0
     assert marker.read_text(encoding="ascii") == receipt.release.commit
+
+
+def test_running_launcher_holds_update_transaction_and_one_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    updater, package, trust_store, bundle, _compatibility_value = _signed_update(tmp_path)
+    observed: dict[str, object] = {}
+
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        observed.update(command=command, cwd=cwd, env=env, check=check)
+        with pytest.raises(ValueError, match="another update transaction"):
+            updater.install(package=package, trust_store=trust_store)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("updater.core.subprocess.run", fake_run)
+
+    assert (
+        updater.run_launcher(
+            python=Path(sys.executable),
+            home=tmp_path / "home",
+            pg_bin_dir=tmp_path / "pgsql/bin",
+            uv=tmp_path / "uv",
+            arguments=["status"],
+        )
+        == 0
+    )
+
+    assert observed["cwd"] == bundle.resolve()
+    environment = cast(dict[str, str], observed["env"])
+    assert environment["PYTHONPATH"].split(os.pathsep)[0] == str(observed["cwd"])
+
+
+def test_healthy_completion_is_allowed_while_selected_launcher_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    updater, package, trust_store, _bundle, _compatibility_value = _signed_update(tmp_path)
+    receipt = updater.install(package=package, trust_store=trust_store)
+
+    def fake_run(
+        command: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, env, check
+        completed = updater.complete(success=True)
+        assert completed.release == receipt.release
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("updater.core.subprocess.run", fake_run)
+
+    assert (
+        updater.run_launcher(
+            python=Path(sys.executable),
+            home=tmp_path / "home",
+            pg_bin_dir=tmp_path / "pgsql/bin",
+            uv=tmp_path / "uv",
+            arguments=["up"],
+        )
+        == 0
+    )
+    assert not updater.pending_path.exists()
+    assert updater.rollback_path.exists()
 
 
 @pytest.mark.parametrize(

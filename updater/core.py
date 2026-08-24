@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -11,9 +12,11 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 from app.infrastructure.license.signatures import verify_ed25519_signature
 
@@ -26,6 +29,12 @@ _MAX_TRUST_STORE_BYTES = 1024 * 1024
 _MAX_FILES = 20_000
 _MAX_PAYLOAD_BYTES = 128 * 1024 * 1024
 _RUNTIME_SUPPORT_FILES = ("alembic.ini", "pyproject.toml", "uv.lock", ".python-version")
+_WINDOWS_INVALID_PATH_CHARS = frozenset('<>:"|?*')
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{number}" for number in range(1, 10)}
+    | {f"lpt{number}" for number in range(1, 10)}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +146,49 @@ def _atomic_write(path: Path, value: object) -> None:
         temporary.unlink(missing_ok=True)
 
 
+@contextmanager
+def _file_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    if handle.seek(0, os.SEEK_END) == 0:
+        handle.write(b"\0")
+        handle.flush()
+        os.fsync(handle.fileno())
+    handle.seek(0)
+    module: Any
+    try:
+        if os.name == "nt":
+            module = importlib.import_module("msvcrt")
+            mode = module.LK_NBLCK if exclusive else module.LK_NBRLCK
+            module.locking(handle.fileno(), mode, 1)
+        else:
+            module = importlib.import_module("fcntl")
+            mode = module.LOCK_EX if exclusive else module.LOCK_SH
+            module.flock(handle.fileno(), mode | module.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise ValueError("another update transaction is active") from exc
+    try:
+        yield
+    finally:
+        handle.seek(0)
+        if os.name == "nt":
+            module.locking(handle.fileno(), module.LK_UNLCK, 1)
+        else:
+            module.flock(handle.fileno(), module.LOCK_UN)
+        handle.close()
+
+
+def _unsafe_windows_component(part: str) -> bool:
+    normalized = part.rstrip(" .")
+    stem = normalized.split(".", 1)[0].casefold()
+    return (
+        normalized != part
+        or any(character in _WINDOWS_INVALID_PATH_CHARS for character in part)
+        or stem in _WINDOWS_RESERVED_NAMES
+    )
+
+
 class PayloadUpdater:
     """The single public seam for payload selection and update transactions."""
 
@@ -148,6 +200,8 @@ class PayloadUpdater:
         self.current_path = self.update_root / "current.json"
         self.pending_path = self.update_root / "pending.json"
         self.rollback_path = self.update_root / "rollback.json"
+        self.transaction_lock_path = self.update_root / "transaction.lock"
+        self.runtime_lock_path = self.update_root / "runtime.lock"
 
     def _installed_compatibility(self) -> dict[str, Any]:
         path = self.bundle_root / "runtime/update-compatibility.json"
@@ -244,6 +298,8 @@ class PayloadUpdater:
                 raise ValueError("invalid or duplicate update path")
             if pure.is_absolute() or pure.as_posix() != path or ".." in pure.parts or "\\" in path:
                 raise ValueError("unsafe update path")
+            if any(_unsafe_windows_component(part) for part in pure.parts):
+                raise ValueError("unsafe update path")
             if path.startswith("app/"):
                 has_app = True
             elif path.startswith("frontend/dist/"):
@@ -264,7 +320,10 @@ class PayloadUpdater:
             unix_mode = info.external_attr >> 16
             if unix_mode and (unix_mode & 0o170000) == 0o120000:
                 raise ValueError("update payload must not contain symlinks")
-            output = destination / pure
+            destination_root = destination.resolve()
+            output = (destination / Path(*pure.parts)).resolve(strict=False)
+            if not output.is_relative_to(destination_root):
+                raise ValueError("unsafe update path")
             output.parent.mkdir(parents=True, exist_ok=True)
             with archive.open(info) as source, output.open("wb") as target:
                 actual_sha256, actual_size = _sha256_stream(source, target)
@@ -291,6 +350,63 @@ class PayloadUpdater:
                 raise ValueError("invalid payload update pointer")
         return value
 
+    def _recover_incomplete_pending(
+        self,
+        *,
+        release: ReleaseIdentity,
+        manifest_bytes: bytes,
+        signature_bytes: bytes,
+    ) -> None:
+        if not self.pending_path.exists():
+            return
+        pending = _read_json_bytes(self.pending_path.read_bytes(), name="pending update")
+        if (
+            set(pending) != {"schema_version", "previous", "target"}
+            or pending.get("schema_version") != 1
+        ):
+            raise ValueError("invalid pending update")
+        previous = pending["previous"]
+        target = pending["target"]
+        if not isinstance(previous, dict) or not isinstance(target, dict):
+            raise ValueError("invalid pending update pointers")
+        self._selection(previous)
+        target_selection = self._selection(target)
+        current = self._current_record()
+        if current != previous:
+            raise ValueError("an update is already pending health verification")
+        if target.get("kind") != "payload":
+            raise ValueError("invalid pending update target")
+        if target.get("release_id") != _release_id(release):
+            raise ValueError("pending update belongs to a different signed release")
+        try:
+            same_release = (
+                target_selection.root.parent / "manifest.json"
+            ).read_bytes() == manifest_bytes and (
+                target_selection.root.parent / "signature.json"
+            ).read_bytes() == signature_bytes
+        except OSError:
+            same_release = False
+        if not same_release:
+            raise ValueError("pending update belongs to a different signed release")
+        shutil.rmtree(target_selection.root.parent)
+        self.pending_path.unlink()
+
+    def _rollback_references(self, release_id: str) -> bool:
+        if not self.rollback_path.exists():
+            return False
+        rollback = _read_json_bytes(self.rollback_path.read_bytes(), name="update rollback")
+        if set(rollback) != {"schema_version", "from", "to"} or rollback.get("schema_version") != 1:
+            raise ValueError("invalid update rollback state")
+        records = (rollback["from"], rollback["to"])
+        if not all(isinstance(record, dict) for record in records):
+            raise ValueError("invalid update rollback pointers")
+        for value in records:
+            record = cast(dict[str, Any], value)
+            self._selection(record)
+            if record.get("kind") == "payload" and record.get("release_id") == release_id:
+                return True
+        return False
+
     def _selection(self, record: dict[str, Any]) -> RuntimeSelection:
         if record["kind"] == "base":
             return RuntimeSelection(root=self.bundle_root, release=None)
@@ -300,14 +416,19 @@ class PayloadUpdater:
             raise ValueError("active update payload is missing")
         return RuntimeSelection(root=root, release=release)
 
-    def resolve_active(self) -> RuntimeSelection:
+    def _resolve_active_unlocked(self) -> RuntimeSelection:
         return self._selection(self._current_record())
 
-    def launcher_environment(self, base: dict[str, str] | None = None) -> dict[str, str]:
-        """Return the environment that launches the selected app/frontend identity."""
+    def resolve_active(self) -> RuntimeSelection:
+        with _file_lock(self.transaction_lock_path, exclusive=False):
+            return self._resolve_active_unlocked()
 
+    def _launcher_environment(
+        self,
+        selected: RuntimeSelection,
+        base: dict[str, str] | None,
+    ) -> dict[str, str]:
         environment = dict(os.environ if base is None else base)
-        selected = self.resolve_active()
         existing_pythonpath = environment.get("PYTHONPATH")
         python_paths = [str(selected.root)]
         if existing_pythonpath:
@@ -327,6 +448,13 @@ class PayloadUpdater:
             environment["DATAOPS_IMAGE_VERSION"] = release.image_version
         return environment
 
+    def launcher_environment(self, base: dict[str, str] | None = None) -> dict[str, str]:
+        """Return one coherent snapshot of the selected app/frontend identity."""
+
+        with _file_lock(self.transaction_lock_path, exclusive=False):
+            selected = self._resolve_active_unlocked()
+            return self._launcher_environment(selected, base)
+
     def run_launcher(
         self,
         *,
@@ -338,42 +466,75 @@ class PayloadUpdater:
     ) -> int:
         """Run app.launcher from the selected payload without shell interpolation."""
 
-        selected = self.resolve_active()
-        command = [
-            str(python),
-            "-m",
-            "app.launcher",
-            "--root",
-            str(home),
-            "--pg-bin-dir",
-            str(pg_bin_dir),
-            "--uv",
-            str(uv),
-            *arguments,
-        ]
-        result = subprocess.run(
-            command,
-            cwd=selected.root,
-            env=self.launcher_environment(),
-            check=False,
-        )
-        return result.returncode
+        with _file_lock(self.runtime_lock_path, exclusive=False):
+            with _file_lock(self.transaction_lock_path, exclusive=False):
+                selected = self._resolve_active_unlocked()
+                environment = self._launcher_environment(selected, None)
+            command = [
+                str(python),
+                "-m",
+                "app.launcher",
+                "--root",
+                str(home),
+                "--pg-bin-dir",
+                str(pg_bin_dir),
+                "--uv",
+                str(uv),
+                *arguments,
+            ]
+            result = subprocess.run(
+                command,
+                cwd=selected.root,
+                env=environment,
+                check=False,
+            )
+            return result.returncode
 
     def install(self, *, package: Path, trust_store: Path) -> UpdateReceipt:
-        if self.pending_path.exists():
-            raise ValueError("an update is already pending health verification")
+        with _file_lock(self.runtime_lock_path, exclusive=True):
+            with _file_lock(self.transaction_lock_path, exclusive=True):
+                return self._install_unlocked(package=package, trust_store=trust_store)
+
+    def _install_unlocked(self, *, package: Path, trust_store: Path) -> UpdateReceipt:
         archive, manifest, manifest_bytes, release = self._verify_package(package, trust_store)
+        incoming_signature = archive.read("signature.json")
+        try:
+            self._recover_incomplete_pending(
+                release=release,
+                manifest_bytes=manifest_bytes,
+                signature_bytes=incoming_signature,
+            )
+        except Exception:
+            archive.close()
+            raise
         previous_record = self._current_record()
         previous = self._selection(previous_record).release
         self.versions_root.mkdir(parents=True, exist_ok=True)
         staging_root = self.update_root / "staging"
         staging_root.mkdir(parents=True, exist_ok=True)
         temporary = Path(tempfile.mkdtemp(prefix="payload-", dir=staging_root))
-        target = self.versions_root / _release_id(release)
+        release_id = _release_id(release)
+        target = self.versions_root / release_id
         if target.exists():
-            archive.close()
-            shutil.rmtree(temporary)
-            raise ValueError("update release is already installed")
+            current_references_target = (
+                previous_record.get("kind") == "payload"
+                and previous_record.get("release_id") == release_id
+            )
+            if current_references_target or self._rollback_references(release_id):
+                archive.close()
+                shutil.rmtree(temporary)
+                raise ValueError("update release is already installed")
+            try:
+                same_release = (target / "manifest.json").read_bytes() == manifest_bytes and (
+                    target / "signature.json"
+                ).read_bytes() == incoming_signature
+            except OSError:
+                same_release = False
+            if not same_release:
+                archive.close()
+                shutil.rmtree(temporary)
+                raise ValueError("update release id collides with different staged content")
+            shutil.rmtree(target)
         try:
             payload = temporary / "payload"
             payload.mkdir()
@@ -404,7 +565,16 @@ class PayloadUpdater:
         except Exception:
             if temporary.exists():
                 shutil.rmtree(temporary)
-            if self.pending_path.exists() and self._current_record() == previous_record:
+            try:
+                current_unchanged = self._current_record() == previous_record
+            except Exception:
+                current_unchanged = False
+            if current_unchanged and target.exists():
+                try:
+                    shutil.rmtree(target)
+                except OSError:
+                    pass
+            if current_unchanged and self.pending_path.exists() and not target.exists():
                 self.pending_path.unlink()
             raise
         finally:
@@ -414,6 +584,14 @@ class PayloadUpdater:
     def complete(self, *, success: bool) -> RuntimeSelection:
         """Commit a healthy activation or automatically restore its predecessor."""
 
+        if success:
+            with _file_lock(self.transaction_lock_path, exclusive=True):
+                return self._complete_unlocked(success=True)
+        with _file_lock(self.runtime_lock_path, exclusive=True):
+            with _file_lock(self.transaction_lock_path, exclusive=True):
+                return self._complete_unlocked(success=False)
+
+    def _complete_unlocked(self, *, success: bool) -> RuntimeSelection:
         if not self.pending_path.exists():
             raise ValueError("no update is pending health verification")
         pending = _read_json_bytes(self.pending_path.read_bytes(), name="pending update")
@@ -446,11 +624,16 @@ class PayloadUpdater:
         else:
             _atomic_write(self.current_path, previous)
         self.pending_path.unlink()
-        return self.resolve_active()
+        return self._resolve_active_unlocked()
 
     def rollback(self) -> RuntimeSelection:
         """Consume the single retained rollback pointer after a committed update."""
 
+        with _file_lock(self.runtime_lock_path, exclusive=True):
+            with _file_lock(self.transaction_lock_path, exclusive=True):
+                return self._rollback_unlocked()
+
+    def _rollback_unlocked(self) -> RuntimeSelection:
         if self.pending_path.exists():
             raise ValueError("pending health verification must be completed before rollback")
         if not self.rollback_path.exists():
@@ -468,7 +651,7 @@ class PayloadUpdater:
             raise ValueError("active payload does not match rollback source")
         _atomic_write(self.current_path, target)
         self.rollback_path.unlink()
-        return self.resolve_active()
+        return self._resolve_active_unlocked()
 
 
 __all__ = ["PayloadUpdater", "ReleaseIdentity", "RuntimeSelection", "UpdateReceipt"]

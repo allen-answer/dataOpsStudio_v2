@@ -1,6 +1,6 @@
 # Manual, artifact-only packaging rehearsal. This workflow intentionally has no
 # tag trigger, signing key, publication endpoint or release-creation permission.
-name: Release Candidate Artifacts
+name: Package Build Rehearsal (Unverified)
 
 on:
   workflow_dispatch:
@@ -140,7 +140,7 @@ jobs:
       - name: Upload Windows candidate artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dataops-windows-gui-${{ github.sha }}
+          name: unverified-dataops-windows-gui-${{ github.sha }}
           path: |
             ${{ runner.temp }}/release-output/dataops-studio-*-win10-x64-gui.zip
             ${{ runner.temp }}/release-output/dataops-studio-*-win10-x64-gui.MANIFEST.txt
@@ -214,7 +214,7 @@ jobs:
       - name: Upload Mint candidate artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dataops-mint-${{ github.sha }}
+          name: unverified-dataops-mint-${{ github.sha }}
           path: |
             ${{ runner.temp }}/release-output/dataops-studio-*-mint21.3-amd64-offline.deb
             ${{ runner.temp }}/release-output/dataops-studio-*-mint21.3-amd64-offline.deb.MANIFEST.txt

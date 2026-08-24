@@ -122,6 +122,7 @@ def test_non_gate_step_conditions_are_preserved() -> None:
 
 def test_release_candidate_is_manual_artifact_only_and_read_only() -> None:
     workflow = _release_candidate_workflow()
+    assert workflow["name"] == "Package Build Rehearsal (Unverified)"
     # PyYAML 1.1 parses the unquoted YAML key `on` as boolean True.
     yaml_mapping = cast(dict[Any, Any], workflow)
     triggers = yaml_mapping.get("on", yaml_mapping.get(True))
@@ -223,6 +224,7 @@ def test_release_candidate_builds_existing_packages_and_uploads_only_final_artif
         step for step in _job_steps(job) if step.get("uses") == "actions/upload-artifact@v4"
     )
     upload_config = cast(dict[str, Any], upload["with"])
+    assert str(upload_config["name"]).startswith("unverified-dataops-")
     paths = tuple(line.strip() for line in str(upload_config["path"]).splitlines())
     assert len(paths) == 2
     assert all("/release-output/dataops-studio-*" in path for path in paths)
