@@ -306,6 +306,18 @@ test('Monaco tokenizes SQL keywords and identifiers with distinct styles', async
   await page.goto('/projects/project-1/sql')
   const viewLines = page.locator('.monaco-editor .view-lines')
   await expect(viewLines).toContainText('SELECT')
+  await expect
+    .poll(() =>
+      viewLines.evaluate(
+        (root) =>
+          new Set(
+            Array.from(root.querySelectorAll('span[class*="mtk"]'))
+              .filter((node) => (node.textContent ?? '').trim().length > 0)
+              .map((node) => node.className),
+          ).size,
+      ),
+    )
+    .toBeGreaterThan(1)
   const tokens = await viewLines.evaluate((root) =>
     Array.from(root.querySelectorAll('span[class*="mtk"]'))
       .map((node) => ({ text: node.textContent ?? '', className: node.className }))
