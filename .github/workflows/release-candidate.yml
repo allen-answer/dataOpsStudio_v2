@@ -1,0 +1,223 @@
+# Manual, artifact-only packaging rehearsal. This workflow intentionally has no
+# tag trigger, signing key, publication endpoint or release-creation permission.
+name: Package Build Rehearsal (Unverified)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UV_VERSION: "0.11.16"
+  TAURI_CLI_VERSION: "2.11.4"
+
+jobs:
+  preflight:
+    name: Packaging identity, locks, and red lines
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Verify locked dependency inputs
+        run: |
+          uv sync --locked --all-groups
+          cargo metadata --manifest-path desktop/src-tauri/Cargo.toml --locked --no-deps --format-version 1 > /dev/null
+
+      - name: Verify frontend lock
+        working-directory: frontend
+        run: npm ci --ignore-scripts
+
+      - name: Verify package versions agree
+        run: |
+          uv run python - <<'PY'
+          import json
+          import tomllib
+          from pathlib import Path
+
+          pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          cargo = tomllib.loads(
+              Path("desktop/src-tauri/Cargo.toml").read_text(encoding="utf-8")
+          )
+          tauri = json.loads(
+              Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8")
+          )
+          versions = {
+              "pyproject": str(pyproject["project"]["version"]),
+              "cargo": str(cargo["package"]["version"]),
+              "tauri": str(tauri["version"]),
+          }
+          if len(set(versions.values())) != 1:
+              raise SystemExit(f"package version mismatch: {versions}")
+          print(f"package version: {versions['pyproject']}")
+          PY
+
+      - name: Static red lines
+        run: |
+          uv run ruff check app tests tools
+          uv run ruff format --check app tests tools
+          uv run sg scan --config tools/lint/sgconfig.yml
+
+      - name: Install gitleaks
+        run: |
+          GITLEAKS_VERSION="8.21.2"
+          curl -sSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+
+      - name: Secret scan (R8)
+        run: gitleaks detect --redact --no-banner --config .gitleaks.toml --exit-code 1
+
+      - name: Focused red-line and packaging tests
+        run: >-
+          uv run pytest
+          tests/unit/test_redlines.py
+          tests/unit/test_redaction.py
+          tests/unit/test_models.py
+          tests/unit/test_package_build_identity.py
+          tests/unit/test_win10_bundle.py
+          tests/unit/test_mint_bundle.py
+          tests/unit/test_ci_workflow.py
+          -q
+
+  windows-package:
+    name: Windows 10 x64 GUI ZIP
+    needs: preflight
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Restore verified runtime download cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/dataops-win-cache
+          key: >-
+            dataops-win-bundle-v1-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('uv.lock', 'frontend/package-lock.json',
+            'desktop/src-tauri/Cargo.lock', 'tools/package/build_identity.py',
+            'tools/package/build_win10_bundle.py') }}
+
+      - name: Build existing Windows GUI bundle
+        shell: pwsh
+        run: >-
+          uv run python tools/package/build_win10_bundle.py --gui
+          --output-dir "$env:RUNNER_TEMP/release-output"
+          --cache-dir "$env:RUNNER_TEMP/dataops-win-cache"
+
+      - name: Upload Windows candidate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: unverified-dataops-windows-gui-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/release-output/dataops-studio-*-win10-x64-gui.zip
+            ${{ runner.temp }}/release-output/dataops-studio-*-win10-x64-gui.MANIFEST.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  mint-package:
+    name: Linux Mint 21.3 x64 DEB
+    needs: preflight
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Mint-compatible Tauri build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            bzip2 \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            pkg-config
+          ldd --version | head -1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Restore Tauri CLI cache
+        id: tauri-cli-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-tauri
+          key: tauri-cli-${{ runner.os }}-${{ runner.arch }}-${{ env.TAURI_CLI_VERSION }}
+
+      - name: Install pinned Tauri CLI
+        if: steps.tauri-cli-cache.outputs.cache-hit != 'true'
+        run: cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
+
+      - name: Restore verified runtime download cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/dataops-mint-cache
+          key: >-
+            dataops-mint-bundle-v1-${{ runner.os }}-${{ runner.arch }}-${{
+            hashFiles('uv.lock', 'frontend/package-lock.json',
+            'desktop/src-tauri/Cargo.lock', 'tools/package/build_identity.py',
+            'tools/package/build_mint_bundle.py') }}
+
+      - name: Build existing Mint bundle
+        run: >-
+          uv run python tools/package/build_mint_bundle.py
+          --output-dir "$RUNNER_TEMP/release-output"
+          --cache-dir "$RUNNER_TEMP/dataops-mint-cache"
+
+      - name: Upload Mint candidate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: unverified-dataops-mint-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/release-output/dataops-studio-*-mint21.3-amd64-offline.deb
+            ${{ runner.temp }}/release-output/dataops-studio-*-mint21.3-amd64-offline.deb.MANIFEST.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

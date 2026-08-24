@@ -25,20 +25,20 @@ lock:  ## uv lock — 重新解析依赖,刷新 uv.lock
 
 # ─── 代码质量 ───
 fmt:  ## ruff format
-	$(UV) run ruff format app tests tools
+	$(UV) run ruff format app updater tests tools
 
 lint:  ## ruff lint(含 R1/R3 banned-api)
-	$(UV) run ruff check app tests tools
+	$(UV) run ruff check app updater tests tools
 
 typecheck:  ## mypy strict
-	$(UV) run mypy app
+	$(UV) run mypy app updater
 
 # ─── 红线检查(分层,见契约 §4) ───
 check-redlines:  ## 跑全部红线检查(R1-R9 本地版,CI 会再 enforce 一遍)
 	@echo "→ R1/R3 import 越界:ruff TID251 banned-api"
-	$(UV) run ruff check app tests tools
+	$(UV) run ruff check app updater tests tools
 	@echo "→ ruff format check(防漏 format 进 CI)"
-	$(UV) run ruff format --check app tests tools
+	$(UV) run ruff format --check app updater tests tools
 	@echo "→ R2/R6 字段/调用模式:ast-grep(dev 组依赖,severity=error 自动 exit 1)"
 	$(UV) run sg scan --config tools/lint/sgconfig.yml
 	@echo "→ R8 配置文件明文 secret:gitleaks"

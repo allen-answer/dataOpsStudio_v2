@@ -159,6 +159,10 @@ def test_r3_tid251_waivers_match_the_contract_inventory() -> None:
             "app/infrastructure/license/verifier.py",
             "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey",
         ),
+        (
+            "app/infrastructure/license/signatures.py",
+            "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey",
+        ),
         ("app/infrastructure/secretstore/local_file.py", "import bcrypt"),
         (
             "app/infrastructure/secretstore/local_file.py",
@@ -174,6 +178,10 @@ def test_r3_tid251_waivers_match_the_contract_inventory() -> None:
         ),
         (
             "tests/unit/test_license_verifier.py",
+            "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey",
+        ),
+        (
+            "tests/unit/test_payload_update.py",
             "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey",
         ),
         ("tests/unit/test_migrate_from_v1.py", "from cryptography.fernet import Fernet"),

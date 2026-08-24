@@ -16,7 +16,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import uuid4
 
 from sqlalchemy import URL, create_engine, insert, select, text, update
@@ -321,11 +321,25 @@ def command_admin_create(context: LauncherContext, args: argparse.Namespace) -> 
 
 
 def command_up(context: LauncherContext, args: argparse.Namespace) -> int:
-    command_pg_up(context, args)
-    command_alembic_up(context, args)
-    _write_pid(context.data_dir / "launcher.pid", os.getpid())
-    api = _start_child(context, "api", [context.uv, "run", "python", "-m", "app.main"])
-    worker = _start_child(context, "worker", [context.uv, "run", "python", "-m", "app.worker"])
+    stop_request = context.data_dir / "launcher.stop" if _is_windows() else None
+    if stop_request is not None:
+        _write_pid(context.data_dir / "launcher.pid", os.getpid())
+    try:
+        command_pg_up(context, args)
+        if _finish_windows_startup_stop(context, stop_request):
+            return 0
+        command_alembic_up(context, args)
+        if _finish_windows_startup_stop(context, stop_request):
+            return 0
+    except BaseException:
+        if stop_request is not None:
+            _unlink_if_exists(context.data_dir / "launcher.pid")
+            _unlink_if_exists(stop_request)
+        raise
+    if stop_request is None:
+        _write_pid(context.data_dir / "launcher.pid", os.getpid())
+    api = _start_child(context, "api", [sys.executable, "-m", "app.main"])
+    worker = _start_child(context, "worker", [sys.executable, "-m", "app.worker"])
     children = {"api": api, "worker": worker}
     stop_requested = False
 
@@ -342,6 +356,9 @@ def command_up(context: LauncherContext, args: argparse.Namespace) -> int:
             "large active queries may take time to drain."
         )
         while not stop_requested:
+            if stop_request is not None and stop_request.is_file():
+                stop_requested = True
+                break
             for name, process in children.items():
                 return_code = process.poll()
                 if return_code is not None:
@@ -358,7 +375,22 @@ def command_up(context: LauncherContext, args: argparse.Namespace) -> int:
     _unlink_child_pid_files(context)
     command_pg_stop(context, argparse.Namespace(force=False))
     _unlink_if_exists(context.data_dir / "launcher.pid")
+    if stop_request is not None:
+        _unlink_if_exists(stop_request)
     return 0
+
+
+def _finish_windows_startup_stop(
+    context: LauncherContext,
+    stop_request: Path | None,
+) -> bool:
+    if stop_request is None or not stop_request.is_file():
+        return False
+    print("Stop requested during startup; stopping metadata PostgreSQL before launching children.")
+    command_pg_stop(context, argparse.Namespace(force=False))
+    _unlink_if_exists(context.data_dir / "launcher.pid")
+    _unlink_if_exists(stop_request)
+    return True
 
 
 def command_stop(context: LauncherContext, args: argparse.Namespace) -> int:
@@ -370,12 +402,23 @@ def command_stop(context: LauncherContext, args: argparse.Namespace) -> int:
             "Stopping launcher supervisor. Active worker jobs run to completion; "
             "use --force only for emergency stop."
         )
-        _terminate_pid(
-            launcher_pid,
-            "launcher",
-            grace_seconds=grace_seconds,
-            force=force,
-        )
+        if _is_windows():
+            stop_request = context.data_dir / "launcher.stop"
+            stop_request.write_text("stop\n", encoding="ascii")
+            _wait_for_pid_exit(
+                launcher_pid,
+                "launcher",
+                grace_seconds=grace_seconds + 35.0,
+                force=force,
+            )
+            _unlink_if_exists(stop_request)
+        else:
+            _terminate_pid(
+                launcher_pid,
+                "launcher",
+                grace_seconds=grace_seconds,
+                force=force,
+            )
         _unlink_if_exists(context.data_dir / "launcher.pid")
         _unlink_child_pid_files(context)
         return 0
@@ -624,8 +667,11 @@ def _initdb(context: LauncherContext) -> None:
 def _pg_ctl_start(context: LauncherContext) -> None:
     pg_ctl = _find_pg_binary(context, "pg_ctl")
     pg_log = context.log_dir / "pg.log"
-    socket_dir = context.data_dir / "pg-socket"
-    socket_dir.mkdir(parents=True, exist_ok=True)
+    postgres_options = f"-h {context.settings.db.host} -p {context.settings.db.port}"
+    if not _is_windows():
+        socket_dir = context.data_dir / "pg-socket"
+        socket_dir.mkdir(parents=True, exist_ok=True)
+        postgres_options += f" -k {socket_dir}"
     print(f"Starting PG: log={pg_log}")
     try:
         _run(
@@ -636,7 +682,7 @@ def _pg_ctl_start(context: LauncherContext) -> None:
                 "-l",
                 str(pg_log),
                 "-o",
-                f"-h {context.settings.db.host} -p {context.settings.db.port} -k {socket_dir}",
+                postgres_options,
                 "start",
             ],
             cwd=context.repo_root,
@@ -834,6 +880,9 @@ def _start_child(
 ) -> subprocess.Popen[bytes]:
     log_path = context.log_dir / f"{name}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    creationflags = 0
+    if _is_windows():
+        creationflags = cast(Any, subprocess).CREATE_NEW_PROCESS_GROUP
     handle = log_path.open("ab")
     try:
         process = subprocess.Popen(
@@ -842,6 +891,7 @@ def _start_child(
             env=_child_env(context),
             stdout=handle,
             stderr=subprocess.STDOUT,
+            creationflags=creationflags,
         )
     finally:
         handle.close()
@@ -878,13 +928,16 @@ def _terminate_process(
 ) -> None:
     if process.poll() is not None:
         return
-    process.terminate()
+    if _is_windows():
+        process.send_signal(cast(Any, signal).CTRL_BREAK_EVENT)
+    else:
+        process.terminate()
     try:
         process.wait(timeout=grace_seconds)
         print(f"{name} stopped.")
     except subprocess.TimeoutExpired:
         if force:
-            process.kill()
+            _kill_pid(process.pid)
             process.wait(timeout=10)
             print(f"{name} force-stopped.")
         else:
@@ -921,6 +974,21 @@ def _terminate_pid(
     force: bool,
 ) -> None:
     os.kill(pid, signal.SIGTERM)
+    _wait_for_pid_exit(
+        pid,
+        name,
+        grace_seconds=grace_seconds,
+        force=force,
+    )
+
+
+def _wait_for_pid_exit(
+    pid: int,
+    name: str,
+    *,
+    grace_seconds: float,
+    force: bool,
+) -> None:
     deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
         if not _pid_alive(pid):
@@ -954,6 +1022,8 @@ def _read_pid(path: Path) -> int | None:
 
 
 def _pid_alive(pid: int) -> bool:
+    if _is_windows():
+        return _windows_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except OSError:
@@ -961,7 +1031,49 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _windows_pid_alive(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    error_access_denied = 5
+    windows_ctypes = cast(Any, ctypes)
+    get_last_error = cast(Callable[[], int], windows_ctypes.get_last_error)
+    kernel32 = windows_ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    open_process.restype = wintypes.HANDLE
+    get_exit_code = kernel32.GetExitCodeProcess
+    get_exit_code.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    get_exit_code.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    handle = open_process(process_query_limited_information, False, pid)
+    if not handle:
+        return get_last_error() == error_access_denied
+    try:
+        exit_code = wintypes.DWORD()
+        if not get_exit_code(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == still_active
+    finally:
+        close_handle(handle)
+
+
 def _kill_pid(pid: int) -> None:
+    if _is_windows():
+        completed = subprocess.run(
+            ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0 and _windows_pid_alive(pid):
+            raise LauncherError(f"failed to force-stop process tree pid={pid}")
+        return
     sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
     os.kill(pid, sigkill)
 

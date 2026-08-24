@@ -82,11 +82,10 @@ dataops-studio-<ver>-win10-x64-<mode>/
 | `DATAOPS_ADMIN_USER` | `admin` | 首次创建的管理员用户名 |
 | `DATAOPS_ADMIN_PASSWORD` | (交互输入) | 设置后非交互创建管理员(自动化用) |
 
-### 路径注意(短路径)
+### 实例路径
 
-解压路径 + `DATAOPS_HOME` 不要太深:内置 PostgreSQL 的本地 socket 路径
-(`<DATAOPS_HOME>\data\pg-socket\...`)有 107 字节上限,路径过长会导致 PG 启动失败
-(pg.log 报 Unix socket 路径过长)。建议解压到较短路径,如 `D:\dataops\`。
+Windows 内置 PostgreSQL 只监听 loopback TCP,不使用 Unix socket;`DATAOPS_HOME` 可包含空格
+或较深路径。Linux Mint 包仍会在安装时检查 Unix socket 的 107 字节路径上限。
 
 ## 停止
 
@@ -95,10 +94,13 @@ dataops-studio-<ver>-win10-x64-<mode>/
 
 ## 升级
 
-用新版包替换 `app/`、`frontend/dist/`、`runtime/requirements-frozen.txt`
-(offline 另换 `runtime/wheels/`;online 另换 `runtime/download-manifest.json`),
-删除旧 `.venv/`(下次 `start` 会重建),保留 `home/`(实例数据),再运行 `start`
-(会自动跑新迁移)。升级前请先备份 `home/`。
+如果发布方提供签名的 `.dupdate` 与对应更新说明,可以只更新 `app/ + frontend/dist/`。
+更新器会验证发布签名和每个文件的 sha256,健康检查失败时恢复旧版本,并始终保留
+`home/`、PostgreSQL data、bootstrap secrets 与 `.venv/`。当前第一阶段尚未提供 GUI 内
+“检查更新”按钮,请只按发布方给出的命令操作,不要自行解压或替换更新包内容。
+
+依赖 wheels、Python/uv、PostgreSQL、Tauri、迁移或更新器本身有变化时必须安装完整包。
+完整包升级前请备份 `home/`;不要手工混换 `app/`、runtime 与 `.venv/`。
 
 ## 达梦(DM)数据源
 

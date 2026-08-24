@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 import os
 import shutil
 import subprocess
@@ -31,6 +32,9 @@ def test_common_script_exports_packaged_build_identity(
     monkeypatch.setattr(build, "BUNDLE_ROOT", bundle)
     build.write_scripts(_identity())
     common = bundle / "_common.sh"
+    common_text = common.read_text(encoding="utf-8")
+    assert '"$VENV_PY" -m updater run' in common_text
+    assert '--state-root "$DATAOPS_STATE_ROOT"' in common_text
     assert build.BUILD_IDENTITY_MARKER not in common.read_text(encoding="utf-8")
     assert common.stat().st_size <= (build.SCRIPTS_ROOT / "_common.sh").stat().st_size
     env = os.environ.copy()
@@ -153,6 +157,34 @@ def test_wheel_cache_is_bound_to_current_requirements(tmp_path: Path, monkeypatc
     assert (wheels / ".complete").read_text(encoding="ascii").strip() == build.sha256_file(
         requirements
     )
+
+
+def test_full_bundle_writes_payload_update_compatibility_and_base_identity(
+    tmp_path: Path,
+) -> None:
+    requirements = tmp_path / "requirements-frozen.txt"
+    requirements.write_text("example==1 --hash=sha256:abc\n", encoding="utf-8")
+
+    build.write_update_metadata(tmp_path, requirements, _identity())
+
+    compatibility = json.loads(
+        (tmp_path / "runtime/update-compatibility.json").read_text(encoding="utf-8")
+    )
+    identity = json.loads((tmp_path / "runtime/build-identity.json").read_text(encoding="utf-8"))
+    assert compatibility["platform"] == "mint21.3-x86_64"
+    assert compatibility["python"] == {
+        "version": build.PYTHON_VERSION,
+        "sha256": build.PYTHON_SHA256,
+    }
+    assert compatibility["postgres"] == {
+        "version": build.POSTGRES_VERSION,
+        "sha256": build.POSTGRES_SHA256,
+    }
+    assert identity == {
+        "version": "2.0.1",
+        "commit": "a" * 40,
+        "image_version": "2.0.1-mint21.3-amd64-offline",
+    }
 
 
 def test_repack_deb_is_deterministic_and_preserves_member_payloads(tmp_path: Path) -> None:
