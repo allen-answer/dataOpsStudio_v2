@@ -19,7 +19,12 @@ from app.domain.lineage import (
     merge_ddl_schema,
     schema_from_ddl_text,
 )
-from app.domain.lineage.ddl_schema import DDL_MAX_STATEMENTS, _is_constraint_entry
+from app.domain.lineage.ddl_schema import (
+    DDL_MAX_STATEMENTS,
+    _is_constraint_entry,
+    _rules_for,
+    _strip_constraint_state,
+)
 
 
 def test_parses_basic_create_table_into_schema() -> None:
@@ -245,9 +250,15 @@ def test_comment_between_table_name_and_column_list() -> None:
 
 
 def test_single_unparsable_entry_only_loses_that_column() -> None:
-    """F6:``NOT NULL ENABLE`` 一个条目失败,修复前整表零列被采纳。"""
+    """F6 的兜底:真正未知的语法只损失该列,不再丢掉整张表。
+
+    ★ 用一段**确实无法识别**的垃圾条目来触发兜底 —— 不能再用 ``NOT NULL ENABLE``:
+    那是达梦 / Oracle 的标准写法,已经被约束状态后缀剥离处理成正常解析
+    (见 test_constraint_state_suffixes_parse_normally)。兜底是兜未知语法的,
+    标准写法走兜底就等于该列凭空消失。
+    """
     result = schema_from_ddl_text(
-        "CREATE TABLE ods.t (id NUMBER NOT NULL ENABLE, amt NUMBER(18,2), nm VARCHAR2(64));",
+        "CREATE TABLE ods.t (id NUMBER ?!$ &&, amt NUMBER(18,2), nm VARCHAR2(64));",
         dialect="oracle",
     )
 
@@ -255,6 +266,111 @@ def test_single_unparsable_entry_only_loses_that_column() -> None:
     # 整表没被跳过,但"少了一列"必须是独立可见的信号,不能报 0 跳过就完事。
     assert result.skipped_statement_count == 0
     assert result.failed_column_entry_count == 1
+
+
+# ── Oracle / 达梦约束状态后缀:必须正常解析,不许走降级 ────────────────────
+#
+# 达梦把 NOT NULL 一律写成 ``NOT NULL ENABLE``,所以不剥后缀的话**每一个非空列都丢**,
+# 而非空列通常正是主键列和分区列。实测这一族 sqlglot 一个都解析不动(全 ParseError),
+# 修复前它们全靠逐条目降级兜底 —— 整表活了,列没了。
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "NOT NULL ENABLE",
+        "NOT NULL DISABLE",
+        "NOT NULL ENABLE VALIDATE",
+        "NOT NULL ENABLE NOVALIDATE",
+        "NOT NULL DISABLE NOVALIDATE",
+        "NOT NULL RELY ENABLE",
+        "NOT NULL NORELY DISABLE",
+        "NOT NULL DEFERRABLE",
+        "NOT NULL NOT DEFERRABLE",
+        "NOT NULL INITIALLY DEFERRED",
+        "NOT NULL INITIALLY IMMEDIATE",
+        "NOT NULL DEFERRABLE INITIALLY DEFERRED ENABLE VALIDATE",
+        "NOT NULL USING INDEX TABLESPACE ts_idx",
+        "NOT NULL USING INDEX ix_a ENABLE",
+        "NOT NULL EXCEPTIONS INTO err_tab",
+        "NOT NULL ENABLE EXCEPTIONS INTO ods.err_tab",
+    ],
+)
+def test_constraint_state_suffixes_parse_normally(suffix: str) -> None:
+    """★ 这一族必须**正常解析**,不是"失败后计数"。"""
+    result = schema_from_ddl_text(
+        f"CREATE TABLE ods.t (period VARCHAR2(8) {suffix}, amt NUMBER(18,2));", dialect="dm"
+    )
+
+    assert result.schema == {"ods": {"t": {"period": "VARCHAR2(8)", "amt": "NUMBER(18, 2)"}}}
+    # ★ 语义钉死:标准达梦写法跑完必须是 0 —— 非零只留给真正未知的语法。
+    assert result.failed_column_entry_count == 0
+    assert result.skipped_statement_count == 0
+
+
+def test_column_level_check_constraint_with_state_suffix() -> None:
+    result = schema_from_ddl_text(
+        "CREATE TABLE ods.t (a VARCHAR2(10) CONSTRAINT ck_a CHECK (a > 0) ENABLE, b NUMBER);",
+        dialect="dm",
+    )
+
+    assert set(result.schema["ods"]["t"]) == {"a", "b"}
+    assert result.failed_column_entry_count == 0
+
+
+def test_default_before_not_null_enable_keeps_the_column() -> None:
+    result = schema_from_ddl_text(
+        "CREATE TABLE ods.t (a NUMBER(18) DEFAULT 0 NOT NULL ENABLE, b NUMBER);", dialect="dm"
+    )
+
+    assert set(result.schema["ods"]["t"]) == {"a", "b"}
+    assert result.failed_column_entry_count == 0
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        # 列名就叫这些词 —— 不在尾部,不该被剥。
+        ("CREATE TABLE ods.t (validate VARCHAR2(10), enable NUMBER)", {"validate", "enable"}),
+        ("CREATE TABLE ods.t (rely NUMBER, disable NUMBER)", {"rely", "disable"}),
+        # 字面量里含这些词 —— 尾部是 `')` 而不是"空白 + 关键字",形状匹配天然不命中。
+        ("CREATE TABLE ods.t (status VARCHAR2(10) DEFAULT 'ENABLE', b NUMBER)", {"status", "b"}),
+        (
+            "CREATE TABLE ods.t (s VARCHAR2(10) CHECK (s <> 'NOVALIDATE'), b NUMBER)",
+            {"s", "b"},
+        ),
+    ],
+)
+def test_state_suffix_stripping_does_not_eat_names_or_literals(
+    entry: str, expected: set[str]
+) -> None:
+    """只剥尾部,别误伤列名 / 类型 / 字面量里含这些词的情况。"""
+    result = schema_from_ddl_text(entry, dialect="dm")
+
+    assert set(result.schema["ods"]["t"]) == expected
+    assert result.failed_column_entry_count == 0
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        # 剥到只剩列名就停手:``a`` 单独一个 token 不是列定义,剥了会凭空造出无类型列。
+        ("a ENABLE", "a ENABLE"),
+        # 剥一层后 ``a RELY`` 还剩两个 token,再剥就只剩列名 —— 到此为止。
+        ("a RELY ENABLE", "a RELY"),
+        # 留得下"列名 + 类型"才剥。
+        ("a NUMBER ENABLE", "a NUMBER"),
+        ("a VARCHAR2(10) NOT NULL ENABLE VALIDATE", "a VARCHAR2(10) NOT NULL"),
+        ("a VARCHAR2(10) NOT NULL USING INDEX TABLESPACE ts", "a VARCHAR2(10) NOT NULL"),
+        # 尾部没有状态后缀就原样返回。
+        ("a VARCHAR2(10) NOT NULL", "a VARCHAR2(10) NOT NULL"),
+        ("validate VARCHAR2(10)", "validate VARCHAR2(10)"),
+        ("status VARCHAR2(10) DEFAULT 'ENABLE'", "status VARCHAR2(10) DEFAULT 'ENABLE'"),
+    ],
+)
+def test_strip_constraint_state_never_eats_name_or_type(entry: str, expected: str) -> None:
+    """直接钉死剥离函数的边界(而不是绕经 sqlglot —— 它对 ``a ENABLE`` 会当成名+类型)。"""
+    assert _strip_constraint_state(entry, _rules_for("dm")) == expected
 
 
 @pytest.mark.parametrize("entry", ["KEY idx_b (b)", "INDEX idx_c (c)"])
@@ -702,14 +818,17 @@ def test_same_table_written_in_two_cases_is_one_entry() -> None:
 #   1. 表级 NOT CLUSTER PRIMARY KEY("ID")   —— 漏过即挂死(F4)
 #   2. 约束行带前置中文注释                  —— 绕过预过滤(F4)
 #   3. 每列尾部中文 -- 注释                  —— 吞掉右括号,整表丢弃(F5)
-#   4. NOT NULL ENABLE 后缀                  —— 单条目失败拖垮整表(F6)
+#   4. NOT NULL ENABLE 后缀                  —— 约束状态后缀让整列解析失败(F6)
 #   5. period 裸列名                         —— 被首词匹配整列吞掉(F3)
-# 这一份能出列级血缘,才算 F3-F6 真的修好。
+# 这一份能出**完整的列** + 列级血缘,才算 F3-F6 真的修好。
+#
+# ★ 验收点是"列齐全",不是"失败计数等于几"。达梦每个非空列都带 ENABLE,
+#   按失败计数验收等于把"主键列全丢"当成合格。
 
 _DM_REAL_SHAPE_DDL = """CREATE TABLE "ODS"."KGRP_RPT"
 (
   "ID" NUMBER(18,0) NOT NULL ENABLE, -- 主键标识
-  period VARCHAR2(8), -- 账期分区(裸列名,非保留字)
+  period VARCHAR2(8) NOT NULL ENABLE, -- 账期分区(裸列名,非保留字)
   "AMT" NUMBER(18,2) DEFAULT 0, -- 金额
   "NOTE" VARCHAR2(200), -- 备注说明
   -- 主键约束
@@ -724,6 +843,7 @@ def test_dm_real_export_shape_yields_all_columns() -> None:
     assert result.schema == {
         "ODS": {
             "KGRP_RPT": {
+                "ID": "NUMBER(18, 0)",
                 "period": "VARCHAR2(8)",
                 "AMT": "NUMBER(18, 2)",
                 "NOTE": "VARCHAR2(200)",
@@ -731,8 +851,8 @@ def test_dm_real_export_shape_yields_all_columns() -> None:
         }
     }
     assert result.skipped_statement_count == 0
-    # "ID" 那条因 ENABLE 解析不动 —— 只损失该列,并且诚实报出来。
-    assert result.failed_column_entry_count == 1
+    # ★ 标准达梦写法零降级:主键列 "ID" 与分区列 period 都必须原样解析出来。
+    assert result.failed_column_entry_count == 0
 
 
 def test_dm_real_export_shape_gives_column_level_lineage() -> None:

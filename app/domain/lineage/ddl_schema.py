@@ -114,6 +114,33 @@ _MYSQL_INDEX_SHAPE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Oracle / 达梦的**约束状态后缀**(constraint_state):跟在列内联约束后面的一串
+# 状态词,对列名与类型毫无信息量,但 sqlglot 一个都解析不动(实测全部 ParseError)。
+#
+# ★ 这不是"未知语法",是达梦 / Oracle 导出 DDL 的**标准写法** —— 达梦把 ``NOT NULL``
+#   一律写成 ``NOT NULL ENABLE``,所以不剥的话**每一个非空列都丢**,而非空列通常
+#   正是主键列和分区列(实测 CISP 月报表丢掉 belt_org / indices_dt / customer_no /
+#   department_id / period)。逐条目降级兜底能让整表不死,但列还是没了 —— 兜底是
+#   兜真正未知的语法,不该由标准写法来触发。
+#
+# 沿用 F3/F4 的思路:**形状匹配而非词匹配**,且只认**条目尾部**。列名或类型里含这些
+# 词(列名就叫 ``validate``)、或字面量里含这些词(``CHECK (status = 'ENABLE')``)
+# 都不会误伤 —— 前者不在尾部,后者尾部是 ``')`` 而不是空白加关键字。
+_CONSTRAINT_STATE_TAIL_RE = re.compile(
+    r"\s+(?:"
+    # 多词形态放前面(leftmost 匹配已能正确处理,顺序只为可读)
+    r"NOT\s+DEFERRABLE"
+    r"|INITIALLY\s+(?:DEFERRED|IMMEDIATE)"
+    r"|EXCEPTIONS\s+INTO\s+" + _IDENT + r"(?:\s*\.\s*" + _IDENT + r")?"
+    r"|ENABLE|DISABLE|VALIDATE|NOVALIDATE|RELY|NORELY|DEFERRABLE"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+# ``USING INDEX`` 之后到条目结尾全是索引存储子句(可带表空间 / 括号里整条建索引语句),
+# 结构不定,整段截掉最省事;它在列定义里只可能出现在约束状态位置,即尾部。
+_USING_INDEX_RE = re.compile(r"USING\s+INDEX\b", re.IGNORECASE)
+
 # 建表语句头(到表名为止)。覆盖 OR REPLACE / 临时表 / 外部表 / 达梦 HUGE 表 /
 # IF NOT EXISTS 等修饰词;匹配结束处即表名起点。
 _CREATE_TABLE_RE = re.compile(
@@ -409,7 +436,9 @@ def _table_from_statement(
         # ★ 必须剥注释再重组:重组用 ", " 拼接会丢掉终结行注释的换行,随后的逗号
         # 与右括号被 ``--`` 吞掉,sqlglot 解析失败 → 整张表静默丢弃。
         # DIDA 导出的 SQL 每个字段都带中文行注释,这一形态在真实输入里极其常见。
-        cleaned = _strip_comments(entry, rules).strip()
+        # 再剥掉 Oracle / 达梦的约束状态后缀(NOT NULL **ENABLE** 之类)。这是达梦
+        # 导出 DDL 的标准写法,不剥的话每个非空列都解析失败 —— 主键列 / 分区列全丢。
+        cleaned = _strip_constraint_state(_strip_comments(entry, rules).strip(), rules).strip()
         if cleaned:
             entries.append(cleaned)
     if not entries:
@@ -509,6 +538,49 @@ def _is_constraint_entry(entry: str, dialect: str = "") -> bool:
     if _CONSTRAINT_SHAPE_RE.match(stripped) is not None:
         return True
     return dialect == "mysql" and _MYSQL_INDEX_SHAPE_RE.match(stripped) is not None
+
+
+def _strip_constraint_state(entry: str, rules: _ScanRules) -> str:
+    """剥掉列条目**尾部**的 Oracle / 达梦约束状态后缀,让这些列正常解析。
+
+    ``a VARCHAR(10) NOT NULL ENABLE VALIDATE`` → ``a VARCHAR(10) NOT NULL``。
+    只动尾部、且永远给列名 + 类型留够 token,剥不动就原样返回(交给 sqlglot 判)。
+    """
+    text = entry
+    using_index = _first_top_level_match(text, _USING_INDEX_RE, rules)
+    if using_index is not None and len(text[:using_index].split()) >= 2:
+        text = text[:using_index].rstrip()
+    while True:
+        match = _CONSTRAINT_STATE_TAIL_RE.search(text)
+        if match is None:
+            break
+        head = text[: match.start()].rstrip()
+        # 再剥就要吃掉列名 / 类型了 —— 宁可留着让 sqlglot 判,也不自作主张。
+        if len(head.split()) < 2:
+            break
+        text = head
+    return text
+
+
+def _first_top_level_match(text: str, pattern: re.Pattern[str], rules: _ScanRules) -> int | None:
+    """``pattern`` 在括号深度 0、且不在注释 / 引号内的首个匹配位置。"""
+    depth = 0
+    index = 0
+    length = len(text)
+    while index < length:
+        skipped = _skip_atom(text, index, rules)
+        if skipped is not None:
+            index = skipped
+            continue
+        char = text[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and pattern.match(text, index) is not None:
+            return index
+        index += 1
+    return None
 
 
 def _strip_comments(text: str, rules: _ScanRules) -> str:
