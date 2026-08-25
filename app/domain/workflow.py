@@ -272,6 +272,20 @@ class WorkflowNode(BaseModel):
                     "invalid_sleep_payload: sleep 节点只接受 1..86400 的 duration_seconds"
                 )
             return self
+        if self.job_kind == "lineage_analyze" and "ddl_text" in self.payload:
+            # ★ workflow 的 lineage_analyze 是第三条分析路径,只从元数据目录构造
+            # schema_context,不接 DDL 文本数据源。此前 ddl_text 能通过校验、带进
+            # 子 job、然后被**静默忽略** —— 用户以为补了列元数据,实际什么也没发生。
+            # 明确拒绝,不做静默忽略。
+            #
+            # 没有选择接通,是因为 workflow 是被调度反复重跑的存量规格,而 ddl_text
+            # 上限 1 MB 会整段内联进 workflow spec 与每次 run 的 payload;真要支持,
+            # 该走 upload_id / storage_uri 引用(与同作业的 SQL zip 同款),那是独立
+            # 设计,不该顺手塞进本次修复。
+            raise ValueError(
+                "invalid_lineage_analyze_payload: lineage_analyze 节点不支持 ddl_text"
+                "(DDL 文本数据源仅在 SQL 解析与批量分析两个入口可用)"
+            )
         if self.job_kind == "notify":
             if not set(self.payload) <= {"target_ids", "message"}:
                 raise ValueError("invalid_notify_payload: notify 节点含未知字段")

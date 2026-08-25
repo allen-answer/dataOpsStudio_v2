@@ -177,6 +177,32 @@ def test_notify_payload_shape_and_caps() -> None:
             make_node(job_kind="notify", payload=payload)
 
 
+def test_lineage_analyze_node_rejects_ddl_text_instead_of_ignoring_it() -> None:
+    """F11:此前 ddl_text 通过校验、带进子 job、然后被静默忽略。
+
+    workflow 的 lineage_analyze 不接 DDL 文本数据源。静默忽略不可接受 —— 用户以为
+    补了列元数据,实际什么也没发生。要么接通,要么明确拒绝;这里选明确拒绝。
+    """
+    with pytest.raises(ValidationError, match="invalid_lineage_analyze_payload"):
+        make_node(
+            job_kind="lineage_analyze",
+            payload={
+                "datasource_id": "ds-1",
+                "sql_text": "select 1",
+                "ddl_text": "CREATE TABLE t (a INT)",
+            },
+        )
+
+
+def test_lineage_analyze_node_without_ddl_text_is_still_accepted() -> None:
+    node = make_node(
+        job_kind="lineage_analyze",
+        payload={"datasource_id": "ds-1", "sql_text": "select 1"},
+    )
+
+    assert node.payload["sql_text"] == "select 1"
+
+
 # ---------------------------------------------------------------- RetryPolicy 边界
 
 
