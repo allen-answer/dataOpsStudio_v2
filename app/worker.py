@@ -96,8 +96,10 @@ from app.domain.lineage import (
     LineageParseRequest,
     LineageReport,
     analyze_sql_lineage,
+    apply_ddl_schema,
     build_lineage_edge_rows,
     build_semantic_view,
+    lineage_ddl_fingerprint,
     lineage_sql_hash,
     schema_from_metadata_cache_rows,
 )
@@ -438,6 +440,7 @@ class LineageCatalogLike(Protocol):
         sql_hash: str,
         sql_text: str,
         report: LineageReport,
+        ddl_summary: dict[str, Any] | None = None,
     ) -> None: ...
 
 
@@ -1405,12 +1408,19 @@ class WorkerRunner:
         if dialect is None:
             dialect = self._datasource_loader(datasource_id).db_type.value
         dialect = dialect.lower()
+        # DDL 文本数据源:与单条解析 / 批量分析同款语义,workflow 不再是第四种行为。
+        ddl_text = _payload_optional_str(payload, "ddl_text")
         schema_context = self._lineage_catalog.schema_context(datasource_id, default_schema)
         sql_hash = lineage_sql_hash(
             sql_text=sql_text,
             dialect=dialect,
             schema_context=schema_context,
             parser_version=LINEAGE_PARSER_VERSION,
+            # F8:缓存维度取 ddl_text **原文**指纹 —— 合并可能是空操作,光靠
+            # schema_context 区分不开"带 DDL"与"不带 DDL"。
+            ddl_source=lineage_ddl_fingerprint(
+                ddl_text, dialect=dialect, default_schema=default_schema
+            ),
         )
         cached_run_id = self._lineage_catalog.cached_run_id(
             project_id=job.project_id,
@@ -1427,6 +1437,18 @@ class WorkerRunner:
                     metadata={"lineage_run_id": cached_run_id, "cached": True},
                 )
             )
+        # F8:缓存未命中之后才解析 DDL(命中缓存不必白解一遍)。
+        # F12:方言不受支持时让节点**明确失败**。workflow 是配置好、会被反复调度的
+        # 流水线,静默降级只会让下游长期拿到一份悄悄缺列的血缘;批量路径那种
+        # "降级但在报告里可见"的策略适合一次性批处理,不适合这里。
+        try:
+            ddl_summary = apply_ddl_schema(
+                schema_context, ddl_text, dialect=dialect, default_schema=default_schema
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"lineage_analyze ddl_text dialect is not supported: {dialect}"
+            ) from exc
         report = analyze_sql_lineage(
             LineageParseRequest.model_validate(
                 {
@@ -1447,6 +1469,8 @@ class WorkerRunner:
             sql_hash=sql_hash,
             sql_text=sql_text,
             report=report,
+            # F13:摘要随 parse_summary 持久化,与 API analyze 同范式。
+            ddl_summary=ddl_summary,
         )
         self._heartbeat(job.id)
         return _ExecutionOutcome(
@@ -1495,6 +1519,27 @@ class WorkerRunner:
             dialect = dialect or detect_default
             schema_context = {"schema": {}, "default_schema": default_schema}
         dialect = dialect.lower()
+        # DDL 文本数据源(可选):补齐列元数据,把宽松表级降级重新拉回列级。批级只解析一次。
+        ddl_text = _payload_optional_str(payload, "ddl_text")
+        ddl_dialect = dialect
+        if dialect == AUTO_DIALECT:
+            # ★ 对 DDL 文本**自己**做一次识别,而不是套用文件级回落值 detect_default。
+            # 无库时 detect_default 恒为 "oracle",而同一作业的 SQL 文件却是逐文件
+            # 自动识别的 —— 实测同一份 MySQL DDL:dialect='auto'(前端默认)得
+            # 0 表 0 列 2 skipped、列映射 0 条;dialect='mysql' 得 2 表 4 列、列映射 2 条。
+            ddl_dialect = resolve_dialect(
+                AUTO_DIALECT, ddl_text or "", default=detect_default
+            ).dialect
+        ddl_summary = _lineage_batch_ddl_schema(
+            schema_context,
+            ddl_text,
+            dialect=ddl_dialect,
+            default_schema=default_schema,
+        )
+        # 批级算一次,逐文件复用(见 _lineage_batch_file 的 sql_hash)。
+        ddl_fingerprint = lineage_ddl_fingerprint(
+            ddl_text, dialect=ddl_dialect, default_schema=default_schema
+        )
 
         files_report: list[dict[str, Any]] = []
         skipped: dict[str, int] = {"non_sql": 0, "too_large": 0, "over_file_limit": 0}
@@ -1537,6 +1582,8 @@ class WorkerRunner:
                             schema_context=schema_context,
                             source_ref=info.filename,
                             raw=raw,
+                            ddl_fingerprint=ddl_fingerprint,
+                            ddl_summary=ddl_summary,
                         )
                     )
         script_edges = _lineage_batch_script_edges(files_report)
@@ -1589,6 +1636,8 @@ class WorkerRunner:
             "semantic_view": semantic_view.model_dump(mode="json"),
             # 任一文件任一类明细发生截断即置真,供导出 / 前端提示"明细不完整"。
             "details_truncated": bool(details_dropped),
+            # DDL 文本数据源摘要(没给 DDL 时为 None,前端据此决定是否显示)。
+            "ddl_schema": ddl_summary,
         }
         artifact_ref = self._result_store.put_artifact(
             job.id,
@@ -1621,6 +1670,8 @@ class WorkerRunner:
         schema_context: dict[str, Any],
         source_ref: str,
         raw: bytes,
+        ddl_fingerprint: dict[str, str] | None = None,
+        ddl_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         assert self._lineage_catalog is not None
         sql_text = _decode_sql_bytes(raw)
@@ -1648,6 +1699,9 @@ class WorkerRunner:
                 dialect=file_dialect,
                 schema_context=schema_context,
                 parser_version=LINEAGE_PARSER_VERSION,
+                # 与单条解析同一维度:合并可能是空操作,光靠 schema_context 区分不开
+                # "带 DDL"与"不带 DDL"两种运行。
+                ddl_source=ddl_fingerprint,
             )
             cached_run_id = self._lineage_catalog.cached_run_id(
                 project_id=job.project_id,
@@ -1670,6 +1724,9 @@ class WorkerRunner:
                     sql_hash=sql_hash,
                     sql_text=sql_text,
                     report=report,
+                    # 这一行的 sql_hash 是带 DDL 维度算的,parse_summary 不带 ddl_schema
+                    # 的话,跨路径缓存命中会把"这份结果用了 DDL"这件事隐藏掉。
+                    ddl_summary=ddl_summary,
                 )
                 status = "parsed"
         else:
@@ -2564,10 +2621,15 @@ class PostgresLineageCatalog:
         sql_hash: str,
         sql_text: str,
         report: LineageReport,
+        ddl_summary: dict[str, Any] | None = None,
     ) -> None:
         now = datetime.now(UTC)
         parse_summary = dict(report.report or {})
         parse_summary["parser_version"] = LINEAGE_PARSER_VERSION
+        if ddl_summary is not None:
+            # 与 API analyze 同范式:DDL 摘要随 parse_summary 持久化,缓存命中的 run
+            # 回读时同样带着,前端能显示"这份结果用了 DDL 数据源"。
+            parse_summary["ddl_schema"] = ddl_summary
         table_rows, column_rows = build_lineage_edge_rows(
             run_id=run_id,
             project_id=project_id,
@@ -2934,6 +2996,37 @@ def _project_lineage_batch_details(
             dropped.append(f"{kind}:{total}->{len(kept)}")
         budget -= len(kept)
     return details, budget, dropped
+
+
+def _lineage_batch_ddl_schema(
+    schema_context: dict[str, Any],
+    ddl_text: str | None,
+    *,
+    dialect: str,
+    default_schema: str | None,
+) -> dict[str, Any] | None:
+    """DDL 文本数据源并进批量 ``schema_context``(原地改),返回落报告的摘要。
+
+    解析与合并复用 :func:`apply_ddl_schema`(与单条解析同一实现,摘要口径一致);
+    这里只负责批量路径特有的**错误策略**:方言不在白名单时整批不失败,降级继续。
+
+    ★ 降级时**不能返回 None** —— 报告契约里 ``null`` 表示"未提供 DDL",与"提供了
+    但被丢弃"同形的话,用户在界面上零提示,只能去翻 worker 日志。返回带 ``error``
+    的摘要,让"DDL 没生效"这件事在报告里可见。
+    """
+    try:
+        return apply_ddl_schema(
+            schema_context, ddl_text, dialect=dialect, default_schema=default_schema
+        )
+    except ValueError:
+        logger.warning("lineage_batch_ddl_dialect_unsupported", dialect=dialect)
+        return {
+            "error": "dialect_unsupported",
+            "dialect": dialect,
+            "table_count": 0,
+            "column_count": 0,
+            "skipped_statement_count": 0,
+        }
 
 
 def _lineage_batch_script_edges(files_report: list[dict[str, Any]]) -> list[dict[str, Any]]:

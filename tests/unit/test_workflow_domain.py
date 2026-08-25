@@ -18,6 +18,7 @@ from app.domain.workflow import (
     BUILTIN_VARIABLE_NAMES,
     MAX_VARIABLE_LIST_LENGTH,
     MAX_VARIABLE_VALUE_LENGTH,
+    MAX_WORKFLOW_DDL_TEXT_CHARS,
     MAX_WORKFLOW_VARIABLES,
     SUPPORTED_WORKFLOW_NODE_KINDS_V1,
     CronSchedule,
@@ -175,6 +176,50 @@ def test_notify_payload_shape_and_caps() -> None:
     for payload in payloads:
         with pytest.raises(ValidationError, match="invalid_notify_payload"):
             make_node(job_kind="notify", payload=payload)
+
+
+def test_lineage_analyze_node_accepts_ddl_text() -> None:
+    """F11:ddl_text 在 workflow 节点上**真正生效**(worker 侧接通),不再被静默忽略。"""
+    node = make_node(
+        job_kind="lineage_analyze",
+        payload={
+            "datasource_id": "ds-1",
+            "sql_text": "select 1",
+            "ddl_text": "CREATE TABLE t (a INT)",
+        },
+    )
+
+    assert node.payload["ddl_text"] == "CREATE TABLE t (a INT)"
+
+
+def test_lineage_analyze_node_caps_inline_ddl_text() -> None:
+    """workflow spec 内联存储且按计划反复执行,上限必须比交互式解析紧。"""
+    with pytest.raises(ValidationError, match="invalid_lineage_analyze_payload"):
+        make_node(
+            job_kind="lineage_analyze",
+            payload={
+                "datasource_id": "ds-1",
+                "sql_text": "select 1",
+                "ddl_text": "x" * (MAX_WORKFLOW_DDL_TEXT_CHARS + 1),
+            },
+        )
+
+
+def test_lineage_analyze_node_rejects_non_string_ddl_text() -> None:
+    with pytest.raises(ValidationError, match="invalid_lineage_analyze_payload"):
+        make_node(
+            job_kind="lineage_analyze",
+            payload={"datasource_id": "ds-1", "sql_text": "select 1", "ddl_text": 123},
+        )
+
+
+def test_lineage_analyze_node_without_ddl_text_is_still_accepted() -> None:
+    node = make_node(
+        job_kind="lineage_analyze",
+        payload={"datasource_id": "ds-1", "sql_text": "select 1"},
+    )
+
+    assert node.payload["sql_text"] == "select 1"
 
 
 # ---------------------------------------------------------------- RetryPolicy 边界

@@ -665,6 +665,10 @@ class CompareTaskSuggestionResponse(BaseModel):
 
 LineageDirection = Literal["upstream", "downstream", "both"]
 
+# DDL 文本数据源载荷上限。一份 1 MB 的建表 DDL 已覆盖数千张表,远超正常用量;
+# 设上限是为了让批量 job payload(整段 DDL 随 payload 落 jobs 表)保持可控。
+LINEAGE_DDL_MAX_CHARS = 1_000_000
+
 
 class LineageAnalyzeRequest(BaseModel):
     datasource_id: str
@@ -675,6 +679,10 @@ class LineageAnalyzeRequest(BaseModel):
     # AI 兜底解析(L2,默认关;设计稿 §2.4 第 7 条)。开关形态设计稿未定,
     # 先按请求级可选字段实现(最小假设,见 PR 说明)。
     ai_fallback: bool = False
+    # DDL 文本数据源:贴一段建表 DDL 补齐列元数据,让元数据缓存缺失的表也能出
+    # 列级血缘(对标 DataGrip DDL data source)。缺省 None = 行为与从前完全一致;
+    # 元数据缓存里已有的表永远以缓存为准,DDL 只填空洞。
+    ddl_text: str | None = Field(default=None, max_length=LINEAGE_DDL_MAX_CHARS)
 
 
 class LineageAiFallbackResult(BaseModel):
@@ -793,6 +801,8 @@ class LineageBatchCreateRequest(BaseModel):
     datasource_id: str | None = None
     dialect: str | None = Field(default=None, min_length=1, max_length=32)
     default_schema: str | None = Field(default=None, min_length=1, max_length=128)
+    # DDL 文本数据源(与单条解析同形):无库 / 缺元数据时补齐列元数据 → 列级血缘。
+    ddl_text: str | None = Field(default=None, max_length=LINEAGE_DDL_MAX_CHARS)
 
     @model_validator(mode="after")
     def _require_dialect_without_datasource(self) -> LineageBatchCreateRequest:

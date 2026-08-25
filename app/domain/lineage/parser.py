@@ -12,7 +12,7 @@ from sqlglot.errors import ParseError, SqlglotError
 from sqlglot.lineage import Node, lineage
 from sqlglot.optimizer.qualify import qualify
 
-from app.domain.lineage.dialects import register_lineage_dialects
+from app.domain.lineage.dialects import normalize_lineage_dialect, register_lineage_dialects
 from app.domain.lineage.models import (
     InsertMapping,
     LineageParseError,
@@ -70,7 +70,7 @@ class _StatementContext:
 
 def analyze_sql_lineage(request: LineageParseRequest) -> LineageReport:
     register_lineage_dialects()
-    dialect = _normalize_dialect(request.dialect)
+    dialect = normalize_lineage_dialect(request.dialect)
     sql_text = request.sql_text
     # L-3:PL/SQL 深度解析。控制流感知切段 + 动态 SQL 抽取,纯静态(无 DB,R1 满足)。
     # 变量在任何 normalize 之前抽(``${name}`` 模板名不能丢)。
@@ -1500,19 +1500,6 @@ def _looks_like_plsql(sql_text: str) -> bool:
     # L-3:覆盖 PROCEDURE / FUNCTION / PACKAGE BODY / TRIGGER / 匿名 DECLARE 块 ——
     # 这些形态都要走控制流感知切段,不能拿 sqlglot 顶层解析的整块结果。
     return _RE_LOOKS_LIKE_PLSQL.search(sql_text) is not None
-
-
-def _normalize_dialect(dialect: str) -> str:
-    normalized = dialect.lower()
-    if normalized in {"dameng"}:
-        return "dm"
-    if normalized == "postgresql":
-        return "postgres"  # sqlglot 原生方言名
-    # L-1:放开 sqlglot 原生支持的方言(tsql 随自动识别一并放开);db2 保持不加
-    # (GA 未 Certified,差距矩阵 L-1)。
-    if normalized not in {"mysql", "oracle", "dm", "postgres", "tsql"}:
-        raise ValueError("lineage dialect must be mysql, oracle, dm, postgres, or tsql")
-    return normalized
 
 
 def _non_empty_str(value: object) -> str | None:
