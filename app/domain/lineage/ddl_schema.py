@@ -156,17 +156,27 @@ def merge_ddl_schema(base: LineageSchema, ddl: LineageSchema) -> LineageSchema:
 
     按表粒度合并(不混列):某张表只要元数据缓存里有,就整张用缓存的,DDL 不参与。
     这保证"有真实数据源时行为完全不变",DDL 只填缓存缺失的空洞。
+
+    ★ 未限定 schema 的 DDL 表(落 ``""`` 桶)要**跨全部缓存桶**比对表名,不能只看
+    ``""`` 桶。否则 ``""``.T 会与缓存里的 ``ODS``.T 并存,qualify 反而挑中信息更少的
+    DDL 副本 —— 血缘比"根本不给 DDL"还差(见 F1 回归用例)。
     """
     merged: LineageSchema = {schema_name: dict(tables) for schema_name, tables in base.items()}
     lowered_index = {
         schema_name.lower(): {table_name.lower() for table_name in tables}
         for schema_name, tables in base.items()
     }
+    # 全库表名(小写)集合:裸表名 DDL 判"缓存里到底有没有这张表"用。
+    cached_table_names = {name for names in lowered_index.values() for name in names}
     for schema_name, tables in ddl.items():
         existing = lowered_index.get(schema_name.lower(), set())
         target_key = _case_key(merged, schema_name)
         for table_name, columns in tables.items():
-            if table_name.lower() in existing:
+            lowered_table = table_name.lower()
+            if lowered_table in existing:
+                continue
+            if not schema_name and lowered_table in cached_table_names:
+                # 缓存优先:缓存里已有同名表(在别的 schema 桶里),不再造 "" 桶副本。
                 continue
             merged.setdefault(target_key, {})[table_name] = dict(columns)
     return merged

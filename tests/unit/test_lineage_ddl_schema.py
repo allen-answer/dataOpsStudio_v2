@@ -283,6 +283,25 @@ def test_merge_matches_table_names_case_insensitively() -> None:
     assert merged == {"ODS": {"ORDERS": {"ID": "integer"}}}
 
 
+def test_merge_bare_ddl_table_defers_to_cache_in_another_schema() -> None:
+    """F1:裸表名 DDL 不得在 "" 桶造出缓存同名表的副本(否则 qualify 反被遮蔽)。"""
+    base = {"ODS": {"SRC": {"ID": "integer", "AMT": "numeric"}}}
+
+    merged = merge_ddl_schema(base, {"": {"SRC": {"ID": "INT"}}})
+
+    assert merged == {"ODS": {"SRC": {"ID": "integer", "AMT": "numeric"}}}
+
+
+def test_merge_bare_ddl_table_absent_from_cache_still_lands_in_empty_bucket() -> None:
+    """F1 的另一半:全库都没有这张表时 DDL 仍要补进来(别为了修 F1 矫枉过正)。"""
+    base = {"ODS": {"SRC": {"ID": "integer"}}}
+
+    merged = merge_ddl_schema(base, {"": {"NEW_T": {"ID": "INT"}}})
+
+    assert merged[""] == {"NEW_T": {"ID": "INT"}}
+    assert merged["ODS"] == {"SRC": {"ID": "integer"}}
+
+
 def test_merge_does_not_mutate_inputs() -> None:
     base = {"ods": {"orders": {"id": "integer"}}}
     ddl = {"ods": {"dwd": {"id": "INT"}}}
@@ -331,3 +350,76 @@ def test_ddl_schema_restores_column_level_lineage_without_a_database() -> None:
     assert ("ORDER_ID", "ORDER_ID") in mappings
     assert ("AMT", "AMT") in mappings
     assert not any(warning["code"] == "lenient_table_level" for warning in report.warnings)
+
+
+# ── F1 长期护栏:带 DDL 的结果永远不劣于不带 DDL ──────────────────────────
+#
+# 价值判断 #1(任务书总纲):DDL 是补充信息,任何情况下都不该让血缘变差。
+# 这条护栏刻意用"同一段 SQL 跑两遍比计数"的形态,而不是断言某个具体数字 ——
+# 将来 DDL 预处理再怎么改,这条断言都还成立才算没砸锅。
+
+_F1_BASE_SCHEMA = {
+    "ODS": {
+        "SRC": {"ID": "integer", "AMT": "numeric"},
+        "TGT": {"ID": "integer", "AMT": "numeric"},
+    }
+}
+
+
+@pytest.mark.parametrize(
+    ("label", "sql", "default_schema", "ddl"),
+    [
+        (
+            "裸表名 DDL + 未限定 SQL + 无 default_schema(F1 实测退化形态)",
+            "INSERT INTO TGT (ID, AMT) SELECT ID, AMT FROM SRC",
+            None,
+            "CREATE TABLE SRC (ID INT, AMT DECIMAL(18,2));\n"
+            "CREATE TABLE TGT (ID INT, AMT DECIMAL(18,2));",
+        ),
+        (
+            "裸表名 DDL + 限定 SQL",
+            "INSERT INTO ODS.TGT (ID, AMT) SELECT ID, AMT FROM ODS.SRC",
+            "ODS",
+            "CREATE TABLE SRC (ID INT, AMT DECIMAL(18,2));",
+        ),
+        (
+            "DDL 列比缓存少(不得让缓存降级)",
+            "INSERT INTO TGT (ID, AMT) SELECT ID, AMT FROM SRC",
+            "ODS",
+            "CREATE TABLE SRC (ID INT);",
+        ),
+        (
+            "DDL 全是垃圾(不得比不给 DDL 更差)",
+            "INSERT INTO ODS.TGT (ID, AMT) SELECT ID, AMT FROM ODS.SRC",
+            "ODS",
+            "not sql at all ;;; ((( ;",
+        ),
+    ],
+)
+def test_ddl_never_degrades_lineage_versus_no_ddl(
+    label: str, sql: str, default_schema: str | None, ddl: str
+) -> None:
+    """F1 护栏:同一段 SQL,带 DDL 的列映射 / 列数不得少于不带 DDL。"""
+
+    def run(schema: dict[str, dict[str, dict[str, str]]]) -> tuple[int, int, bool]:
+        report = analyze_sql_lineage(
+            LineageParseRequest(
+                sql_text=sql,
+                dialect="dm",
+                schema=schema,
+                default_schema=default_schema,
+                lenient=True,
+            )
+        )
+        degraded = any(w["code"] == "lenient_table_level" for w in report.warnings)
+        return len(report.insert_mappings), len(report.columns), degraded
+
+    baseline = run(_F1_BASE_SCHEMA)
+    merged = merge_ddl_schema(
+        _F1_BASE_SCHEMA, schema_from_ddl_text(ddl, dialect="dm", default_schema=None).schema
+    )
+    with_ddl = run(merged)
+
+    assert with_ddl[0] >= baseline[0], f"{label}: 列映射变少了 {baseline[0]} → {with_ddl[0]}"
+    assert with_ddl[1] >= baseline[1], f"{label}: 列数变少了 {baseline[1]} → {with_ddl[1]}"
+    assert not (with_ddl[2] and not baseline[2]), f"{label}: 带 DDL 反而降级成表级"
