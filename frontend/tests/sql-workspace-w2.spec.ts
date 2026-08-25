@@ -147,6 +147,50 @@ test('metadata browser drills schema → table → columns and inserts SELECT', 
   expectNoConsoleErrors()
 })
 
+test('the metadata browser can refresh one table so its columns are re-read', async ({ page }) => {
+  // `toggleTable(schema, node, true)` 一直写着,但 UI 上没有任何调用者 —— 是死路径。
+  // 元数据浏览器顶部那个刷新只重写 schemas 层,列缓存怎么点都刷不到。
+  await mockBase(page)
+  const columnUrls: string[] = []
+  const tableUrls: string[] = []
+  const column = (name: string) => ({
+    name,
+    type: 'string',
+    driver_type: 'VARCHAR(64)',
+    nullable: true,
+    primary_key: false,
+    comment: null,
+  })
+  await page.route(/\/api\/datasources\/ds-1\/metadata\/schemas/, (r) =>
+    json(r, 200, [{ name: 'app' }]),
+  )
+  await page.route(/\/api\/datasources\/ds-1\/metadata\/tables/, (r) => {
+    tableUrls.push(r.request().url())
+    return json(r, 200, [{ schema_name: 'app', name: 'users', table_type: 'BASE TABLE' }])
+  })
+  await page.route(/\/api\/datasources\/ds-1\/metadata\/columns/, (r) => {
+    const url = r.request().url()
+    columnUrls.push(url)
+    // 表结构改过:重读才看得到 email,旧缓存里还是 legacy_col。
+    return json(r, 200, url.includes('refresh=1') ? [column('email')] : [column('legacy_col')])
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.locator('button[title="Metadata"]').click()
+  const tree = page.locator('aside')
+  await tree.getByText('app', { exact: true }).click()
+  await page.locator('button[title="Show columns"]').click()
+  await expect(tree.getByText('legacy_col', { exact: true })).toBeVisible()
+
+  await page.getByTestId('metadata-refresh-table').click()
+  await expect(tree.getByText('email', { exact: true })).toBeVisible()
+  expect(columnUrls.some((url) => url.includes('refresh=1'))).toBe(true)
+
+  await page.getByTestId('metadata-refresh-schema').click()
+  await expect.poll(() => tableUrls.some((url) => url.includes('refresh=1'))).toBe(true)
+  expectNoConsoleErrors()
+})
+
 test('typing schema dot suggests tables from the selected datasource', async ({ page }) => {
   await mockBase(page)
   const tableRequests: string[] = []
@@ -634,7 +678,52 @@ test('expand-star cache miss surfaces a refresh-metadata hint', async ({ page })
 
   await page.goto('/projects/project-1/sql')
   await page.getByRole('button', { name: 'Expand *' }).click()
-  await expect(page.getByText(/Refresh the metadata browser first/)).toBeVisible()
+  await expect(page.getByText(/No column metadata for this table yet/)).toBeVisible()
+  expectNoConsoleErrors()
+})
+
+test('the cache-miss hint comes with a refresh action that actually refreshes', async ({ page }) => {
+  // 那句"先刷新该表再展开 *"以前在 UI 上做不到 —— 没有任何入口能刷到列缓存。
+  await mockBase(page)
+  const bodies: Record<string, unknown>[] = []
+  await page.route('**/api/sql/expand-star', (r) => {
+    const body = r.request().postDataJSON() as Record<string, unknown>
+    bodies.push(body)
+    if (!body.refresh) {
+      return json(r, 409, {
+        error: 'metadata_cache_missing',
+        message: 'Column metadata cache is missing',
+      })
+    }
+    return json(r, 200, {
+      expanded_sql: 'SELECT id, email FROM users',
+      metadata_refreshed_at: new Date().toISOString(),
+    })
+  })
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Expand *' }).click()
+  await page.getByTestId('expand-star-refresh').click()
+
+  await expect
+    .poll(async () => (await page.locator('.monaco-editor').innerText()).includes('email'))
+    .toBeTruthy()
+  expect(bodies.map((body) => body.refresh)).toEqual([false, true])
+  expectNoConsoleErrors()
+})
+
+test('expanding * says how old the metadata behind the column list is', async ({ page }) => {
+  await mockBase(page)
+  await page.route('**/api/sql/expand-star', (r) =>
+    json(r, 200, {
+      expanded_sql: 'SELECT id, name FROM users',
+      metadata_refreshed_at: new Date(Date.now() - 3 * 86_400_000).toISOString(),
+    }),
+  )
+
+  await page.goto('/projects/project-1/sql')
+  await page.getByRole('button', { name: 'Expand *' }).click()
+  await expect(page.getByTestId('expand-star-age')).toContainText('3d ago')
   expectNoConsoleErrors()
 })
 

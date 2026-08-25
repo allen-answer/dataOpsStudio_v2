@@ -49,6 +49,8 @@ export interface SqlFormatResponse {
 // POST /sql/expand-star
 export interface SqlExpandStarResponse {
   expanded_sql: string
+  /** 这份列清单所依据的元数据缓存写入时间(多表取最旧);旧缓存行可能没有。 */
+  metadata_refreshed_at?: string | null
 }
 
 // POST /jobs/{job_id}/export
@@ -104,13 +106,19 @@ export function formatSql(sql: string, dialect: string): Promise<SqlFormatRespon
   return apiClient.post<SqlFormatResponse>('/sql/format', { sql, dialect })
 }
 
+/**
+ * `refresh=true` 让后端先重读列元数据再展开(用户显式点的那一次)。默认走缓存 ——
+ * 展开保持"纯缓存、不建连",带 refresh 时才可能 503 metadata_probe_failed。
+ */
 export function expandSqlStar(
   sql: string,
   datasourceId: string,
+  refresh = false,
 ): Promise<SqlExpandStarResponse> {
   return apiClient.post<SqlExpandStarResponse>('/sql/expand-star', {
     sql,
     datasource_id: datasourceId,
+    refresh,
   })
 }
 

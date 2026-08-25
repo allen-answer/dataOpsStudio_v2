@@ -1247,6 +1247,7 @@ def test_sql_expand_star_uses_metadata_cache_contract_fields() -> None:
                     },
                 ],
                 "expires_at": datetime.now(UTC) + timedelta(days=1),
+                "refreshed_at": datetime(2026, 8, 20, 9, 0, tzinfo=UTC),
             },
         ]
     )
@@ -1260,10 +1261,13 @@ def test_sql_expand_star_uses_metadata_cache_contract_fields() -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert set(payload) == {"expanded_sql"}
+    assert set(payload) == {"expanded_sql", "metadata_refreshed_at"}
     assert "id" in payload["expanded_sql"]
     assert "name" in payload["expanded_sql"]
     assert "*" not in payload["expanded_sql"]
+    # 展开用的是**缓存里的**列清单;把这份缓存的写入时间一并回给前端,
+    # 用户才判断得了"表结构改过没有、要不要先刷新"。
+    assert str(payload["metadata_refreshed_at"]).startswith("2026-08-20T09:00:00")
 
 
 def test_sql_expand_star_cache_miss_is_structured_error() -> None:
@@ -1278,6 +1282,38 @@ def test_sql_expand_star_cache_miss_is_structured_error() -> None:
 
     assert response.status_code == 409
     assert response.json()["error"] == "metadata_cache_missing"
+
+
+def test_sql_expand_star_refresh_rereads_columns_and_rewrites_the_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`refresh=true` 是用户显式要的那一次重读:绕开缓存、重写缓存。
+
+    没有这个开关时,409 那句"请先刷新该表再展开 *"在 UI 上根本做不到 ——
+    元数据浏览器的刷新只重写 schemas 层,列缓存怎么也刷不到。
+    """
+    monkeypatch.setattr(
+        core_routes,
+        "build_database_adapter",
+        lambda conn_info, secret_store, **kwargs: _MetadataAdapter(),
+    )
+    # 队列里**没有**缓存行:命中缓存读就会翻车,证明 refresh 真的绕开了缓存。
+    engine = _FakeEngine([_datasource_row(), {"id": "project-1"}])
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/sql/expand-star",
+        headers=_auth_headers(),
+        json_body={"sql": "SELECT * FROM users", "datasource_id": "ds-1", "refresh": True},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "id" in payload["expanded_sql"]
+    assert "*" not in payload["expanded_sql"]
+    assert payload["metadata_refreshed_at"] is not None
+    # 重读的结果落回缓存,下一次不带 refresh 的展开才吃得到。
+    assert any("metadata_caches" in statement for statement in engine.statements)
 
 
 def test_sql_explain_enqueues_explain_job_with_result_set() -> None:
