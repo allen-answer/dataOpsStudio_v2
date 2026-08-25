@@ -1804,6 +1804,7 @@ onBeforeUnmount(stopBatchPolling)
                 class="hidden"
                 accept=".zip,.sql,.txt"
                 multiple
+                data-testid="lineage-batch-file"
                 :disabled="writesBlocked || batchBusy"
                 @click.stop
                 @change="onBatchFileChange"

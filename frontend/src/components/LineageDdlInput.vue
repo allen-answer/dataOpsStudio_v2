@@ -98,6 +98,7 @@ async function onFileChange(event: Event): Promise<void> {
       type="file"
       class="hidden"
       accept=".sql,.txt,.ddl"
+      data-testid="lineage-ddl-file"
       :disabled="disabled"
       @click.stop
       @change="onFileChange"
