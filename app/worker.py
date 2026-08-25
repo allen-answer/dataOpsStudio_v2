@@ -99,6 +99,8 @@ from app.domain.lineage import (
     build_lineage_edge_rows,
     build_semantic_view,
     lineage_sql_hash,
+    merge_ddl_schema,
+    schema_from_ddl_text,
     schema_from_metadata_cache_rows,
 )
 from app.domain.lineage.detect import AUTO_DIALECT, resolve_dialect
@@ -1495,6 +1497,15 @@ class WorkerRunner:
             dialect = dialect or detect_default
             schema_context = {"schema": {}, "default_schema": default_schema}
         dialect = dialect.lower()
+        # DDL 文本数据源(可选):补齐列元数据,把宽松表级降级重新拉回列级。
+        # 批级只解析一次;dialect 为 "auto" 哨兵时按 detect_default 解 DDL
+        # (DDL 是一整段文本,没有逐文件识别的语义)。
+        ddl_summary = _lineage_batch_ddl_schema(
+            schema_context,
+            _payload_optional_str(payload, "ddl_text"),
+            dialect=detect_default if dialect == AUTO_DIALECT else dialect,
+            default_schema=default_schema,
+        )
 
         files_report: list[dict[str, Any]] = []
         skipped: dict[str, int] = {"non_sql": 0, "too_large": 0, "over_file_limit": 0}
@@ -1589,6 +1600,8 @@ class WorkerRunner:
             "semantic_view": semantic_view.model_dump(mode="json"),
             # 任一文件任一类明细发生截断即置真,供导出 / 前端提示"明细不完整"。
             "details_truncated": bool(details_dropped),
+            # DDL 文本数据源摘要(没给 DDL 时为 None,前端据此决定是否显示)。
+            "ddl_schema": ddl_summary,
         }
         artifact_ref = self._result_store.put_artifact(
             job.id,
@@ -2934,6 +2947,30 @@ def _project_lineage_batch_details(
             dropped.append(f"{kind}:{total}->{len(kept)}")
         budget -= len(kept)
     return details, budget, dropped
+
+
+def _lineage_batch_ddl_schema(
+    schema_context: dict[str, Any],
+    ddl_text: str | None,
+    *,
+    dialect: str,
+    default_schema: str | None,
+) -> dict[str, int] | None:
+    """DDL 文本数据源并进批量 ``schema_context``(原地改),返回落报告的摘要。
+
+    ``ddl_text`` 为空时返回 None 且不碰 schema_context —— 没给 DDL 的批量分析
+    行为与从前完全一致。方言不在白名单时降级为"无 DDL"(整批不因此失败),
+    只在日志留痕。
+    """
+    if not ddl_text or not ddl_text.strip():
+        return None
+    try:
+        result = schema_from_ddl_text(ddl_text, dialect=dialect, default_schema=default_schema)
+    except ValueError:
+        logger.warning("lineage_batch_ddl_dialect_unsupported", dialect=dialect)
+        return None
+    schema_context["schema"] = merge_ddl_schema(schema_context["schema"], result.schema)
+    return result.as_summary()
 
 
 def _lineage_batch_script_edges(files_report: list[dict[str, Any]]) -> list[dict[str, Any]]:

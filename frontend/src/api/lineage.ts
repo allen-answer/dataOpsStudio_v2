@@ -32,6 +32,22 @@ export interface LineageAnalyzeRequest {
   source_ref: string
   dialect?: string | null
   default_schema?: string | null
+  /**
+   * DDL 文本数据源(对标 DataGrip DDL data source):贴一段建表 DDL 补齐列元数据,
+   * 让元数据缓存缺失的表也能出列级血缘。不给 = 行为与从前完全一致;元数据缓存里
+   * 已有的表永远以缓存为准,DDL 只填空洞。上限 schemas.py LINEAGE_DDL_MAX_CHARS。
+   */
+  ddl_text?: string | null
+}
+
+/**
+ * DDL 数据源解析摘要,锚 app/domain/lineage/ddl_schema.py DdlSchemaResult.as_summary()。
+ * 单条解析挂 parse_summary.ddl_schema;批量挂 report.ddl_schema。没给 DDL 时不存在。
+ */
+export interface LineageDdlSchemaSummary {
+  table_count: number
+  column_count: number
+  skipped_statement_count: number
 }
 
 /**
@@ -44,6 +60,7 @@ export interface LineageParseSummary {
   column_mapping_count?: number
   parse_error_count?: number
   parser_version?: string
+  ddl_schema?: LineageDdlSchemaSummary
   [key: string]: unknown
 }
 
@@ -460,6 +477,8 @@ export interface LineageBatchCreateRequest {
   datasource_id?: string | null
   dialect?: string | null
   default_schema?: string | null
+  /** DDL 文本数据源(与单条解析同形):补齐列元数据 → 把宽松表级升回列级。 */
+  ddl_text?: string | null
 }
 
 export type LineageBatchJobStatus =
@@ -550,6 +569,8 @@ export interface LineageBatchReport {
   script_edges: LineageBatchScriptEdge[]
   /** L-4 语义视图(旧 report 无此段,可选守空)。 */
   semantic_view?: LineageSemanticView
+  /** DDL 文本数据源摘要;本次未给 DDL 时后端写 null,旧 report 无此键。 */
+  ddl_schema?: LineageDdlSchemaSummary | null
 }
 
 export interface LineageBatchStatusResponse {

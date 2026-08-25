@@ -3966,6 +3966,90 @@ def test_worker_runs_lineage_batch_without_datasource_report_only() -> None:
     assert "_report" not in file_a
 
 
+def test_worker_lineage_batch_ddl_text_restores_column_level_lineage() -> None:
+    """无库批量 + DDL 文本数据源 → 从宽松表级升回列级(合成表结构)。"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "load.sql",
+            "insert into ods.dwd_orders (order_id, amt) select o.order_id, o.amt from ods.orders o",
+        )
+    job = _make_job(
+        kind=JobKind.LINEAGE_BATCH,
+        payload={
+            "upload_id": "up-1",
+            "storage_uri": "uploads/up-1/scripts.zip",
+            "datasource_id": None,
+            "dialect": "dm",
+            "ddl_text": (
+                'CREATE TABLE "ODS"."ORDERS" ("ORDER_ID" NUMBER(18), "AMT" NUMBER(12,2), '
+                'NOT CLUSTER PRIMARY KEY("ORDER_ID")) STORAGE(ON "MAIN", CLUSTERBTR);'
+                'CREATE TABLE "ODS"."DWD_ORDERS" ("ORDER_ID" NUMBER(18), "AMT" NUMBER(12,2));'
+            ),
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    result_store.downloads["uploads/up-1/scripts.zip"] = buffer.getvalue()
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=_FakeLineageCatalog(),
+    )
+
+    assert runner.run_once() is True
+
+    report = json.loads(result_store.run_artifacts[("job-1", "lineage_batch_report.json")])
+    assert report["ddl_schema"] == {
+        "table_count": 2,
+        "column_count": 4,
+        "skipped_statement_count": 0,
+    }
+    assert report["column_mapping_total"] == 2
+    entry = report["files"][0]
+    assert entry["lenient_statement_count"] == 0
+
+
+def test_worker_lineage_batch_without_ddl_text_stays_table_level() -> None:
+    """对照组:同一 ZIP 不给 DDL —— 维持现状的宽松表级降级。"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "load.sql",
+            "insert into ods.dwd_orders (order_id, amt) select o.order_id, o.amt from ods.orders o",
+        )
+    job = _make_job(
+        kind=JobKind.LINEAGE_BATCH,
+        payload={
+            "upload_id": "up-1",
+            "storage_uri": "uploads/up-1/scripts.zip",
+            "datasource_id": None,
+            "dialect": "dm",
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    result_store.downloads["uploads/up-1/scripts.zip"] = buffer.getvalue()
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=_FakeLineageCatalog(),
+    )
+
+    assert runner.run_once() is True
+
+    report = json.loads(result_store.run_artifacts[("job-1", "lineage_batch_report.json")])
+    assert report["ddl_schema"] is None
+    assert report["column_mapping_total"] == 0
+    assert report["files"][0]["lenient_statement_count"] == 1
+
+
 def test_worker_lineage_batch_emits_semantic_view_with_refresh_and_risk() -> None:
     # L-4:DELETE(无 WHERE)+ INSERT 同表 → 全量重刷 delete_insert + full_reload 风险
     buffer = io.BytesIO()

@@ -13,7 +13,7 @@ from app.api.app import create_app
 from app.api.errors import ApiError
 from app.api.routes import compare_result_inputs as compare_result_inputs_routes
 from app.api.routes import core as core_routes
-from app.api.schemas import CompareDataRef, SqlGenerateResponse
+from app.api.schemas import LINEAGE_DDL_MAX_CHARS, CompareDataRef, SqlGenerateResponse
 from app.api.security import create_access_token, decode_access_token
 from app.api.services import ApiServices
 from app.dbclients.protocol import AdapterConnectionError
@@ -4447,6 +4447,167 @@ def test_lineage_analyze_cache_hit_does_not_reinsert_edges() -> None:
         }
     ]
     assert not any("INSERT INTO lineage_edges" in statement for statement in engine.statements)
+
+
+# ── DDL 文本数据源(元数据缓存为空时靠 DDL 拿回列级血缘)────────────────
+
+_DDL_ANALYZE_SQL = (
+    "INSERT INTO ODS.DWD_ORDERS (ORDER_ID, AMT) SELECT O.ORDER_ID, O.AMT FROM ODS.ORDERS O"
+)
+
+# 达梦导出实拍形态(合成表结构,非真实业务表)。
+_DDL_ANALYZE_DDL = (
+    'CREATE TABLE "ODS"."ORDERS" ("ORDER_ID" NUMBER(18), "AMT" NUMBER(12,2), '
+    'NOT CLUSTER PRIMARY KEY("ORDER_ID")) STORAGE(ON "MAIN", CLUSTERBTR);\n'
+    'CREATE TABLE "ODS"."DWD_ORDERS" ("ORDER_ID" NUMBER(18), "AMT" NUMBER(12,2));'
+)
+
+
+def _ddl_analyze_engine() -> _FakeEngine:
+    """元数据缓存 **为空**(第三项 ``[]``)—— 列级血缘只可能来自 DDL。"""
+    return _FakeEngine(
+        [
+            {"id": "project-1"},
+            _datasource_row(),
+            [],
+            None,
+            {
+                "id": "run-ddl",
+                "project_id": "project-1",
+                "datasource_id": "ds-1",
+                "dialect": "dm",
+                "source_ref": "script.sql",
+                "sql_hash": "hash-ddl",
+                "parser_version": "sqlglot-w1-v1",
+                "status": "success",
+                "parse_summary": {},
+            },
+            1,
+            2,
+        ]
+    )
+
+
+def _persisted_parse_summary(engine: _FakeEngine) -> dict[str, Any]:
+    for statement in engine.executed:
+        if "INSERT INTO lineage_runs" not in str(statement):
+            continue
+        params = cast(dict[str, Any], cast(Any, statement).compile().params)
+        summary = next(
+            (value for key, value in params.items() if key.startswith("parse_summary")),
+            None,
+        )
+        if isinstance(summary, dict):
+            return cast(dict[str, Any], summary)
+    raise AssertionError("lineage_runs insert not found")
+
+
+def test_lineage_analyze_with_ddl_text_yields_column_level_edges_without_metadata() -> None:
+    """无元数据缓存 + 带 DDL 载荷 → 列级边落库,parse_summary 带 ddl_schema 摘要。"""
+    engine = _ddl_analyze_engine()
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/analyze",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "source_ref": "script.sql",
+            "dialect": "dm",
+            "sql_text": _DDL_ANALYZE_SQL,
+            "ddl_text": _DDL_ANALYZE_DDL,
+        },
+    )
+
+    assert response.status_code == 201
+    assert any("INSERT INTO lineage_column_edges" in statement for statement in engine.statements)
+    summary = _persisted_parse_summary(engine)
+    assert summary["ddl_schema"] == {
+        "table_count": 2,
+        "column_count": 4,
+        "skipped_statement_count": 0,
+    }
+    assert summary["column_mapping_count"] == 2
+    assert summary["parse_error_count"] == 0
+
+
+def test_lineage_analyze_without_ddl_text_keeps_unsupported_schema_behaviour() -> None:
+    """对照组:同一请求去掉 ddl_text —— 维持现状(缺元数据 → 无列级边 + 无 ddl_schema)。"""
+    engine = _ddl_analyze_engine()
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/analyze",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "source_ref": "script.sql",
+            "dialect": "dm",
+            "sql_text": _DDL_ANALYZE_SQL,
+        },
+    )
+
+    assert response.status_code == 201
+    assert not any(
+        "INSERT INTO lineage_column_edges" in statement for statement in engine.statements
+    )
+    summary = _persisted_parse_summary(engine)
+    assert "ddl_schema" not in summary
+    assert summary["column_mapping_count"] == 0
+    # 两张表都缺元数据缓存 → 各出一条 unsupported_schema(现状行为,未被本 PR 改动)
+    assert summary["parse_error_count"] == 2
+    assert {error["error_type"] for error in summary["parse_errors"]} == {"unsupported_schema"}
+
+
+def test_lineage_analyze_rejects_ddl_text_over_size_limit() -> None:
+    engine = _ddl_analyze_engine()
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/analyze",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "source_ref": "script.sql",
+            "sql_text": _DDL_ANALYZE_SQL,
+            "ddl_text": "x" * (LINEAGE_DDL_MAX_CHARS + 1),
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_lineage_batch_forwards_ddl_text_into_job_payload() -> None:
+    """批量:DDL 原文随 job payload 下发,worker 侧解析(见 test_worker)。"""
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            {
+                "id": "up-1",
+                "project_id": "project-1",
+                "owner_user_id": "user-1",
+                "purpose": "lineage_batch",
+                "filename": "scripts.zip",
+                "content_type": "application/zip",
+                "bytes": 2048,
+                "storage_uri": "uploads/up-1/scripts.zip",
+                "created_at": _dt(1),
+            },
+        ]
+    )
+    services = _Services(engine)
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/batch",
+        headers=_auth_headers(),
+        json_body={"upload_id": "up-1", "dialect": "dm", "ddl_text": _DDL_ANALYZE_DDL},
+    )
+
+    assert response.status_code == 202
+    job = services.job_backend.enqueued[0]
+    assert job.payload["ddl_text"] == _DDL_ANALYZE_DDL
+    assert job.payload["dialect"] == "dm"
 
 
 def test_lineage_subgraph_contract_uses_recursive_cte() -> None:

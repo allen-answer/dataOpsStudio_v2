@@ -250,7 +250,9 @@ from app.domain.lineage import (
     build_lineage_edge_rows,
     build_semantic_view,
     lineage_sql_hash,
+    merge_ddl_schema,
     resolve_dialect,
+    schema_from_ddl_text,
     schema_from_metadata_cache_rows,
 )
 from app.domain.lineage.ai_enrichment import build_enrichment_profile
@@ -4228,6 +4230,16 @@ def analyze_project_lineage(
         detection = resolve_dialect(body.dialect or db_type, body.sql_text, default=db_type)
         dialect = detection.dialect
         schema_context = _lineage_schema_context(conn, body.datasource_id, body.default_schema)
+        # DDL 文本数据源:在算 sql_hash 之前并入,DDL 变更自动落到不同 hash。
+        try:
+            ddl_summary = _apply_lineage_ddl_schema(
+                schema_context,
+                body.ddl_text,
+                dialect=dialect,
+                default_schema=body.default_schema,
+            )
+        except ValueError as exc:  # 方言不在白名单(normalize_lineage_dialect)
+            raise ApiError(400, "lineage_ddl_parse_failed", "Lineage DDL parse failed") from exc
         sql_hash = lineage_sql_hash(
             sql_text=body.sql_text,
             dialect=dialect,
@@ -4280,6 +4292,10 @@ def analyze_project_lineage(
         if detection.auto_detected:
             # L-1:识别结果落 parse_summary(前端可显示 "auto-detected: oracle")。
             parse_summary["dialect_detection"] = detection.as_summary()
+        if ddl_summary is not None:
+            # DDL 数据源摘要随 parse_summary 持久化:缓存命中的 run 回读时同样带着,
+            # 前端能显示"DDL 补充了 N 张表 / M 列"(与 dialect_detection 同范式)。
+            parse_summary["ddl_schema"] = ddl_summary
         conn.execute(
             insert(lineage_runs).values(
                 id=run_id,
@@ -4907,6 +4923,9 @@ def create_lineage_batch(
                 "dialect": body.dialect,
                 "default_schema": body.default_schema,
                 "filename": str(upload_row["filename"]),
+                # DDL 文本数据源(可选):worker 侧解析成列元数据后并入 schema,
+                # 让无库 / 缺元数据的批量分析也能出列级血缘。
+                "ddl_text": body.ddl_text,
             },
         )
         _enqueue_job_txn(conn, services, job)
@@ -8448,6 +8467,28 @@ def _lineage_schema_context(
     schema_rows = [dict(row) for row in rows]
     schema = schema_from_metadata_cache_rows(schema_rows)
     return {"default_schema": default_schema, "schema": schema}
+
+
+def _apply_lineage_ddl_schema(
+    schema_context: dict[str, Any],
+    ddl_text: str | None,
+    *,
+    dialect: str,
+    default_schema: str | None,
+) -> dict[str, int] | None:
+    """把 DDL 文本数据源解析出的列元数据并进 ``schema_context``(原地改)。
+
+    返回摘要 dict(落 parse_summary 供前端展示),``ddl_text`` 为空时返回 None
+    且 **完全不碰 schema_context** —— 没给 DDL 的请求行为与从前逐字节一致。
+
+    ★ 必须在 :func:`lineage_sql_hash` 之前调用:hash 吃 schema_context,DDL 变了
+    hash 就变,缓存自然失效,不需要额外的缓存维度。
+    """
+    if not ddl_text or not ddl_text.strip():
+        return None
+    result = schema_from_ddl_text(ddl_text, dialect=dialect, default_schema=default_schema)
+    schema_context["schema"] = merge_ddl_schema(schema_context["schema"], result.schema)
+    return result.as_summary()
 
 
 def _lineage_cached_run(

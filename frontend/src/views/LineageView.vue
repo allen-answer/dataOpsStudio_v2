@@ -71,6 +71,7 @@ import { createStoredZip } from '../utils/zip'
 import { ApiError, type DatasourceListItem } from '../api/types'
 import { useLicense } from '../composables/useLicense'
 import LoadingDots from '../components/LoadingDots.vue'
+import LineageDdlInput from '../components/LineageDdlInput.vue'
 import TraceCompareDialog from '../components/TraceCompareDialog.vue'
 import { createUserErrorMessage } from '../utils/userErrorMessage'
 
@@ -557,10 +558,14 @@ const analyzeDsId = ref('')
 const analyzeSourceRef = ref('')
 const analyzeDefaultSchema = ref('')
 const analyzeSql = ref('')
+// DDL 文本数据源(可选):补齐列元数据 → 元数据缺失的表也能出列级血缘
+const analyzeDdl = ref('')
 const analyzeRefresh = ref(false)
 const analyzing = ref(false)
 const analyzeError = ref<string | null>(null)
 const analyzeResult = ref<LineageAnalyzeResponse | null>(null)
+// 后端把 DDL 解析摘要放进 parse_summary.ddl_schema(与 dialect_detection 同范式)
+const analyzeDdlSummary = computed(() => analyzeResult.value?.parse_summary?.ddl_schema ?? null)
 
 watch(datasources, (list) => {
   if (!analyzeDsId.value && list.length > 0) analyzeDsId.value = list[0].id
@@ -622,6 +627,7 @@ async function onAnalyze(): Promise<void> {
         sql_text: analyzeSql.value,
         source_ref: analyzeSourceRef.value.trim(),
         default_schema: analyzeDefaultSchema.value.trim() || null,
+        ddl_text: analyzeDdl.value.trim() || null,
       },
       analyzeRefresh.value,
     )
@@ -667,6 +673,8 @@ type BatchPhase = 'idle' | 'uploading' | 'running' | 'done' | 'failed'
 const batchDsId = ref('')
 const batchManualDialect = ref('auto')
 const batchDefaultSchema = ref('')
+// DDL 文本数据源(可选,与单条解析同形):把宽松表级降级重新拉回列级
+const batchDdl = ref('')
 const batchFiles = ref<File[]>([])
 const batchFileInput = ref<HTMLInputElement | null>(null)
 
@@ -848,6 +856,7 @@ async function onBatchSubmit(): Promise<void> {
       // 无库必须显式 dialect;有库留空由后端按 db_type 推导
       dialect: batchNoDb.value ? batchManualDialect.value : null,
       default_schema: batchDefaultSchema.value.trim() || null,
+      ddl_text: batchDdl.value.trim() || null,
     })
     if (generation !== batchPollGeneration) return
     batchJobId.value = job_id
@@ -1560,6 +1569,12 @@ onBeforeUnmount(stopBatchPolling)
             />
           </label>
 
+          <LineageDdlInput
+            v-model="analyzeDdl"
+            :disabled="analyzing"
+            :summary="analyzeDdlSummary"
+          />
+
           <div class="flex items-center gap-3">
             <button
               type="button"
@@ -1761,6 +1776,12 @@ onBeforeUnmount(stopBatchPolling)
             <AlertTriangle class="w-4 h-4 shrink-0" />
             {{ t('lineage.dialect_unsupported', { db: batchDialect }) }}
           </div>
+
+          <LineageDdlInput
+            v-model="batchDdl"
+            :disabled="batchBusy"
+            :summary="batchReport?.ddl_schema ?? null"
+          />
 
           <div class="block">
             <span class="block text-xs chrome-text-muted mb-1">{{ t('lineage.batch_file') }}</span>
