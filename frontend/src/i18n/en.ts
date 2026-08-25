@@ -1136,6 +1136,11 @@ export default {
       dialect: 'Dialect (optional)',
       default_schema: 'Default schema (optional)',
       source_ref: 'Source reference (optional)',
+      ddl_text: 'DDL text data source (optional)',
+      ddl_text_ph:
+        'Paste CREATE TABLE statements to supply metadata the cache is missing → column-level lineage…',
+      ddl_text_hint:
+        'Same as the two lineage entry points; capped at {max} characters (a workflow definition is stored and re-run on a schedule, so the cap is tighter than interactive analysis).',
       upstream_result: 'Upstream SQL result',
       filename: 'Filename',
       export_edge_hint: 'Choose an upstream SQL node; a success edge will be added.',

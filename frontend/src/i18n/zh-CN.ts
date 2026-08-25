@@ -1107,6 +1107,10 @@ export default {
       dialect: '方言（可选）',
       default_schema: '默认 Schema（可选）',
       source_ref: '来源引用（可选）',
+      ddl_text: 'DDL 文本数据源（可选）',
+      ddl_text_ph: '粘贴 CREATE TABLE ... 建表语句，补齐元数据缓存缺失的表 → 列级血缘…',
+      ddl_text_hint:
+        '与血缘页两个入口同义；上限 {max} 字符（编排定义会被存储并按计划反复执行，故比交互式解析更紧）。',
       upstream_result: '上游 SQL 结果',
       filename: '文件名',
       export_edge_hint: '选择上游 SQL 节点后会补充成功边。',

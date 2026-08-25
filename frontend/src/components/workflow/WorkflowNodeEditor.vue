@@ -14,6 +14,13 @@ import {
 } from '../../api/workflow'
 import { cloneValue, defaultPayload } from './workflowEditor'
 
+/**
+ * lineage_analyze 节点内联 DDL 文本的上限,与后端
+ * app/domain/workflow.py MAX_WORKFLOW_DDL_TEXT_CHARS 对齐。
+ * 比血缘页那两个入口的 1 MB 紧得多 —— workflow spec 会被存储并按计划反复执行。
+ */
+const MAX_WORKFLOW_DDL_TEXT_CHARS = 65_536
+
 const props = defineProps<{
   index: number
   nodes: WorkflowNode[]
@@ -372,6 +379,27 @@ function toggleTarget(targetId: string, checked: boolean): void {
             class="chrome-input w-full font-mono text-sm"
             @input="setPayloadString('sql_text', $event)"
           />
+        </label>
+        <!--
+          DDL 文本数据源:补齐元数据缓存缺失的表 → 列级血缘,与 SQL 解析 / 批量分析
+          两个入口同义。★ 上限比那两处紧(64 KB):workflow spec 会被存储并按计划
+          反复执行,这段文本内联在 spec 与每次 run 的 payload 里。
+        -->
+        <label class="mt-3 block">
+          <span class="mb-1 block text-xs chrome-text-muted">
+            {{ t('workflow.editor.ddl_text') }}
+          </span>
+          <textarea
+            :value="payloadString('ddl_text')"
+            rows="3"
+            class="chrome-input w-full font-mono text-sm"
+            :placeholder="t('workflow.editor.ddl_text_ph')"
+            :data-testid="`lineage-ddl-text-${index}`"
+            @input="setPayloadString('ddl_text', $event)"
+          />
+          <span class="mt-1 block text-[11px] chrome-text-muted">
+            {{ t('workflow.editor.ddl_text_hint', { max: MAX_WORKFLOW_DDL_TEXT_CHARS }) }}
+          </span>
         </label>
       </template>
 
