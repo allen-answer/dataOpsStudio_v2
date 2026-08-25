@@ -294,8 +294,12 @@ onUnmounted(() => {
       <span>{{ t('results.preview_truncated', { count: previewTruncatedCells }) }}</span>
     </div>
 
-    <!-- 空态 -->
-    <div v-if="rows.length === 0" class="flex-1 grid place-items-center">
+    <!--
+      空态 —— 只在「既无行也无列」时接管整个面板。
+      「有列无行」不是空态:列头是 schema 事实,与行数无关(DataGrip / DBeaver 惯例),
+      所以走下面的表格分支,把「无数据行」提示放在列头之下。
+    -->
+    <div v-if="rows.length === 0 && columns.length === 0" class="flex-1 grid place-items-center">
       <EmptyState
         :icon="Database"
         :title="t('results.empty_title')"
@@ -351,6 +355,18 @@ onUnmounted(() => {
           </tr>
         </thead>
         <tbody>
+          <!--
+            有列无行:列头保留,这里给一条跨列的「无数据行」提示。
+            与 results.empty_title(完全没有结果形状)是两种不同状态,文案分开。
+          -->
+          <tr v-if="rows.length === 0" data-testid="result-table-no-rows">
+            <td
+              :colspan="columns.length + 1"
+              class="py-6 px-3 text-center text-xs chrome-text-muted italic"
+            >
+              {{ t('results.no_rows') }}
+            </td>
+          </tr>
           <tr
             v-if="topSpacerHeight > 0"
             aria-hidden="true"
