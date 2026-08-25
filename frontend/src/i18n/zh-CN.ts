@@ -1220,6 +1220,8 @@ export default {
     too_many_rows: '为防止浏览器卡死,只渲染前 {max} 行',
     empty_title: '空结果集',
     empty_hint: 'SQL 返回 0 行',
+    // 有列无行:列头照常展示,行区给这条提示(与 empty_* 的「完全没有结果」区分)。
+    no_rows: '查询未返回数据行',
     col_pk: '主键',
     page_info: '{start}-{end} / 共 {total} 行',
     pagination_order_required: '数据库仍有更多行，但必须添加顶层 ORDER BY 才能安全获取下一页。',

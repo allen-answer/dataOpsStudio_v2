@@ -1247,6 +1247,8 @@ export default {
     too_many_rows: 'Rendering capped at {max} rows to keep the browser snappy',
     empty_title: 'Empty result set',
     empty_hint: 'SQL returned 0 rows',
+    // 有列无行:列头照常展示,行区给这条提示(与 empty_* 的「完全没有结果」区分)。
+    no_rows: 'No rows returned',
     col_pk: 'Primary key',
     page_info: '{start}-{end} of {total}',
     pagination_order_required: 'More rows exist, but next-page fetching requires a top-level ORDER BY.',
