@@ -282,6 +282,8 @@ export default {
     metadata_empty: 'No schemas found',
     metadata_no_tables: 'No tables in this schema',
     metadata_expand_columns: 'Show columns',
+    metadata_refresh_schema: 'Re-read this schema’s table list',
+    metadata_refresh_table: 'Re-read this table’s columns (what expand * uses)',
     metadata_select_table: 'Insert SELECT into editor',
     metadata_pk: 'Primary key',
     metadata_unsupported_db: 'Metadata introspection supports MySQL / DM only.',
@@ -355,7 +357,17 @@ export default {
       sql_unknown_table: 'The generated SQL referenced a table outside the confirmed scope.',
       sql_unknown_column: 'The generated SQL referenced a column outside the confirmed schema.',
     },
-    expand_needs_metadata: 'Refresh the metadata browser first, then expand *.',
+    expand_needs_metadata:
+      'No column metadata for this table yet. Use the refresh button on the right, or refresh the table in the metadata browser.',
+    expand_refresh_and_retry: 'Refresh metadata and expand',
+    expand_refresh_hint: 'Re-read column metadata before expanding * (connects to the database)',
+    expand_metadata_age_fresh: 'Expanded from metadata just read',
+    expand_metadata_age_hours:
+      'Expanded from metadata cached {hours}h ago — refresh the table if its schema changed',
+    expand_metadata_age_days:
+      'Expanded from metadata cached {days}d ago — refresh the table if its schema changed',
+    expand_metadata_age_unknown:
+      'Expanded from cached metadata — refresh the table if its schema changed',
     plan_running: 'Computing plan…',
     plan_empty: 'Run Explain to see the query plan',
     ai_diagnose: 'AI Diagnose',

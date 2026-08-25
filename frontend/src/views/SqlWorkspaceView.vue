@@ -315,6 +315,13 @@ const metadataError = ref<string | null>(null)
 // ── 编辑器工具栏(format / expand-star / explain / preflight)──────
 const toolError = ref<string | null>(null)
 const toolBusy = ref<'' | 'format' | 'expand' | 'explain' | 'preflight'>('')
+/**
+ * 展开 `*` 用的是**缓存里的**列清单。表结构改了缓存不会自己知道,所以展开后
+ * 明说这份清单有多旧,把"要不要刷新"的判断交给用户 —— 系统不去猜表变没变。
+ */
+const expandStarAge = ref<string | null>(null)
+/** 409 metadata_cache_missing 后给出的"刷新并展开"入口(否则那句提示做不到)。 */
+const expandStarNeedsRefresh = ref(false)
 
 // SQL 体检(C-11):文本级 advisory finding;卡片展示,可关闭。行数估算复用 EXPLAIN。
 const preflightFindings = ref<SqlPreflightFinding[] | null>(null)
@@ -2010,6 +2017,8 @@ async function toggleSchema(node: MetadataSchemaNode, refresh = false): Promise<
   }
   node.expanded = true
   if (node.tables.length > 0 && !refresh) return
+  // 刷新时一并丢掉编辑器补全的本地记忆,否则补全还在按旧列清单提示。
+  if (refresh && metadataDsId.value) clearSqlMetadataCache(metadataDsId.value)
   node.loading = true
   node.error = null
   try {
@@ -2039,6 +2048,7 @@ async function toggleTable(
   }
   node.expanded = true
   if (node.columns.length > 0 && !refresh) return
+  if (refresh && metadataDsId.value) clearSqlMetadataCache(metadataDsId.value)
   node.loading = true
   node.error = null
   try {
@@ -2083,7 +2093,7 @@ async function onFormatSql(): Promise<void> {
   }
 }
 
-async function onExpandStar(): Promise<void> {
+async function onExpandStar(refresh = false): Promise<void> {
   if (writesBlocked.value) {
     toolError.value = t('license.writes_blocked')
     return
@@ -2091,20 +2101,37 @@ async function onExpandStar(): Promise<void> {
   const target = editorSqlTarget()
   if (!target?.sql.trim() || !selectedDsId.value) return
   toolError.value = null
+  expandStarAge.value = null
+  expandStarNeedsRefresh.value = false
   toolBusy.value = 'expand'
   try {
-    const res = await expandSqlStar(target.sql, selectedDsId.value)
+    const res = await expandSqlStar(target.sql, selectedDsId.value, refresh)
     replaceEditorSqlTarget(target, res.expanded_sql)
+    expandStarAge.value = metadataAgeHint(res.metadata_refreshed_at)
   } catch (e) {
-    // 缓存缺失(409 metadata_cache_missing)→ 提示先刷新元数据。
+    // 缓存缺失(409 metadata_cache_missing)→ 提示先刷新元数据,并给出真能刷新的入口。
     if (e instanceof ApiError && e.code === 'metadata_cache_missing') {
       toolError.value = t('sql.expand_needs_metadata')
+      expandStarNeedsRefresh.value = true
     } else {
       toolError.value = errorMessage(e)
     }
   } finally {
     toolBusy.value = ''
   }
+}
+
+/** 「这份列清单有多旧」。刻意粗粒度:用户要的是"要不要重刷",不是精确时刻。 */
+function metadataAgeHint(refreshedAt: string | null | undefined): string | null {
+  const ms = parseTimeMs(refreshedAt)
+  if (ms === null) return t('sql.expand_metadata_age_unknown')
+  const ageMs = Math.max(0, Date.now() - ms)
+  const hours = Math.floor(ageMs / 3_600_000)
+  if (hours < 1) return t('sql.expand_metadata_age_fresh')
+  const days = Math.floor(hours / 24)
+  return days >= 1
+    ? t('sql.expand_metadata_age_days', { days })
+    : t('sql.expand_metadata_age_hours', { hours })
 }
 
 async function onExplain(): Promise<void> {
@@ -2704,16 +2731,31 @@ function parseVariables(value: string): string[] {
             {{ t('sql.metadata_empty') }}
           </div>
           <div v-for="schemaNode in metadataSchemas" :key="schemaNode.schema.name">
-            <button
-              type="button"
-              class="w-full flex items-center gap-1.5 px-2 py-1.5 rounded-card hover:chrome-bg-elevated text-left"
-              @click="toggleSchema(schemaNode)"
-            >
-              <ChevronDown v-if="schemaNode.expanded" class="w-3.5 h-3.5 chrome-text-muted shrink-0" />
-              <ChevronRight v-else class="w-3.5 h-3.5 chrome-text-muted shrink-0" />
-              <Database class="w-3.5 h-3.5 chrome-text-muted shrink-0" />
-              <span class="truncate chrome-text-heading">{{ schemaNode.schema.name }}</span>
-            </button>
+            <div class="group flex items-center gap-1.5 px-2 py-1.5 rounded-card hover:chrome-bg-elevated">
+              <button
+                type="button"
+                class="flex-1 min-w-0 flex items-center gap-1.5 text-left"
+                @click="toggleSchema(schemaNode)"
+              >
+                <ChevronDown v-if="schemaNode.expanded" class="w-3.5 h-3.5 chrome-text-muted shrink-0" />
+                <ChevronRight v-else class="w-3.5 h-3.5 chrome-text-muted shrink-0" />
+                <Database class="w-3.5 h-3.5 chrome-text-muted shrink-0" />
+                <span class="truncate chrome-text-heading">{{ schemaNode.schema.name }}</span>
+              </button>
+              <button
+                type="button"
+                data-testid="metadata-refresh-schema"
+                class="shrink-0 opacity-0 group-hover:opacity-100 focus:opacity-100"
+                :title="t('sql.metadata_refresh_schema')"
+                :disabled="schemaNode.loading"
+                @click.stop="toggleSchema(schemaNode, true)"
+              >
+                <RefreshCw
+                  class="w-3.5 h-3.5 chrome-text-muted"
+                  :class="schemaNode.loading && 'animate-spin'"
+                />
+              </button>
+            </div>
             <div v-if="schemaNode.expanded" class="pl-4">
               <div v-if="schemaNode.loading" class="px-2 py-1 chrome-text-muted">
                 <LoadingDots />
@@ -2746,6 +2788,19 @@ function parseVariables(value: string): string[] {
                     @click="selectTableIntoConsole(schemaNode.schema.name, tableNode)"
                   >
                     {{ tableNode.table.name }}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="metadata-refresh-table"
+                    class="shrink-0 opacity-0 group-hover:opacity-100 focus:opacity-100"
+                    :title="t('sql.metadata_refresh_table')"
+                    :disabled="tableNode.loading"
+                    @click.stop="toggleTable(schemaNode.schema.name, tableNode, true)"
+                  >
+                    <RefreshCw
+                      class="w-3.5 h-3.5 chrome-text-muted"
+                      :class="tableNode.loading && 'animate-spin'"
+                    />
                   </button>
                   <span
                     v-if="tableNode.table.table_type && tableNode.table.table_type !== 'BASE TABLE'"
@@ -2972,7 +3027,7 @@ function parseVariables(value: string): string[] {
             class="chrome-btn-secondary"
             :disabled="writesBlocked || !editorSql.trim() || !toolsSupported || editorReadOnly || toolBusy !== ''"
             :title="writesBlocked ? t('license.writes_blocked') : !toolsSupported ? t('sql.tools_unsupported_db') : t('sql.tool_expand_hint')"
-            @click="onExpandStar"
+            @click="onExpandStar()"
           >
             <Asterisk class="w-3.5 h-3.5" />
             {{ toolBusy === 'expand' ? t('common.submitting') : t('sql.tool_expand') }}
@@ -3026,17 +3081,47 @@ function parseVariables(value: string): string[] {
             <GitCompareArrows class="w-3.5 h-3.5" />
             {{ t('sql.send_to_compare') }}
           </button>
-          <div class="flex-1" />
-          <span
-            v-if="!toolError"
-            class="hidden xl:inline text-[11px] chrome-text-muted truncate max-w-[24rem]"
-            :title="t('sql.metadata_editor_hint')"
+          <div class="flex-1 min-w-0 flex items-center justify-end">
+            <span
+              v-if="expandStarAge && !toolError"
+              data-testid="expand-star-age"
+              class="text-[11px] chrome-text-muted truncate"
+              :title="expandStarAge"
+            >
+              {{ expandStarAge }}
+            </span>
+            <span
+              v-else-if="!toolError"
+              class="hidden xl:inline text-[11px] chrome-text-muted truncate"
+              :title="t('sql.metadata_editor_hint')"
+            >
+              {{ t('sql.metadata_editor_hint') }}
+            </span>
+          </div>
+        </div>
+
+        <!--
+          工具错误单独一行。挤在工具栏里实测只剩 65px 宽 —— 等于把话说一半;
+          "还没有这张表的列元数据"这种要照着做的提示尤其不能被截断。
+          刷新入口跟着提示走,带文字标签。
+        -->
+        <div
+          v-if="toolError"
+          class="flex items-center gap-3 px-5 py-2 border-b chrome-border-subtle text-xs text-red-600 dark:text-red-400"
+        >
+          <span data-testid="sql-tool-error" class="flex-1 min-w-0">{{ toolError }}</span>
+          <button
+            v-if="expandStarNeedsRefresh"
+            type="button"
+            data-testid="expand-star-refresh"
+            class="chrome-btn-secondary shrink-0"
+            :disabled="writesBlocked || !editorSql.trim() || !toolsSupported || editorReadOnly || toolBusy !== ''"
+            :title="t('sql.expand_refresh_hint')"
+            @click="onExpandStar(true)"
           >
-            {{ t('sql.metadata_editor_hint') }}
-          </span>
-          <span v-if="toolError" class="text-xs text-red-600 dark:text-red-400 truncate max-w-[24rem]" :title="toolError">
-            {{ toolError }}
-          </span>
+            <RefreshCw class="w-3.5 h-3.5" :class="toolBusy === 'expand' && 'animate-spin'" />
+            {{ toolBusy === 'expand' ? t('common.submitting') : t('sql.expand_refresh_and_retry') }}
+          </button>
         </div>
 
         <!-- SQL 体检结果卡(C-11 advisory:只提示不拦截)-->
