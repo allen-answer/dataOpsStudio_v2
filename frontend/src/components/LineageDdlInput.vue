@@ -15,6 +15,8 @@ import type { LineageDdlSchemaSummary } from '../api/lineage'
 
 /** 与后端 app/api/schemas.py LINEAGE_DDL_MAX_CHARS 对齐(超限前端先拦,不等 422)。 */
 const DDL_MAX_CHARS = 1_000_000
+/** UTF-8 单字符最多 4 字节:超过这个字节数就不可能在字符数上限内,不必解码。 */
+const DDL_MAX_BYTES = DDL_MAX_CHARS * 4
 
 const props = defineProps<{
   modelValue: string
@@ -28,7 +30,10 @@ const emit = defineEmits<{ 'update:modelValue': [string] }>()
 const { t, te } = useI18n()
 
 const fileInput = ref<HTMLInputElement | null>(null)
+const textarea = ref<HTMLTextAreaElement | null>(null)
 const error = ref<string | null>(null)
+/** 异步读文件的代次:只有最后一次选择的结果算数。 */
+let readGeneration = 0
 
 /**
  * 摘要文案。★ 跳过原因逐条展开,不合并成一个数字 —— 「3 条解析失败」和
@@ -61,10 +66,21 @@ const summaryText = computed<string>(() => {
 function setValue(next: string): void {
   if (next.length > DDL_MAX_CHARS) {
     error.value = t('lineage.ddl_too_large', { max: DDL_MAX_CHARS })
+    // ★ 拒绝时必须**强制把 DOM 写回**模型值。不 emit 则 modelValue 不变,Vue 就
+    // 不会把 :value 回写进 textarea —— 用户看着满屏自己的 DDL,提交的却是陈旧或
+    // 空的 ddl_text,而且第二次连续超限时 error 被赋同一字符串,连错误提示的
+    // 重渲染都被相等性守卫抑制,DOM 与模型永久脱同步。
+    syncTextarea()
     return
   }
   error.value = null
   emit('update:modelValue', next)
+}
+
+/** 把 textarea 的 DOM 值拉回模型值(拒绝输入后用,不能指望响应式)。 */
+function syncTextarea(): void {
+  const element = textarea.value
+  if (element && element.value !== props.modelValue) element.value = props.modelValue
 }
 
 function onInput(event: Event): void {
@@ -81,9 +97,21 @@ async function onFileChange(event: Event): Promise<void> {
   const file = input.files?.[0]
   input.value = '' // 允许再次选同名文件触发 change
   if (!file) return
+  // ★ 先看 file.size,别把整个文件解码成字符串再来判长度 —— 选中一个几百 MB 的
+  // 文件会直接把标签页解码到卡死。UTF-8 单字符最多 4 字节,超过这个字节数就
+  // **不可能**落在字符数上限内;字节数以内的仍由 setValue 按真实字符数把关。
+  if (file.size > DDL_MAX_BYTES) {
+    error.value = t('lineage.ddl_too_large', { max: DDL_MAX_CHARS })
+    return
+  }
+  // ★ 代次计数器:两次选择重叠时,后解析完的那次会覆盖后选择的那次。
+  const generation = ++readGeneration
   try {
-    setValue(await file.text())
+    const text = await file.text()
+    if (generation !== readGeneration) return // 已有更晚的选择,丢弃这次结果
+    setValue(text)
   } catch {
+    if (generation !== readGeneration) return
     error.value = t('lineage.ddl_read_failed')
   }
 }
@@ -134,6 +162,7 @@ async function onFileChange(event: Event): Promise<void> {
       @change="onFileChange"
     />
     <textarea
+      ref="textarea"
       :value="modelValue"
       rows="5"
       class="chrome-input w-full text-sm font-mono"
