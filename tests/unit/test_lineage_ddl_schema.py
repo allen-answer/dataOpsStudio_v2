@@ -430,6 +430,119 @@ def test_ddl_schema_restores_column_level_lineage_without_a_database() -> None:
     assert not any(warning["code"] == "lenient_table_level" for warning in report.warnings)
 
 
+# ── 各家导出工具的原样输出形态 ────────────────────────────────────────────
+
+
+def test_pg_dump_shape_does_not_inject_tables_from_function_bodies() -> None:
+    """F2a:``$$`` 函数体不认就会被按体内分号切开,体内建的临时表被当真表注入。
+
+    注入的表在无缓存时会成为该表的**权威列定义**,血缘对着虚构列产出结果,还写进缓存。
+    """
+    ddl = """
+    CREATE TABLE public.orders (id integer, amount numeric);
+    CREATE FUNCTION public.f() RETURNS void AS $$
+    BEGIN
+      RAISE NOTICE 'building';
+      CREATE TABLE orders (wrong_col text);
+    END;
+    $$ LANGUAGE plpgsql;
+    CREATE TABLE public.customers (id integer, name text);
+    """
+    result = schema_from_ddl_text(ddl, dialect="postgres")
+
+    assert result.schema == {
+        "public": {
+            "orders": {"id": "INT", "amount": "DECIMAL"},
+            "customers": {"id": "INT", "name": "TEXT"},
+        }
+    }
+    # 函数体里的 orders(wrong_col)绝不能进来。
+    assert "wrong_col" not in str(result.schema)
+
+
+def test_pg_dump_dollar_quote_with_tag() -> None:
+    ddl = """
+    CREATE FUNCTION f() RETURNS void AS $body$
+    BEGIN
+      CREATE TABLE ghost (nope text);
+    END;
+    $body$ LANGUAGE plpgsql;
+    CREATE TABLE public.real_t (id integer);
+    """
+    result = schema_from_ddl_text(ddl, dialect="postgres")
+
+    assert result.schema == {"public": {"real_t": {"id": "INT"}}}
+
+
+def test_mysqldump_shape_survives_backslash_escaped_quotes() -> None:
+    """F2b:``VALUES (1,'it\\'s here')`` 让字符串扫描提前结束,吞掉后续全部建表。"""
+    ddl = (
+        "CREATE TABLE `orders` (`id` int NOT NULL, `note` varchar(64)) ENGINE=InnoDB;\n"
+        "INSERT INTO `orders` VALUES (1,'it\\'s here');\n"
+        "CREATE TABLE `customers` (`id` int NOT NULL, `name` varchar(64)) ENGINE=InnoDB;\n"
+    )
+    result = schema_from_ddl_text(ddl, dialect="mysql")
+
+    assert set(result.schema[""]) == {"orders", "customers"}
+
+
+def test_mysql_hash_line_comment_is_recognised() -> None:
+    ddl = "CREATE TABLE `t` (`a` int, # 说明\n`b` int);"
+    result = schema_from_ddl_text(ddl, dialect="mysql")
+
+    assert result.schema == {"": {"t": {"a": "INT", "b": "INT"}}}
+
+
+def test_postgres_nested_block_comment_does_not_break_the_scanner() -> None:
+    ddl = "CREATE TABLE ods.t (/* outer /* inner */ still comment */ a int, b int);"
+    result = schema_from_ddl_text(ddl, dialect="postgres")
+
+    assert result.schema == {"ods": {"t": {"a": "INT", "b": "INT"}}}
+
+
+def test_ssms_go_batch_separator_splits_statements() -> None:
+    """F9:SSMS「Generate Scripts」用 GO 分批,不认就丢掉首个 GO 之后的全部建表。"""
+    ddl = (
+        "CREATE TABLE dbo.orders (id int, amount decimal(18,2))\n"
+        "GO\n"
+        "CREATE TABLE dbo.customers (id int, name nvarchar(64))\n"
+        "GO\n"
+    )
+    result = schema_from_ddl_text(ddl, dialect="tsql")
+
+    assert set(result.schema["dbo"]) == {"orders", "customers"}
+    assert result.skipped_statement_count == 0
+
+
+def test_go_inside_an_identifier_is_not_a_batch_separator() -> None:
+    """``GO`` 必须独占一行才算分隔符,别把 ``go_live_dt`` 之类切开。"""
+    result = schema_from_ddl_text("CREATE TABLE dbo.t (go_live_dt date, ago int)", dialect="tsql")
+
+    assert result.schema == {"dbo": {"t": {"go_live_dt": "DATE", "ago": "INTEGER"}}}
+
+
+def test_template_variables_in_ddl_are_normalized() -> None:
+    """F10:``${VAR}`` 要和 sql_text 路径一样先归一,否则解析失败只计一次无理由 skipped。"""
+    result = schema_from_ddl_text(
+        "CREATE TABLE ${ODS_SCHEMA}.T (id INT, amt DECIMAL(18,2));", dialect="oracle"
+    )
+
+    assert result.skipped_statement_count == 0
+    assert result.table_count == 1
+    # 占位符 schema 无法当成真 schema 名,归入 "" 桶(parser 侧是"扫所有桶"语义)。
+    assert result.schema[""]["T"] == {"id": "INT", "amt": "NUMBER(18, 2)"}
+
+
+def test_same_table_written_in_two_cases_is_one_entry() -> None:
+    """大小写只是写法差异,不是两张表 —— 否则计数翻倍、取哪份列集看插入顺序。"""
+    ddl = 'CREATE TABLE "ODS"."T" ("A" INT);\nCREATE TABLE ods.t (a INT, b INT);'
+    result = schema_from_ddl_text(ddl, dialect="dm")
+
+    assert result.table_count == 1
+    assert len(result.schema) == 1
+    assert result.column_count == 2
+
+
 # ── 达梦导出实拍形态:五个坑同时出现在一份 DDL 里 ─────────────────────────
 #
 # 这一份是 F3–F6 的合并验收点。同时具备:

@@ -22,7 +22,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import sqlglot
 from sqlglot import exp
@@ -30,6 +32,7 @@ from sqlglot.errors import SqlglotError
 
 from app.domain.lineage.dialects import normalize_lineage_dialect, register_lineage_dialects
 from app.domain.lineage.parser import LineageSchema
+from app.domain.lineage.variables import normalize_template_variables
 
 # 单次 DDL 文本最多处理的语句数(超出部分计入 skipped,不静默丢弃)。
 # API 层另有字符数上限,这里是二道闸:防超长文本把解析时间拖爆。
@@ -101,6 +104,49 @@ _CREATE_TABLE_RE = re.compile(
 # 引号 / 括号标识符的配对表(``[`` 为 T-SQL 方括号标识符)。
 _QUOTE_PAIRS = {"'": "'", '"': '"', "`": "`", "[": "]"}
 
+# PG 美元引号的开闭标记:``$$`` 或 ``$tag$``。
+_DOLLAR_TAG_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$")
+
+# T-SQL 批处理分隔符:整行只有一个 ``GO``(可带行注释)。SSMS「Generate Scripts」
+# 原样导出的脚本用它分批,不认就会丢掉首个 GO 之后的全部 CREATE TABLE。
+_GO_RE = re.compile(r"GO[ \t]*(?:--[^\n]*)?(?=\n|\r|$)", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class _ScanRules:
+    """词法扫描的方言开关 —— 同一段文本在不同方言下的"非代码"边界并不一样。"""
+
+    # MySQL 默认在 '...' / "..." 里认反斜杠转义(NO_BACKSLASH_ESCAPES 默认关)。
+    backslash_escapes: bool = False
+    # PG 只在 E'...' 前缀字符串里认反斜杠转义。
+    escape_string_prefix: bool = False
+    # PG 美元引号 $$ ... $$ / $tag$ ... $tag$。
+    dollar_quotes: bool = False
+    # MySQL 的 # 行注释。
+    hash_comments: bool = False
+    # PG 的块注释可嵌套。
+    nested_block_comments: bool = False
+    # T-SQL 的 GO 批处理分隔符。
+    batch_separator: bool = False
+
+
+_MYSQL_RULES = _ScanRules(backslash_escapes=True, hash_comments=True)
+_POSTGRES_RULES = _ScanRules(
+    escape_string_prefix=True, dollar_quotes=True, nested_block_comments=True
+)
+_TSQL_RULES = _ScanRules(batch_separator=True)
+_DEFAULT_RULES = _ScanRules()
+
+_RULES_BY_DIALECT = {
+    "mysql": _MYSQL_RULES,
+    "postgres": _POSTGRES_RULES,
+    "tsql": _TSQL_RULES,
+}
+
+
+def _rules_for(dialect: str) -> _ScanRules:
+    return _RULES_BY_DIALECT.get(dialect, _DEFAULT_RULES)
+
 # 无类型信息时的占位,与 metadata_cache 路径 (schema_from_metadata_cache_rows) 一致。
 _UNKNOWN_TYPE = "unknown"
 
@@ -157,28 +203,33 @@ def schema_from_ddl_text(
     """
     register_lineage_dialects()
     normalized_dialect = normalize_lineage_dialect(dialect)
+    rules = _rules_for(normalized_dialect)
     schema: LineageSchema = {}
     table_count = 0
     column_count = 0
     skipped = 0
-    statements = _split_top_level(ddl_text, ";")
+    statements = _split_statements(ddl_text, rules)
     if len(statements) > DDL_MAX_STATEMENTS:
         skipped += len(statements) - DDL_MAX_STATEMENTS
         statements = statements[:DDL_MAX_STATEMENTS]
     failed_column_entries = 0
     for statement in statements:
-        parsed = _table_from_statement(statement, normalized_dialect, default_schema)
+        parsed = _table_from_statement(statement, normalized_dialect, rules, default_schema)
         if parsed is None:
             skipped += 1
             continue
         failed_column_entries += parsed.failed_entry_count
+        # 大小写只是写法差异,不是两张表:引号大写与裸小写折叠进同一个桶 / 同一条目,
+        # 否则同一逻辑表产生重复条目、计数翻倍,下游取哪份列集取决于插入顺序。
+        bucket = _case_key(schema, parsed.schema_name)
+        tables = schema.setdefault(bucket, {})
         # 同名表重复出现(DDL 里先建后改)按后者覆盖,与"最后一次定义生效"直觉一致。
-        tables = schema.setdefault(parsed.schema_name, {})
-        if parsed.table_name not in tables:
+        table_key = _case_key(tables, parsed.table_name)
+        if table_key not in tables:
             table_count += 1
         else:
-            column_count -= len(tables[parsed.table_name])
-        tables[parsed.table_name] = parsed.columns
+            column_count -= len(tables[table_key])
+        tables[table_key] = parsed.columns
         column_count += len(parsed.columns)
     return DdlSchemaResult(
         schema=schema,
@@ -220,28 +271,32 @@ def merge_ddl_schema(base: LineageSchema, ddl: LineageSchema) -> LineageSchema:
     return merged
 
 
-def _case_key(schema: LineageSchema, schema_name: str) -> str:
-    """已有同名(忽略大小写)桶时复用它的原始键,避免 ODS / ods 分裂成两个桶。"""
-    if schema_name in schema:
-        return schema_name
-    lowered = schema_name.lower()
-    for key in schema:
+def _case_key(mapping: Mapping[str, Any], name: str) -> str:
+    """已有同名(忽略大小写)键时复用它的原始写法,避免 ODS / ods 分裂成两份。
+
+    与 ``parser.py:_case_get`` 是两件事:那个取**值**,这个取**键**(要拿键回去写入)。
+    """
+    if name in mapping:
+        return name
+    lowered = name.lower()
+    for key in mapping:
         if key.lower() == lowered:
             return key
-    return schema_name
+    return name
 
 
 def _table_from_statement(
     statement: str,
     dialect: str,
+    rules: _ScanRules,
     default_schema: str | None,
 ) -> _ParsedTable | None:
     """单条语句 → :class:`_ParsedTable`;非建表 / 无法采纳任何列时为 None。"""
-    body_text = _strip_leading_noise(statement)
+    body_text = _strip_leading_noise(statement, rules)
     header = _CREATE_TABLE_RE.match(body_text)
     if header is None:
         return None
-    span = _column_list_span(body_text, header.end())
+    span = _column_list_span(body_text, header.end(), rules)
     if span is None:
         # CTAS(``CREATE TABLE t AS SELECT ...``)没有列清单:类型要靠查询推导,
         # 不是 DDL 数据源的职责,跳过。
@@ -249,18 +304,18 @@ def _table_from_statement(
     open_index, close_index = span
     # 表名与左括号之间也可能夹注释(``CREATE TABLE t /* 订单表 */ (...)``),
     # 剥掉再判 token 数,否则整条被当子查询拒掉。
-    name_part = _strip_comments(body_text[header.end() : open_index]).strip()
+    name_part = _strip_comments(body_text[header.end() : open_index], rules).strip()
     # 表名必须是单个 token(``t AS`` 之类说明括号是子查询而非列清单,跳过)。
-    if not name_part or len(_split_top_level(name_part, " ")) != 1:
+    if not name_part or len(_split_top_level(name_part, " ", rules)) != 1:
         return None
     entries: list[str] = []
-    for entry in _split_top_level(body_text[open_index + 1 : close_index], ","):
+    for entry in _split_top_level(body_text[open_index + 1 : close_index], ",", rules):
         if _is_constraint_entry(entry, dialect):
             continue
         # ★ 必须剥注释再重组:重组用 ", " 拼接会丢掉终结行注释的换行,随后的逗号
         # 与右括号被 ``--`` 吞掉,sqlglot 解析失败 → 整张表静默丢弃。
         # DIDA 导出的 SQL 每个字段都带中文行注释,这一形态在真实输入里极其常见。
-        cleaned = _strip_comments(entry).strip()
+        cleaned = _strip_comments(entry, rules).strip()
         if cleaned:
             entries.append(cleaned)
     if not entries:
@@ -313,7 +368,10 @@ def _parse_column_list(
 ) -> dict[str, str] | None:
     """把列条目重组成 ``CREATE TABLE`` 交给 sqlglot;解析失败返回 None(区别于 ``{}``)。"""
     # 列清单括号之后一律丢弃(TABLESPACE / STORAGE / PARTITION BY / ENGINE= …)。
-    rebuilt = f"CREATE TABLE {name_part} ({', '.join(entries)})"
+    # ${VAR} 归一成 :VAR 再进 sqlglot —— 与 sql_text 路径(parser.py:232/250)同一步。
+    # 模板化 ETL 导出的 CREATE TABLE ${ODS_SCHEMA}.T (...) 不做这步会解析失败,
+    # 而同样的占位符贴进 SQL 框却能正常处理。
+    rebuilt = normalize_template_variables(f"CREATE TABLE {name_part} ({', '.join(entries)})")
     try:
         parsed = sqlglot.parse_one(rebuilt, read=dialect)
     except (SqlglotError, RecursionError):
@@ -337,7 +395,7 @@ def _table_ref(name_part: str, dialect: str) -> exp.Table | None:
     这条语句建的是哪张表。
     """
     try:
-        table = exp.to_table(name_part, dialect=dialect)
+        table = exp.to_table(normalize_template_variables(name_part).strip(), dialect=dialect)
     except (SqlglotError, RecursionError, ValueError):
         return None
     return table if isinstance(table, exp.Table) and table.name else None
@@ -350,7 +408,7 @@ def _is_constraint_entry(entry: str, dialect: str = "") -> bool:
     (``-- 主键\\n NOT CLUSTER PRIMARY KEY("ID")``),不剥注释就匹配不上形状,
     条目直接送进 sqlglot —— 正是预过滤本要规避的挂死。
     """
-    stripped = _strip_comments(entry).strip()
+    stripped = _strip_comments(entry, _rules_for(dialect)).strip()
     if not stripped:
         return False
     if _CONSTRAINT_SHAPE_RE.match(stripped) is not None:
@@ -358,18 +416,18 @@ def _is_constraint_entry(entry: str, dialect: str = "") -> bool:
     return dialect == "mysql" and _MYSQL_INDEX_SHAPE_RE.match(stripped) is not None
 
 
-def _strip_comments(text: str) -> str:
+def _strip_comments(text: str, rules: _ScanRules) -> str:
     """去掉注释,保留字符串 / 引号标识符原样;注释位置留一个空格防止 token 粘连。"""
     out: list[str] = []
     index = 0
     length = len(text)
     while index < length:
-        comment_end = _skip_comment(text, index)
+        comment_end = _skip_comment(text, index, rules)
         if comment_end is not None:
             out.append(" ")
             index = comment_end
             continue
-        atom_end = _skip_atom(text, index)
+        atom_end = _skip_atom(text, index, rules)
         if atom_end is not None:
             out.append(text[index:atom_end])
             index = atom_end
@@ -379,7 +437,7 @@ def _strip_comments(text: str) -> str:
     return "".join(out)
 
 
-def _strip_leading_noise(text: str) -> str:
+def _strip_leading_noise(text: str, rules: _ScanRules) -> str:
     """跳过语句前导的空白与注释,让 :data:`_CREATE_TABLE_RE` 能贴到 ``CREATE``。"""
     index = 0
     length = len(text)
@@ -387,41 +445,97 @@ def _strip_leading_noise(text: str) -> str:
         if text[index].isspace():
             index += 1
             continue
-        skipped = _skip_comment(text, index)
+        skipped = _skip_comment(text, index, rules)
         if skipped is None:
             break
         index = skipped
     return text[index:]
 
 
-def _skip_comment(text: str, index: int) -> int | None:
+def _skip_comment(text: str, index: int, rules: _ScanRules) -> int | None:
     pair = text[index : index + 2]
-    if pair == "--":
+    if pair == "--" or (rules.hash_comments and text[index] == "#"):
         end = text.find("\n", index)
         return len(text) if end < 0 else end + 1
     if pair == "/*":
+        if rules.nested_block_comments:
+            return _skip_nested_block_comment(text, index)
         end = text.find("*/", index + 2)
         return len(text) if end < 0 else end + 2
     return None
 
 
-def _skip_atom(text: str, index: int) -> int | None:
+def _skip_nested_block_comment(text: str, index: int) -> int:
+    """PG 的块注释可嵌套(``/* /* */ */``);按深度配对,别在第一个 ``*/`` 就收工。"""
+    depth = 0
+    cursor = index
+    length = len(text)
+    while cursor < length - 1:
+        pair = text[cursor : cursor + 2]
+        if pair == "/*":
+            depth += 1
+            cursor += 2
+            continue
+        if pair == "*/":
+            depth -= 1
+            cursor += 2
+            if depth <= 0:
+                return cursor
+            continue
+        cursor += 1
+    return length
+
+
+def _skip_atom(text: str, index: int, rules: _ScanRules) -> int | None:
     """index 处若是注释或引号标识符/字面量,返回其结束后的下标;否则 None。
 
     这是全模块唯一的"跳过非代码"逻辑:切语句、切条目、找括号三处共用,保证
     ``';'`` / ``','`` / ``'('`` 出现在字符串或引号标识符里时不会被误当分隔符。
     """
-    comment_end = _skip_comment(text, index)
+    comment_end = _skip_comment(text, index, rules)
     if comment_end is not None:
         return comment_end
+    if rules.dollar_quotes:
+        dollar_end = _skip_dollar_quoted(text, index)
+        if dollar_end is not None:
+            return dollar_end
     char = text[index]
+    # PG 只在 E'...' 里认反斜杠转义;E 本身不是引号,跳过它让引号逻辑接手。
+    if rules.escape_string_prefix and char in "eE" and text[index + 1 : index + 2] == "'":
+        return _skip_quoted(text, index + 1, "'", backslash=True)
     closing = _QUOTE_PAIRS.get(char)
     if closing is None:
         return None
+    # 反斜杠转义只作用于字符串 / 双引号,不作用于反引号与 T-SQL 方括号。
+    return _skip_quoted(text, index, closing, backslash=rules.backslash_escapes and char in "'\"")
+
+
+def _skip_dollar_quoted(text: str, index: int) -> int | None:
+    """PG 美元引号 ``$$ ... $$`` / ``$tag$ ... $tag$``。
+
+    不认这个,pg_dump 的 ``CREATE FUNCTION ... AS $$ BEGIN ... END; $$`` 会被按
+    函数体内的分号切开,函数里建的临时表被当成真表注入 schema —— 血缘对着虚构列
+    产出结果,而且写进缓存。
+    """
+    match = _DOLLAR_TAG_RE.match(text, index)
+    if match is None:
+        return None
+    tag = match.group(0)
+    end = text.find(tag, match.end())
+    return len(text) if end < 0 else end + len(tag)
+
+
+def _skip_quoted(text: str, index: int, closing: str, *, backslash: bool) -> int:
     cursor = index + 1
     length = len(text)
     while cursor < length:
-        if text[cursor] == closing:
+        char = text[cursor]
+        if backslash and char == "\\":
+            # mysqldump 默认输出 INSERT ... VALUES (1,'it\'s here');不认这个转义,
+            # 字符串扫描提前结束,其后引号开启失控字面量,吞掉后续全部 CREATE TABLE。
+            cursor += 2
+            continue
+        if char == closing:
             if text[cursor : cursor + 2] == closing * 2:  # 双写转义:'' / "" / ]]
                 cursor += 2
                 continue
@@ -430,7 +544,7 @@ def _skip_atom(text: str, index: int) -> int | None:
     return length
 
 
-def _split_top_level(text: str, separator: str) -> list[str]:
+def _split_top_level(text: str, separator: str, rules: _ScanRules) -> list[str]:
     """按 ``separator`` 在括号深度 0 处切分,跳过注释与引号内容;丢空片段。"""
     segments: list[str] = []
     depth = 0
@@ -438,7 +552,7 @@ def _split_top_level(text: str, separator: str) -> list[str]:
     index = 0
     length = len(text)
     while index < length:
-        skipped = _skip_atom(text, index)
+        skipped = _skip_atom(text, index, rules)
         if skipped is not None:
             index = skipped
             continue
@@ -455,14 +569,62 @@ def _split_top_level(text: str, separator: str) -> list[str]:
     return [segment for segment in segments if segment.strip()]
 
 
-def _column_list_span(text: str, start: int) -> tuple[int, int] | None:
+def _split_statements(text: str, rules: _ScanRules) -> list[str]:
+    """把 DDL 文本切成语句:顶层 ``;``,外加 T-SQL 的整行 ``GO`` 批处理分隔符。
+
+    只按分号切会丢掉 SSMS 导出脚本里首个 ``GO`` 之后的全部建表语句 —— 而且无分号
+    时是**静默**丢弃(skipped 报 0,界面显示一切正常),比报错更难排查。
+    """
+    segments: list[str] = []
+    depth = 0
+    start = 0
+    index = 0
+    length = len(text)
+    while index < length:
+        skipped = _skip_atom(text, index, rules)
+        if skipped is not None:
+            index = skipped
+            continue
+        char = text[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif char == ";" and depth == 0:
+            segments.append(text[start:index])
+            start = index + 1
+        elif rules.batch_separator and depth == 0 and char in "gG":
+            end = _batch_separator_end(text, index)
+            if end is not None:
+                segments.append(text[start:index])
+                start = end
+                index = end
+                continue
+        index += 1
+    segments.append(text[start:])
+    return [segment for segment in segments if segment.strip()]
+
+
+def _batch_separator_end(text: str, index: int) -> int | None:
+    """``index`` 处若是独占一行的 ``GO``,返回它结束后的下标;否则 None。"""
+    match = _GO_RE.match(text, index)
+    if match is None:
+        return None
+    # 必须是行首(前面只有空白),否则 ``go`` 只是某个标识符的一部分。
+    line_start = text.rfind("\n", 0, index) + 1
+    if text[line_start:index].strip():
+        return None
+    return match.end()
+
+
+def _column_list_span(text: str, start: int, rules: _ScanRules) -> tuple[int, int] | None:
     """从 ``start`` 起找第一对顶层括号,返回 ``(开括号下标, 闭括号下标)``。"""
     depth = 0
     open_index: int | None = None
     index = start
     length = len(text)
     while index < length:
-        skipped = _skip_atom(text, index)
+        skipped = _skip_atom(text, index, rules)
         if skipped is not None:
             index = skipped
             continue
