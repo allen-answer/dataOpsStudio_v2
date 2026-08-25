@@ -4129,15 +4129,57 @@ def test_lineage_batch_ddl_schema_keeps_a_discarded_ddl_visible() -> None:
     """
     context: dict[str, Any] = {"default_schema": None, "schema": {}}
 
-    summary = _lineage_batch_ddl_schema(
-        context, _MYSQL_DDL, dialect="db2", default_schema=None
-    )
+    summary = _lineage_batch_ddl_schema(context, _MYSQL_DDL, dialect="db2", default_schema=None)
 
     assert summary is not None, "降级不能与'未提供 DDL'同形"
     assert summary["error"] == "dialect_unsupported"
     assert summary["dialect"] == "db2"
     assert summary["table_count"] == 0
     assert context["schema"] == {}
+
+
+def test_worker_lineage_batch_persists_ddl_schema_into_parse_summary() -> None:
+    """批量落 lineage_runs 的 sql_hash 是带 DDL 维度算的,parse_summary 也得带 ddl_schema。
+
+    否则跨路径缓存命中(API analyze 命中批量落的 run)会把"这份结果用了 DDL"
+    这件事整个隐藏掉,前端徽标不出现。
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "load.sql",
+            "insert into ods.dwd (id, amt) select o.id, o.amt from ods.orders o",
+        )
+    job = _make_job(
+        kind=JobKind.LINEAGE_BATCH,
+        payload={
+            "upload_id": "up-1",
+            "storage_uri": "uploads/up-1/scripts.zip",
+            "datasource_id": "ds-1",
+            "dialect": "mysql",
+            "ddl_text": _MYSQL_DDL,
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    result_store.downloads["uploads/up-1/scripts.zip"] = buffer.getvalue()
+    catalog = _FakeLineageCatalog()
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert catalog.persisted, "有数据源的批量必须落 lineage_runs"
+    persisted_summary = catalog.persisted[0]["ddl_summary"]
+    assert isinstance(persisted_summary, dict)
+    assert persisted_summary["dialect"] == "mysql"
+    assert persisted_summary["table_count"] == 2
 
 
 def test_lineage_batch_ddl_schema_returns_none_only_when_no_ddl_given() -> None:
@@ -4381,6 +4423,7 @@ class _FakeLineageCatalog:
         sql_hash: str,
         sql_text: str,
         report: LineageReport,
+        ddl_summary: dict[str, Any] | None = None,
     ) -> None:
         self.persisted.append(
             {
@@ -4392,5 +4435,6 @@ class _FakeLineageCatalog:
                 "sql_hash": sql_hash,
                 "sql_text": sql_text,
                 "table_edges": len(report.graph_edges),
+                "ddl_summary": ddl_summary,
             }
         )

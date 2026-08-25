@@ -440,6 +440,7 @@ class LineageCatalogLike(Protocol):
         sql_hash: str,
         sql_text: str,
         report: LineageReport,
+        ddl_summary: dict[str, Any] | None = None,
     ) -> None: ...
 
 
@@ -1561,6 +1562,7 @@ class WorkerRunner:
                             source_ref=info.filename,
                             raw=raw,
                             ddl_fingerprint=ddl_fingerprint,
+                            ddl_summary=ddl_summary,
                         )
                     )
         script_edges = _lineage_batch_script_edges(files_report)
@@ -1648,6 +1650,7 @@ class WorkerRunner:
         source_ref: str,
         raw: bytes,
         ddl_fingerprint: dict[str, str] | None = None,
+        ddl_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         assert self._lineage_catalog is not None
         sql_text = _decode_sql_bytes(raw)
@@ -1700,6 +1703,9 @@ class WorkerRunner:
                     sql_hash=sql_hash,
                     sql_text=sql_text,
                     report=report,
+                    # 这一行的 sql_hash 是带 DDL 维度算的,parse_summary 不带 ddl_schema
+                    # 的话,跨路径缓存命中会把"这份结果用了 DDL"这件事隐藏掉。
+                    ddl_summary=ddl_summary,
                 )
                 status = "parsed"
         else:
@@ -2594,10 +2600,15 @@ class PostgresLineageCatalog:
         sql_hash: str,
         sql_text: str,
         report: LineageReport,
+        ddl_summary: dict[str, Any] | None = None,
     ) -> None:
         now = datetime.now(UTC)
         parse_summary = dict(report.report or {})
         parse_summary["parser_version"] = LINEAGE_PARSER_VERSION
+        if ddl_summary is not None:
+            # 与 API analyze 同范式:DDL 摘要随 parse_summary 持久化,缓存命中的 run
+            # 回读时同样带着,前端能显示"这份结果用了 DDL 数据源"。
+            parse_summary["ddl_schema"] = ddl_summary
         table_rows, column_rows = build_lineage_edge_rows(
             run_id=run_id,
             project_id=project_id,

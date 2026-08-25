@@ -77,7 +77,7 @@ import { createUserErrorMessage } from '../utils/userErrorMessage'
 
 type Tab = 'subgraph' | 'impact' | 'analyze' | 'batch'
 
-// 血缘解析器支持的方言(app/domain/lineage/parser.py _normalize_dialect);
+// 血缘解析器支持的方言(app/domain/lineage/dialects.py normalize_lineage_dialect);
 // 'auto' 是自动识别哨兵(L-1),非真实 db_type,但作为合法方言不触发 unsupported 提示。
 const LINEAGE_DIALECTS: ReadonlySet<string> = new Set([
   'auto',

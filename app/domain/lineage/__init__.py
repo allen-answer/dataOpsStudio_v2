@@ -4,7 +4,6 @@ from app.domain.lineage.cache import (
     lineage_sql_hash,
 )
 from app.domain.lineage.ddl_schema import (
-    DdlSchemaResult,
     apply_ddl_schema,
     merge_ddl_schema,
     schema_from_ddl_text,
@@ -43,7 +42,6 @@ from app.domain.lineage.semantic import build_semantic_view
 __all__ = [
     "AUTO_DIALECT",
     "LINEAGE_PARSER_VERSION",
-    "DdlSchemaResult",
     "DialectDetection",
     "InsertMapping",
     "LineageParseError",

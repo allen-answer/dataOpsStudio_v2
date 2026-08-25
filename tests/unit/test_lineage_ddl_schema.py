@@ -505,9 +505,10 @@ def test_empty_merge_still_yields_a_different_hash_than_no_ddl() -> None:
     以及带有效 DDL 的请求命中旧的无 DDL 运行(徽标不出现,skipped 计数丢失)。
     """
     # DDL 表已全在缓存中 → 合并后 schema_context 与不带 DDL 时逐字节相同。
-    context = {"default_schema": None, "schema": {"ods": {"orders": {"id": "integer"}}}}
+    base = {"ods": {"orders": {"id": "integer"}}}
+    context: dict[str, Any] = {"default_schema": None, "schema": base}
     ddl = "CREATE TABLE ods.orders (id INT);"
-    merged = {"default_schema": None, "schema": dict(context["schema"])}
+    merged: dict[str, Any] = {"default_schema": None, "schema": dict(base)}
     apply_ddl_schema(merged, ddl, dialect="postgres", default_schema=None)
 
     assert merged["schema"] == context["schema"], "前提:这一份合并确实是空操作"
@@ -522,7 +523,7 @@ def test_all_statements_skipped_still_yields_a_different_hash() -> None:
 
 
 def test_different_ddl_text_yields_different_hash() -> None:
-    context = {"default_schema": None, "schema": {}}
+    context: dict[str, Any] = {"default_schema": None, "schema": {}}
 
     assert _hash_with("CREATE TABLE ods.a (x INT);", context) != _hash_with(
         "CREATE TABLE ods.a (y INT);", context
@@ -697,15 +698,15 @@ def test_same_table_written_in_two_cases_is_one_entry() -> None:
 
 # ── 达梦导出实拍形态:五个坑同时出现在一份 DDL 里 ─────────────────────────
 #
-# 这一份是 F3–F6 的合并验收点。同时具备:
+# 这一份是 F3-F6 的合并验收点。同时具备:
 #   1. 表级 NOT CLUSTER PRIMARY KEY("ID")   —— 漏过即挂死(F4)
 #   2. 约束行带前置中文注释                  —— 绕过预过滤(F4)
 #   3. 每列尾部中文 -- 注释                  —— 吞掉右括号,整表丢弃(F5)
 #   4. NOT NULL ENABLE 后缀                  —— 单条目失败拖垮整表(F6)
 #   5. period 裸列名                         —— 被首词匹配整列吞掉(F3)
-# 这一份能出列级血缘,才算 F3–F6 真的修好。
+# 这一份能出列级血缘,才算 F3-F6 真的修好。
 
-_DM_REAL_SHAPE_DDL = '''CREATE TABLE "ODS"."KGRP_RPT"
+_DM_REAL_SHAPE_DDL = """CREATE TABLE "ODS"."KGRP_RPT"
 (
   "ID" NUMBER(18,0) NOT NULL ENABLE, -- 主键标识
   period VARCHAR2(8), -- 账期分区(裸列名,非保留字)
@@ -714,7 +715,7 @@ _DM_REAL_SHAPE_DDL = '''CREATE TABLE "ODS"."KGRP_RPT"
   -- 主键约束
   NOT CLUSTER PRIMARY KEY("ID")
 ) STORAGE(ON "MAIN", CLUSTERBTR);
-'''
+"""
 
 
 def test_dm_real_export_shape_yields_all_columns() -> None:
