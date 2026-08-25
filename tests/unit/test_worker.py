@@ -52,6 +52,7 @@ from app.worker import (
     _build_workflow_child_job,
     _compare_export_row_cap,
     _DatabaseCompareReader,
+    _lineage_batch_ddl_schema,
     _worker_stop_signals,
     _workflow_children_snapshots,
 )
@@ -3867,6 +3868,125 @@ def test_worker_runs_lineage_analyze_with_thin_catalog_handler() -> None:
     assert result_ref.metadata["cached"] is False
 
 
+def _run_lineage_analyze_node(payload: dict[str, Any]) -> dict[str, object]:
+    """跑一个 lineage_analyze workflow 节点,返回落库的那条记录(F11 用)。"""
+    backend = _FakeBackend([_make_job(kind=JobKind.LINEAGE_ANALYZE, payload=payload)])
+    catalog = _FakeLineageCatalog()
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=catalog,
+    )
+    assert runner.run_once() is True
+    return catalog.persisted[0]
+
+
+_WF_SQL = (
+    "INSERT INTO ODS.KGRP_SUM (period, AMT) "
+    "SELECT R.period, SUM(R.AMT) FROM ODS.KGRP_RPT R GROUP BY R.period"
+)
+# 达梦形态:NOT NULL ENABLE + 表级 NOT CLUSTER PRIMARY KEY + period 裸列名
+_WF_DDL = (
+    'CREATE TABLE "ODS"."KGRP_RPT" ('
+    '"ID" NUMBER(18,0) NOT NULL ENABLE, '
+    "period VARCHAR2(8) NOT NULL ENABLE, "
+    '"AMT" NUMBER(18,2), '
+    'NOT CLUSTER PRIMARY KEY("ID"));'
+    'CREATE TABLE "ODS"."KGRP_SUM" (period VARCHAR2(8), "AMT" NUMBER(18,2));'
+)
+
+
+def test_worker_lineage_analyze_applies_ddl_text_from_the_node_payload() -> None:
+    """F11:workflow 节点的 ddl_text 必须**真正生效** —— 此前带进子 job 后被静默忽略。
+
+    _FakeLineageCatalog.schema_context 返回空 schema(等价于元数据缓存缺失),
+    所以出现列级映射只可能来自 DDL 数据源。
+    """
+    persisted = _run_lineage_analyze_node(
+        {
+            "datasource_id": "ds-9",
+            "sql_text": _WF_SQL,
+            "dialect": "dm",
+            "source_ref": "wf-node-ddl",
+            "ddl_text": _WF_DDL,
+        }
+    )
+
+    # F13:摘要随 parse_summary 落库,与 API analyze 同范式。
+    summary = persisted["ddl_summary"]
+    assert isinstance(summary, dict)
+    assert summary["table_count"] == 2
+    assert summary["dialect"] == "dm"
+    # F6:标准达梦写法零降级。
+    assert summary["failed_column_entry_count"] == 0
+    # ★ 真正生效的证据:无元数据缓存却拿到了列级映射。
+    assert persisted["column_mappings"] == 2
+
+
+def test_worker_lineage_analyze_without_ddl_text_stays_table_level() -> None:
+    """对照组:同一段 SQL 去掉 ddl_text —— 无元数据即无列级映射。"""
+    persisted = _run_lineage_analyze_node(
+        {
+            "datasource_id": "ds-9",
+            "sql_text": _WF_SQL,
+            "dialect": "dm",
+            "source_ref": "wf-node-nodll",
+        }
+    )
+
+    assert persisted["ddl_summary"] is None
+    assert persisted["column_mappings"] == 0
+
+
+def test_worker_lineage_analyze_ddl_changes_the_cache_key() -> None:
+    """F8:workflow 路径的缓存键同样要含 ddl_text 原文指纹。"""
+    base: dict[str, Any] = {
+        "datasource_id": "ds-9",
+        "sql_text": _WF_SQL,
+        "dialect": "dm",
+        "source_ref": "wf-node-hash",
+    }
+    without = _run_lineage_analyze_node(dict(base))
+    with_ddl = _run_lineage_analyze_node({**base, "ddl_text": _WF_DDL})
+
+    assert without["sql_hash"] != with_ddl["sql_hash"], "带 DDL 与不带 DDL 必须落到不同缓存键"
+
+
+def test_worker_lineage_analyze_unsupported_ddl_dialect_fails_the_node() -> None:
+    """F12:workflow 是会被反复调度的流水线,方言不受支持要明确失败,不静默降级。"""
+    backend = _FakeBackend(
+        [
+            _make_job(
+                kind=JobKind.LINEAGE_ANALYZE,
+                payload={
+                    "datasource_id": "ds-9",
+                    "sql_text": _WF_SQL,
+                    "dialect": "db2",
+                    "source_ref": "wf-node-bad-dialect",
+                    "ddl_text": _WF_DDL,
+                },
+            )
+        ]
+    )
+    catalog = _FakeLineageCatalog()
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert catalog.persisted == [], "失败的节点不该落 lineage_runs"
+    assert backend.failed, "节点必须明确失败"
+
+
 def test_worker_runs_lineage_batch_over_zip_with_lenient_parsing() -> None:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -3964,6 +4084,228 @@ def test_worker_runs_lineage_batch_without_datasource_report_only() -> None:
     assert file_a["tables_written"] == ["kgrp.mid"]
     # 内存透传键不得泄漏进序列化报告
     assert "_report" not in file_a
+
+
+def test_worker_lineage_batch_ddl_text_restores_column_level_lineage() -> None:
+    """无库批量 + DDL 文本数据源 → 从宽松表级升回列级(合成表结构)。"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "load.sql",
+            "insert into ods.dwd_orders (order_id, amt) select o.order_id, o.amt from ods.orders o",
+        )
+    job = _make_job(
+        kind=JobKind.LINEAGE_BATCH,
+        payload={
+            "upload_id": "up-1",
+            "storage_uri": "uploads/up-1/scripts.zip",
+            "datasource_id": None,
+            "dialect": "dm",
+            "ddl_text": (
+                'CREATE TABLE "ODS"."ORDERS" ("ORDER_ID" NUMBER(18), "AMT" NUMBER(12,2), '
+                'NOT CLUSTER PRIMARY KEY("ORDER_ID")) STORAGE(ON "MAIN", CLUSTERBTR);'
+                'CREATE TABLE "ODS"."DWD_ORDERS" ("ORDER_ID" NUMBER(18), "AMT" NUMBER(12,2));'
+            ),
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    result_store.downloads["uploads/up-1/scripts.zip"] = buffer.getvalue()
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=_FakeLineageCatalog(),
+    )
+
+    assert runner.run_once() is True
+
+    report = json.loads(result_store.run_artifacts[("job-1", "lineage_batch_report.json")])
+    assert report["ddl_schema"] == {
+        "table_count": 2,
+        "column_count": 4,
+        "parsed_table_count": 2,
+        "parsed_column_count": 4,
+        "skipped_statement_count": 0,
+        "skipped_reasons": {},
+        "failed_column_entry_count": 0,
+        "dialect": "dm",
+    }
+    assert report["column_mapping_total"] == 2
+    entry = report["files"][0]
+    assert entry["lenient_statement_count"] == 0
+
+
+def test_worker_lineage_batch_without_ddl_text_stays_table_level() -> None:
+    """对照组:同一 ZIP 不给 DDL —— 维持现状的宽松表级降级。"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "load.sql",
+            "insert into ods.dwd_orders (order_id, amt) select o.order_id, o.amt from ods.orders o",
+        )
+    job = _make_job(
+        kind=JobKind.LINEAGE_BATCH,
+        payload={
+            "upload_id": "up-1",
+            "storage_uri": "uploads/up-1/scripts.zip",
+            "datasource_id": None,
+            "dialect": "dm",
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    result_store.downloads["uploads/up-1/scripts.zip"] = buffer.getvalue()
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=_FakeLineageCatalog(),
+    )
+
+    assert runner.run_once() is True
+
+    report = json.loads(result_store.run_artifacts[("job-1", "lineage_batch_report.json")])
+    assert report["ddl_schema"] is None
+    assert report["column_mapping_total"] == 0
+    assert report["files"][0]["lenient_statement_count"] == 1
+
+
+def _lineage_batch_ddl_report(*, dialect: str, ddl_text: str) -> dict[str, Any]:
+    """跑一次无库批量分析,返回报告(F7 / F12 用)。"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "load.sql",
+            "insert into ods.dwd (id, amt) select o.id, o.amt from ods.orders o",
+        )
+    job = _make_job(
+        kind=JobKind.LINEAGE_BATCH,
+        payload={
+            "upload_id": "up-1",
+            "storage_uri": "uploads/up-1/scripts.zip",
+            "datasource_id": None,
+            "dialect": dialect,
+            "ddl_text": ddl_text,
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    result_store.downloads["uploads/up-1/scripts.zip"] = buffer.getvalue()
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=_FakeLineageCatalog(),
+    )
+    assert runner.run_once() is True
+    report: dict[str, Any] = json.loads(
+        result_store.run_artifacts[("job-1", "lineage_batch_report.json")]
+    )
+    return report
+
+
+_MYSQL_DDL = (
+    "CREATE TABLE `ods`.`orders` (`id` int NOT NULL, `amt` decimal(18,2)) ENGINE=InnoDB;\n"
+    "CREATE TABLE `ods`.`dwd` (`id` int NOT NULL, `amt` decimal(18,2)) ENGINE=InnoDB;\n"
+)
+
+
+def test_worker_lineage_batch_auto_dialect_detects_from_the_ddl_text_itself() -> None:
+    """F7:无库 + auto 时 DDL 曾被硬编码按 oracle 解 —— 同一份 MySQL DDL 全军覆没。
+
+    detect_default 无库时恒为 "oracle",而同一作业的 SQL 文件却是逐文件自动识别的。
+    DDL 是独立的一整段文本,方言要按它自己识别。
+    """
+    report = _lineage_batch_ddl_report(dialect="auto", ddl_text=_MYSQL_DDL)
+
+    assert report["ddl_schema"]["dialect"] == "mysql"
+    assert report["ddl_schema"]["table_count"] == 2
+    assert report["ddl_schema"]["column_count"] == 4
+    assert report["ddl_schema"]["skipped_statement_count"] == 0
+    assert report["column_mapping_total"] == 2
+
+
+def test_worker_lineage_batch_explicit_dialect_is_never_overridden() -> None:
+    """显式方言永远原样透传 —— 自动识别只在 auto 哨兵下发生。"""
+    report = _lineage_batch_ddl_report(dialect="mysql", ddl_text=_MYSQL_DDL)
+
+    assert report["ddl_schema"]["dialect"] == "mysql"
+
+
+def test_lineage_batch_ddl_schema_keeps_a_discarded_ddl_visible() -> None:
+    """F12:降级返回 None 会与"未提供 DDL"同形,用户在界面上零提示。
+
+    直接测这个辅助函数而不是整条批量路径:方言不在白名单时
+    ``analyze_sql_lineage`` 会先让整个 job 失败,端到端走不到这个分支。
+    这里守的是"批量路径的错误策略"本身 —— 降级可以,静默不行。
+    """
+    context: dict[str, Any] = {"default_schema": None, "schema": {}}
+
+    summary = _lineage_batch_ddl_schema(context, _MYSQL_DDL, dialect="db2", default_schema=None)
+
+    assert summary is not None, "降级不能与'未提供 DDL'同形"
+    assert summary["error"] == "dialect_unsupported"
+    assert summary["dialect"] == "db2"
+    assert summary["table_count"] == 0
+    assert context["schema"] == {}
+
+
+def test_worker_lineage_batch_persists_ddl_schema_into_parse_summary() -> None:
+    """批量落 lineage_runs 的 sql_hash 是带 DDL 维度算的,parse_summary 也得带 ddl_schema。
+
+    否则跨路径缓存命中(API analyze 命中批量落的 run)会把"这份结果用了 DDL"
+    这件事整个隐藏掉,前端徽标不出现。
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "load.sql",
+            "insert into ods.dwd (id, amt) select o.id, o.amt from ods.orders o",
+        )
+    job = _make_job(
+        kind=JobKind.LINEAGE_BATCH,
+        payload={
+            "upload_id": "up-1",
+            "storage_uri": "uploads/up-1/scripts.zip",
+            "datasource_id": "ds-1",
+            "dialect": "mysql",
+            "ddl_text": _MYSQL_DDL,
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    result_store.downloads["uploads/up-1/scripts.zip"] = buffer.getvalue()
+    catalog = _FakeLineageCatalog()
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert catalog.persisted, "有数据源的批量必须落 lineage_runs"
+    persisted_summary = catalog.persisted[0]["ddl_summary"]
+    assert isinstance(persisted_summary, dict)
+    assert persisted_summary["dialect"] == "mysql"
+    assert persisted_summary["table_count"] == 2
+
+
+def test_lineage_batch_ddl_schema_returns_none_only_when_no_ddl_given() -> None:
+    context: dict[str, Any] = {"default_schema": None, "schema": {}}
+
+    assert _lineage_batch_ddl_schema(context, None, dialect="dm", default_schema=None) is None
+    assert _lineage_batch_ddl_schema(context, "  ", dialect="dm", default_schema=None) is None
 
 
 def test_worker_lineage_batch_emits_semantic_view_with_refresh_and_risk() -> None:
@@ -4200,6 +4542,7 @@ class _FakeLineageCatalog:
         sql_hash: str,
         sql_text: str,
         report: LineageReport,
+        ddl_summary: dict[str, Any] | None = None,
     ) -> None:
         self.persisted.append(
             {
@@ -4211,5 +4554,7 @@ class _FakeLineageCatalog:
                 "sql_hash": sql_hash,
                 "sql_text": sql_text,
                 "table_edges": len(report.graph_edges),
+                "column_mappings": len(report.insert_mappings),
+                "ddl_summary": ddl_summary,
             }
         )

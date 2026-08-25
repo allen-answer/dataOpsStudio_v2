@@ -923,6 +923,27 @@ export default {
     default_schema_ph: 'Schema for unqualified table names',
     sql_text: 'SQL text',
     sql_ph: 'Paste INSERT ... SELECT statements…',
+    ddl_source: 'DDL text data source (optional)',
+    ddl_hint:
+      'Paste CREATE TABLE statements to supply column metadata — column-level lineage without connecting to a database. Tables already in the metadata cache win; DDL only fills the gaps.',
+    ddl_ph: 'Paste CREATE TABLE ... statements (multiple allowed; indexes / comments / grants are skipped)…',
+    ddl_load_file: 'Load from .sql file',
+    ddl_clear: 'Clear',
+    ddl_too_large: 'DDL text exceeds the {max} character limit.',
+    ddl_read_failed: 'Could not read the DDL file.',
+    ddl_applied: 'DDL source: added {tables} tables / {columns} columns',
+    // ★ Skip reasons must stay distinguishable: one merged "non-CREATE-TABLE" count
+    //   sends users hunting in entirely the wrong place — "3 failed to parse" and
+    //   "3 GRANT statements" are not the same problem.
+    ddl_skipped_non_create_table: '{count} non-CREATE-TABLE statements skipped',
+    ddl_skipped_ctas: '{count} CREATE TABLE AS SELECT skipped (no column list; types need the query)',
+    ddl_skipped_constraints_only: '{count} CREATE TABLE with constraints but no columns skipped',
+    ddl_skipped_parse_failed: '{count} CREATE TABLE statements failed to parse',
+    ddl_skipped_over_statement_limit: 'Over the {count}-statement limit; the rest were not processed',
+    ddl_partial_columns: '{count} column definitions failed to parse (the other columns were kept)',
+    ddl_shadowed: '{count} of them already had cached metadata, which takes precedence',
+    ddl_dialect: 'parsed as {dialect}',
+    ddl_dialect_unsupported: 'DDL not applied: dialect {dialect} is not supported',
     refresh_cache: 'Bypass cache and re-parse',
     analyze: 'Analyze',
     analyzing: 'Analyzing…',
@@ -1115,6 +1136,11 @@ export default {
       dialect: 'Dialect (optional)',
       default_schema: 'Default schema (optional)',
       source_ref: 'Source reference (optional)',
+      ddl_text: 'DDL text data source (optional)',
+      ddl_text_ph:
+        'Paste CREATE TABLE statements to supply metadata the cache is missing → column-level lineage…',
+      ddl_text_hint:
+        'Same as the two lineage entry points; capped at {max} characters (a workflow definition is stored and re-run on a schedule, so the cap is tighter than interactive analysis).',
       upstream_result: 'Upstream SQL result',
       filename: 'Filename',
       export_edge_hint: 'Choose an upstream SQL node; a success edge will be added.',

@@ -235,7 +235,7 @@ diff 按 PR 切小。1.x 的段 SQL 复用 2.0 已有的 qualify+lineage 列级�
 
 **关键实现注意**(1.x 踩过的坑,移植时保留):段落喂 sqlglot **必须保留换行**
 (`clean_procedure_segment`),不可用压平文本;`script_variables` 在
-`_normalize_dialect` 相关 normalize **之前**抽。
+`normalize_lineage_dialect` 相关 normalize **之前**抽。
 
 ### PR2 —— 游标 / UDF / BULK COLLECT / TRIGGER 补链边
 

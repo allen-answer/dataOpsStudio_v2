@@ -1,11 +1,20 @@
-from app.domain.lineage.cache import LINEAGE_PARSER_VERSION, lineage_sql_hash
+from app.domain.lineage.cache import (
+    LINEAGE_PARSER_VERSION,
+    lineage_ddl_fingerprint,
+    lineage_sql_hash,
+)
+from app.domain.lineage.ddl_schema import (
+    apply_ddl_schema,
+    merge_ddl_schema,
+    schema_from_ddl_text,
+)
 from app.domain.lineage.detect import (
     AUTO_DIALECT,
     DialectDetection,
     detect_dialect,
     resolve_dialect,
 )
-from app.domain.lineage.dialects import register_lineage_dialects
+from app.domain.lineage.dialects import normalize_lineage_dialect, register_lineage_dialects
 from app.domain.lineage.edge_rows import build_lineage_edge_rows
 from app.domain.lineage.models import (
     InsertMapping,
@@ -49,12 +58,17 @@ __all__ = [
     "TransformationKind",
     "TransformationSubtype",
     "analyze_sql_lineage",
+    "apply_ddl_schema",
     "build_lineage_edge_rows",
     "build_semantic_view",
     "detect_dialect",
+    "lineage_ddl_fingerprint",
     "lineage_sql_hash",
+    "merge_ddl_schema",
+    "normalize_lineage_dialect",
     "register_lineage_dialects",
     "resolve_dialect",
+    "schema_from_ddl_text",
     "schema_from_metadata_cache_rows",
     "split_plsql_statements",
 ]

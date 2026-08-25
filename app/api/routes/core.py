@@ -247,8 +247,10 @@ from app.domain.lineage import (
     LineageParseRequest,
     LineageReport,
     analyze_sql_lineage,
+    apply_ddl_schema,
     build_lineage_edge_rows,
     build_semantic_view,
+    lineage_ddl_fingerprint,
     lineage_sql_hash,
     resolve_dialect,
     schema_from_metadata_cache_rows,
@@ -4228,11 +4230,16 @@ def analyze_project_lineage(
         detection = resolve_dialect(body.dialect or db_type, body.sql_text, default=db_type)
         dialect = detection.dialect
         schema_context = _lineage_schema_context(conn, body.datasource_id, body.default_schema)
+        # DDL 文本数据源的缓存维度取**原文**指纹,不取合并后的 schema_context:
+        # 合并可能是空操作,那时带 DDL 与不带 DDL 会算出同一个 hash,缓存双向串位。
         sql_hash = lineage_sql_hash(
             sql_text=body.sql_text,
             dialect=dialect,
             schema_context=schema_context,
             parser_version=LINEAGE_PARSER_VERSION,
+            ddl_source=lineage_ddl_fingerprint(
+                body.ddl_text, dialect=dialect, default_schema=body.default_schema
+            ),
         )
         if not refresh:
             cached = _lineage_cached_run(
@@ -4261,6 +4268,23 @@ def analyze_project_lineage(
                 sql_hash=sql_hash,
             )
 
+        # ★ 缓存未命中之后才解析 DDL:解析在查缓存之前的话,命中缓存也要在
+        # engine.begin() 事务内、占着连接池连接,把最多 1 MB 文本全额解析一遍再丢弃。
+        try:
+            ddl_summary = apply_ddl_schema(
+                schema_context,
+                body.ddl_text,
+                dialect=dialect,
+                default_schema=body.default_schema,
+            )
+        except ValueError as exc:
+            # ★ 名副其实:schema_from_ddl_text 对畸形 DDL 从不抛错(只跳过并计数),
+            # 这里唯一可能的原因就是方言不在白名单。原来的 lineage_ddl_parse_failed
+            # 会让用户反复修改本来正确的 DDL。
+            raise ApiError(
+                400, "lineage_dialect_unsupported", "Lineage DDL dialect is not supported"
+            ) from exc
+
         try:
             report = analyze_sql_lineage(
                 LineageParseRequest(
@@ -4280,6 +4304,10 @@ def analyze_project_lineage(
         if detection.auto_detected:
             # L-1:识别结果落 parse_summary(前端可显示 "auto-detected: oracle")。
             parse_summary["dialect_detection"] = detection.as_summary()
+        if ddl_summary is not None:
+            # DDL 数据源摘要随 parse_summary 持久化:缓存命中的 run 回读时同样带着,
+            # 前端能显示"DDL 补充了 N 张表 / M 列"(与 dialect_detection 同范式)。
+            parse_summary["ddl_schema"] = ddl_summary
         conn.execute(
             insert(lineage_runs).values(
                 id=run_id,
@@ -4907,6 +4935,9 @@ def create_lineage_batch(
                 "dialect": body.dialect,
                 "default_schema": body.default_schema,
                 "filename": str(upload_row["filename"]),
+                # DDL 文本数据源(可选):worker 侧解析成列元数据后并入 schema,
+                # 让无库 / 缺元数据的批量分析也能出列级血缘。
+                "ddl_text": body.ddl_text,
             },
         )
         _enqueue_job_txn(conn, services, job)
