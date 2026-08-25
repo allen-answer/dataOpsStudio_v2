@@ -159,18 +159,28 @@ def test_parses_dm_export_shape_with_not_cluster_primary_key() -> None:
         "CONSTRAINT pk_orders PRIMARY KEY (id)",
         "PRIMARY KEY (id)",
         "UNIQUE KEY idx_a (a)",
+        "UNIQUE (a, b)",
         "FOREIGN KEY (cust_id) REFERENCES ods.cust (id)",
         "CHECK (amt >= 0)",
-        "KEY idx_b (b)",
-        "INDEX idx_c (c)",
+        "KEY (b)",
+        "INDEX (c)",
+        "PERIOD FOR system_time (vs, ve)",
+        "EXCLUDE USING gist (room WITH =)",
+        "PARTITION BY RANGE (dt)",
+        "INHERITS (parent)",
+        "FULLTEXT KEY ft_a (a)",
+        # F4:带前置注释的约束条目 —— 剥注释之后仍然要认出来,否则进 sqlglot 挂死。
+        '-- 主键约束\n NOT CLUSTER PRIMARY KEY("ID")',
+        "/* 主键 */ PRIMARY KEY (id)",
     ],
 )
 def test_constraint_entries_are_filtered_before_sqlglot(entry: str) -> None:
     """★ 回归护栏:约束条目一律不进 sqlglot。
 
-    ``NOT CLUSTER PRIMARY KEY`` 若漏过这层过滤会让解析器挂死(不是变慢,是不返回)。
+    ``NOT CLUSTER PRIMARY KEY`` 若漏过这层过滤会让解析器挂死(不是变慢,是不返回);
+    ``CLUSTER PRIMARY KEY`` / ``KEY (...)`` 漏过则凭空多出幻影列。
     """
-    assert _is_constraint_entry(entry) is True
+    assert _is_constraint_entry(entry, "dm") is True
 
 
 @pytest.mark.parametrize(
@@ -180,10 +190,36 @@ def test_constraint_entries_are_filtered_before_sqlglot(entry: str) -> None:
         '"NOT_NULL_FLAG" CHAR(1)',
         "amount DECIMAL(12,2) DEFAULT 0",
         "`key_name` VARCHAR(20)",
+        # F3:PG / Oracle / DM 的非保留字,不加引号就能当列名。
+        # ``period`` 是本项目 kgrp 报表层的真实分区列名 —— 被吞掉等于整列血缘丢失。
+        "period text",
+        "period VARCHAR2(8)",
+        "key varchar(20)",
+        "index numeric(10)",
+        "cluster int",
+        "partition int",
+        "exclude int",
+        "constraint_name varchar(64)",
+        "primary_flag char(1)",
+        "check_sum bigint",
+        # 带尾部注释的普通列(达梦 / DIDA 导出每列都带中文注释)。
+        "period VARCHAR2(8) -- 账期分区",
+        "-- 账期分区\n period VARCHAR2(8)",
     ],
 )
 def test_column_entries_are_not_filtered(entry: str) -> None:
-    assert _is_constraint_entry(entry) is False
+    assert _is_constraint_entry(entry, "dm") is False
+
+
+@pytest.mark.parametrize("entry", ["KEY idx_b (b)", "INDEX idx_c (c)"])
+def test_named_index_entries_are_filtered_only_for_mysql(entry: str) -> None:
+    """``KEY idx (col)`` 是 MySQL 独有语法,且 MySQL 里 KEY/INDEX 是保留字。
+
+    非 mysql 方言下这套语法不合法,裸 ``key`` / ``index`` 只可能是列名 —— 放过去。
+    """
+    assert _is_constraint_entry(entry, "mysql") is True
+    assert _is_constraint_entry(entry, "dm") is False
+    assert _is_constraint_entry(entry, "postgres") is False
 
 
 def test_skips_non_create_table_statements_and_counts_them() -> None:

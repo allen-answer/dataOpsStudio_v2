@@ -35,33 +35,55 @@ from app.domain.lineage.parser import LineageSchema
 # API 层另有字符数上限,这里是二道闸:防超长文本把解析时间拖爆。
 DDL_MAX_STATEMENTS = 2000
 
-# 列清单里以这些关键字开头的条目是表级约束 / 索引 / 分区子句,不是列定义。
-# ★ ``not`` / ``cluster`` 必须在列表里:达梦导出的 ``NOT CLUSTER PRIMARY KEY(...)``
-#   会让 sqlglot 挂死(见模块 docstring),绝不能让它进解析器。
-# 裸标识符恒不区分大小写;真要拿这些词当列名的库会加引号,加了引号就不会命中。
-_CONSTRAINT_ENTRY_KEYWORDS = frozenset(
-    {
-        "check",
-        "cluster",
-        "clustered",
-        "constraint",
-        "exclude",
-        "foreign",
-        "fulltext",
-        "index",
-        "inherits",
-        "key",
-        "like",
-        "nonclustered",
-        "not",
-        "partition",
-        "period",
-        "primary",
-        "spatial",
-        "unique",
-        "using",
-        "with",
-    }
+# 条目里可能出现的标识符:裸标识符 / 双引号 / 反引号 / T-SQL 方括号。
+_IDENT = r"""(?:"[^"]*"|`[^`]*`|\[[^\]]*\]|[A-Za-z_][A-Za-z_0-9$#]*)"""
+
+# 表级约束条目的**形状**匹配(不是首词匹配)。
+#
+# ★ 为什么是形状而不是关键字集合:``period`` / ``key`` / ``index`` / ``cluster`` /
+#   ``partition`` 在 PG / Oracle / DM 里都是非保留字,可以不加引号直接当列名
+#   (``period`` 正是本项目 kgrp 报表层的分区列名)。按首词匹配会把整列吞掉。
+#   实测 sqlglot 对 ``period text`` / ``key varchar(20)`` / ``cluster int`` 三个
+#   方言全都解析正常 —— 我们的过滤是唯一的杀手。
+#
+# 所以只匹配"关键字 + 左括号"或"关键字 + 名称 + 左括号"这类多词形态:
+# ``period text`` 这种单词加类型的条目永远匹配不上,自然不会被误删。
+#
+# 必须命中的三类(实测,见 PR 说明):
+#   1. ``NOT CLUSTER PRIMARY KEY(...)`` —— 进了 sqlglot 会指数回溯到**挂死**
+#      (不是变慢,是不返回)。``NOT`` 是所有方言的保留字,不可能是列名。
+#   2. ``CLUSTER PRIMARY KEY(...)`` / ``KEY idx(...)`` / ``INDEX idx(...)`` ——
+#      不挂死,但 sqlglot 会把关键字本身当成列名,凭空多出 ``CLUSTER`` /
+#      ``KEY`` / ``INDEX`` 幻影列。
+#   3. 其余标准约束 —— sqlglot 自己就能正确排除,这里拦下只是省解析器功夫。
+_CONSTRAINT_SHAPE_RE = re.compile(
+    r"^(?:"
+    r"NOT\s"
+    r"|CONSTRAINT\s+" + _IDENT + r"\s"
+    r"|(?:CLUSTER|CLUSTERED|NONCLUSTERED)\s+(?:PRIMARY|UNIQUE)\s*"
+    r"|PRIMARY\s+KEY\s*\("
+    r"|FOREIGN\s+KEY\s*\("
+    r"|UNIQUE\s*(?:(?:KEY|INDEX)\s+)?(?:" + _IDENT + r"\s*)?\("
+    r"|CHECK\s*\("
+    r"|EXCLUDE\s*(?:USING\s|\()"
+    r"|PERIOD\s+FOR\s+" + _IDENT + r"\s*\("
+    r"|INHERITS\s*\("
+    r"|PARTITION\s+BY\s"
+    r"|LIKE\s+" + _IDENT + r"\b"
+    r"|(?:FULLTEXT|SPATIAL)\s+(?:KEY|INDEX)\s"
+    r"|(?:KEY|INDEX)\s*\("
+    r")",
+    re.IGNORECASE,
+)
+
+# ``KEY idx_b (b)`` / ``INDEX idx_c (c)``(带名字的索引条目)是 **MySQL 独有**的
+# 建表内联索引语法,而 MySQL 恰好把 ``KEY`` / ``INDEX`` 列为保留字 —— 两件事合起来
+# 给出一个干净的判据:只在 mysql 方言下按索引条目剔除。
+# 非 mysql 方言里这套语法根本不合法,出现裸 ``key`` / ``index`` 就是货真价实的列名
+# (实测 dm / postgres 下 ``key varchar(20)`` 解析正常),放它过去。
+_MYSQL_INDEX_SHAPE_RE = re.compile(
+    r"^(?:KEY|INDEX)\s+" + _IDENT + r"\s*\(",
+    re.IGNORECASE,
 )
 
 # 建表语句头(到表名为止)。覆盖 OR REPLACE / 临时表 / 外部表 / 达梦 HUGE 表 /
@@ -75,9 +97,6 @@ _CREATE_TABLE_RE = re.compile(
     r"(?:IF\s+NOT\s+EXISTS\s+)?",
     re.IGNORECASE,
 )
-
-# 条目首个裸标识符(用来判断是不是约束条目)。
-_LEADING_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9$#]*")
 
 # 引号 / 括号标识符的配对表(``[`` 为 T-SQL 方括号标识符)。
 _QUOTE_PAIRS = {"'": "'", '"': '"', "`": "`", "[": "]"}
@@ -216,7 +235,7 @@ def _table_from_statement(
     entries = [
         entry
         for entry in _split_top_level(body_text[open_index + 1 : close_index], ",")
-        if not _is_constraint_entry(entry)
+        if not _is_constraint_entry(entry, dialect)
     ]
     if not entries:
         return None
@@ -243,9 +262,40 @@ def _table_from_statement(
     return table.db or default_schema or "", table.name, columns
 
 
-def _is_constraint_entry(entry: str) -> bool:
-    match = _LEADING_WORD_RE.match(entry.strip())
-    return match is not None and match.group(0).lower() in _CONSTRAINT_ENTRY_KEYWORDS
+def _is_constraint_entry(entry: str, dialect: str = "") -> bool:
+    """条目是不是表级约束 / 索引子句(而不是列定义)。
+
+    ★ 必须在**剥离注释之后**判断:达梦 / Oracle 导出的约束行常带前置中文注释
+    (``-- 主键\\n NOT CLUSTER PRIMARY KEY("ID")``),不剥注释就匹配不上形状,
+    条目直接送进 sqlglot —— 正是预过滤本要规避的挂死。
+    """
+    stripped = _strip_comments(entry).strip()
+    if not stripped:
+        return False
+    if _CONSTRAINT_SHAPE_RE.match(stripped) is not None:
+        return True
+    return dialect == "mysql" and _MYSQL_INDEX_SHAPE_RE.match(stripped) is not None
+
+
+def _strip_comments(text: str) -> str:
+    """去掉注释,保留字符串 / 引号标识符原样;注释位置留一个空格防止 token 粘连。"""
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        comment_end = _skip_comment(text, index)
+        if comment_end is not None:
+            out.append(" ")
+            index = comment_end
+            continue
+        atom_end = _skip_atom(text, index)
+        if atom_end is not None:
+            out.append(text[index:atom_end])
+            index = atom_end
+            continue
+        out.append(text[index])
+        index += 1
+    return "".join(out)
 
 
 def _strip_leading_noise(text: str) -> str:
