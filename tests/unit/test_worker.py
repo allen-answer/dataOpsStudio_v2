@@ -4007,6 +4007,7 @@ def test_worker_lineage_batch_ddl_text_restores_column_level_lineage() -> None:
         "table_count": 2,
         "column_count": 4,
         "skipped_statement_count": 0,
+        "failed_column_entry_count": 0,
     }
     assert report["column_mapping_total"] == 2
     entry = report["files"][0]

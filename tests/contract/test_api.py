@@ -4526,6 +4526,7 @@ def test_lineage_analyze_with_ddl_text_yields_column_level_edges_without_metadat
         "table_count": 2,
         "column_count": 4,
         "skipped_statement_count": 0,
+        "failed_column_entry_count": 0,
     }
     assert summary["column_mapping_count"] == 2
     assert summary["parse_error_count"] == 0

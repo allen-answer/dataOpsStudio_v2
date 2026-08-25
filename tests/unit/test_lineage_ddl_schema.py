@@ -28,6 +28,7 @@ def test_parses_basic_create_table_into_schema() -> None:
         "table_count": 1,
         "column_count": 2,
         "skipped_statement_count": 0,
+        "failed_column_entry_count": 0,
     }
 
 
@@ -211,6 +212,47 @@ def test_column_entries_are_not_filtered(entry: str) -> None:
     assert _is_constraint_entry(entry, "dm") is False
 
 
+def test_trailing_line_comment_on_last_column_keeps_the_table() -> None:
+    """F5:列尾 ``--`` 注释被逗号拼接吞掉右括号 → 整表静默丢弃。"""
+    result = schema_from_ddl_text(
+        "CREATE TABLE ods.t (a INT, b INT -- 最后一列说明\n);", dialect="dm"
+    )
+
+    assert result.schema == {"ods": {"t": {"a": "INT", "b": "INT"}}}
+    assert result.skipped_statement_count == 0
+
+
+def test_leading_comma_style_line_comments_keep_the_table() -> None:
+    """F5:前导逗号风格(每行 ``, col -- 注释``)同样中招。"""
+    ddl = """CREATE TABLE ods.t (
+      a INT -- 首列
+    , b INT -- 次列
+    , c INT -- 末列
+    );"""
+    result = schema_from_ddl_text(ddl, dialect="dm")
+
+    assert result.schema == {"ods": {"t": {"a": "INT", "b": "INT", "c": "INT"}}}
+
+
+def test_comment_between_table_name_and_column_list() -> None:
+    result = schema_from_ddl_text("CREATE TABLE ods.t /* 订单表 */ (a INT)", dialect="dm")
+
+    assert result.schema == {"ods": {"t": {"a": "INT"}}}
+
+
+def test_single_unparsable_entry_only_loses_that_column() -> None:
+    """F6:``NOT NULL ENABLE`` 一个条目失败,修复前整表零列被采纳。"""
+    result = schema_from_ddl_text(
+        "CREATE TABLE ods.t (id NUMBER NOT NULL ENABLE, amt NUMBER(18,2), nm VARCHAR2(64));",
+        dialect="oracle",
+    )
+
+    assert result.schema == {"ods": {"t": {"amt": "NUMBER(18, 2)", "nm": "VARCHAR2(64)"}}}
+    # 整表没被跳过,但"少了一列"必须是独立可见的信号,不能报 0 跳过就完事。
+    assert result.skipped_statement_count == 0
+    assert result.failed_column_entry_count == 1
+
+
 @pytest.mark.parametrize("entry", ["KEY idx_b (b)", "INDEX idx_c (c)"])
 def test_named_index_entries_are_filtered_only_for_mysql(entry: str) -> None:
     """``KEY idx (col)`` 是 MySQL 独有语法,且 MySQL 里 KEY/INDEX 是保留字。
@@ -384,6 +426,70 @@ def test_ddl_schema_restores_column_level_lineage_without_a_database() -> None:
         (mapping["source_column"], mapping["target_column"]) for mapping in report.insert_mappings
     }
     assert ("ORDER_ID", "ORDER_ID") in mappings
+    assert ("AMT", "AMT") in mappings
+    assert not any(warning["code"] == "lenient_table_level" for warning in report.warnings)
+
+
+# ── 达梦导出实拍形态:五个坑同时出现在一份 DDL 里 ─────────────────────────
+#
+# 这一份是 F3–F6 的合并验收点。同时具备:
+#   1. 表级 NOT CLUSTER PRIMARY KEY("ID")   —— 漏过即挂死(F4)
+#   2. 约束行带前置中文注释                  —— 绕过预过滤(F4)
+#   3. 每列尾部中文 -- 注释                  —— 吞掉右括号,整表丢弃(F5)
+#   4. NOT NULL ENABLE 后缀                  —— 单条目失败拖垮整表(F6)
+#   5. period 裸列名                         —— 被首词匹配整列吞掉(F3)
+# 这一份能出列级血缘,才算 F3–F6 真的修好。
+
+_DM_REAL_SHAPE_DDL = '''CREATE TABLE "ODS"."KGRP_RPT"
+(
+  "ID" NUMBER(18,0) NOT NULL ENABLE, -- 主键标识
+  period VARCHAR2(8), -- 账期分区(裸列名,非保留字)
+  "AMT" NUMBER(18,2) DEFAULT 0, -- 金额
+  "NOTE" VARCHAR2(200), -- 备注说明
+  -- 主键约束
+  NOT CLUSTER PRIMARY KEY("ID")
+) STORAGE(ON "MAIN", CLUSTERBTR);
+'''
+
+
+def test_dm_real_export_shape_yields_all_columns() -> None:
+    result = schema_from_ddl_text(_DM_REAL_SHAPE_DDL, dialect="dm")
+
+    assert result.schema == {
+        "ODS": {
+            "KGRP_RPT": {
+                "period": "VARCHAR2(8)",
+                "AMT": "NUMBER(18, 2)",
+                "NOTE": "VARCHAR2(200)",
+            }
+        }
+    }
+    assert result.skipped_statement_count == 0
+    # "ID" 那条因 ENABLE 解析不动 —— 只损失该列,并且诚实报出来。
+    assert result.failed_column_entry_count == 1
+
+
+def test_dm_real_export_shape_gives_column_level_lineage() -> None:
+    """★ 终极验收:这份 DDL 要能真的产出列级血缘,不只是解析出列名。"""
+    ddl = schema_from_ddl_text(_DM_REAL_SHAPE_DDL, dialect="dm")
+    sql = (
+        "INSERT INTO ODS.KGRP_SUM (period, AMT) "
+        "SELECT R.period, SUM(R.AMT) FROM ODS.KGRP_RPT R GROUP BY R.period"
+    )
+    schema = merge_ddl_schema(
+        {"ODS": {"KGRP_SUM": {"period": "VARCHAR2(8)", "AMT": "NUMBER(18,2)"}}}, ddl.schema
+    )
+
+    report = analyze_sql_lineage(
+        LineageParseRequest(sql_text=sql, dialect="dm", schema=schema, lenient=True)
+    )
+
+    # dm / Oracle 把裸标识符归一成大写,比对时统一大小写(是正确行为,不是缺陷)。
+    mappings = {
+        (mapping["source_column"].upper(), mapping["target_column"].upper())
+        for mapping in report.insert_mappings
+    }
+    assert ("PERIOD", "PERIOD") in mappings
     assert ("AMT", "AMT") in mappings
     assert not any(warning["code"] == "lenient_table_level" for warning in report.warnings)
 

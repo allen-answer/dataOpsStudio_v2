@@ -106,6 +106,20 @@ _UNKNOWN_TYPE = "unknown"
 
 
 @dataclass(frozen=True)
+class _ParsedTable:
+    """一条 ``CREATE TABLE`` 解析出的表。
+
+    ``failed_entry_count`` 是"这张表有几个列条目没解析动" —— 与整表被跳过是两回事,
+    必须分开报告,否则用户看到"0 跳过"却少了几列,完全无从排查。
+    """
+
+    schema_name: str
+    table_name: str
+    columns: dict[str, str]
+    failed_entry_count: int
+
+
+@dataclass(frozen=True)
 class DdlSchemaResult:
     """DDL 文本的解析结果 + 诚实的统计(跳过多少一目了然,不静默吞)。"""
 
@@ -113,6 +127,8 @@ class DdlSchemaResult:
     table_count: int
     column_count: int
     skipped_statement_count: int
+    # 解析成功但个别列条目没解析动的条目总数(整表被跳过之外的独立信号)。
+    failed_column_entry_count: int = 0
 
     def as_summary(self) -> dict[str, int]:
         """落 parse_summary / 批量报告用的扁平摘要(前端直接展示)。"""
@@ -120,6 +136,7 @@ class DdlSchemaResult:
             "table_count": self.table_count,
             "column_count": self.column_count,
             "skipped_statement_count": self.skipped_statement_count,
+            "failed_column_entry_count": self.failed_column_entry_count,
         }
 
 
@@ -148,25 +165,27 @@ def schema_from_ddl_text(
     if len(statements) > DDL_MAX_STATEMENTS:
         skipped += len(statements) - DDL_MAX_STATEMENTS
         statements = statements[:DDL_MAX_STATEMENTS]
+    failed_column_entries = 0
     for statement in statements:
         parsed = _table_from_statement(statement, normalized_dialect, default_schema)
         if parsed is None:
             skipped += 1
             continue
-        schema_name, table_name, columns = parsed
+        failed_column_entries += parsed.failed_entry_count
         # 同名表重复出现(DDL 里先建后改)按后者覆盖,与"最后一次定义生效"直觉一致。
-        tables = schema.setdefault(schema_name, {})
-        if table_name not in tables:
+        tables = schema.setdefault(parsed.schema_name, {})
+        if parsed.table_name not in tables:
             table_count += 1
         else:
-            column_count -= len(tables[table_name])
-        tables[table_name] = columns
-        column_count += len(columns)
+            column_count -= len(tables[parsed.table_name])
+        tables[parsed.table_name] = parsed.columns
+        column_count += len(parsed.columns)
     return DdlSchemaResult(
         schema=schema,
         table_count=table_count,
         column_count=column_count,
         skipped_statement_count=skipped,
+        failed_column_entry_count=failed_column_entries,
     )
 
 
@@ -216,8 +235,8 @@ def _table_from_statement(
     statement: str,
     dialect: str,
     default_schema: str | None,
-) -> tuple[str, str, dict[str, str]] | None:
-    """单条语句 → ``(schema_name, table_name, {column: type})``;非建表 / 解析失败为 None。"""
+) -> _ParsedTable | None:
+    """单条语句 → :class:`_ParsedTable`;非建表 / 无法采纳任何列时为 None。"""
     body_text = _strip_leading_noise(statement)
     header = _CREATE_TABLE_RE.match(body_text)
     if header is None:
@@ -228,27 +247,78 @@ def _table_from_statement(
         # 不是 DDL 数据源的职责,跳过。
         return None
     open_index, close_index = span
-    name_part = body_text[header.end() : open_index].strip()
+    # 表名与左括号之间也可能夹注释(``CREATE TABLE t /* 订单表 */ (...)``),
+    # 剥掉再判 token 数,否则整条被当子查询拒掉。
+    name_part = _strip_comments(body_text[header.end() : open_index]).strip()
     # 表名必须是单个 token(``t AS`` 之类说明括号是子查询而非列清单,跳过)。
     if not name_part or len(_split_top_level(name_part, " ")) != 1:
         return None
-    entries = [
-        entry
-        for entry in _split_top_level(body_text[open_index + 1 : close_index], ",")
-        if not _is_constraint_entry(entry, dialect)
-    ]
+    entries: list[str] = []
+    for entry in _split_top_level(body_text[open_index + 1 : close_index], ","):
+        if _is_constraint_entry(entry, dialect):
+            continue
+        # ★ 必须剥注释再重组:重组用 ", " 拼接会丢掉终结行注释的换行,随后的逗号
+        # 与右括号被 ``--`` 吞掉,sqlglot 解析失败 → 整张表静默丢弃。
+        # DIDA 导出的 SQL 每个字段都带中文行注释,这一形态在真实输入里极其常见。
+        cleaned = _strip_comments(entry).strip()
+        if cleaned:
+            entries.append(cleaned)
     if not entries:
         return None
+    table = _table_ref(name_part, dialect)
+    if table is None:
+        return None
+    columns, failed_entry_count = _columns_from_entries(entries, name_part, dialect)
+    if not columns:
+        return None
+    return _ParsedTable(
+        schema_name=table.db or default_schema or "",
+        table_name=table.name,
+        columns=columns,
+        failed_entry_count=failed_entry_count,
+    )
+
+
+def _columns_from_entries(
+    entries: list[str],
+    name_part: str,
+    dialect: str,
+) -> tuple[dict[str, str], int]:
+    """列清单 → ``({列名: 类型}, 解析失败的条目数)``。
+
+    先整表一次解析(快路,绝大多数输入走这条);失败再逐条目解析,**单个条目失败
+    只损失该列,不再丢掉整张表**。Oracle / DM 原样导出的 DDL 里 ``NOT NULL`` 列常以
+    ``ENABLE`` 结尾(``id NUMBER NOT NULL ENABLE``),实测该条目让 sqlglot 报
+    ParseError —— 修复前整表零列被采纳。
+    """
+    columns = _parse_column_list(entries, name_part, dialect)
+    if columns is not None:
+        return columns, 0
+    merged: dict[str, str] = {}
+    failed = 0
+    for entry in entries:
+        parsed = _parse_column_list([entry], name_part, dialect)
+        if parsed is None:
+            failed += 1
+            continue
+        # 解析成功但没产出 ColumnDef = sqlglot 自己认出这是约束,不算失败。
+        merged.update(parsed)
+    return merged, failed
+
+
+def _parse_column_list(
+    entries: list[str],
+    name_part: str,
+    dialect: str,
+) -> dict[str, str] | None:
+    """把列条目重组成 ``CREATE TABLE`` 交给 sqlglot;解析失败返回 None(区别于 ``{}``)。"""
     # 列清单括号之后一律丢弃(TABLESPACE / STORAGE / PARTITION BY / ENGINE= …)。
-    rebuilt = f"CREATE TABLE {name_part} ({', '.join(entry.strip() for entry in entries)})"
+    rebuilt = f"CREATE TABLE {name_part} ({', '.join(entries)})"
     try:
         parsed = sqlglot.parse_one(rebuilt, read=dialect)
     except (SqlglotError, RecursionError):
         return None
     if not isinstance(parsed, exp.Create) or not isinstance(parsed.this, exp.Schema):
-        return None
-    table = parsed.this.this
-    if not isinstance(table, exp.Table) or not table.name:
         return None
     columns: dict[str, str] = {}
     for column_def in parsed.this.expressions:
@@ -257,9 +327,20 @@ def _table_from_statement(
         columns[column_def.name] = (
             column_def.kind.sql(dialect=dialect) if column_def.kind else _UNKNOWN_TYPE
         )
-    if not columns:
+    return columns
+
+
+def _table_ref(name_part: str, dialect: str) -> exp.Table | None:
+    """``name_part`` → :class:`exp.Table`;解析不动为 None。
+
+    单独解析表名(而不是从列清单那次解析里取),这样列条目全军覆没时仍然知道
+    这条语句建的是哪张表。
+    """
+    try:
+        table = exp.to_table(name_part, dialect=dialect)
+    except (SqlglotError, RecursionError, ValueError):
         return None
-    return table.db or default_schema or "", table.name, columns
+    return table if isinstance(table, exp.Table) and table.name else None
 
 
 def _is_constraint_entry(entry: str, dialect: str = "") -> bool:
