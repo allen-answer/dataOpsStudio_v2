@@ -360,6 +360,33 @@ test('one console submits statements serially, then cancel and re-run reuse the 
   expect(consoleErrors, consoleErrors.join('\n')).toEqual([])
 })
 
+test('a failed statement shows the driver summary and its classified code', async ({ page }) => {
+  // 用户改了表结构、控制台按旧元数据展开 `*` 的真实形态:红条必须给出"哪一列
+  // 无效",而不是缝里那句英文常量。分类码跟在下面当排查线索。
+  const driverSummary =
+    "OperationalError code=1054 message=Unknown column 'legacy_col' in 'field list'"
+  await mockSessionWorkspace(page, {
+    progress: (statementId) =>
+      progressBody(statementId, 'failed', {
+        error: driverSummary,
+        error_code: 'statement_error:1054',
+        result_version: 0,
+        columns_ready: false,
+        first_batch_ready: false,
+      }),
+  })
+  const consoleErrors = await openWorkspace(page)
+
+  await page.getByTestId('sql-execute').click()
+
+  await expect(page.getByTestId('result-error-text')).toHaveText(driverSummary)
+  await expect(page.getByTestId('result-error-text')).not.toContainText(
+    'interactive statement failed',
+  )
+  await expect(page.getByTestId('result-error-code')).toContainText('statement_error:1054')
+  expect(consoleErrors, consoleErrors.join('\n')).toEqual([])
+})
+
 test('a second window taking the session over is surfaced, and reconnect takes it back', async ({
   page,
 }) => {

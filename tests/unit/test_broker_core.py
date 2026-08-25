@@ -27,10 +27,12 @@ from app.dbclients.interactive import (
     ServerCancelSupport,
     StatementRequest,
 )
+from app.dbclients.interactive.errors import MySQLErrorClassifier
 from app.dbclients.query_limit import apply_database_row_limit
 from app.domain.console_session import ConsoleSession, ConsoleSessionState, ConsoleStatementState
 from app.domain.datasource import DbType
 from app.domain.schema import Row
+from tests.unit._interactive_fakes import mysql_error
 
 
 @dataclass
@@ -50,6 +52,8 @@ class DriverHarness:
     block_execute: bool = False
     cancel_causes_confirmation: bool = True
     block_cancel_return: bool = False
+    # 置上后 execute 抛缝的标准执行错;测试可中途换掉它,逐条语句给不同分类。
+    execute_error: ClassifiedError | None = None
     execute_started: threading.Event = field(default_factory=threading.Event)
     execute_release: threading.Event = field(default_factory=threading.Event)
     cancel_started: threading.Event = field(default_factory=threading.Event)
@@ -115,6 +119,11 @@ class FakeInteractiveConnection:
         self.harness.execute_started.set()
         if self.harness.block_execute:
             assert self.harness.execute_release.wait(3), "test did not release execute"
+        if self.harness.execute_error is not None:
+            # 缝在 `_run` 里就是这么抛的:消息恒为该常量,真原因只在 classified 里。
+            raise InteractiveExecuteError(
+                "interactive statement failed", self.harness.execute_error
+            )
         if self._soft_cancel.is_set() and self.harness.cancel_causes_confirmation:
             raise InteractiveExecuteError(
                 "cancelled",
@@ -291,6 +300,68 @@ def test_dm_session_pushes_max_result_rows_into_execute_sql() -> None:
         assert harness.connections[0].executed_sql == [
             "SELECT * FROM SJCS.ACC_FUNDACCOUNT FETCH FIRST 1001 ROWS ONLY"
         ]
+    finally:
+        broker.shutdown()
+
+
+def test_failed_statement_reports_the_driver_summary_not_the_seam_constant() -> None:
+    """回归:`error_summary` 曾恒为缝里写死的 "interactive statement failed"。
+
+    用户改了表结构、控制台按旧元数据展开 `*`,数据库报的是"无效的列名",而这一
+    条常量把真原因整个吞掉 —— 全系统再没有第二处留有它。摘要必须来自
+    `classified.summary`(protocol.py 给该字段写明的用途),常量只做兜底。
+    """
+    real_summary = "OperationalError code=1054 message=Unknown column 'legacy_col' in 'field list'"
+    harness = DriverHarness(
+        execute_error=ClassifiedError(
+            ErrorCategory.STATEMENT_ERROR,
+            driver_code=1054,
+            summary=real_summary,
+        )
+    )
+    broker, store, _ = _broker(harness)
+    try:
+        session = broker.attach(_request())
+        _wait(lambda: broker.observe(session.id).state is ConsoleSessionState.IDLE)
+        receipt = broker.submit(
+            session.id, session.epoch, "SELECT legacy_col FROM t", "request-bad-column"
+        )
+        _wait(lambda: store.statements[receipt.statement.id].state is ConsoleStatementState.FAILED)
+
+        failed = store.statements[receipt.statement.id]
+        assert failed.error_summary == real_summary
+        assert "interactive statement failed" not in (failed.error_summary or "")
+        # 分类码一并落库,前端拿它当排查线索(sessions.ts raw_error_code)。
+        assert failed.error_code == "statement_error:1054"
+
+        # 摘要为空时(分类器没造出摘要)仍回落到缝的常量,不写出空错误。
+        harness.execute_error = ClassifiedError(ErrorCategory.STATEMENT_ERROR, driver_code=1064)
+        second = broker.submit(session.id, session.epoch, "SELECT 2", "request-no-summary")
+        _wait(lambda: store.statements[second.statement.id].state is ConsoleStatementState.FAILED)
+        assert store.statements[second.statement.id].error_summary == "interactive statement failed"
+    finally:
+        broker.shutdown()
+
+
+def test_failed_statement_summary_never_carries_a_password() -> None:
+    """R5:摘要现在带驱动原文,必须仍然脱敏 —— 密码在到达 broker 前就已抹掉。"""
+    classified = MySQLErrorClassifier().classify(
+        mysql_error(1045, "Access denied for password='hunter2' at mysql://db:3306/x")
+    )
+    harness = DriverHarness(execute_error=classified)
+    logger = RecordingLogger()
+    broker, store, _ = _broker(harness, logger=logger)
+    try:
+        session = broker.attach(_request())
+        _wait(lambda: broker.observe(session.id).state is ConsoleSessionState.IDLE)
+        receipt = broker.submit(session.id, session.epoch, "SELECT 1", "request-secret")
+        _wait(lambda: store.statements[receipt.statement.id].state is ConsoleStatementState.FAILED)
+
+        summary = store.statements[receipt.statement.id].error_summary or ""
+        assert "hunter2" not in summary
+        assert "***REDACTED***" in summary
+        assert "<redacted-url>" in summary
+        assert "hunter2" not in repr(logger.records)
     finally:
         broker.shutdown()
 
