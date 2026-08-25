@@ -4006,8 +4006,12 @@ def test_worker_lineage_batch_ddl_text_restores_column_level_lineage() -> None:
     assert report["ddl_schema"] == {
         "table_count": 2,
         "column_count": 4,
+        "parsed_table_count": 2,
+        "parsed_column_count": 4,
         "skipped_statement_count": 0,
+        "skipped_reasons": {},
         "failed_column_entry_count": 0,
+        "dialect": "dm",
     }
     assert report["column_mapping_total"] == 2
     entry = report["files"][0]

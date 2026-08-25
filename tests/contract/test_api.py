@@ -4525,8 +4525,12 @@ def test_lineage_analyze_with_ddl_text_yields_column_level_edges_without_metadat
     assert summary["ddl_schema"] == {
         "table_count": 2,
         "column_count": 4,
+        "parsed_table_count": 2,
+        "parsed_column_count": 4,
         "skipped_statement_count": 0,
+        "skipped_reasons": {},
         "failed_column_entry_count": 0,
+        "dialect": "dm",
     }
     assert summary["column_mapping_count"] == 2
     assert summary["parse_error_count"] == 0

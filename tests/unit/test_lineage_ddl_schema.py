@@ -11,6 +11,7 @@ import pytest
 from app.domain.lineage import (
     LineageParseRequest,
     analyze_sql_lineage,
+    apply_ddl_schema,
     merge_ddl_schema,
     schema_from_ddl_text,
 )
@@ -24,12 +25,11 @@ def test_parses_basic_create_table_into_schema() -> None:
     )
 
     assert result.schema == {"ods": {"orders": {"id": "INT", "amount": "DECIMAL(12, 2)"}}}
-    assert result.as_summary() == {
-        "table_count": 1,
-        "column_count": 2,
-        "skipped_statement_count": 0,
-        "failed_column_entry_count": 0,
-    }
+    assert result.table_count == 1
+    assert result.column_count == 2
+    assert result.skipped == {}
+    assert result.skipped_statement_count == 0
+    assert result.failed_column_entry_count == 0
 
 
 @pytest.mark.parametrize(
@@ -388,6 +388,97 @@ def test_merge_does_not_mutate_inputs() -> None:
 
     assert base == {"ods": {"orders": {"id": "integer"}}}
     assert ddl == {"ods": {"dwd": {"id": "INT"}}}
+
+
+# ── F13 摘要必须诚实 ──────────────────────────────────────────────────
+
+
+def test_skipped_reasons_are_distinguishable() -> None:
+    """六种结果混成一个数字会把用户引向完全错误的排查方向。"""
+    ddl = """
+    CREATE INDEX idx_a ON ods.t (a);
+    CREATE TABLE ods.ctas AS SELECT * FROM ods.src;
+    CREATE TABLE ods.only_constraints (PRIMARY KEY (id));
+    GRANT SELECT ON ods.t TO reader;
+    """
+    result = schema_from_ddl_text(ddl, dialect="postgres")
+
+    assert result.skipped == {
+        "non_create_table": 2,  # CREATE INDEX + GRANT
+        "ctas": 1,
+        "constraints_only": 1,
+    }
+    assert result.skipped_statement_count == 4
+
+
+def test_trailing_comment_is_not_counted_as_a_skipped_statement() -> None:
+    """脚本尾部的说明行根本不是语句,计进 skipped 会让用户以为丢了东西。"""
+    result = schema_from_ddl_text(
+        "CREATE TABLE ods.t (a INT);\n-- 以上为订单相关表\n", dialect="postgres"
+    )
+
+    assert result.skipped == {}
+    assert result.table_count == 1
+
+
+def test_summary_reports_applied_counts_not_parsed_counts() -> None:
+    """★ 生效数是**合并**才知道的事实:被缓存完全遮蔽的表贡献 0,不能报 1。"""
+    context = {
+        "default_schema": None,
+        "schema": {"ods": {"orders": {"id": "integer", "amount": "numeric"}}},
+    }
+
+    summary = apply_ddl_schema(
+        context,
+        "CREATE TABLE ods.orders (id INT, amount DECIMAL(12,2));",
+        dialect="postgres",
+        default_schema=None,
+    )
+
+    assert summary is not None
+    # 解析出 1 张表 2 列,但全被缓存遮蔽 → 实际贡献 0。
+    assert summary["table_count"] == 0
+    assert summary["column_count"] == 0
+    assert summary["parsed_table_count"] == 1
+    assert summary["parsed_column_count"] == 2
+    # 缓存那份原封不动。
+    assert context["schema"] == {"ods": {"orders": {"id": "integer", "amount": "numeric"}}}
+
+
+def test_summary_counts_only_the_tables_ddl_actually_contributed() -> None:
+    context = {"default_schema": None, "schema": {"ods": {"orders": {"id": "integer"}}}}
+
+    summary = apply_ddl_schema(
+        context,
+        "CREATE TABLE ods.orders (id INT);\nCREATE TABLE ods.dwd (a INT, b INT);",
+        dialect="postgres",
+        default_schema=None,
+    )
+
+    assert summary is not None
+    assert (summary["table_count"], summary["column_count"]) == (1, 2)
+    assert (summary["parsed_table_count"], summary["parsed_column_count"]) == (2, 3)
+
+
+def test_apply_ddl_schema_without_ddl_text_touches_nothing() -> None:
+    context = {"default_schema": None, "schema": {"ods": {"orders": {"id": "integer"}}}}
+    before = {"ods": {"orders": {"id": "integer"}}}
+
+    assert apply_ddl_schema(context, None, dialect="postgres", default_schema=None) is None
+    assert apply_ddl_schema(context, "   ", dialect="postgres", default_schema=None) is None
+    assert context["schema"] == before
+
+
+def test_summary_reports_the_dialect_actually_used() -> None:
+    summary = apply_ddl_schema(
+        {"default_schema": None, "schema": {}},
+        "CREATE TABLE ods.t (a INT);",
+        dialect="dameng",
+        default_schema=None,
+    )
+
+    assert summary is not None
+    assert summary["dialect"] == "dm"
 
 
 # ── 端到端:DDL 把表级降级重新拉回列级 ────────────────────────────────

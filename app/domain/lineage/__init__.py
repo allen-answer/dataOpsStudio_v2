@@ -1,6 +1,7 @@
 from app.domain.lineage.cache import LINEAGE_PARSER_VERSION, lineage_sql_hash
 from app.domain.lineage.ddl_schema import (
     DdlSchemaResult,
+    apply_ddl_schema,
     merge_ddl_schema,
     schema_from_ddl_text,
 )
@@ -55,6 +56,7 @@ __all__ = [
     "TransformationKind",
     "TransformationSubtype",
     "analyze_sql_lineage",
+    "apply_ddl_schema",
     "build_lineage_edge_rows",
     "build_semantic_view",
     "detect_dialect",

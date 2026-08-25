@@ -96,11 +96,10 @@ from app.domain.lineage import (
     LineageParseRequest,
     LineageReport,
     analyze_sql_lineage,
+    apply_ddl_schema,
     build_lineage_edge_rows,
     build_semantic_view,
     lineage_sql_hash,
-    merge_ddl_schema,
-    schema_from_ddl_text,
     schema_from_metadata_cache_rows,
 )
 from app.domain.lineage.detect import AUTO_DIALECT, resolve_dialect
@@ -2955,22 +2954,19 @@ def _lineage_batch_ddl_schema(
     *,
     dialect: str,
     default_schema: str | None,
-) -> dict[str, int] | None:
+) -> dict[str, Any] | None:
     """DDL 文本数据源并进批量 ``schema_context``(原地改),返回落报告的摘要。
 
-    ``ddl_text`` 为空时返回 None 且不碰 schema_context —— 没给 DDL 的批量分析
-    行为与从前完全一致。方言不在白名单时降级为"无 DDL"(整批不因此失败),
-    只在日志留痕。
+    解析与合并复用 :func:`apply_ddl_schema`(与单条解析同一实现,摘要口径一致);
+    这里只负责批量路径特有的**错误策略**:方言不在白名单时整批不失败,降级继续。
     """
-    if not ddl_text or not ddl_text.strip():
-        return None
     try:
-        result = schema_from_ddl_text(ddl_text, dialect=dialect, default_schema=default_schema)
+        return apply_ddl_schema(
+            schema_context, ddl_text, dialect=dialect, default_schema=default_schema
+        )
     except ValueError:
         logger.warning("lineage_batch_ddl_dialect_unsupported", dialect=dialect)
         return None
-    schema_context["schema"] = merge_ddl_schema(schema_context["schema"], result.schema)
-    return result.as_summary()
 
 
 def _lineage_batch_script_edges(files_report: list[dict[str, Any]]) -> list[dict[str, Any]]:

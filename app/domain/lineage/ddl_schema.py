@@ -150,6 +150,15 @@ def _rules_for(dialect: str) -> _ScanRules:
 # 无类型信息时的占位,与 metadata_cache 路径 (schema_from_metadata_cache_rows) 一致。
 _UNKNOWN_TYPE = "unknown"
 
+# 跳过原因。分开计数是为了让用户能定位**真实**原因 —— 把"非建表语句"与
+# "建表语句解析失败"混成一个数字,界面统一标成"跳过 N 条非 CREATE TABLE 语句",
+# 用户会去检查明明没问题的语句类型,而真正的解析失败一声不响。
+SKIP_NON_CREATE_TABLE = "non_create_table"
+SKIP_CTAS = "ctas"
+SKIP_CONSTRAINTS_ONLY = "constraints_only"
+SKIP_PARSE_FAILED = "parse_failed"
+SKIP_OVER_STATEMENT_LIMIT = "over_statement_limit"
+
 
 @dataclass(frozen=True)
 class _ParsedTable:
@@ -172,18 +181,15 @@ class DdlSchemaResult:
     schema: LineageSchema
     table_count: int
     column_count: int
-    skipped_statement_count: int
+    # 跳过原因 → 条数。★ 六种结果混成一个数字会把用户引向完全错误的排查方向:
+    # "跳过 3 条非 CREATE TABLE 语句"可能实际是 3 张表**解析失败**。
+    skipped: dict[str, int]
     # 解析成功但个别列条目没解析动的条目总数(整表被跳过之外的独立信号)。
     failed_column_entry_count: int = 0
 
-    def as_summary(self) -> dict[str, int]:
-        """落 parse_summary / 批量报告用的扁平摘要(前端直接展示)。"""
-        return {
-            "table_count": self.table_count,
-            "column_count": self.column_count,
-            "skipped_statement_count": self.skipped_statement_count,
-            "failed_column_entry_count": self.failed_column_entry_count,
-        }
+    @property
+    def skipped_statement_count(self) -> int:
+        return sum(self.skipped.values())
 
 
 def schema_from_ddl_text(
@@ -207,16 +213,21 @@ def schema_from_ddl_text(
     schema: LineageSchema = {}
     table_count = 0
     column_count = 0
-    skipped = 0
+    skipped: dict[str, int] = {}
     statements = _split_statements(ddl_text, rules)
     if len(statements) > DDL_MAX_STATEMENTS:
-        skipped += len(statements) - DDL_MAX_STATEMENTS
+        overflow = len(statements) - DDL_MAX_STATEMENTS
+        skipped[SKIP_OVER_STATEMENT_LIMIT] = overflow
         statements = statements[:DDL_MAX_STATEMENTS]
     failed_column_entries = 0
     for statement in statements:
+        # 纯注释片段(脚本尾部的说明行)根本不是语句,不该计进 skipped 让用户以为
+        # 丢了东西。
+        if not _strip_comments(statement, rules).strip():
+            continue
         parsed = _table_from_statement(statement, normalized_dialect, rules, default_schema)
-        if parsed is None:
-            skipped += 1
+        if isinstance(parsed, str):
+            skipped[parsed] = skipped.get(parsed, 0) + 1
             continue
         failed_column_entries += parsed.failed_entry_count
         # 大小写只是写法差异,不是两张表:引号大写与裸小写折叠进同一个桶 / 同一条目,
@@ -235,7 +246,7 @@ def schema_from_ddl_text(
         schema=schema,
         table_count=table_count,
         column_count=column_count,
-        skipped_statement_count=skipped,
+        skipped=skipped,
         failed_column_entry_count=failed_column_entries,
     )
 
@@ -271,6 +282,63 @@ def merge_ddl_schema(base: LineageSchema, ddl: LineageSchema) -> LineageSchema:
     return merged
 
 
+def apply_ddl_schema(
+    schema_context: dict[str, Any],
+    ddl_text: str | None,
+    *,
+    dialect: str,
+    default_schema: str | None,
+) -> dict[str, Any] | None:
+    """解析 DDL 文本并把结果**原地**并进 ``schema_context``,返回展示用摘要。
+
+    单条解析(API)与批量分析(worker)两路共用这一个实现 —— 摘要口径必须一致,
+    两份复制粘贴迟早漂移。**错误策略留给调用方**:方言不在白名单时这里照常抛
+    ``ValueError``,由调用方决定是 400 还是降级。
+
+    ``ddl_text`` 为空时返回 ``None`` 且**完全不碰** ``schema_context`` —— 没给 DDL
+    的请求行为与从前逐字节一致。
+
+    ★ 摘要在合并处产出,不在解析处:"生效了几张表"是合并才知道的事实。解析出 1 张
+    表但被缓存完全遮蔽时,徽标显示「DDL 数据源:1 表」而实际贡献 0,是纯粹的误导。
+    """
+    if not ddl_text or not ddl_text.strip():
+        return None
+    result = schema_from_ddl_text(ddl_text, dialect=dialect, default_schema=default_schema)
+    base: LineageSchema = schema_context["schema"]
+    merged = merge_ddl_schema(base, result.schema)
+    schema_context["schema"] = merged
+    applied_tables, applied_columns = _applied_counts(base, merged)
+    summary: dict[str, Any] = {
+        # 真正生效的数量(前端徽标显示这个)。
+        "table_count": applied_tables,
+        "column_count": applied_columns,
+        # 解析出来的数量;与上面不等就说明有表被元数据缓存遮蔽了(正常,缓存优先)。
+        "parsed_table_count": result.table_count,
+        "parsed_column_count": result.column_count,
+        "skipped_statement_count": result.skipped_statement_count,
+        # 只放非零原因,前端按键取文案,未知键宽容降级。
+        "skipped_reasons": {reason: count for reason, count in result.skipped.items() if count},
+        "failed_column_entry_count": result.failed_column_entry_count,
+        # 实际采用的方言(auto 识别时用户才知道 DDL 是按什么解的)。
+        "dialect": normalize_lineage_dialect(dialect),
+    }
+    return summary
+
+
+def _applied_counts(base: LineageSchema, merged: LineageSchema) -> tuple[int, int]:
+    """``merged`` 比 ``base`` 多出来的表数与列数 —— 即 DDL 真正贡献了多少。"""
+    tables = 0
+    columns = 0
+    for schema_name, merged_tables in merged.items():
+        base_tables = base.get(schema_name, {})
+        for table_name, merged_columns in merged_tables.items():
+            if table_name in base_tables:
+                continue
+            tables += 1
+            columns += len(merged_columns)
+    return tables, columns
+
+
 def _case_key(mapping: Mapping[str, Any], name: str) -> str:
     """已有同名(忽略大小写)键时复用它的原始写法,避免 ODS / ods 分裂成两份。
 
@@ -290,24 +358,24 @@ def _table_from_statement(
     dialect: str,
     rules: _ScanRules,
     default_schema: str | None,
-) -> _ParsedTable | None:
-    """单条语句 → :class:`_ParsedTable`;非建表 / 无法采纳任何列时为 None。"""
+) -> _ParsedTable | str:
+    """单条语句 → :class:`_ParsedTable`,或一个跳过原因字符串(``SKIP_*``)。"""
     body_text = _strip_leading_noise(statement, rules)
     header = _CREATE_TABLE_RE.match(body_text)
     if header is None:
-        return None
+        return SKIP_NON_CREATE_TABLE
     span = _column_list_span(body_text, header.end(), rules)
     if span is None:
         # CTAS(``CREATE TABLE t AS SELECT ...``)没有列清单:类型要靠查询推导,
         # 不是 DDL 数据源的职责,跳过。
-        return None
+        return SKIP_CTAS
     open_index, close_index = span
     # 表名与左括号之间也可能夹注释(``CREATE TABLE t /* 订单表 */ (...)``),
     # 剥掉再判 token 数,否则整条被当子查询拒掉。
     name_part = _strip_comments(body_text[header.end() : open_index], rules).strip()
     # 表名必须是单个 token(``t AS`` 之类说明括号是子查询而非列清单,跳过)。
     if not name_part or len(_split_top_level(name_part, " ", rules)) != 1:
-        return None
+        return SKIP_CTAS
     entries: list[str] = []
     for entry in _split_top_level(body_text[open_index + 1 : close_index], ",", rules):
         if _is_constraint_entry(entry, dialect):
@@ -319,13 +387,14 @@ def _table_from_statement(
         if cleaned:
             entries.append(cleaned)
     if not entries:
-        return None
+        # 列清单里全是约束条目(纯约束表),没有列可采纳。
+        return SKIP_CONSTRAINTS_ONLY
     table = _table_ref(name_part, dialect)
     if table is None:
-        return None
+        return SKIP_PARSE_FAILED
     columns, failed_entry_count = _columns_from_entries(entries, name_part, dialect)
     if not columns:
-        return None
+        return SKIP_PARSE_FAILED
     return _ParsedTable(
         schema_name=table.db or default_schema or "",
         table_name=table.name,
@@ -645,7 +714,13 @@ def _column_list_span(text: str, start: int, rules: _ScanRules) -> tuple[int, in
 
 __all__ = [
     "DDL_MAX_STATEMENTS",
+    "SKIP_CONSTRAINTS_ONLY",
+    "SKIP_CTAS",
+    "SKIP_NON_CREATE_TABLE",
+    "SKIP_OVER_STATEMENT_LIMIT",
+    "SKIP_PARSE_FAILED",
     "DdlSchemaResult",
+    "apply_ddl_schema",
     "merge_ddl_schema",
     "schema_from_ddl_text",
 ]

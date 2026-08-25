@@ -8,7 +8,7 @@
  * 只负责"收文本 + 回显上次解析摘要";DDL 怎么解析、和元数据缓存怎么合并全在后端
  * (app/domain/lineage/ddl_schema.py),前端不做任何解析。
  */
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { FileCode2, X } from 'lucide-vue-next'
 import type { LineageDdlSchemaSummary } from '../api/lineage'
@@ -25,10 +25,38 @@ const props = defineProps<{
 
 const emit = defineEmits<{ 'update:modelValue': [string] }>()
 
-const { t } = useI18n()
+const { t, te } = useI18n()
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const error = ref<string | null>(null)
+
+/**
+ * 摘要文案。★ 跳过原因逐条展开,不合并成一个数字 —— 「3 条解析失败」和
+ * 「3 条 GRANT」是完全不同的排查方向,混为一谈等于把用户往错误的方向推。
+ * 未知的 reason 键宽容跳过(后端加新原因不会让前端崩)。
+ */
+const summaryText = computed<string>(() => {
+  const value = props.summary
+  if (!value) return ''
+  if (value.error) {
+    return t('lineage.ddl_dialect_unsupported', { dialect: value.dialect ?? value.error })
+  }
+  const parts = [
+    t('lineage.ddl_applied', { tables: value.table_count, columns: value.column_count }),
+  ]
+  const shadowed = (value.parsed_table_count ?? value.table_count) - value.table_count
+  if (shadowed > 0) parts.push(t('lineage.ddl_shadowed', { count: shadowed }))
+  for (const [reason, count] of Object.entries(value.skipped_reasons ?? {})) {
+    if (!count) continue
+    const key = `lineage.ddl_skipped_${reason}`
+    if (te(key)) parts.push(t(key, { count }))
+  }
+  if (value.failed_column_entry_count) {
+    parts.push(t('lineage.ddl_partial_columns', { count: value.failed_column_entry_count }))
+  }
+  if (value.dialect) parts.push(t('lineage.ddl_dialect', { dialect: value.dialect }))
+  return parts.join(' · ')
+})
 
 function setValue(next: string): void {
   if (next.length > DDL_MAX_CHARS) {
@@ -84,13 +112,15 @@ async function onFileChange(event: Event): Promise<void> {
       </button>
       <span
         v-if="summary"
-        class="inline-flex items-center rounded-input px-1.5 py-0.5 text-[10px] font-medium bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300"
+        class="inline-flex items-center rounded-input px-1.5 py-0.5 text-[10px] font-medium"
+        :class="
+          summary.error
+            ? 'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300'
+            : 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300'
+        "
         data-testid="lineage-ddl-summary"
       >
-        {{ t('lineage.ddl_applied', { tables: summary.table_count, columns: summary.column_count }) }}
-        <template v-if="summary.skipped_statement_count > 0">
-          · {{ t('lineage.ddl_skipped', { count: summary.skipped_statement_count }) }}
-        </template>
+        {{ summaryText }}
       </span>
     </div>
     <input

@@ -247,12 +247,11 @@ from app.domain.lineage import (
     LineageParseRequest,
     LineageReport,
     analyze_sql_lineage,
+    apply_ddl_schema,
     build_lineage_edge_rows,
     build_semantic_view,
     lineage_sql_hash,
-    merge_ddl_schema,
     resolve_dialect,
-    schema_from_ddl_text,
     schema_from_metadata_cache_rows,
 )
 from app.domain.lineage.ai_enrichment import build_enrichment_profile
@@ -4232,7 +4231,7 @@ def analyze_project_lineage(
         schema_context = _lineage_schema_context(conn, body.datasource_id, body.default_schema)
         # DDL 文本数据源:在算 sql_hash 之前并入,DDL 变更自动落到不同 hash。
         try:
-            ddl_summary = _apply_lineage_ddl_schema(
+            ddl_summary = apply_ddl_schema(
                 schema_context,
                 body.ddl_text,
                 dialect=dialect,
@@ -8467,28 +8466,6 @@ def _lineage_schema_context(
     schema_rows = [dict(row) for row in rows]
     schema = schema_from_metadata_cache_rows(schema_rows)
     return {"default_schema": default_schema, "schema": schema}
-
-
-def _apply_lineage_ddl_schema(
-    schema_context: dict[str, Any],
-    ddl_text: str | None,
-    *,
-    dialect: str,
-    default_schema: str | None,
-) -> dict[str, int] | None:
-    """把 DDL 文本数据源解析出的列元数据并进 ``schema_context``(原地改)。
-
-    返回摘要 dict(落 parse_summary 供前端展示),``ddl_text`` 为空时返回 None
-    且 **完全不碰 schema_context** —— 没给 DDL 的请求行为与从前逐字节一致。
-
-    ★ 必须在 :func:`lineage_sql_hash` 之前调用:hash 吃 schema_context,DDL 变了
-    hash 就变,缓存自然失效,不需要额外的缓存维度。
-    """
-    if not ddl_text or not ddl_text.strip():
-        return None
-    result = schema_from_ddl_text(ddl_text, dialect=dialect, default_schema=default_schema)
-    schema_context["schema"] = merge_ddl_schema(schema_context["schema"], result.schema)
-    return result.as_summary()
 
 
 def _lineage_cached_run(
