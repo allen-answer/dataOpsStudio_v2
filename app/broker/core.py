@@ -648,7 +648,11 @@ class SessionBroker:
         except (InteractiveExecuteError, SoftCancelledError) as exc:
             classified = exc.classified
             error_code = classified.error_code
-            error_summary = str(exc)
+            # `str(exc)` 是缝里写死的常量("interactive statement failed"),对用户
+            # 零信息量;真实原因(脱敏后的驱动原文 + 数值码)在 `classified.summary`
+            # 里,那正是 protocol.py 给该字段写明的用途 —— 供 `error_summary` 列。
+            # 常量只在 summary 为空(分类器没造出摘要)时兜底。
+            error_summary = classified.summary or str(exc)
             if classified.connection_aborted:
                 connection_lost = True
                 terminal_state = (

@@ -36,6 +36,7 @@ MYSQL_TABLE = [
     (2005, ErrorCategory.HOST_UNREACHABLE, False),
     (1317, ErrorCategory.CANCELLED, True),
     (3024, ErrorCategory.TIMEOUT, True),
+    (1054, ErrorCategory.STATEMENT_ERROR, False),
     (1064, ErrorCategory.STATEMENT_ERROR, False),
     (1146, ErrorCategory.STATEMENT_ERROR, False),
     (2006, ErrorCategory.CONNECTION_DEAD, False),
@@ -151,6 +152,16 @@ def test_summary_redacts_password_and_urls() -> None:
     assert "***REDACTED***" in summary
     assert "<redacted-url>" in summary
     assert "code=1045" in summary
+
+
+def test_bad_column_summary_carries_the_driver_text_for_the_user() -> None:
+    """改表后按旧元数据展开 `*` 的真实形态:摘要必须带得走列名,否则用户无从判断。"""
+    classified = MySQLErrorClassifier().classify(
+        mysql_error(1054, "Unknown column 'legacy_col' in 'field list'")
+    )
+    assert classified.category is ErrorCategory.STATEMENT_ERROR
+    assert classified.error_code == "statement_error:1054"
+    assert "Unknown column 'legacy_col'" in classified.summary
 
 
 def test_summary_is_truncated() -> None:

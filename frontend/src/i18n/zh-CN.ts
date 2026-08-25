@@ -440,6 +440,7 @@ export default {
     session_cancel_degraded_hint: '该数据源不可用服务端取消,取消会断开当前会话。',
     session_statement_skipped: '已跳过 —— 本批次的前一条语句未能提交。',
     session_partial_rows: '已保留被打断前的部分结果:{rows} 行。',
+    error_code_label: '错误码:{code}',
     session_page_beyond_loaded: '会话结果只能在已流式落盘的行内翻页。需要更多行请调大行数上限后重跑。',
     history_all_datasources: '全部数据源',
     history_empty: '暂无历史记录',

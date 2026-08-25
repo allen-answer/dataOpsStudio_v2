@@ -63,6 +63,13 @@ export interface JobProgressResponse {
   terminal: boolean
   error: string | null
   error_code: JobErrorCode | null
+  /**
+   * 会话路径的原始分类码(`category` 或 `category:driver_code`,见
+   * `app/dbclients/interactive/protocol.py`)。`error_code` 是它压成 7 值枚举
+   * 后的结果 —— 压完数值驱动码就没了,而排查"表结构变了"这类问题恰恰要它。
+   * job 路径没有对应物(后端直接给枚举),保持 undefined。
+   */
+  raw_error_code?: string | null
   retry_after_ms: number
   has_new_result: boolean
   truncated: boolean | null

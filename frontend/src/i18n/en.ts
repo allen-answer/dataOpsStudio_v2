@@ -446,6 +446,7 @@ export default {
       'Server-side cancel is unavailable for this datasource, so cancelling disconnects the session.',
     session_statement_skipped: 'Skipped — an earlier statement in this batch did not start.',
     session_partial_rows: 'Partial result kept: {rows} rows loaded before the interruption.',
+    error_code_label: 'Error code: {code}',
     session_page_beyond_loaded:
       'Session results only page through rows already streamed. Re-run with a larger row limit to see more.',
     history_all_datasources: 'All datasources',

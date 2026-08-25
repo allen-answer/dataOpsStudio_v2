@@ -183,7 +183,8 @@ export function statementJobStatus(state: StatementState): JobStatus {
 /**
  * `ClassifiedError.error_code`(`category` 或 `category:driver_code`,
  * `app/dbclients/interactive/protocol.py`)→ 前端 7 值 `JobErrorCode`。
- * 数值驱动码只喂分类,不进 UI —— 错误消息文本与语言在生产是配置项。
+ * 数值驱动码只喂分类,**不参与任何判据** —— 错误消息文本与语言在生产是配置项。
+ * 原始码本身经 `raw_error_code` 原样带进 UI 当排查线索(只显示,不分支)。
  */
 const ERROR_CATEGORY_TO_JOB_CODE: Record<string, JobErrorCode> = {
   auth_failed: 'permission_denied',
@@ -220,6 +221,7 @@ export function toJobProgress(progress: StatementProgressResponse): JobProgressR
     terminal: progress.terminal,
     error: progress.error,
     error_code: statementJobErrorCode(progress.error_code),
+    raw_error_code: progress.error_code,
     retry_after_ms: progress.retry_after_ms,
     has_new_result: progress.has_new_result,
     truncated: progress.truncated,

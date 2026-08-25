@@ -41,6 +41,11 @@ _MAX_CAUSE_DEPTH = 5
 # 依据: DM 侧 -2501 / -70028 / -6515 / -2104 出自 DM-SPIKE §1-E/§3;
 # -2106(无效的表或视图)由本 PR 在同一 DM 8 实例上实测补入,与 -2104(同批新建
 # 对象不可见)同属语句级。MySQL 侧为常识码,A7 的 CI 容器用例负责钉死。
+#
+# ★ DM 的"无效的列名"码**尚未实测**,故意留空:表结构被改后按旧元数据展开 `*`
+# 正是这个错误,但没有实例可验的数字不写进码表(写错比缺失更坏 —— 会把别的
+# 错误误分类)。缺失的代价仅是该错误落 UNKNOWN 兜底、多一次 ping 往返;
+# 错误摘要本身照常带驱动原文与数值码回给用户。拿到实测码后补这一行即可。
 
 DM_ERROR_CODES: Mapping[int, ErrorCategory] = {
     -2501: ErrorCategory.AUTH_FAILED,  # 用户名或密码错误
@@ -56,6 +61,7 @@ MYSQL_ERROR_CODES: Mapping[int, ErrorCategory] = {
     2005: ErrorCategory.HOST_UNREACHABLE,  # CR_UNKNOWN_HOST
     1317: ErrorCategory.CANCELLED,  # ER_QUERY_INTERRUPTED(KILL QUERY)
     3024: ErrorCategory.TIMEOUT,  # ER_QUERY_TIMEOUT(max_execution_time)
+    1054: ErrorCategory.STATEMENT_ERROR,  # ER_BAD_FIELD_ERROR(无效的列名)
     1064: ErrorCategory.STATEMENT_ERROR,  # ER_PARSE_ERROR
     1146: ErrorCategory.STATEMENT_ERROR,  # ER_NO_SUCH_TABLE
     2006: ErrorCategory.CONNECTION_DEAD,  # CR_SERVER_GONE_ERROR
