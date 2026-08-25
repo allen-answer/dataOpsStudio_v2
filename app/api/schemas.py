@@ -1288,10 +1288,16 @@ class SqlFormatResponse(BaseModel):
 class SqlExpandStarRequest(BaseModel):
     sql: str = Field(min_length=1)
     datasource_id: str
+    # 展开前强制重读列元数据(用户显式点的那一次)。默认 False —— 展开保持
+    # "纯缓存、不建连",这是它当初刻意选的失败模式。
+    refresh: bool = False
 
 
 class SqlExpandStarResponse(BaseModel):
     expanded_sql: str
+    # 这份列清单所依据的缓存写入时间(多表取最旧);UI 据此提示新鲜度。
+    # 旧缓存行可能没有该值,故可为 None。
+    metadata_refreshed_at: datetime | None = None
 
 
 class SqlConsoleCreateRequest(BaseModel):

@@ -2028,7 +2028,7 @@ def expand_sql_star(body: SqlExpandStarRequest, request: Request) -> SqlExpandSt
     user = current_user_from(request)
     row = _datasource_for_current_user(request, body.datasource_id)
     try:
-        expanded = _expand_star_sql(services, row, body.sql)
+        expanded, refreshed_at = _expand_star_sql(services, row, body.sql, refresh=body.refresh)
     except ParseError as exc:
         raise ApiError(400, "invalid_sql", "SQL could not be parsed") from exc
     _audit_business(
@@ -2040,9 +2040,9 @@ def expand_sql_star(body: SqlExpandStarRequest, request: Request) -> SqlExpandSt
         resource_type="datasource",
         resource_id=body.datasource_id,
         result="success",
-        detail={"sql_len": len(body.sql)},
+        detail={"sql_len": len(body.sql), "refresh": body.refresh},
     )
-    return SqlExpandStarResponse(expanded_sql=expanded)
+    return SqlExpandStarResponse(expanded_sql=expanded, metadata_refreshed_at=refreshed_at)
 
 
 @router.get("/sql/consoles", response_model=list[SqlConsoleResponse])
@@ -7372,10 +7372,39 @@ def _read_metadata_cache(
     table_name: str,
     now: datetime,
 ) -> list[dict[str, object]] | None:
+    entry = _read_metadata_cache_entry(
+        services,
+        datasource_id,
+        cache_level,
+        schema_name=schema_name,
+        table_name=table_name,
+        now=now,
+    )
+    return None if entry is None else entry[0]
+
+
+def _read_metadata_cache_entry(
+    services: ApiServices,
+    datasource_id: str,
+    cache_level: str,
+    *,
+    schema_name: str,
+    table_name: str,
+    now: datetime,
+) -> tuple[list[dict[str, object]], datetime | None] | None:
+    """缓存行的 payload **与写入时间**。
+
+    `refreshed_at` 一直在写(`_write_metadata_cache`)却从没人读过。展开 `*` 时
+    把它带给用户,是"不去猜表结构变没变、但把判断依据交到用户手上"的那一半。
+    """
     with services.engine.connect() as conn:
         row = (
             conn.execute(
-                select(metadata_caches.c.payload, metadata_caches.c.expires_at).where(
+                select(
+                    metadata_caches.c.payload,
+                    metadata_caches.c.expires_at,
+                    metadata_caches.c.refreshed_at,
+                ).where(
                     and_(
                         metadata_caches.c.datasource_id == datasource_id,
                         metadata_caches.c.cache_level == cache_level,
@@ -7389,7 +7418,12 @@ def _read_metadata_cache(
         )
     if row is None:
         return None
-    return _metadata_cache_payload(row, now=now)
+    payload = _metadata_cache_payload(row, now=now)
+    if payload is None:
+        return None
+    # 老缓存行(该列加进来之前写的)可能没有值 —— 未知就如实回 None,别编一个时间。
+    refreshed_at = row.get("refreshed_at")
+    return payload, _as_utc(refreshed_at) if isinstance(refreshed_at, datetime) else None
 
 
 def _write_metadata_cache(
@@ -7623,7 +7657,14 @@ def _expand_star_sql(
     services: ApiServices,
     datasource_row: RowMapping,
     sql: str,
-) -> str:
+    *,
+    refresh: bool = False,
+) -> tuple[str, datetime | None]:
+    """展开 `*`,并回报这份列清单**最旧**那张缓存的写入时间。
+
+    多表展开取最旧的一份:提示要按"最不新鲜的那份"说话,否则等于用最新的那张
+    表给整条 SQL 背书。全部未知则回 None(旧缓存行可能没有 refreshed_at)。
+    """
     dialect = _sqlglot_dialect(str(datasource_row["db_type"]))
     expression = sqlglot.parse_one(sql, read=dialect)
     select_expr = expression.find(exp.Select)
@@ -7634,12 +7675,25 @@ def _expand_star_sql(
         raise ApiError(400, "invalid_sql", "SELECT must reference at least one table")
 
     changed = False
+    oldest_refreshed_at: datetime | None = None
     expanded_selects: list[exp.Expression] = []
+
+    def expand(table_ref: dict[str, str], qualifier: str | None) -> list[exp.Column]:
+        nonlocal oldest_refreshed_at
+        columns, refreshed_at = _column_expressions_for_ref(
+            services, datasource_row, table_ref, qualifier, refresh=refresh
+        )
+        if refreshed_at is not None and (
+            oldest_refreshed_at is None or refreshed_at < oldest_refreshed_at
+        ):
+            oldest_refreshed_at = refreshed_at
+        return columns
+
     for item in list(select_expr.expressions):
         if isinstance(item, exp.Star):
             changed = True
             for table_ref in table_refs:
-                expanded_selects.extend(_column_expressions_for_ref(services, table_ref, None))
+                expanded_selects.extend(expand(table_ref, None))
             continue
         if isinstance(item, exp.Column) and isinstance(item.this, exp.Star):
             table_name = item.table
@@ -7647,15 +7701,13 @@ def _expand_star_sql(
             if matched_table_ref is None:
                 raise ApiError(400, "unknown_table", "SELECT star qualifier does not match a table")
             changed = True
-            expanded_selects.extend(
-                _column_expressions_for_ref(services, matched_table_ref, table_name)
-            )
+            expanded_selects.extend(expand(matched_table_ref, table_name))
             continue
         expanded_selects.append(item)
     if not changed:
         raise ApiError(400, "no_star", "SQL does not contain SELECT *")
     select_expr.set("expressions", expanded_selects)
-    return expression.sql(dialect=dialect, pretty=True)
+    return expression.sql(dialect=dialect, pretty=True), oldest_refreshed_at
 
 
 def _select_table_refs(
@@ -7692,41 +7744,70 @@ def _table_ref_by_qualifier(
 
 def _column_expressions_for_ref(
     services: ApiServices,
+    datasource_row: RowMapping,
     table_ref: dict[str, str],
     qualifier: str | None,
-) -> list[exp.Column]:
-    columns = _metadata_columns_from_cache(
+    *,
+    refresh: bool,
+) -> tuple[list[exp.Column], datetime | None]:
+    columns, refreshed_at = _metadata_columns_for_expand(
         services,
-        table_ref["datasource_id"],
+        datasource_row,
         schema_name=table_ref["schema"],
         table_name=table_ref["table"],
+        refresh=refresh,
     )
     table_name = qualifier or table_ref["alias"]
-    return [exp.column(str(column["name"]), table=table_name, quoted=True) for column in columns]
+    return (
+        [exp.column(str(column["name"]), table=table_name, quoted=True) for column in columns],
+        refreshed_at,
+    )
 
 
-def _metadata_columns_from_cache(
+def _metadata_columns_for_expand(
     services: ApiServices,
-    datasource_id: str,
+    datasource_row: RowMapping,
     *,
     schema_name: str,
     table_name: str,
-) -> list[dict[str, object]]:
-    payload = _read_metadata_cache(
+    refresh: bool,
+) -> tuple[list[dict[str, object]], datetime | None]:
+    """展开 `*` 要用的列清单 + 这份清单的缓存写入时间。
+
+    默认**纯缓存**:不建连、不 DESCRIBE,展开要么命中缓存要么 409 —— 这是当初
+    把展开做成纯缓存刻意保留的失败模式,不能因为"想更准"就每次多一次建连往返。
+    `refresh=True` 是**用户显式要的**那一次重读(此时才可能 503),不是系统自作主张。
+    """
+    now = datetime.now(UTC)
+    if refresh:
+        payload = _metadata_payload(
+            services,
+            datasource_row,
+            _METADATA_LEVEL_COLUMNS,
+            schema_name=schema_name,
+            table_name=table_name,
+            refresh=True,
+            load=lambda adapter: [
+                _metadata_column_item(column).model_dump(mode="json")
+                for column in adapter.list_columns(schema_name, table_name)
+            ],
+        )
+        return payload, now
+    entry = _read_metadata_cache_entry(
         services,
-        datasource_id,
+        str(datasource_row["id"]),
         _METADATA_LEVEL_COLUMNS,
         schema_name=schema_name,
         table_name=table_name,
-        now=datetime.now(UTC),
+        now=now,
     )
-    if payload is None:
+    if entry is None:
         raise ApiError(
             409,
             "metadata_cache_missing",
             "Column metadata cache is missing; refresh metadata first",
         )
-    return payload
+    return entry
 
 
 def _console_for_current_user(request: Request, console_id: str) -> RowMapping:
