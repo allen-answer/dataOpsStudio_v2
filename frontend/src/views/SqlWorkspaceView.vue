@@ -486,6 +486,18 @@ const resultPanelError = computed<string | null>(() => {
   if (!runtime || runtime.status === 'cancelled') return null
   return runtime.error
 })
+/**
+ * 驱动分类码(`category:driver_code`),跟在错误摘要下面当排查线索。
+ * 摘要本身已带数值码,这里多给的是**分类**:`statement_error` 还是
+ * `unknown` 决定了报障时该往哪个方向查。只对会话路径有值(job 路径后端
+ * 直接给 7 值枚举,没有原始码);前端本地错误(execError)没有驱动码。
+ */
+const resultPanelErrorCode = computed<string | null>(() => {
+  if (execError.value) return null
+  const runtime = activeRuntime.value
+  if (!runtime || runtime.status === 'cancelled' || !runtime.error) return null
+  return runtime.progress?.raw_error_code ?? null
+})
 const shouldShowResultTable = computed(() => {
   const rt = activeRuntime.value
   if (!rt?.result) return false
@@ -3208,7 +3220,14 @@ function parseVariables(value: string): string[] {
               style="background-color: rgb(239 68 68 / 0.08); color: rgb(185 28 28);"
             >
               <AlertTriangle class="w-4 h-4 shrink-0 mt-0.5" />
-              <span class="font-mono whitespace-pre-wrap">{{ resultPanelError }}</span>
+              <div class="min-w-0 flex flex-col gap-1">
+                <span data-testid="result-error-text" class="font-mono whitespace-pre-wrap">{{ resultPanelError }}</span>
+                <span
+                  v-if="resultPanelErrorCode"
+                  data-testid="result-error-code"
+                  class="font-mono text-xs opacity-70"
+                >{{ t('sql.error_code_label', { code: resultPanelErrorCode }) }}</span>
+              </div>
             </div>
             <div class="flex-1 min-h-0">
               <ResultTable
