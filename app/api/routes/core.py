@@ -4237,8 +4237,13 @@ def analyze_project_lineage(
                 dialect=dialect,
                 default_schema=body.default_schema,
             )
-        except ValueError as exc:  # 方言不在白名单(normalize_lineage_dialect)
-            raise ApiError(400, "lineage_ddl_parse_failed", "Lineage DDL parse failed") from exc
+        except ValueError as exc:
+            # ★ 名副其实:schema_from_ddl_text 对畸形 DDL 从不抛错(只跳过并计数),
+            # 这里唯一可能的原因就是方言不在白名单。原来的 lineage_ddl_parse_failed
+            # 会让用户反复修改本来正确的 DDL。
+            raise ApiError(
+                400, "lineage_dialect_unsupported", "Lineage DDL dialect is not supported"
+            ) from exc
         sql_hash = lineage_sql_hash(
             sql_text=body.sql_text,
             dialect=dialect,

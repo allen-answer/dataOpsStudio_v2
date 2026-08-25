@@ -1496,13 +1496,21 @@ class WorkerRunner:
             dialect = dialect or detect_default
             schema_context = {"schema": {}, "default_schema": default_schema}
         dialect = dialect.lower()
-        # DDL 文本数据源(可选):补齐列元数据,把宽松表级降级重新拉回列级。
-        # 批级只解析一次;dialect 为 "auto" 哨兵时按 detect_default 解 DDL
-        # (DDL 是一整段文本,没有逐文件识别的语义)。
+        # DDL 文本数据源(可选):补齐列元数据,把宽松表级降级重新拉回列级。批级只解析一次。
+        ddl_text = _payload_optional_str(payload, "ddl_text")
+        ddl_dialect = dialect
+        if dialect == AUTO_DIALECT:
+            # ★ 对 DDL 文本**自己**做一次识别,而不是套用文件级回落值 detect_default。
+            # 无库时 detect_default 恒为 "oracle",而同一作业的 SQL 文件却是逐文件
+            # 自动识别的 —— 实测同一份 MySQL DDL:dialect='auto'(前端默认)得
+            # 0 表 0 列 2 skipped、列映射 0 条;dialect='mysql' 得 2 表 4 列、列映射 2 条。
+            ddl_dialect = resolve_dialect(
+                AUTO_DIALECT, ddl_text or "", default=detect_default
+            ).dialect
         ddl_summary = _lineage_batch_ddl_schema(
             schema_context,
-            _payload_optional_str(payload, "ddl_text"),
-            dialect=detect_default if dialect == AUTO_DIALECT else dialect,
+            ddl_text,
+            dialect=ddl_dialect,
             default_schema=default_schema,
         )
 
@@ -2959,6 +2967,10 @@ def _lineage_batch_ddl_schema(
 
     解析与合并复用 :func:`apply_ddl_schema`(与单条解析同一实现,摘要口径一致);
     这里只负责批量路径特有的**错误策略**:方言不在白名单时整批不失败,降级继续。
+
+    ★ 降级时**不能返回 None** —— 报告契约里 ``null`` 表示"未提供 DDL",与"提供了
+    但被丢弃"同形的话,用户在界面上零提示,只能去翻 worker 日志。返回带 ``error``
+    的摘要,让"DDL 没生效"这件事在报告里可见。
     """
     try:
         return apply_ddl_schema(
@@ -2966,7 +2978,13 @@ def _lineage_batch_ddl_schema(
         )
     except ValueError:
         logger.warning("lineage_batch_ddl_dialect_unsupported", dialect=dialect)
-        return None
+        return {
+            "error": "dialect_unsupported",
+            "dialect": dialect,
+            "table_count": 0,
+            "column_count": 0,
+            "skipped_statement_count": 0,
+        }
 
 
 def _lineage_batch_script_edges(files_report: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -4582,6 +4582,52 @@ def test_lineage_analyze_rejects_ddl_text_over_size_limit() -> None:
     assert response.status_code == 422
 
 
+def test_lineage_analyze_unsupported_ddl_dialect_says_so_by_name() -> None:
+    """F12:schema_from_ddl_text 对畸形 DDL 从不抛错(只跳过并计数)。
+
+    这个 400 唯一可能的原因就是方言不受支持 —— 原来叫 lineage_ddl_parse_failed,
+    会让用户反复修改本来正确的 DDL。
+    """
+    engine = _ddl_analyze_engine()
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/analyze",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "source_ref": "script.sql",
+            "sql_text": _DDL_ANALYZE_SQL,
+            "dialect": "db2",
+            "ddl_text": _DDL_ANALYZE_DDL,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "lineage_dialect_unsupported"
+
+
+def test_lineage_analyze_malformed_ddl_is_counted_not_rejected() -> None:
+    """畸形 DDL 不该报错 —— 跳过并计数,让用户看见跳了什么、为什么。"""
+    engine = _ddl_analyze_engine()
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/analyze",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "source_ref": "script.sql",
+            "sql_text": _DDL_ANALYZE_SQL,
+            "ddl_text": "CREATE TABLE ((( broken;",
+        },
+    )
+
+    assert response.status_code == 201
+    summary = _persisted_parse_summary(engine)
+    assert summary["ddl_schema"]["skipped_reasons"]
+
+
 def test_lineage_batch_forwards_ddl_text_into_job_payload() -> None:
     """批量:DDL 原文随 job payload 下发,worker 侧解析(见 test_worker)。"""
     engine = _FakeEngine(

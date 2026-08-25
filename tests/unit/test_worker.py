@@ -52,6 +52,7 @@ from app.worker import (
     _build_workflow_child_job,
     _compare_export_row_cap,
     _DatabaseCompareReader,
+    _lineage_batch_ddl_schema,
     _worker_stop_signals,
     _workflow_children_snapshots,
 )
@@ -4053,6 +4054,97 @@ def test_worker_lineage_batch_without_ddl_text_stays_table_level() -> None:
     assert report["ddl_schema"] is None
     assert report["column_mapping_total"] == 0
     assert report["files"][0]["lenient_statement_count"] == 1
+
+
+def _lineage_batch_ddl_report(*, dialect: str, ddl_text: str) -> dict[str, Any]:
+    """跑一次无库批量分析,返回报告(F7 / F12 用)。"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "load.sql",
+            "insert into ods.dwd (id, amt) select o.id, o.amt from ods.orders o",
+        )
+    job = _make_job(
+        kind=JobKind.LINEAGE_BATCH,
+        payload={
+            "upload_id": "up-1",
+            "storage_uri": "uploads/up-1/scripts.zip",
+            "datasource_id": None,
+            "dialect": dialect,
+            "ddl_text": ddl_text,
+        },
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    result_store.downloads["uploads/up-1/scripts.zip"] = buffer.getvalue()
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=_FakeLineageCatalog(),
+    )
+    assert runner.run_once() is True
+    report: dict[str, Any] = json.loads(
+        result_store.run_artifacts[("job-1", "lineage_batch_report.json")]
+    )
+    return report
+
+
+_MYSQL_DDL = (
+    "CREATE TABLE `ods`.`orders` (`id` int NOT NULL, `amt` decimal(18,2)) ENGINE=InnoDB;\n"
+    "CREATE TABLE `ods`.`dwd` (`id` int NOT NULL, `amt` decimal(18,2)) ENGINE=InnoDB;\n"
+)
+
+
+def test_worker_lineage_batch_auto_dialect_detects_from_the_ddl_text_itself() -> None:
+    """F7:无库 + auto 时 DDL 曾被硬编码按 oracle 解 —— 同一份 MySQL DDL 全军覆没。
+
+    detect_default 无库时恒为 "oracle",而同一作业的 SQL 文件却是逐文件自动识别的。
+    DDL 是独立的一整段文本,方言要按它自己识别。
+    """
+    report = _lineage_batch_ddl_report(dialect="auto", ddl_text=_MYSQL_DDL)
+
+    assert report["ddl_schema"]["dialect"] == "mysql"
+    assert report["ddl_schema"]["table_count"] == 2
+    assert report["ddl_schema"]["column_count"] == 4
+    assert report["ddl_schema"]["skipped_statement_count"] == 0
+    assert report["column_mapping_total"] == 2
+
+
+def test_worker_lineage_batch_explicit_dialect_is_never_overridden() -> None:
+    """显式方言永远原样透传 —— 自动识别只在 auto 哨兵下发生。"""
+    report = _lineage_batch_ddl_report(dialect="mysql", ddl_text=_MYSQL_DDL)
+
+    assert report["ddl_schema"]["dialect"] == "mysql"
+
+
+def test_lineage_batch_ddl_schema_keeps_a_discarded_ddl_visible() -> None:
+    """F12:降级返回 None 会与"未提供 DDL"同形,用户在界面上零提示。
+
+    直接测这个辅助函数而不是整条批量路径:方言不在白名单时
+    ``analyze_sql_lineage`` 会先让整个 job 失败,端到端走不到这个分支。
+    这里守的是"批量路径的错误策略"本身 —— 降级可以,静默不行。
+    """
+    context: dict[str, Any] = {"default_schema": None, "schema": {}}
+
+    summary = _lineage_batch_ddl_schema(
+        context, _MYSQL_DDL, dialect="db2", default_schema=None
+    )
+
+    assert summary is not None, "降级不能与'未提供 DDL'同形"
+    assert summary["error"] == "dialect_unsupported"
+    assert summary["dialect"] == "db2"
+    assert summary["table_count"] == 0
+    assert context["schema"] == {}
+
+
+def test_lineage_batch_ddl_schema_returns_none_only_when_no_ddl_given() -> None:
+    context: dict[str, Any] = {"default_schema": None, "schema": {}}
+
+    assert _lineage_batch_ddl_schema(context, None, dialect="dm", default_schema=None) is None
+    assert _lineage_batch_ddl_schema(context, "  ", dialect="dm", default_schema=None) is None
 
 
 def test_worker_lineage_batch_emits_semantic_view_with_refresh_and_risk() -> None:
