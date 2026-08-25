@@ -3868,6 +3868,125 @@ def test_worker_runs_lineage_analyze_with_thin_catalog_handler() -> None:
     assert result_ref.metadata["cached"] is False
 
 
+def _run_lineage_analyze_node(payload: dict[str, Any]) -> dict[str, object]:
+    """跑一个 lineage_analyze workflow 节点,返回落库的那条记录(F11 用)。"""
+    backend = _FakeBackend([_make_job(kind=JobKind.LINEAGE_ANALYZE, payload=payload)])
+    catalog = _FakeLineageCatalog()
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=catalog,
+    )
+    assert runner.run_once() is True
+    return catalog.persisted[0]
+
+
+_WF_SQL = (
+    "INSERT INTO ODS.KGRP_SUM (period, AMT) "
+    "SELECT R.period, SUM(R.AMT) FROM ODS.KGRP_RPT R GROUP BY R.period"
+)
+# 达梦形态:NOT NULL ENABLE + 表级 NOT CLUSTER PRIMARY KEY + period 裸列名
+_WF_DDL = (
+    'CREATE TABLE "ODS"."KGRP_RPT" ('
+    '"ID" NUMBER(18,0) NOT NULL ENABLE, '
+    "period VARCHAR2(8) NOT NULL ENABLE, "
+    '"AMT" NUMBER(18,2), '
+    'NOT CLUSTER PRIMARY KEY("ID"));'
+    'CREATE TABLE "ODS"."KGRP_SUM" (period VARCHAR2(8), "AMT" NUMBER(18,2));'
+)
+
+
+def test_worker_lineage_analyze_applies_ddl_text_from_the_node_payload() -> None:
+    """F11:workflow 节点的 ddl_text 必须**真正生效** —— 此前带进子 job 后被静默忽略。
+
+    _FakeLineageCatalog.schema_context 返回空 schema(等价于元数据缓存缺失),
+    所以出现列级映射只可能来自 DDL 数据源。
+    """
+    persisted = _run_lineage_analyze_node(
+        {
+            "datasource_id": "ds-9",
+            "sql_text": _WF_SQL,
+            "dialect": "dm",
+            "source_ref": "wf-node-ddl",
+            "ddl_text": _WF_DDL,
+        }
+    )
+
+    # F13:摘要随 parse_summary 落库,与 API analyze 同范式。
+    summary = persisted["ddl_summary"]
+    assert isinstance(summary, dict)
+    assert summary["table_count"] == 2
+    assert summary["dialect"] == "dm"
+    # F6:标准达梦写法零降级。
+    assert summary["failed_column_entry_count"] == 0
+    # ★ 真正生效的证据:无元数据缓存却拿到了列级映射。
+    assert persisted["column_mappings"] == 2
+
+
+def test_worker_lineage_analyze_without_ddl_text_stays_table_level() -> None:
+    """对照组:同一段 SQL 去掉 ddl_text —— 无元数据即无列级映射。"""
+    persisted = _run_lineage_analyze_node(
+        {
+            "datasource_id": "ds-9",
+            "sql_text": _WF_SQL,
+            "dialect": "dm",
+            "source_ref": "wf-node-nodll",
+        }
+    )
+
+    assert persisted["ddl_summary"] is None
+    assert persisted["column_mappings"] == 0
+
+
+def test_worker_lineage_analyze_ddl_changes_the_cache_key() -> None:
+    """F8:workflow 路径的缓存键同样要含 ddl_text 原文指纹。"""
+    base: dict[str, Any] = {
+        "datasource_id": "ds-9",
+        "sql_text": _WF_SQL,
+        "dialect": "dm",
+        "source_ref": "wf-node-hash",
+    }
+    without = _run_lineage_analyze_node(dict(base))
+    with_ddl = _run_lineage_analyze_node({**base, "ddl_text": _WF_DDL})
+
+    assert without["sql_hash"] != with_ddl["sql_hash"], "带 DDL 与不带 DDL 必须落到不同缓存键"
+
+
+def test_worker_lineage_analyze_unsupported_ddl_dialect_fails_the_node() -> None:
+    """F12:workflow 是会被反复调度的流水线,方言不受支持要明确失败,不静默降级。"""
+    backend = _FakeBackend(
+        [
+            _make_job(
+                kind=JobKind.LINEAGE_ANALYZE,
+                payload={
+                    "datasource_id": "ds-9",
+                    "sql_text": _WF_SQL,
+                    "dialect": "db2",
+                    "source_ref": "wf-node-bad-dialect",
+                    "ddl_text": _WF_DDL,
+                },
+            )
+        ]
+    )
+    catalog = _FakeLineageCatalog()
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(_FakeAdapter([])),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        lineage_catalog=catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert catalog.persisted == [], "失败的节点不该落 lineage_runs"
+    assert backend.failed, "节点必须明确失败"
+
+
 def test_worker_runs_lineage_batch_over_zip_with_lenient_parsing() -> None:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -4435,6 +4554,7 @@ class _FakeLineageCatalog:
                 "sql_hash": sql_hash,
                 "sql_text": sql_text,
                 "table_edges": len(report.graph_edges),
+                "column_mappings": len(report.insert_mappings),
                 "ddl_summary": ddl_summary,
             }
         )

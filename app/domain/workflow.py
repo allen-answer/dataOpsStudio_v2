@@ -49,6 +49,11 @@ SUPPORTED_WORKFLOW_NODE_KINDS_V1: frozenset[str] = frozenset(
     }
 )
 
+# lineage_analyze 节点内联 DDL 文本的上限。比 API 的 LINEAGE_DDL_MAX_CHARS(1 MB)
+# 紧得多:workflow spec 被存储且按计划反复执行,DDL 整段内联进 spec 与每次 run 的
+# payload。改成 upload_id / storage_uri 引用之后可以放开。
+MAX_WORKFLOW_DDL_TEXT_CHARS = 65_536
+
 MAX_WORKFLOW_NODES = 50
 MAX_RETRIES_LIMIT = 5
 MAX_BACKOFF_SECONDS = 3600
@@ -273,19 +278,24 @@ class WorkflowNode(BaseModel):
                 )
             return self
         if self.job_kind == "lineage_analyze" and "ddl_text" in self.payload:
-            # ★ workflow 的 lineage_analyze 是第三条分析路径,只从元数据目录构造
-            # schema_context,不接 DDL 文本数据源。此前 ddl_text 能通过校验、带进
-            # 子 job、然后被**静默忽略** —— 用户以为补了列元数据,实际什么也没发生。
-            # 明确拒绝,不做静默忽略。
+            # DDL 文本数据源在 workflow 节点上**真正生效**(worker
+            # _execute_lineage_analyze 接通),与单条解析 / 批量分析同款语义:
+            # 缓存键含 ddl_text 原文指纹、摘要落 parse_summary、方言不受支持即失败。
             #
-            # 没有选择接通,是因为 workflow 是被调度反复重跑的存量规格,而 ddl_text
-            # 上限 1 MB 会整段内联进 workflow spec 与每次 run 的 payload;真要支持,
-            # 该走 upload_id / storage_uri 引用(与同作业的 SQL zip 同款),那是独立
-            # 设计,不该顺手塞进本次修复。
-            raise ValueError(
-                "invalid_lineage_analyze_payload: lineage_analyze 节点不支持 ddl_text"
-                "(DDL 文本数据源仅在 SQL 解析与批量分析两个入口可用)"
-            )
+            # ★ 这里的上限比 API 的 1 MB 紧得多:workflow spec 会被存储并按计划反复
+            # 执行,ddl_text 是**内联**在 spec 与每次 run 的 payload 里的,1 MB 足以
+            # 把规格表和作业队列撑爆。64 KB 覆盖几十张表的建表语句绰绰有余。
+            # 后续应改成 upload_id / storage_uri 引用(与同作业的 SQL zip 同款),
+            # 届时这个上限可以放开 —— 见 PR 说明。
+            ddl_text = self.payload.get("ddl_text")
+            if ddl_text is not None and (
+                not isinstance(ddl_text, str) or len(ddl_text) > MAX_WORKFLOW_DDL_TEXT_CHARS
+            ):
+                raise ValueError(
+                    "invalid_lineage_analyze_payload: ddl_text 必须是字符串且不超过 "
+                    f"{MAX_WORKFLOW_DDL_TEXT_CHARS} 字符"
+                    "(workflow spec 内联存储,上限比交互式解析更紧)"
+                )
         if self.job_kind == "notify":
             if not set(self.payload) <= {"target_ids", "message"}:
                 raise ValueError("invalid_notify_payload: notify 节点含未知字段")

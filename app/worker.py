@@ -1408,12 +1408,19 @@ class WorkerRunner:
         if dialect is None:
             dialect = self._datasource_loader(datasource_id).db_type.value
         dialect = dialect.lower()
+        # DDL 文本数据源:与单条解析 / 批量分析同款语义,workflow 不再是第四种行为。
+        ddl_text = _payload_optional_str(payload, "ddl_text")
         schema_context = self._lineage_catalog.schema_context(datasource_id, default_schema)
         sql_hash = lineage_sql_hash(
             sql_text=sql_text,
             dialect=dialect,
             schema_context=schema_context,
             parser_version=LINEAGE_PARSER_VERSION,
+            # F8:缓存维度取 ddl_text **原文**指纹 —— 合并可能是空操作,光靠
+            # schema_context 区分不开"带 DDL"与"不带 DDL"。
+            ddl_source=lineage_ddl_fingerprint(
+                ddl_text, dialect=dialect, default_schema=default_schema
+            ),
         )
         cached_run_id = self._lineage_catalog.cached_run_id(
             project_id=job.project_id,
@@ -1430,6 +1437,18 @@ class WorkerRunner:
                     metadata={"lineage_run_id": cached_run_id, "cached": True},
                 )
             )
+        # F8:缓存未命中之后才解析 DDL(命中缓存不必白解一遍)。
+        # F12:方言不受支持时让节点**明确失败**。workflow 是配置好、会被反复调度的
+        # 流水线,静默降级只会让下游长期拿到一份悄悄缺列的血缘;批量路径那种
+        # "降级但在报告里可见"的策略适合一次性批处理,不适合这里。
+        try:
+            ddl_summary = apply_ddl_schema(
+                schema_context, ddl_text, dialect=dialect, default_schema=default_schema
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"lineage_analyze ddl_text dialect is not supported: {dialect}"
+            ) from exc
         report = analyze_sql_lineage(
             LineageParseRequest.model_validate(
                 {
@@ -1450,6 +1469,8 @@ class WorkerRunner:
             sql_hash=sql_hash,
             sql_text=sql_text,
             report=report,
+            # F13:摘要随 parse_summary 持久化,与 API analyze 同范式。
+            ddl_summary=ddl_summary,
         )
         self._heartbeat(job.id)
         return _ExecutionOutcome(

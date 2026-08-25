@@ -18,6 +18,7 @@ from app.domain.workflow import (
     BUILTIN_VARIABLE_NAMES,
     MAX_VARIABLE_LIST_LENGTH,
     MAX_VARIABLE_VALUE_LENGTH,
+    MAX_WORKFLOW_DDL_TEXT_CHARS,
     MAX_WORKFLOW_VARIABLES,
     SUPPORTED_WORKFLOW_NODE_KINDS_V1,
     CronSchedule,
@@ -177,20 +178,38 @@ def test_notify_payload_shape_and_caps() -> None:
             make_node(job_kind="notify", payload=payload)
 
 
-def test_lineage_analyze_node_rejects_ddl_text_instead_of_ignoring_it() -> None:
-    """F11:此前 ddl_text 通过校验、带进子 job、然后被静默忽略。
+def test_lineage_analyze_node_accepts_ddl_text() -> None:
+    """F11:ddl_text 在 workflow 节点上**真正生效**(worker 侧接通),不再被静默忽略。"""
+    node = make_node(
+        job_kind="lineage_analyze",
+        payload={
+            "datasource_id": "ds-1",
+            "sql_text": "select 1",
+            "ddl_text": "CREATE TABLE t (a INT)",
+        },
+    )
 
-    workflow 的 lineage_analyze 不接 DDL 文本数据源。静默忽略不可接受 —— 用户以为
-    补了列元数据,实际什么也没发生。要么接通,要么明确拒绝;这里选明确拒绝。
-    """
+    assert node.payload["ddl_text"] == "CREATE TABLE t (a INT)"
+
+
+def test_lineage_analyze_node_caps_inline_ddl_text() -> None:
+    """workflow spec 内联存储且按计划反复执行,上限必须比交互式解析紧。"""
     with pytest.raises(ValidationError, match="invalid_lineage_analyze_payload"):
         make_node(
             job_kind="lineage_analyze",
             payload={
                 "datasource_id": "ds-1",
                 "sql_text": "select 1",
-                "ddl_text": "CREATE TABLE t (a INT)",
+                "ddl_text": "x" * (MAX_WORKFLOW_DDL_TEXT_CHARS + 1),
             },
+        )
+
+
+def test_lineage_analyze_node_rejects_non_string_ddl_text() -> None:
+    with pytest.raises(ValidationError, match="invalid_lineage_analyze_payload"):
+        make_node(
+            job_kind="lineage_analyze",
+            payload={"datasource_id": "ds-1", "sql_text": "select 1", "ddl_text": 123},
         )
 
 
