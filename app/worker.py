@@ -99,6 +99,7 @@ from app.domain.lineage import (
     apply_ddl_schema,
     build_lineage_edge_rows,
     build_semantic_view,
+    lineage_ddl_fingerprint,
     lineage_sql_hash,
     schema_from_metadata_cache_rows,
 )
@@ -1513,6 +1514,10 @@ class WorkerRunner:
             dialect=ddl_dialect,
             default_schema=default_schema,
         )
+        # 批级算一次,逐文件复用(见 _lineage_batch_file 的 sql_hash)。
+        ddl_fingerprint = lineage_ddl_fingerprint(
+            ddl_text, dialect=ddl_dialect, default_schema=default_schema
+        )
 
         files_report: list[dict[str, Any]] = []
         skipped: dict[str, int] = {"non_sql": 0, "too_large": 0, "over_file_limit": 0}
@@ -1555,6 +1560,7 @@ class WorkerRunner:
                             schema_context=schema_context,
                             source_ref=info.filename,
                             raw=raw,
+                            ddl_fingerprint=ddl_fingerprint,
                         )
                     )
         script_edges = _lineage_batch_script_edges(files_report)
@@ -1641,6 +1647,7 @@ class WorkerRunner:
         schema_context: dict[str, Any],
         source_ref: str,
         raw: bytes,
+        ddl_fingerprint: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         assert self._lineage_catalog is not None
         sql_text = _decode_sql_bytes(raw)
@@ -1668,6 +1675,9 @@ class WorkerRunner:
                 dialect=file_dialect,
                 schema_context=schema_context,
                 parser_version=LINEAGE_PARSER_VERSION,
+                # 与单条解析同一维度:合并可能是空操作,光靠 schema_context 区分不开
+                # "带 DDL"与"不带 DDL"两种运行。
+                ddl_source=ddl_fingerprint,
             )
             cached_run_id = self._lineage_catalog.cached_run_id(
                 project_id=job.project_id,

@@ -6,12 +6,16 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from app.domain.lineage import (
     LineageParseRequest,
     analyze_sql_lineage,
     apply_ddl_schema,
+    lineage_ddl_fingerprint,
+    lineage_sql_hash,
     merge_ddl_schema,
     schema_from_ddl_text,
 )
@@ -479,6 +483,63 @@ def test_summary_reports_the_dialect_actually_used() -> None:
 
     assert summary is not None
     assert summary["dialect"] == "dm"
+
+
+# ── F8 缓存键必须区分"带 DDL"与"不带 DDL" ────────────────────────────
+
+
+def _hash_with(ddl_text: str | None, schema_context: dict[str, Any]) -> str:
+    return lineage_sql_hash(
+        sql_text="INSERT INTO ods.dwd SELECT * FROM ods.orders",
+        dialect="postgres",
+        schema_context=schema_context,
+        ddl_source=lineage_ddl_fingerprint(ddl_text, dialect="postgres", default_schema=None),
+    )
+
+
+def test_empty_merge_still_yields_a_different_hash_than_no_ddl() -> None:
+    """★ 合并是空操作时,缓存键**必须**还能区分带没带 DDL。
+
+    取合并后的 schema_context 算 hash 就区分不开,两个方向都串位:
+    带 DDL 的运行被不带 DDL 的请求命中(界面显示从未提交过的 DDL 徽标),
+    以及带有效 DDL 的请求命中旧的无 DDL 运行(徽标不出现,skipped 计数丢失)。
+    """
+    # DDL 表已全在缓存中 → 合并后 schema_context 与不带 DDL 时逐字节相同。
+    context = {"default_schema": None, "schema": {"ods": {"orders": {"id": "integer"}}}}
+    ddl = "CREATE TABLE ods.orders (id INT);"
+    merged = {"default_schema": None, "schema": dict(context["schema"])}
+    apply_ddl_schema(merged, ddl, dialect="postgres", default_schema=None)
+
+    assert merged["schema"] == context["schema"], "前提:这一份合并确实是空操作"
+    assert _hash_with(ddl, merged) != _hash_with(None, context)
+
+
+def test_all_statements_skipped_still_yields_a_different_hash() -> None:
+    """另一种空操作:DDL 全被跳过(比如整段都不是建表语句)。"""
+    context = {"default_schema": None, "schema": {"ods": {"orders": {"id": "integer"}}}}
+
+    assert _hash_with("GRANT SELECT ON ods.orders TO reader;", context) != _hash_with(None, context)
+
+
+def test_different_ddl_text_yields_different_hash() -> None:
+    context = {"default_schema": None, "schema": {}}
+
+    assert _hash_with("CREATE TABLE ods.a (x INT);", context) != _hash_with(
+        "CREATE TABLE ods.a (y INT);", context
+    )
+
+
+def test_hash_without_ddl_is_unchanged_by_the_new_field() -> None:
+    """不给 DDL 的请求 hash 与从前逐字节一致 —— 既有缓存不因本次改动整体失效。"""
+    context = {"default_schema": None, "schema": {"ods": {"orders": {"id": "integer"}}}}
+    legacy = lineage_sql_hash(
+        sql_text="INSERT INTO ods.dwd SELECT * FROM ods.orders",
+        dialect="postgres",
+        schema_context=context,
+    )
+
+    assert _hash_with(None, context) == legacy
+    assert _hash_with("   ", context) == legacy
 
 
 # ── 端到端:DDL 把表级降级重新拉回列级 ────────────────────────────────
