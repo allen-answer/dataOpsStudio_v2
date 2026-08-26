@@ -49,6 +49,7 @@ from app.domain.compare import (
     CompareColumn,
     CompareDiffBucket,
     CompareDiffEvent,
+    CompareDiffStream,
     CompareHashLevel,
     CompareHashPlan,
     CompareHashRequest,
@@ -56,13 +57,12 @@ from app.domain.compare import (
     CompareRules,
     CompareSegment,
     CompareTableRef,
-    HashdiffProgress,
-    HashdiffResult,
     RunLimits,
     SegmentFingerprint,
     compare_row_hash64,
+    diff_stream_from_events,
     normalized_compare_identity,
-    recursive_hashdiff,
+    recursive_hashdiff_stream,
 )
 from app.domain.compare_profile import (
     DEFAULT_SAMPLE_CONFIDENCE,
@@ -1193,7 +1193,6 @@ class WorkerRunner:
                 limits=effective_limits,
             )
         bucket_counts = empty_bucket_counts()
-        bucket_counts[CompareDiffBucket.SAME.value] += result.progress.skipped_rows
         profile_builder: DiffProfileBuilder | None = DiffProfileBuilder(
             key_columns=key_columns,
             value_columns=compare_columns,
@@ -1205,6 +1204,8 @@ class WorkerRunner:
         flush_batch_size = min(self._config.sql_spool_batch_size, limits.compare_batch_size)
         last_heartbeat = time.monotonic()
 
+        # 惰性流:事件边算边落盘,内存与差异条数解耦(此前是全量攒 list,
+        # 单条约 1.7KB,百万级差异即 1.6GB 常驻)。
         for event in result.events:
             bucket = event.bucket.value
             bucket_counts[bucket] += 1
@@ -1245,9 +1246,12 @@ class WorkerRunner:
             flushed_rows += len(batch)
 
         self._heartbeat(job.id)
+        # ★ 流消费完之后 progress 才是终值(skipped_rows 尤其如此)。
+        final_progress = result.progress()
+        bucket_counts[CompareDiffBucket.SAME.value] += final_progress.skipped_rows
         progress = {
             key: value
-            for key, value in result.progress.model_dump(mode="json").items()
+            for key, value in final_progress.model_dump(mode="json").items()
             if isinstance(value, int)
         }
         diff_profile = _finish_diff_profile(
@@ -3569,7 +3573,7 @@ def _run_compare_hashdiff(
     target_reader: _DatabaseCompareReader,
     key_columns: list[CompareColumn],
     limits: RunLimits,
-) -> HashdiffResult:
+) -> CompareDiffStream:
     if len(key_columns) != 1 or key_columns[0].type is not ColumnType.INTEGER:
         # 非单整数主键 -> 无法分段,只能两侧全量物化。#251 把 max_rows 接了进来,
         # 但 run_limits.max_rows 缺省是 None,于是缺省情况下这条路依然无顶 ——
@@ -3596,7 +3600,7 @@ def _run_compare_hashdiff(
         start=min(bounds),
         end=max(bounds) + 1,
     )
-    return recursive_hashdiff(source_reader, target_reader, root, limits)
+    return recursive_hashdiff_stream(source_reader, target_reader, root, limits)
 
 
 def _run_compare_sample_quick_check(
@@ -3606,7 +3610,7 @@ def _run_compare_sample_quick_check(
     key_columns: list[CompareColumn],
     limits: RunLimits,
     run_id: str,
-) -> tuple[HashdiffResult, dict[str, object]]:
+) -> tuple[CompareDiffStream, dict[str, object]]:
     requested_rows = limits.sample_size or DEFAULT_SAMPLE_SIZE
     confidence = limits.sample_confidence or DEFAULT_SAMPLE_CONFIDENCE
     if len(key_columns) != 1 or key_columns[0].type is not ColumnType.INTEGER:
@@ -3625,7 +3629,7 @@ def _run_compare_sample_quick_check(
             confidence=confidence,
         )
         sample_result["error"] = "empty_bounds"
-        return HashdiffResult(events=[], progress=HashdiffProgress()), sample_result
+        return CompareDiffStream(iter(())), sample_result
 
     start = min(bounds)
     end = max(bounds)
@@ -3637,6 +3641,7 @@ def _run_compare_sample_quick_check(
         requested_rows=requested_rows,
         seed=_sample_seed(run_id),
     )
+    # 抽样本身有界(sample_size),这里仍物化 —— 统计量需要总数与差异数。
     events: list[CompareDiffEvent] = []
     for key in sampled_keys:
         events.extend(
@@ -3647,7 +3652,6 @@ def _run_compare_sample_quick_check(
         )
 
     observed_differences = sum(1 for event in events if event.bucket is not CompareDiffBucket.SAME)
-    progress = HashdiffProgress(row_mode_segments=1 if events else 0)
     sample_result = sample_quick_check_result(
         requested_rows=requested_rows,
         sampled_rows=len(events),
@@ -3655,7 +3659,7 @@ def _run_compare_sample_quick_check(
         confidence=confidence,
     )
     sample_result["anchor_strategy"] = "pk_random_anchor_no_order_by_rand"
-    return HashdiffResult(events=events, progress=progress), sample_result
+    return diff_stream_from_events(events), sample_result
 
 
 def _sample_primary_keys(
@@ -3734,45 +3738,42 @@ def _finish_diff_profile(
         return empty_diff_profile(reason=type(exc).__name__, sample_result=sample_result)
 
 
-def _diff_all_rows(source_rows: list[CompareRow], target_rows: list[CompareRow]) -> HashdiffResult:
-    source_by_pk = {row.pk: row for row in source_rows}
-    target_by_pk = {row.pk: row for row in target_rows}
-    events: list[CompareDiffEvent] = []
-    for pk in sorted(source_by_pk.keys() | target_by_pk.keys()):
-        source = source_by_pk.get(pk)
-        target = target_by_pk.get(pk)
-        if source is None and target is not None:
-            events.append(
-                CompareDiffEvent(
+def _diff_all_rows(
+    source_rows: list[CompareRow],
+    target_rows: list[CompareRow],
+) -> CompareDiffStream:
+    def _generate() -> Iterator[CompareDiffEvent]:
+        source_by_pk = {row.pk: row for row in source_rows}
+        target_by_pk = {row.pk: row for row in target_rows}
+        for pk in sorted(source_by_pk.keys() | target_by_pk.keys()):
+            source = source_by_pk.get(pk)
+            target = target_by_pk.get(pk)
+            if source is None and target is not None:
+                yield CompareDiffEvent(
                     bucket=CompareDiffBucket.ONLY_TARGET,
                     pk=pk,
                     target_values=target.raw_values or target.values,
                 )
-            )
-        elif target is None and source is not None:
-            events.append(
-                CompareDiffEvent(
+            elif target is None and source is not None:
+                yield CompareDiffEvent(
                     bucket=CompareDiffBucket.ONLY_SOURCE,
                     pk=pk,
                     source_values=source.raw_values or source.values,
                 )
-            )
-        elif source is not None and target is not None:
-            bucket = (
-                CompareDiffBucket.SAME if source.values == target.values else CompareDiffBucket.DIFF
-            )
-            events.append(
-                CompareDiffEvent(
+            elif source is not None and target is not None:
+                bucket = (
+                    CompareDiffBucket.SAME
+                    if source.values == target.values
+                    else CompareDiffBucket.DIFF
+                )
+                yield CompareDiffEvent(
                     bucket=bucket,
                     pk=pk,
                     source_values=source.raw_values or source.values,
                     target_values=target.raw_values or target.values,
                 )
-            )
-    return HashdiffResult(
-        events=events,
-        progress=HashdiffProgress(row_mode_segments=1 if events else 0),
-    )
+
+    return diff_stream_from_events(_generate())
 
 
 def _build_domain_file_reader(data_ref: dict[str, object], path: str) -> RowReader:
@@ -3852,7 +3853,7 @@ def _diff_materialized_rows(
     key_columns: list[CompareColumn],
     rules: CompareRules,
     cancel_check: Callable[[], None] | None = None,
-) -> HashdiffResult:
+) -> CompareDiffStream:
     """按归一化 key 对齐两侧全量行做 4 桶 diff(文件源路径)。
 
     与 `_diff_all_rows` 的差别:匹配键用 `normalized_compare_identity(key)` 而非
@@ -3863,54 +3864,48 @@ def _diff_materialized_rows(
     def _match_key(row: CompareRow) -> tuple[tuple[bool, str], ...]:
         return normalized_compare_identity(key_columns, row.pk, rules)
 
-    source_by_key: dict[tuple[tuple[bool, str], ...], CompareRow] = {}
-    for index, row in enumerate(source_rows):
-        if cancel_check is not None and index % 1000 == 0:
-            cancel_check()
-        source_by_key[_match_key(row)] = row
-    target_by_key: dict[tuple[tuple[bool, str], ...], CompareRow] = {}
-    for index, row in enumerate(target_rows):
-        if cancel_check is not None and index % 1000 == 0:
-            cancel_check()
-        target_by_key[_match_key(row)] = row
-    events: list[CompareDiffEvent] = []
-    for index, key in enumerate(sorted(source_by_key.keys() | target_by_key.keys())):
-        if cancel_check is not None and index % 1000 == 0:
-            cancel_check()
-        source = source_by_key.get(key)
-        target = target_by_key.get(key)
-        if source is None and target is not None:
-            events.append(
-                CompareDiffEvent(
+    def _generate() -> Iterator[CompareDiffEvent]:
+        source_by_key: dict[tuple[tuple[bool, str], ...], CompareRow] = {}
+        for index, row in enumerate(source_rows):
+            if cancel_check is not None and index % 1000 == 0:
+                cancel_check()
+            source_by_key[_match_key(row)] = row
+        target_by_key: dict[tuple[tuple[bool, str], ...], CompareRow] = {}
+        for index, row in enumerate(target_rows):
+            if cancel_check is not None and index % 1000 == 0:
+                cancel_check()
+            target_by_key[_match_key(row)] = row
+        for index, key in enumerate(sorted(source_by_key.keys() | target_by_key.keys())):
+            if cancel_check is not None and index % 1000 == 0:
+                cancel_check()
+            source = source_by_key.get(key)
+            target = target_by_key.get(key)
+            if source is None and target is not None:
+                yield CompareDiffEvent(
                     bucket=CompareDiffBucket.ONLY_TARGET,
                     pk=target.pk,
                     target_values=target.raw_values or target.values,
                 )
-            )
-        elif target is None and source is not None:
-            events.append(
-                CompareDiffEvent(
+            elif target is None and source is not None:
+                yield CompareDiffEvent(
                     bucket=CompareDiffBucket.ONLY_SOURCE,
                     pk=source.pk,
                     source_values=source.raw_values or source.values,
                 )
-            )
-        elif source is not None and target is not None:
-            bucket = (
-                CompareDiffBucket.SAME if source.values == target.values else CompareDiffBucket.DIFF
-            )
-            events.append(
-                CompareDiffEvent(
+            elif source is not None and target is not None:
+                bucket = (
+                    CompareDiffBucket.SAME
+                    if source.values == target.values
+                    else CompareDiffBucket.DIFF
+                )
+                yield CompareDiffEvent(
                     bucket=bucket,
                     pk=source.pk,
                     source_values=source.raw_values or source.values,
                     target_values=target.raw_values or target.values,
                 )
-            )
-    return HashdiffResult(
-        events=events,
-        progress=HashdiffProgress(row_mode_segments=1 if events else 0),
-    )
+
+    return diff_stream_from_events(_generate())
 
 
 def _payload_bucket_result_set_ids(payload: dict[str, object]) -> dict[str, str]:
