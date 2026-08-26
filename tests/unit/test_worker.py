@@ -828,6 +828,198 @@ def test_worker_db_compare_recursive_fails_when_source_exceeds_max_rows() -> Non
     assert compare_catalog.terminal == [{"run_id": "run-max-rows-recursive", "status": "failed"}]
 
 
+def _string_key_compare_job(
+    *,
+    run_id: str,
+    run_limits: dict[str, object],
+    key_type: str = "string",
+) -> Job:
+    """key_type="string" 走不了分段,只能全量物化;"integer" 走分段流式。"""
+    return _make_job(
+        kind=JobKind.COMPARE_RUN,
+        payload={
+            "run_id": run_id,
+            "task_id": "task-1",
+            "source_id": "ds-source",
+            "target_id": "ds-target",
+            "source_ref": {"kind": "table", "schema_name": "app", "table_name": "src"},
+            "target_ref": {"kind": "table", "schema_name": "app", "table_name": "tgt"},
+            "columns": [
+                {"name": "id", "type": key_type},
+                {"name": "name", "type": "string"},
+            ],
+            "compare_rules": {"key_columns": ["id"]},
+            "run_limits": run_limits,
+            "bucket_result_set_ids": {
+                "only_source": "rs-only-source",
+                "only_target": "rs-only-target",
+                "diff": "rs-diff",
+                "same": "rs-same",
+            },
+        },
+    )
+
+
+def test_worker_sample_quick_check_unsupported_key_fails_instead_of_reporting_success() -> None:
+    """抽样快检遇上非单整数主键必须 failed。
+
+    回归一起真实事故:该分支早前返回空 sample_result 且 job 走 success,
+    界面显示「成功、0 差异」,用户读成「两边一致」,实际一行都没比 ——
+    假答案比失败更危险。
+    """
+    job = _string_key_compare_job(
+        run_id="run-sample-unsupported-key",
+        run_limits={"sample_quick_check": True, "sample_size": 2},
+    )
+    backend = _FakeBackend([job])
+    error_writer = _FakeErrorCodeWriter()
+    compare_catalog = _FakeCompareRunCatalog()
+    rows = [Row(values=["1", "1", "one"]), Row(values=["2", "2", "two"])]
+    adapters = [_FakeAdapter(list(rows)), _FakeAdapter(list(rows))]
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size: adapters.pop(0),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=compare_catalog,
+        job_error_code_writer=error_writer,
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.completed == []
+    assert backend.failed == [("job-1", "single_integer_pk_required")]
+    assert error_writer.error_codes == [("job-1", JobErrorCode.COMPARE_SAMPLE_UNSUPPORTED_KEY)]
+    assert compare_catalog.terminal == [
+        {"run_id": "run-sample-unsupported-key", "status": "failed"}
+    ]
+    assert compare_catalog.completed == []
+
+
+def test_worker_db_compare_fallback_caps_rows_when_max_rows_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run_limits.max_rows 缺省(None)时,物化路径仍必须有顶。
+
+    #251 把 max_rows 接进了 fetch_all,但传的是可能为 None 的 limits.max_rows,
+    于是缺省情况下这条路依然无上限 —— 现场实测把 worker 吃到 12.4GB。
+    """
+    monkeypatch.setattr("app.worker._FILE_COMPARE_DEFAULT_MAX_ROWS", 2)
+    job = _string_key_compare_job(run_id="run-default-cap", run_limits={})
+    backend = _FakeBackend([job])
+    error_writer = _FakeErrorCodeWriter()
+    compare_catalog = _FakeCompareRunCatalog()
+    adapters = [
+        _FakeAdapter(
+            [
+                Row(values=["1", "1", "one"]),
+                Row(values=["2", "2", "two"]),
+                Row(values=["3", "3", "three"]),
+            ]
+        ),
+        _FakeAdapter([Row(values=["1", "1", "one"])]),
+    ]
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size: adapters.pop(0),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=compare_catalog,
+        job_error_code_writer=error_writer,
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.failed == [("job-1", "compare_limit_exceeded")]
+    assert error_writer.error_codes == [("job-1", JobErrorCode.COMPARE_LIMIT_EXCEEDED)]
+    assert compare_catalog.terminal == [{"run_id": "run-default-cap", "status": "failed"}]
+
+
+def test_worker_db_compare_segmented_path_ignores_materialize_default_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单整数主键走分段流式,不物化 —— 缺省行数顶不该误伤它。
+
+    这条守着上一个用例的作用域:兜底只加在 _diff_all_rows 那条物化路径上,
+    分段路径的大表照常能跑完。
+    """
+    monkeypatch.setattr("app.worker._FILE_COMPARE_DEFAULT_MAX_ROWS", 2)
+    job = _string_key_compare_job(
+        run_id="run-segmented-uncapped",
+        run_limits={},
+        key_type="integer",
+    )
+    backend = _FakeBackend([job])
+    compare_catalog = _FakeCompareRunCatalog()
+    rows = [
+        Row(values=[1, 1, "one"]),
+        Row(values=[2, 2, "two"]),
+        Row(values=[3, 3, "three"]),
+    ]
+    adapters = [
+        _FakeAdapter(list(rows), bounds=(1, 3)),
+        _FakeAdapter(list(rows), bounds=(1, 3)),
+    ]
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size: adapters.pop(0),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=compare_catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.failed == []
+    assert compare_catalog.completed[0]["bucket_counts"]["same"] == 3
+
+
+def test_compare_db_hash_fallback_logs_warning() -> None:
+    """下推降级会慢一个量级却不报错,必须留下可 grep 的痕迹。"""
+    adapter = _DbHashFallbackAdapter(PermissionError("db hash permission denied"))
+    reader = _database_compare_reader(adapter)
+
+    with capture_logs() as logs:
+        reader.segment_fingerprint(CompareSegment(key_column="id", start=1, end=2))
+
+    fallback = [
+        entry
+        for entry in logs
+        if entry.get("event") == "compare db hash pushdown disabled, falling back to client hash"
+    ]
+    assert len(fallback) == 1
+    assert fallback[0]["log_level"] == "warning"
+    assert fallback[0]["db_type"] == "mysql"
+    assert fallback[0]["error_type"] == "PermissionError"
+    # R5:只记类型名与方言,不得带 SQL 原文或行数据
+    assert "sql" not in fallback[0]
+
+
+@pytest.mark.parametrize("error_type", [QueryCancelledError, QueryTimeoutError])
+def test_compare_db_hash_interruption_does_not_log_fallback(
+    error_type: type[RuntimeError],
+) -> None:
+    """取消/超时是原样上抛而非降级,不该记降级日志(否则日志会误导排查)。"""
+    adapter = _DbHashFallbackAdapter(error_type("db hash interrupted"))
+    reader = _database_compare_reader(adapter)
+
+    with capture_logs() as logs:
+        with pytest.raises(error_type):
+            reader.segment_fingerprint(CompareSegment(key_column="id", start=1, end=2))
+
+    assert not [
+        entry
+        for entry in logs
+        if entry.get("event") == "compare db hash pushdown disabled, falling back to client hash"
+    ]
+
+
 @pytest.mark.parametrize("error_type", [QueryCancelledError, QueryTimeoutError])
 def test_compare_db_hash_cancel_or_timeout_propagates_without_client_fallback(
     error_type: type[RuntimeError],

@@ -158,7 +158,9 @@ _LINEAGE_BATCH_MAX_FILE_BYTES = 2 * 1024 * 1024
 _LINEAGE_BATCH_MAX_TOTAL_BYTES = 100 * 1024 * 1024
 _LINEAGE_BATCH_EXTENSIONS = (".sql", ".txt")
 
-# 文件源对比全量物化的行数硬顶(C-1):防大文件把 worker 撑爆内存。
+# 全量物化对比的行数硬顶(C-1):防把 worker 撑爆内存。
+# 名字虽以 FILE 起头,但同时兜底 db<->db 非单整数主键的物化路径
+# (_run_compare_hashdiff 的 _diff_all_rows 分支)。
 # 任务 run_limits.max_rows 若给出则以其为准,否则用本默认;超限直接 failed(不截断)。
 _FILE_COMPARE_DEFAULT_MAX_ROWS = 1_000_000
 _COMPARE_RESULT_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
@@ -213,6 +215,15 @@ class JobCancelled(RuntimeError):
 
 class UnsupportedJobKindError(RuntimeError):
     """2.0.0 worker supports only the job kinds wired in this module."""
+
+
+class CompareSampleUnsupportedKeyError(RuntimeError):
+    """抽样快检要求单一整数主键。
+
+    联合 / 非整数主键下抽样无法执行,必须让 job failed —— 早前是返回空结果 +
+    sample_result["error"],job 却走 success,界面显示「成功、0 差异」,
+    用户会读成「两边一致」,实际一行都没比。假答案比失败更危险。
+    """
 
 
 class OperationPolicyDeniedError(RuntimeError):
@@ -3349,7 +3360,14 @@ class _DatabaseCompareReader:
             except Exception as exc:
                 if _is_cancel_error(exc) or _is_timeout_error(exc):
                     raise
+                # 退回客户端逐行哈希会慢一个量级却不报错;不打这行,现场只看到
+                # 「对比很慢」而无从判断下推是否失效。只记类型名与方言(R5)。
                 self._db_hash_disabled = True
+                logger.warning(
+                    "compare db hash pushdown disabled, falling back to client hash",
+                    db_type=self._datasource.db_type.value,
+                    error_type=type(exc).__name__,
+                )
         rows = list(self.fetch_rows(segment))
         return SegmentFingerprint(
             row_count=len(rows),
@@ -3497,9 +3515,15 @@ def _run_compare_hashdiff(
     limits: RunLimits,
 ) -> HashdiffResult:
     if len(key_columns) != 1 or key_columns[0].type is not ColumnType.INTEGER:
+        # 非单整数主键 -> 无法分段,只能两侧全量物化。#251 把 max_rows 接了进来,
+        # 但 run_limits.max_rows 缺省是 None,于是缺省情况下这条路依然无顶 ——
+        # 现场实测联合主键 + max_rows=null 把 worker 吃到 12.4GB。这里补上默认值,
+        # 与 file 物化路径(_execute_compare_run)同源同口径。
+        # 注意只兜这一条物化路径:下面单整数主键走分段流式,不该被行数硬顶误伤。
+        materialize_max_rows = limits.max_rows or _FILE_COMPARE_DEFAULT_MAX_ROWS
         return _diff_all_rows(
-            source_reader.fetch_all(max_rows=limits.max_rows),
-            target_reader.fetch_all(max_rows=limits.max_rows),
+            source_reader.fetch_all(max_rows=materialize_max_rows),
+            target_reader.fetch_all(max_rows=materialize_max_rows),
         )
     if limits.max_rows is not None:
         source_reader.enforce_max_rows(limits.max_rows)
@@ -3530,15 +3554,7 @@ def _run_compare_sample_quick_check(
     requested_rows = limits.sample_size or DEFAULT_SAMPLE_SIZE
     confidence = limits.sample_confidence or DEFAULT_SAMPLE_CONFIDENCE
     if len(key_columns) != 1 or key_columns[0].type is not ColumnType.INTEGER:
-        sample_result = sample_quick_check_result(
-            requested_rows=requested_rows,
-            sampled_rows=0,
-            observed_differences=0,
-            confidence=confidence,
-            mode="unsupported_key",
-        )
-        sample_result["error"] = "single_integer_pk_required"
-        return HashdiffResult(events=[], progress=HashdiffProgress()), sample_result
+        raise CompareSampleUnsupportedKeyError("single_integer_pk_required")
 
     source_min, source_max = source_reader.bounds()
     target_min, target_max = target_reader.bounds()
@@ -4064,6 +4080,8 @@ def _public_error_message(exc: Exception, kind: JobKind) -> str:
         return "export_limit_exceeded"
     if isinstance(exc, (MaxRowsExceededError, CompareMaterializationLimitExceeded)):
         return "compare_limit_exceeded"
+    if isinstance(exc, CompareSampleUnsupportedKeyError):
+        return "single_integer_pk_required"
     if isinstance(exc, UnsupportedJobKindError):
         return "internal"
     if isinstance(exc, WorkflowRunFailedError):
@@ -4088,6 +4106,8 @@ def _job_error_code(exc: Exception, kind: JobKind) -> JobErrorCode:
         return JobErrorCode.EXPORT_LIMIT_EXCEEDED
     if isinstance(exc, (MaxRowsExceededError, CompareMaterializationLimitExceeded)):
         return JobErrorCode.COMPARE_LIMIT_EXCEEDED
+    if isinstance(exc, CompareSampleUnsupportedKeyError):
+        return JobErrorCode.COMPARE_SAMPLE_UNSUPPORTED_KEY
     if _is_timeout_error(exc):
         return JobErrorCode.TIMEOUT
     if _is_cancel_error(exc):
