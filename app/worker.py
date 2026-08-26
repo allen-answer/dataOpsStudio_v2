@@ -158,9 +158,15 @@ _LINEAGE_BATCH_MAX_FILE_BYTES = 2 * 1024 * 1024
 _LINEAGE_BATCH_MAX_TOTAL_BYTES = 100 * 1024 * 1024
 _LINEAGE_BATCH_EXTENSIONS = (".sql", ".txt")
 
-# 文件源对比全量物化的行数硬顶(C-1):防大文件把 worker 撑爆内存。
+# 全量物化对比的行数硬顶(C-1):防把 worker 撑爆内存。
+# 名字虽以 FILE 起头,但同时兜底 db<->db 非单整数主键的物化路径
+# (_run_compare_hashdiff 的 _diff_all_rows 分支)。
 # 任务 run_limits.max_rows 若给出则以其为准,否则用本默认;超限直接 failed(不截断)。
 _FILE_COMPARE_DEFAULT_MAX_ROWS = 1_000_000
+
+# compare 单任务查询超时的硬上限(秒)。与 API 建 job 时的 cap 同值:
+# payload 里的 run_limits 是可信度较低的输入,worker 侧不依赖上游已经 cap 过。
+_COMPARE_QUERY_TIMEOUT_MAX_SECONDS = 3600
 _COMPARE_RESULT_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
 
 # Excel 单 sheet 硬上限 1,048,576 行(含表头);数据行上限 = 减去表头 1 行。
@@ -213,6 +219,15 @@ class JobCancelled(RuntimeError):
 
 class UnsupportedJobKindError(RuntimeError):
     """2.0.0 worker supports only the job kinds wired in this module."""
+
+
+class CompareSampleUnsupportedKeyError(RuntimeError):
+    """抽样快检要求单一整数主键。
+
+    联合 / 非整数主键下抽样无法执行,必须让 job failed —— 早前是返回空结果 +
+    sample_result["error"],job 却走 success,界面显示「成功、0 差异」,
+    用户会读成「两边一致」,实际一行都没比。假答案比失败更危险。
+    """
 
 
 class OperationPolicyDeniedError(RuntimeError):
@@ -462,10 +477,29 @@ class SensorTriggerCatalogLike(Protocol):
 
 
 DatasourceLoader = Callable[[str], DatasourceConnInfo]
-AdapterFactory = Callable[
-    [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None], int],
-    DatabaseAdapterLike,
-]
+
+
+class AdapterFactory(Protocol):
+    """DatasourceConnInfo -> adapter。
+
+    timeout_seconds 是单 job 的超时覆盖(秒)。给出时同时抬高语句超时与游标持有
+    上限 —— 两道闸门必须同调,否则先到的那道照样掐(游标上限 300 < 语句超时 600,
+    实际天花板一直是 300)。None 则沿用 worker / result_store 的全局配置。
+
+    用 Protocol 而非给 Callable 加第 5 个位置参数:timeout_seconds 是
+    keyword-only 且有默认值,现有 4 个非 compare 调用点一行都不用改。
+    """
+
+    def __call__(
+        self,
+        conn_info: DatasourceConnInfo,
+        cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
+        /,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> DatabaseAdapterLike: ...
 
 
 @dataclass(frozen=True)
@@ -1092,6 +1126,10 @@ class WorkerRunner:
             ref.get("kind") in {"file", "result_snapshot"} for ref in (source_ref, target_ref)
         )
         max_rows = limits.max_rows or _FILE_COMPARE_DEFAULT_MAX_ROWS
+        # payload 可信度低于配置,worker 侧再兜一次上限(API core 建 job 时也 cap 过)
+        query_timeout_seconds = min(
+            limits.query_timeout_seconds, _COMPARE_QUERY_TIMEOUT_MAX_SECONDS
+        )
 
         source_reader = self._build_compare_reader(
             job,
@@ -1103,6 +1141,7 @@ class WorkerRunner:
             select_value_names=[column.name for column in compare_columns],
             rules=rules,
             max_rows=max_rows,
+            query_timeout_seconds=query_timeout_seconds,
         )
         target_reader = self._build_compare_reader(
             job,
@@ -1118,6 +1157,7 @@ class WorkerRunner:
             ],
             rules=rules,
             max_rows=max_rows,
+            query_timeout_seconds=query_timeout_seconds,
         )
 
         effective_limits = (
@@ -1264,6 +1304,7 @@ class WorkerRunner:
         select_value_names: list[str],
         rules: CompareRules,
         max_rows: int,
+        query_timeout_seconds: int | None = None,
     ) -> _DatabaseCompareReader | _FileCompareReader:
         """按 ref.kind 装配 reader:物化源读内存,table/sql 走 DB。"""
 
@@ -1296,6 +1337,7 @@ class WorkerRunner:
             lambda: self._backend.is_cancel_requested(job.id),
             lambda columns: None,
             self._config.sql_spool_batch_size,
+            timeout_seconds=query_timeout_seconds,
         )
         return _DatabaseCompareReader(
             adapter=adapter,
@@ -2715,6 +2757,23 @@ class PostgresSensorTriggerCatalog:
             return True
 
 
+def _effective_adapter_timeouts(
+    *,
+    default_statement_timeout: int,
+    default_cursor_hold: int,
+    timeout_seconds: int | None,
+) -> tuple[int, int]:
+    """返回 (statement_timeout, cursor_max_hold)。
+
+    单 job 超时只放宽、不收紧全局下限:游标持有上限是 R6 的资源闸门,取 max 保证
+    单个任务抬得高但压不低。未给出 timeout_seconds 时原样返回全局配置 ——
+    非 compare 路径(SQL 工作台等)的有效天花板因此保持不变。
+    """
+    if timeout_seconds is None or timeout_seconds <= 0:
+        return default_statement_timeout, default_cursor_hold
+    return timeout_seconds, max(default_cursor_hold, timeout_seconds)
+
+
 def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
     actual_settings = settings or load_settings()
     configure_logging(actual_settings.logging.level)
@@ -2742,14 +2801,22 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        /,
+        *,
+        timeout_seconds: int | None = None,
     ) -> DatabaseAdapterLike:
+        statement_timeout, cursor_max_hold = _effective_adapter_timeouts(
+            default_statement_timeout=actual_settings.worker.statement_timeout_seconds,
+            default_cursor_hold=actual_settings.result_store.cursor_max_hold_seconds,
+            timeout_seconds=timeout_seconds,
+        )
         return build_database_adapter(
             conn_info,
             secret_store,
             cancel_check=cancel_check,
             column_sink=column_sink,
-            cursor_max_hold_seconds=actual_settings.result_store.cursor_max_hold_seconds,
-            statement_timeout_seconds=actual_settings.worker.heartbeat_timeout_seconds,
+            cursor_max_hold_seconds=cursor_max_hold,
+            statement_timeout_seconds=statement_timeout,
             fetch_chunk_size=fetch_chunk_size,
         )
 
@@ -3349,7 +3416,14 @@ class _DatabaseCompareReader:
             except Exception as exc:
                 if _is_cancel_error(exc) or _is_timeout_error(exc):
                     raise
+                # 退回客户端逐行哈希会慢一个量级却不报错;不打这行,现场只看到
+                # 「对比很慢」而无从判断下推是否失效。只记类型名与方言(R5)。
                 self._db_hash_disabled = True
+                logger.warning(
+                    "compare db hash pushdown disabled, falling back to client hash",
+                    db_type=self._datasource.db_type.value,
+                    error_type=type(exc).__name__,
+                )
         rows = list(self.fetch_rows(segment))
         return SegmentFingerprint(
             row_count=len(rows),
@@ -3497,9 +3571,15 @@ def _run_compare_hashdiff(
     limits: RunLimits,
 ) -> HashdiffResult:
     if len(key_columns) != 1 or key_columns[0].type is not ColumnType.INTEGER:
+        # 非单整数主键 -> 无法分段,只能两侧全量物化。#251 把 max_rows 接了进来,
+        # 但 run_limits.max_rows 缺省是 None,于是缺省情况下这条路依然无顶 ——
+        # 现场实测联合主键 + max_rows=null 把 worker 吃到 12.4GB。这里补上默认值,
+        # 与 file 物化路径(_execute_compare_run)同源同口径。
+        # 注意只兜这一条物化路径:下面单整数主键走分段流式,不该被行数硬顶误伤。
+        materialize_max_rows = limits.max_rows or _FILE_COMPARE_DEFAULT_MAX_ROWS
         return _diff_all_rows(
-            source_reader.fetch_all(max_rows=limits.max_rows),
-            target_reader.fetch_all(max_rows=limits.max_rows),
+            source_reader.fetch_all(max_rows=materialize_max_rows),
+            target_reader.fetch_all(max_rows=materialize_max_rows),
         )
     if limits.max_rows is not None:
         source_reader.enforce_max_rows(limits.max_rows)
@@ -3530,15 +3610,7 @@ def _run_compare_sample_quick_check(
     requested_rows = limits.sample_size or DEFAULT_SAMPLE_SIZE
     confidence = limits.sample_confidence or DEFAULT_SAMPLE_CONFIDENCE
     if len(key_columns) != 1 or key_columns[0].type is not ColumnType.INTEGER:
-        sample_result = sample_quick_check_result(
-            requested_rows=requested_rows,
-            sampled_rows=0,
-            observed_differences=0,
-            confidence=confidence,
-            mode="unsupported_key",
-        )
-        sample_result["error"] = "single_integer_pk_required"
-        return HashdiffResult(events=[], progress=HashdiffProgress()), sample_result
+        raise CompareSampleUnsupportedKeyError("single_integer_pk_required")
 
     source_min, source_max = source_reader.bounds()
     target_min, target_max = target_reader.bounds()
@@ -4064,6 +4136,8 @@ def _public_error_message(exc: Exception, kind: JobKind) -> str:
         return "export_limit_exceeded"
     if isinstance(exc, (MaxRowsExceededError, CompareMaterializationLimitExceeded)):
         return "compare_limit_exceeded"
+    if isinstance(exc, CompareSampleUnsupportedKeyError):
+        return "single_integer_pk_required"
     if isinstance(exc, UnsupportedJobKindError):
         return "internal"
     if isinstance(exc, WorkflowRunFailedError):
@@ -4088,6 +4162,8 @@ def _job_error_code(exc: Exception, kind: JobKind) -> JobErrorCode:
         return JobErrorCode.EXPORT_LIMIT_EXCEEDED
     if isinstance(exc, (MaxRowsExceededError, CompareMaterializationLimitExceeded)):
         return JobErrorCode.COMPARE_LIMIT_EXCEEDED
+    if isinstance(exc, CompareSampleUnsupportedKeyError):
+        return JobErrorCode.COMPARE_SAMPLE_UNSUPPORTED_KEY
     if _is_timeout_error(exc):
         return JobErrorCode.TIMEOUT
     if _is_cancel_error(exc):

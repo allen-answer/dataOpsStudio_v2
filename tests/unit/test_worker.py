@@ -46,12 +46,15 @@ from app.domain.workflow import WorkflowNode
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
 from app.services.notify import WorkflowNotifyService
 from app.worker import (
+    _COMPARE_QUERY_TIMEOUT_MAX_SECONDS,
     _EXCEL_MAX_DATA_ROWS_PER_SHEET,
+    AdapterFactory,
     WorkerRunner,
     WorkerRunnerConfig,
     _build_workflow_child_job,
     _compare_export_row_cap,
     _DatabaseCompareReader,
+    _effective_adapter_timeouts,
     _lineage_batch_ddl_schema,
     _worker_stop_signals,
     _workflow_children_snapshots,
@@ -107,6 +110,8 @@ def test_worker_stops_sql_query_at_requested_max_rows_and_marks_truncated() -> N
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
     ) -> _RangeAdapter:
         del conn_info, cancel_check
         requested_fetch_sizes.append(fetch_chunk_size)
@@ -243,6 +248,8 @@ def test_worker_fetches_only_first_page_then_continuation_appends_next_database_
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
     ) -> _FakeAdapter:
         del conn_info, cancel_check
         requested_fetch_sizes.append(fetch_chunk_size)
@@ -659,6 +666,8 @@ def test_worker_runs_compare_run_to_four_bucket_spools() -> None:
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
     ) -> _ColumnSinkAdapter:
         del conn_info, cancel_check, column_sink, fetch_chunk_size
         return adapters.pop(0)
@@ -756,7 +765,7 @@ def test_worker_db_compare_fallback_fails_when_source_exceeds_max_rows() -> None
         backend,
         _FakeResultStore(),
         lambda datasource_id: _conn_info(datasource_id),
-        lambda conn_info, cancel_check, column_sink, fetch_chunk_size: adapters.pop(0),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size, **_: adapters.pop(0),
         WorkerRunnerConfig(worker_id="worker-1"),
         compare_run_catalog=compare_catalog,
         job_error_code_writer=error_writer,
@@ -815,7 +824,7 @@ def test_worker_db_compare_recursive_fails_when_source_exceeds_max_rows() -> Non
         backend,
         _FakeResultStore(),
         lambda datasource_id: _conn_info(datasource_id),
-        lambda conn_info, cancel_check, column_sink, fetch_chunk_size: adapters.pop(0),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size, **_: adapters.pop(0),
         WorkerRunnerConfig(worker_id="worker-1"),
         compare_run_catalog=compare_catalog,
         job_error_code_writer=error_writer,
@@ -826,6 +835,342 @@ def test_worker_db_compare_recursive_fails_when_source_exceeds_max_rows() -> Non
     assert backend.failed == [("job-1", "compare_limit_exceeded")]
     assert error_writer.error_codes == [("job-1", JobErrorCode.COMPARE_LIMIT_EXCEEDED)]
     assert compare_catalog.terminal == [{"run_id": "run-max-rows-recursive", "status": "failed"}]
+
+
+def _string_key_compare_job(
+    *,
+    run_id: str,
+    run_limits: dict[str, object],
+    key_type: str = "string",
+) -> Job:
+    """key_type="string" 走不了分段,只能全量物化;"integer" 走分段流式。"""
+    return _make_job(
+        kind=JobKind.COMPARE_RUN,
+        payload={
+            "run_id": run_id,
+            "task_id": "task-1",
+            "source_id": "ds-source",
+            "target_id": "ds-target",
+            "source_ref": {"kind": "table", "schema_name": "app", "table_name": "src"},
+            "target_ref": {"kind": "table", "schema_name": "app", "table_name": "tgt"},
+            "columns": [
+                {"name": "id", "type": key_type},
+                {"name": "name", "type": "string"},
+            ],
+            "compare_rules": {"key_columns": ["id"]},
+            "run_limits": run_limits,
+            "bucket_result_set_ids": {
+                "only_source": "rs-only-source",
+                "only_target": "rs-only-target",
+                "diff": "rs-diff",
+                "same": "rs-same",
+            },
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("timeout_seconds", "expected"),
+    [
+        # 不给单任务超时 -> 原样沿用全局,非 compare 路径行为不变
+        (None, (600, 300)),
+        (0, (600, 300)),
+        # 给了就两道闸门同调:只放宽语句超时没用,游标上限会先在 300 秒掐掉
+        (1800, (1800, 1800)),
+        # 单任务只能抬高、不能压低全局资源下限(R6 的游标持有闸门)
+        (120, (120, 300)),
+    ],
+)
+def test_effective_adapter_timeouts(
+    timeout_seconds: int | None,
+    expected: tuple[int, int],
+) -> None:
+    assert (
+        _effective_adapter_timeouts(
+            default_statement_timeout=600,
+            default_cursor_hold=300,
+            timeout_seconds=timeout_seconds,
+        )
+        == expected
+    )
+
+
+def test_worker_compare_passes_query_timeout_to_adapter() -> None:
+    """run_limits.query_timeout_seconds 必须真正到达 adapter。
+
+    此前它只在 API 建 job 时被读过一次(算队列租约),从没传给过 adapter ——
+    界面上那个「查询超时」设了等于没设,实际天花板一直是 cursor_max_hold 的 300 秒。
+    """
+    seen: list[int | None] = []
+    rows = [Row(values=[1, 1, "same-1"])]
+    adapters = [_FakeAdapter(list(rows), bounds=(1, 1)), _FakeAdapter(list(rows), bounds=(1, 1))]
+
+    def recording_factory(
+        conn_info: DatasourceConnInfo,
+        cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> _FakeAdapter:
+        del conn_info, cancel_check, column_sink, fetch_chunk_size
+        seen.append(timeout_seconds)
+        return adapters.pop(0)
+
+    job = _string_key_compare_job(
+        run_id="run-timeout-wiring",
+        run_limits={"query_timeout_seconds": 900},
+        key_type="integer",
+    )
+    backend = _FakeBackend([job])
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        recording_factory,
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=_FakeCompareRunCatalog(),
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.failed == []
+    # 两侧 reader 各建一次 adapter,都要带上本任务的超时
+    assert seen == [900, 900]
+
+
+def test_worker_compare_query_timeout_is_capped() -> None:
+    """payload 里的 run_limits 可信度低于配置,worker 侧要再兜一次上限。"""
+    seen: list[int | None] = []
+    rows = [Row(values=[1, 1, "same-1"])]
+    adapters = [_FakeAdapter(list(rows), bounds=(1, 1)), _FakeAdapter(list(rows), bounds=(1, 1))]
+
+    def recording_factory(
+        conn_info: DatasourceConnInfo,
+        cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> _FakeAdapter:
+        del conn_info, cancel_check, column_sink, fetch_chunk_size
+        seen.append(timeout_seconds)
+        return adapters.pop(0)
+
+    job = _string_key_compare_job(
+        run_id="run-timeout-capped",
+        run_limits={"query_timeout_seconds": 99_999},
+        key_type="integer",
+    )
+    backend = _FakeBackend([job])
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        recording_factory,
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=_FakeCompareRunCatalog(),
+    )
+
+    assert runner.run_once() is True
+
+    assert seen == [_COMPARE_QUERY_TIMEOUT_MAX_SECONDS] * 2
+
+
+def test_worker_non_compare_job_does_not_receive_query_timeout() -> None:
+    """只有 compare 走按任务覆盖;SQL 工作台等仍用全局配置,天花板不该被顺带改掉。"""
+    seen: list[int | None] = []
+
+    def recording_factory(
+        conn_info: DatasourceConnInfo,
+        cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> _FakeAdapter:
+        del conn_info, cancel_check, fetch_chunk_size
+        seen.append(timeout_seconds)
+        return _FakeAdapter([Row(values=[1])]).with_column_sink(column_sink)
+
+    job = _make_job(payload={"sql": "SELECT 1", "result_set_id": "rs-1"})
+    backend = _FakeBackend([job])
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        recording_factory,
+        WorkerRunnerConfig(worker_id="worker-1"),
+    )
+
+    assert runner.run_once() is True
+
+    assert seen == [None]
+
+
+def test_worker_sample_quick_check_unsupported_key_fails_instead_of_reporting_success() -> None:
+    """抽样快检遇上非单整数主键必须 failed。
+
+    回归一起真实事故:该分支早前返回空 sample_result 且 job 走 success,
+    界面显示「成功、0 差异」,用户读成「两边一致」,实际一行都没比 ——
+    假答案比失败更危险。
+    """
+    job = _string_key_compare_job(
+        run_id="run-sample-unsupported-key",
+        run_limits={"sample_quick_check": True, "sample_size": 2},
+    )
+    backend = _FakeBackend([job])
+    error_writer = _FakeErrorCodeWriter()
+    compare_catalog = _FakeCompareRunCatalog()
+    rows = [Row(values=["1", "1", "one"]), Row(values=["2", "2", "two"])]
+    adapters = [_FakeAdapter(list(rows)), _FakeAdapter(list(rows))]
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size, **_: adapters.pop(0),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=compare_catalog,
+        job_error_code_writer=error_writer,
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.completed == []
+    assert backend.failed == [("job-1", "single_integer_pk_required")]
+    assert error_writer.error_codes == [("job-1", JobErrorCode.COMPARE_SAMPLE_UNSUPPORTED_KEY)]
+    assert compare_catalog.terminal == [
+        {"run_id": "run-sample-unsupported-key", "status": "failed"}
+    ]
+    assert compare_catalog.completed == []
+
+
+def test_worker_db_compare_fallback_caps_rows_when_max_rows_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run_limits.max_rows 缺省(None)时,物化路径仍必须有顶。
+
+    #251 把 max_rows 接进了 fetch_all,但传的是可能为 None 的 limits.max_rows,
+    于是缺省情况下这条路依然无上限 —— 现场实测把 worker 吃到 12.4GB。
+    """
+    monkeypatch.setattr("app.worker._FILE_COMPARE_DEFAULT_MAX_ROWS", 2)
+    job = _string_key_compare_job(run_id="run-default-cap", run_limits={})
+    backend = _FakeBackend([job])
+    error_writer = _FakeErrorCodeWriter()
+    compare_catalog = _FakeCompareRunCatalog()
+    adapters = [
+        _FakeAdapter(
+            [
+                Row(values=["1", "1", "one"]),
+                Row(values=["2", "2", "two"]),
+                Row(values=["3", "3", "three"]),
+            ]
+        ),
+        _FakeAdapter([Row(values=["1", "1", "one"])]),
+    ]
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size, **_: adapters.pop(0),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=compare_catalog,
+        job_error_code_writer=error_writer,
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.failed == [("job-1", "compare_limit_exceeded")]
+    assert error_writer.error_codes == [("job-1", JobErrorCode.COMPARE_LIMIT_EXCEEDED)]
+    assert compare_catalog.terminal == [{"run_id": "run-default-cap", "status": "failed"}]
+
+
+def test_worker_db_compare_segmented_path_ignores_materialize_default_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单整数主键走分段流式,不物化 —— 缺省行数顶不该误伤它。
+
+    这条守着上一个用例的作用域:兜底只加在 _diff_all_rows 那条物化路径上,
+    分段路径的大表照常能跑完。
+    """
+    monkeypatch.setattr("app.worker._FILE_COMPARE_DEFAULT_MAX_ROWS", 2)
+    job = _string_key_compare_job(
+        run_id="run-segmented-uncapped",
+        run_limits={},
+        key_type="integer",
+    )
+    backend = _FakeBackend([job])
+    compare_catalog = _FakeCompareRunCatalog()
+    rows = [
+        Row(values=[1, 1, "one"]),
+        Row(values=[2, 2, "two"]),
+        Row(values=[3, 3, "three"]),
+    ]
+    adapters = [
+        _FakeAdapter(list(rows), bounds=(1, 3)),
+        _FakeAdapter(list(rows), bounds=(1, 3)),
+    ]
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size, **_: adapters.pop(0),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=compare_catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.failed == []
+    bucket_counts = compare_catalog.completed[0]["bucket_counts"]
+    assert isinstance(bucket_counts, dict)
+    assert bucket_counts["same"] == 3
+
+
+def test_compare_db_hash_fallback_logs_warning() -> None:
+    """下推降级会慢一个量级却不报错,必须留下可 grep 的痕迹。"""
+    adapter = _DbHashFallbackAdapter(PermissionError("db hash permission denied"))
+    reader = _database_compare_reader(adapter)
+
+    with capture_logs() as logs:
+        reader.segment_fingerprint(CompareSegment(key_column="id", start=1, end=2))
+
+    fallback = [
+        entry
+        for entry in logs
+        if entry.get("event") == "compare db hash pushdown disabled, falling back to client hash"
+    ]
+    assert len(fallback) == 1
+    assert fallback[0]["log_level"] == "warning"
+    assert fallback[0]["db_type"] == "mysql"
+    assert fallback[0]["error_type"] == "PermissionError"
+    # R5:只记类型名与方言,不得带 SQL 原文或行数据
+    assert "sql" not in fallback[0]
+
+
+@pytest.mark.parametrize("error_type", [QueryCancelledError, QueryTimeoutError])
+def test_compare_db_hash_interruption_does_not_log_fallback(
+    error_type: type[RuntimeError],
+) -> None:
+    """取消/超时是原样上抛而非降级,不该记降级日志(否则日志会误导排查)。"""
+    adapter = _DbHashFallbackAdapter(error_type("db hash interrupted"))
+    reader = _database_compare_reader(adapter)
+
+    with capture_logs() as logs:
+        with pytest.raises(error_type):
+            reader.segment_fingerprint(CompareSegment(key_column="id", start=1, end=2))
+
+    assert not [
+        entry
+        for entry in logs
+        if entry.get("event") == "compare db hash pushdown disabled, falling back to client hash"
+    ]
 
 
 @pytest.mark.parametrize("error_type", [QueryCancelledError, QueryTimeoutError])
@@ -1024,7 +1369,7 @@ def test_worker_sample_quick_check_reports_zero_defect_upper_bound() -> None:
         backend,
         result_store,
         lambda datasource_id: _conn_info(datasource_id),
-        lambda conn_info, cancel_check, column_sink, fetch_chunk_size: adapters.pop(0),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size, **_: adapters.pop(0),
         WorkerRunnerConfig(worker_id="worker-1"),
         compare_run_catalog=compare_catalog,
     )
@@ -1222,6 +1567,8 @@ def test_worker_unsupported_db_type_fails_with_precise_message() -> None:
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
     ) -> _ColumnSinkAdapter:
         del cancel_check, column_sink, fetch_chunk_size
         raise UnsupportedDbTypeError(f"Unsupported datasource db_type: {conn_info.db_type.value}")
@@ -1250,6 +1597,8 @@ def test_worker_sql_connection_error_gets_connection_failed_code() -> None:
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
     ) -> _ColumnSinkAdapter:
         del conn_info, cancel_check, column_sink, fetch_chunk_size
         raise AdapterConnectionError("adapter connection failed")
@@ -1521,6 +1870,8 @@ def test_cancel_check_throttled_to_every_n_rows() -> None:
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
     ) -> _RangeAdapter:
         del conn_info, cancel_check, fetch_chunk_size
         return _RangeAdapter(rows).with_column_sink(column_sink)
@@ -1569,6 +1920,8 @@ def test_worker_cancel_still_stops_within_interval() -> None:
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
     ) -> _RangeAdapter:
         del conn_info, cancel_check, fetch_chunk_size
         adapter = _RangeAdapter(row_count).with_column_sink(column_sink)
@@ -2111,15 +2464,14 @@ class _ColumnSinkAdapter(Protocol):
 
 def _adapter_factory(
     adapter: _ColumnSinkAdapter,
-) -> Callable[
-    [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None], int],
-    _ColumnSinkAdapter,
-]:
+) -> AdapterFactory:
     def factory(
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
     ) -> _ColumnSinkAdapter:
         del conn_info, cancel_check, fetch_chunk_size
         return adapter.with_column_sink(column_sink)
@@ -2960,6 +3312,8 @@ def test_workflow_compare_run_child_payload_executes_end_to_end() -> None:
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
     ) -> _ColumnSinkAdapter:
         del conn_info, cancel_check, column_sink, fetch_chunk_size
         return adapters.pop(0)

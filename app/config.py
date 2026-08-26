@@ -126,6 +126,11 @@ class WorkerConfig(BaseSettings):
     max_concurrent_jobs: int = 2
     heartbeat_interval_seconds: int = 15
     heartbeat_timeout_seconds: int = 600  # 慢首行 OLAP 查询优先避免误杀,见 ADR-0018
+    # 适配器语句超时(秒)。此前直接复用 heartbeat_timeout_seconds,导致「放宽查询
+    # 超时」必须连带推迟死 worker 判定 —— 两者语义无关,故拆开。job 心跳由独立线程
+    # 发送(_start_job_heartbeat_thread),长查询阻塞期间不会漏拍,因此本值可以
+    # 独立调大而不影响 stale worker 检测。默认与拆分前逐位等价。
+    statement_timeout_seconds: int = 600
     poll_interval_seconds: float = 0.1  # T6:portable 小队列优先降低首个 job 体感延迟
     cancel_check_row_interval: int = 5000  # F3:cancel 查询节流间隔
     result_gc_interval_seconds: float = 600.0  # ResultSet spool TTL 周期清理间隔

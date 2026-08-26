@@ -20,6 +20,7 @@ from app.config import (
     MetadataDbConfig,
     SchedulerConfig,
     Settings,
+    WorkerConfig,
     load_settings,
 )
 
@@ -132,3 +133,21 @@ def test_scheduler_timezone_defaults_to_local_resolver(
     scheduler = SchedulerConfig()
 
     assert scheduler.timezone is local_zone
+
+
+def test_worker_statement_timeout_defaults_to_600_and_is_independent_of_heartbeat() -> None:
+    """语句超时与心跳阈值解耦后,默认值必须与拆分前逐位等价(600),避免升级即改行为。"""
+    config = WorkerConfig()
+
+    assert config.statement_timeout_seconds == 600
+    assert config.heartbeat_timeout_seconds == 600
+
+
+def test_worker_statement_timeout_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATAOPS_WORKER_STATEMENT_TIMEOUT_SECONDS", "3600")
+
+    config = WorkerConfig()
+
+    assert config.statement_timeout_seconds == 3600
+    # 放宽语句超时不该连带推迟死 worker 判定
+    assert config.heartbeat_timeout_seconds == 600
