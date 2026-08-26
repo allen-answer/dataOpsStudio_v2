@@ -25,7 +25,7 @@ from app.domain.schema import Column
 from app.domain.secret import HashedRef, RotationReport, SecretKind, SecretRef
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
 from app.infrastructure.secretstore.protocol import SecretStore
-from app.worker import WorkerRunner, WorkerRunnerConfig
+from app.worker import AdapterFactory, WorkerRunner, WorkerRunnerConfig
 
 pytestmark = pytest.mark.integration
 
@@ -299,12 +299,14 @@ def _seed_dm_sample(env: dict[str, str]) -> Iterator[None]:
 def _adapter_factory(
     mysql_env: dict[str, str],
     dm_env: dict[str, str],
-) -> Callable[[DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None], int], Any]:
+) -> AdapterFactory:
     def factory(
         conn_info: DatasourceConnInfo,
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
     ) -> Any:
         del column_sink
         if conn_info.db_type is DbType.MYSQL:
