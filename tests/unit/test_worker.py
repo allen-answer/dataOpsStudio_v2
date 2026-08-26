@@ -977,7 +977,9 @@ def test_worker_db_compare_segmented_path_ignores_materialize_default_cap(
     assert runner.run_once() is True
 
     assert backend.failed == []
-    assert compare_catalog.completed[0]["bucket_counts"]["same"] == 3
+    bucket_counts = compare_catalog.completed[0]["bucket_counts"]
+    assert isinstance(bucket_counts, dict)
+    assert bucket_counts["same"] == 3
 
 
 def test_compare_db_hash_fallback_logs_warning() -> None:
