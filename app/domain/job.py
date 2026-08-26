@@ -61,6 +61,8 @@ class JobErrorCode(StrEnum):
     EXPORT_LIMIT_EXCEEDED = "export_limit_exceeded"
     # 文件源对比全量物化超行数硬顶(C-1;不静默截断,任务直接 failed)
     COMPARE_LIMIT_EXCEEDED = "compare_limit_exceeded"
+    # 抽样快检要求单一整数主键;联合/非整数主键直接 failed,不再返回空结果假成功
+    COMPARE_SAMPLE_UNSUPPORTED_KEY = "compare_sample_unsupported_key"
     INTERNAL = "internal"
 
 

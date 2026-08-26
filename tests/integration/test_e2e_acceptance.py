@@ -237,6 +237,8 @@ def _start_worker_thread(
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
     ) -> MySQLAdapter:
         return MySQLAdapter(
             conn_info,
@@ -252,18 +254,7 @@ def _start_worker_thread(
         backend,
         result_store,
         datasource_loader,
-        cast(
-            Callable[
-                [
-                    DatasourceConnInfo,
-                    Callable[[], bool],
-                    Callable[[list[Column]], None],
-                    int,
-                ],
-                MySQLAdapter,
-            ],
-            adapter_factory,
-        ),
+        adapter_factory,
         WorkerRunnerConfig(
             worker_id=worker_id,
             poll_interval_seconds=0.05,

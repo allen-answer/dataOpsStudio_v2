@@ -107,6 +107,8 @@ def _run_worker(
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
     ) -> _ColumnSinkAdapter:
         del conn_info, cancel_check, column_sink, fetch_chunk_size
         return remaining.pop(0)
