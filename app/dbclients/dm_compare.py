@@ -25,8 +25,27 @@ _SUPPORTED_DB_HASH_TYPES = {
 }
 _HASH_DECIMAL_TYPE = "DECIMAL(38,0)"
 
+# MD5 十六进制串前 16 位 -> uint64 的两种等价写法。二者必须产出完全相同的数值,
+# 且必须与 compare_row_hash64(md5[:8] 大端无符号)以及 MySQL 侧的
+# CONV(SUBSTR(MD5(...),1,16),16,10) 一致 —— 否则跨库 / 降级客户端哈希时会误报差异。
+HEX_TO_UINT64_TO_NUMBER = "to_number"  # DM/Oracle X 格式模型,一次函数调用
+HEX_TO_UINT64_NESTED = "nested"  # 不依赖格式模型的展开式,仅作兜底
+HEX_TO_UINT64_MODES = (HEX_TO_UINT64_TO_NUMBER, HEX_TO_UINT64_NESTED)
+_HEX8_FORMAT_MODEL = "X" * 8
+_UINT32_SCALE = 4294967296  # 2^32,高半字的进位权重
 
-def build_dm_compare_hash_plan(request: CompareHashRequest) -> CompareHashPlan:
+
+def build_dm_compare_hash_plan(
+    request: CompareHashRequest,
+    *,
+    hex_to_uint64_mode: str = HEX_TO_UINT64_NESTED,
+) -> CompareHashPlan:
+    """构造 DM 下推哈希计划。
+
+    hex_to_uint64_mode 决定 hex -> uint64 用哪种写法(见模块顶部常量)。默认取
+    保守的 nested:本函数是纯计划构造,不接触连接,无从判断目标实例是否支持 X
+    格式模型;探测与选型由 DMAdapter 负责。
+    """
     reasons = _degrade_reasons(request)
     if reasons:
         return CompareHashPlan(
@@ -39,7 +58,7 @@ def build_dm_compare_hash_plan(request: CompareHashRequest) -> CompareHashPlan:
         f"RAWTOHEX(DBMS_CRYPTO.HASH(UTL_RAW.CAST_TO_RAW({payload_expr}), DBMS_CRYPTO.HASH_MD5))"
     )
     hash_hex_alias = '"__HASH_HEX"'
-    row_hash_expr = _hex_prefix_to_uint64(hash_hex_alias)
+    row_hash_expr = hex_to_uint64_expression(hash_hex_alias, hex_to_uint64_mode)
     table_expr = _table_expression(request.table.schema_name, request.table.name)
     where_clause = _where_clause(request)
     if request.level is CompareHashLevel.ROW:
@@ -162,7 +181,41 @@ def _dm_timestamp_expr(expr: str, precision: int) -> str:
     return f"TO_CHAR(CAST({expr} AS TIMESTAMP({precision})), 'YYYY-MM-DD HH24:MI:SS.FF{precision}')"
 
 
-def _hex_prefix_to_uint64(hex_expr: str) -> str:
+def hex_to_uint64_expression(hex_expr: str, mode: str) -> str:
+    """MD5 十六进制串前 16 位 -> uint64 的 SQL 表达式。
+
+    hex_expr 是一个求值为该串的 SQL 片段(列引用或字面量),由调用方保证。
+    """
+    if mode == HEX_TO_UINT64_TO_NUMBER:
+        return _hex_prefix_to_uint64_halves(hex_expr)
+    return _hex_prefix_to_uint64_nested(hex_expr)
+
+
+def _hex_prefix_to_uint64_halves(hex_expr: str) -> str:
+    """拆成两个 32 位半字分别转换,再按 2^32 合并。
+
+    不能直接用 16 位满宽的 X 格式模型:DM 按两补码 signed 64 位解释,
+    TO_NUMBER('FFFFFFFFFFFFFFFF', 'X'*16) 返回 -1 而不是 18446744073709551615
+    (198/199 上实测)。满宽写法会让首位 >= 8 的行(约一半)哈希变成负数,与
+    compare_row_hash64 / MySQL 侧全面对不上,静默产生海量假差异。
+
+    拆半后每个半字最大 4294967295,恒为正,不需要任何符号修正。
+    """
+    high = f"TO_NUMBER(SUBSTR({hex_expr}, 1, 8), '{_HEX8_FORMAT_MODEL}')"
+    low = f"TO_NUMBER(SUBSTR({hex_expr}, 9, 8), '{_HEX8_FORMAT_MODEL}')"
+    return (
+        f"CAST({high} AS {_HASH_DECIMAL_TYPE})"
+        f" * CAST({_UINT32_SCALE} AS {_HASH_DECIMAL_TYPE})"
+        f" + CAST({low} AS {_HASH_DECIMAL_TYPE})"
+    )
+
+
+def _hex_prefix_to_uint64_nested(hex_expr: str) -> str:
+    """X 格式模型不可用时的兜底展开。
+
+    每行代价:16 次 SUBSTR + 16 次 INSTR + 32 次 DECIMAL(38,0) 乘加。大表全表
+    哈希时这是实测的 CPU 瓶颈,故仅在探测判定 TO_NUMBER 不可用时才走这条路。
+    """
     expr = f"CAST(0 AS {_HASH_DECIMAL_TYPE})"
     multiplier = f"CAST(16 AS {_HASH_DECIMAL_TYPE})"
     for idx in range(1, 17):
@@ -213,4 +266,10 @@ def _sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-__all__ = ["build_dm_compare_hash_plan"]
+__all__ = [
+    "HEX_TO_UINT64_MODES",
+    "HEX_TO_UINT64_NESTED",
+    "HEX_TO_UINT64_TO_NUMBER",
+    "build_dm_compare_hash_plan",
+    "hex_to_uint64_expression",
+]
