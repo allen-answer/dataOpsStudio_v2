@@ -6,7 +6,13 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
-from app.dbclients.dm_compare import build_dm_compare_hash_plan
+from app.dbclients.dm_compare import (
+    HEX_TO_UINT64_MODES,
+    HEX_TO_UINT64_NESTED,
+    HEX_TO_UINT64_TO_NUMBER,
+    build_dm_compare_hash_plan,
+    hex_to_uint64_expression,
+)
 from app.dbclients.dm_types import (
     data_type_string_to_column_type,
     description_item_to_column_type,
@@ -55,6 +61,22 @@ class QueryTimeoutError(DMAdapterError):
 
 class InvalidDatasourceError(ValueError):
     """DatasourceConnInfo 与 DMAdapter 不匹配。"""
+
+
+# 快路可用性探测。刻意复用 hex_to_uint64_expression 构造探测式 —— 探的就是将要
+# 下发的那个表达式本身,而不是它的近似,否则 DM 换个版本改了语义探测会漏过。
+# 两个样本:DEADBEEF 走正常路径,全 F 专门盯 signed/unsigned 边界(满宽 X 模型
+# 在此处返回 -1,正是拆半写法要绕开的坑)。
+_HEX_PROBE_SAMPLES = ("00000000DEADBEEF", "FFFFFFFFFFFFFFFF")
+_HEX_PROBE_EXPECTED = tuple(int(sample, 16) for sample in _HEX_PROBE_SAMPLES)
+_HEX_PROBE_SQL = (
+    "SELECT "
+    + ", ".join(
+        hex_to_uint64_expression(f"'{sample}'", HEX_TO_UINT64_TO_NUMBER)
+        for sample in _HEX_PROBE_SAMPLES
+    )
+    + " FROM DUAL"
+)
 
 
 class DMAdapter(DatabaseAdapter):
@@ -114,6 +136,13 @@ class DMAdapter(DatabaseAdapter):
         self._last_server_version: str | None = None
         self._last_connection_error: str | None = None
         self._query_timing = QueryTimingRecorder()
+        # datasource.extra.compare_hex_mode 可强制选型(auto / to_number / nested),
+        # 与 connect_timeout 同走 extra 这条既有的按数据源覆盖通道。
+        configured = str(conn_info.extra.get("compare_hex_mode", "auto") or "auto").lower()
+        self._configured_hex_mode: str | None = (
+            configured if configured in HEX_TO_UINT64_MODES else None
+        )
+        self._resolved_hex_mode: str | None = None
 
     @property
     def last_server_version(self) -> str | None:
@@ -122,6 +151,11 @@ class DMAdapter(DatabaseAdapter):
     @property
     def last_connection_error(self) -> str | None:
         return self._last_connection_error
+
+    @property
+    def compare_hex_mode(self) -> str | None:
+        """本次会话最终选用的 hex -> uint64 写法;未探测过则为 None。"""
+        return self._resolved_hex_mode
 
     @property
     def query_timings_ms(self) -> dict[str, int]:
@@ -302,7 +336,36 @@ class DMAdapter(DatabaseAdapter):
         return str(rows[0][0])
 
     def build_compare_hash_query(self, request: CompareHashRequest) -> CompareHashPlan:
-        return build_dm_compare_hash_plan(request)
+        return build_dm_compare_hash_plan(
+            request,
+            hex_to_uint64_mode=self._resolve_hex_mode(),
+        )
+
+    def _resolve_hex_mode(self) -> str:
+        """选定 hex -> uint64 写法;每个 adapter 实例(即每个 job)最多探测一次。"""
+        if self._configured_hex_mode is not None:
+            self._resolved_hex_mode = self._configured_hex_mode
+            return self._resolved_hex_mode
+        if self._resolved_hex_mode is None:
+            self._resolved_hex_mode = self._probe_hex_mode()
+        return self._resolved_hex_mode
+
+    def _probe_hex_mode(self) -> str:
+        try:
+            rows = self._query_tuples(_HEX_PROBE_SQL)
+        except Exception:
+            # 探测失败(不支持 X 格式模型 / 无 DUAL / 权限不足)一律回退,
+            # 不让选型问题升级成对比失败。
+            return HEX_TO_UINT64_NESTED
+        if not rows or len(rows[0]) < 2:
+            return HEX_TO_UINT64_NESTED
+        try:
+            probed = (int(rows[0][0]), int(rows[0][1]))
+        except (TypeError, ValueError):
+            return HEX_TO_UINT64_NESTED
+        if probed != _HEX_PROBE_EXPECTED:
+            return HEX_TO_UINT64_NESTED
+        return HEX_TO_UINT64_TO_NUMBER
 
     def kill_query(self, connection_id: str) -> bool:
         # DM 无 driver-level cancel(V1_AS_IS §2.8);走软取消,这里恒 False。

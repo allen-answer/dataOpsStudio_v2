@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 
 from app.dbclients.dm_adapter import DMAdapter, QueryCancelledError
+from app.dbclients.dm_compare import HEX_TO_UINT64_TO_NUMBER, hex_to_uint64_expression
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.schema import Column, ColumnType
 from app.domain.secret import HashedRef, RotationReport, SecretKind, SecretRef
@@ -233,3 +234,52 @@ def test_explain(adapter: DMAdapter, seeded_table: str) -> None:
     rows = plan.details.get("rows")
     assert rows, "EXPLAIN 应返回计划行"
     print(f"\n[evidence] explain rows = {len(rows)}; first = {str(rows[0])[:120]!r}")
+
+
+# ── 6. 下推哈希 hex -> uint64 选型(PR「达梦哈希拆半字」的 hard evidence)────────
+
+
+def test_dm_hex_to_uint64_full_width_x_model_is_signed(adapter: DMAdapter) -> None:
+    """记录达梦的真实语义:X 格式模型按两补码 signed 64 位解释。
+
+    这正是不能直接用 TO_NUMBER(h, 'X'*16) 的原因 —— 满宽会让 MD5 首位 >= 8 的行
+    (约一半)哈希变负,与 compare_row_hash64(无符号)全面对不上,静默产假差异。
+    本用例若某天在新版达梦上变红,说明该版本改了语义,可以考虑简化表达式。
+    """
+    rows = adapter._query_tuples(
+        "SELECT TO_NUMBER('00000000DEADBEEF', 'XXXXXXXXXXXXXXXX'),"
+        " TO_NUMBER('FFFFFFFFFFFFFFFF', 'XXXXXXXXXXXXXXXX') FROM DUAL"
+    )
+    low, high = int(rows[0][0]), int(rows[0][1])
+    assert low == 0xDEADBEEF
+    assert high == -1, "达梦满宽 X 模型返回 -1 而非 18446744073709551615"
+    print(f"\n[evidence] full-width X model: DEADBEEF={low} FFFF...={high} (signed64)")
+
+
+def test_dm_hex_to_uint64_split_halves_matches_unsigned(adapter: DMAdapter) -> None:
+    """拆两个 32 位半字后与无符号语义逐位一致(含全部符号边界)。"""
+    samples = [
+        "0000000000000000",
+        "00000000DEADBEEF",
+        "7FFFFFFFFFFFFFFF",
+        "8000000000000000",
+        "FEDCBA9876543210",
+        "FFFFFFFFFFFFFFFF",
+    ]
+    selects = ", ".join(
+        hex_to_uint64_expression(f"'{sample}'", HEX_TO_UINT64_TO_NUMBER) for sample in samples
+    )
+    row = adapter._query_tuples(f"SELECT {selects} FROM DUAL")[0]
+
+    got = [int(value) for value in row]
+    expected = [int(sample, 16) for sample in samples]
+    assert got == expected
+    print(f"\n[evidence] split-halves on real DM: {list(zip(samples, got, strict=True))}")
+
+
+def test_dm_probe_selects_to_number_on_real_instance(adapter: DMAdapter) -> None:
+    """真实例上探测应选中快路。"""
+    mode = adapter._probe_hex_mode()
+
+    assert mode == HEX_TO_UINT64_TO_NUMBER
+    print(f"\n[evidence] probed mode on real DM = {mode}")
