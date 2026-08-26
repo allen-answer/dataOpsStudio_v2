@@ -27,7 +27,12 @@ from app.domain.secret import SecretKind, SecretRef
 from app.infrastructure.jobbackend.postgres import PostgresJobBackend
 from app.infrastructure.resultstore.local_fs import LocalFsResultStore
 from app.infrastructure.secretstore.local_file import LocalFileSecretStore
-from app.worker import PostgresResultSetCatalog, WorkerRunner, WorkerRunnerConfig
+from app.worker import (
+    AdapterFactory,
+    PostgresResultSetCatalog,
+    WorkerRunner,
+    WorkerRunnerConfig,
+)
 from tests._asgi_client import AsgiClient
 
 pytestmark = pytest.mark.integration
@@ -590,10 +595,7 @@ class _SlowAdapter:
 
 def _slow_adapter_factory(
     release_second_row: threading.Event,
-) -> Callable[
-    [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None], int],
-    _SlowAdapter,
-]:
+) -> AdapterFactory:
     adapter = _SlowAdapter(release_second_row)
 
     def factory(
@@ -601,6 +603,8 @@ def _slow_adapter_factory(
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        *,
+        timeout_seconds: int | None = None,
     ) -> _SlowAdapter:
         del conn_info, cancel_check, fetch_chunk_size
         return adapter.with_column_sink(column_sink)

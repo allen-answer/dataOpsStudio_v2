@@ -163,6 +163,10 @@ _LINEAGE_BATCH_EXTENSIONS = (".sql", ".txt")
 # (_run_compare_hashdiff 的 _diff_all_rows 分支)。
 # 任务 run_limits.max_rows 若给出则以其为准,否则用本默认;超限直接 failed(不截断)。
 _FILE_COMPARE_DEFAULT_MAX_ROWS = 1_000_000
+
+# compare 单任务查询超时的硬上限(秒)。与 API 建 job 时的 cap 同值:
+# payload 里的 run_limits 是可信度较低的输入,worker 侧不依赖上游已经 cap 过。
+_COMPARE_QUERY_TIMEOUT_MAX_SECONDS = 3600
 _COMPARE_RESULT_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
 
 # Excel 单 sheet 硬上限 1,048,576 行(含表头);数据行上限 = 减去表头 1 行。
@@ -473,10 +477,29 @@ class SensorTriggerCatalogLike(Protocol):
 
 
 DatasourceLoader = Callable[[str], DatasourceConnInfo]
-AdapterFactory = Callable[
-    [DatasourceConnInfo, Callable[[], bool], Callable[[list[Column]], None], int],
-    DatabaseAdapterLike,
-]
+
+
+class AdapterFactory(Protocol):
+    """DatasourceConnInfo -> adapter。
+
+    timeout_seconds 是单 job 的超时覆盖(秒)。给出时同时抬高语句超时与游标持有
+    上限 —— 两道闸门必须同调,否则先到的那道照样掐(游标上限 300 < 语句超时 600,
+    实际天花板一直是 300)。None 则沿用 worker / result_store 的全局配置。
+
+    用 Protocol 而非给 Callable 加第 5 个位置参数:timeout_seconds 是
+    keyword-only 且有默认值,现有 4 个非 compare 调用点一行都不用改。
+    """
+
+    def __call__(
+        self,
+        conn_info: DatasourceConnInfo,
+        cancel_check: Callable[[], bool],
+        column_sink: Callable[[list[Column]], None],
+        fetch_chunk_size: int,
+        /,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> DatabaseAdapterLike: ...
 
 
 @dataclass(frozen=True)
@@ -1103,6 +1126,10 @@ class WorkerRunner:
             ref.get("kind") in {"file", "result_snapshot"} for ref in (source_ref, target_ref)
         )
         max_rows = limits.max_rows or _FILE_COMPARE_DEFAULT_MAX_ROWS
+        # payload 可信度低于配置,worker 侧再兜一次上限(API core 建 job 时也 cap 过)
+        query_timeout_seconds = min(
+            limits.query_timeout_seconds, _COMPARE_QUERY_TIMEOUT_MAX_SECONDS
+        )
 
         source_reader = self._build_compare_reader(
             job,
@@ -1114,6 +1141,7 @@ class WorkerRunner:
             select_value_names=[column.name for column in compare_columns],
             rules=rules,
             max_rows=max_rows,
+            query_timeout_seconds=query_timeout_seconds,
         )
         target_reader = self._build_compare_reader(
             job,
@@ -1129,6 +1157,7 @@ class WorkerRunner:
             ],
             rules=rules,
             max_rows=max_rows,
+            query_timeout_seconds=query_timeout_seconds,
         )
 
         effective_limits = (
@@ -1275,6 +1304,7 @@ class WorkerRunner:
         select_value_names: list[str],
         rules: CompareRules,
         max_rows: int,
+        query_timeout_seconds: int | None = None,
     ) -> _DatabaseCompareReader | _FileCompareReader:
         """按 ref.kind 装配 reader:物化源读内存,table/sql 走 DB。"""
 
@@ -1307,6 +1337,7 @@ class WorkerRunner:
             lambda: self._backend.is_cancel_requested(job.id),
             lambda columns: None,
             self._config.sql_spool_batch_size,
+            timeout_seconds=query_timeout_seconds,
         )
         return _DatabaseCompareReader(
             adapter=adapter,
@@ -2726,6 +2757,23 @@ class PostgresSensorTriggerCatalog:
             return True
 
 
+def _effective_adapter_timeouts(
+    *,
+    default_statement_timeout: int,
+    default_cursor_hold: int,
+    timeout_seconds: int | None,
+) -> tuple[int, int]:
+    """返回 (statement_timeout, cursor_max_hold)。
+
+    单 job 超时只放宽、不收紧全局下限:游标持有上限是 R6 的资源闸门,取 max 保证
+    单个任务抬得高但压不低。未给出 timeout_seconds 时原样返回全局配置 ——
+    非 compare 路径(SQL 工作台等)的有效天花板因此保持不变。
+    """
+    if timeout_seconds is None or timeout_seconds <= 0:
+        return default_statement_timeout, default_cursor_hold
+    return timeout_seconds, max(default_cursor_hold, timeout_seconds)
+
+
 def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
     actual_settings = settings or load_settings()
     configure_logging(actual_settings.logging.level)
@@ -2753,14 +2801,22 @@ def build_worker_runner(settings: Settings | None = None) -> WorkerRunner:
         cancel_check: Callable[[], bool],
         column_sink: Callable[[list[Column]], None],
         fetch_chunk_size: int,
+        /,
+        *,
+        timeout_seconds: int | None = None,
     ) -> DatabaseAdapterLike:
+        statement_timeout, cursor_max_hold = _effective_adapter_timeouts(
+            default_statement_timeout=actual_settings.worker.statement_timeout_seconds,
+            default_cursor_hold=actual_settings.result_store.cursor_max_hold_seconds,
+            timeout_seconds=timeout_seconds,
+        )
         return build_database_adapter(
             conn_info,
             secret_store,
             cancel_check=cancel_check,
             column_sink=column_sink,
-            cursor_max_hold_seconds=actual_settings.result_store.cursor_max_hold_seconds,
-            statement_timeout_seconds=actual_settings.worker.heartbeat_timeout_seconds,
+            cursor_max_hold_seconds=cursor_max_hold,
+            statement_timeout_seconds=statement_timeout,
             fetch_chunk_size=fetch_chunk_size,
         )
 
