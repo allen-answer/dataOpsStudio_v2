@@ -11,6 +11,7 @@ from app.dbclients.mysql_compare import build_mysql_compare_hash_plan
 from app.domain.compare import (
     CompareColumn,
     CompareDiffBucket,
+    CompareDiffEvent,
     CompareHashExecutionMode,
     CompareHashLevel,
     CompareHashRequest,
@@ -22,9 +23,11 @@ from app.domain.compare import (
     SegmentFingerprint,
     compare_row_hash64,
     compare_rows_without_prefilter,
+    diff_stream_from_events,
     normalized_compare_identity,
     normalized_compare_payload,
     recursive_hashdiff,
+    recursive_hashdiff_stream,
 )
 from app.domain.schema import ColumnType
 
@@ -323,6 +326,103 @@ def test_row_level_diff_does_not_use_hash_as_final_truth() -> None:
     )
 
     assert [(event.bucket, event.pk) for event in result.events] == [(CompareDiffBucket.DIFF, (1,))]
+
+
+def test_stream_does_not_fetch_every_segment_before_yielding_first_event() -> None:
+    """惰性的实证:只取一个事件,不应该把所有段都扫完。
+
+    这是流式改造要守的核心性质 —— 事件边算边吐,worker 才能边落盘,
+    内存占用与差异条数解耦(此前全量攒 list,单条约 1.7KB,百万级差异即 1.6GB)。
+    """
+    source_rows = [CompareRow(pk=(idx,), values=(idx,), row_hash64=idx) for idx in range(20_000)]
+    target_rows = [
+        CompareRow(pk=(idx,), values=(f"changed-{idx}",), row_hash64=idx + 1)
+        for idx in range(20_000)
+    ]
+    source = _MemorySegmentReader(source_rows)
+    target = _MemorySegmentReader(target_rows)
+    limits = RunLimits(bisection_factor=8, bisection_threshold=500)
+    root_segment = CompareSegment(key_column="id", start=0, end=20_000)
+
+    stream = recursive_hashdiff_stream(source, target, root_segment, limits)
+    first = next(iter(stream.events))
+
+    assert first.bucket is CompareDiffBucket.DIFF
+    # 全量消费需要扫遍所有段;只取一条时远未扫完
+    full_fetches = len(_MemorySegmentReader(source_rows).fetch_calls) or len(
+        recursive_hashdiff(
+            _MemorySegmentReader(source_rows),
+            _MemorySegmentReader(target_rows),
+            root_segment,
+            limits,
+        ).events
+    )
+    assert len(source.fetch_calls) == 1, "只取首个事件时应只物化第一个 row-mode 段"
+    assert full_fetches > 1
+
+
+def test_stream_progress_is_only_final_after_consumption() -> None:
+    """progress 随消费推进 —— 这是流式的代价,调用方必须先消费完再读。"""
+    rows = [CompareRow(pk=(idx,), values=(idx,), row_hash64=idx) for idx in range(8_000)]
+    source = _MemorySegmentReader(rows)
+    target = _MemorySegmentReader(rows)
+    limits = RunLimits(bisection_factor=8, bisection_threshold=100)
+
+    stream = recursive_hashdiff_stream(
+        source,
+        target,
+        CompareSegment(key_column="id", start=0, end=8_000),
+        limits,
+    )
+
+    assert stream.progress().scanned_segments == 0
+    assert stream.progress().skipped_rows == 0
+
+    consumed = list(stream.events)
+
+    assert consumed == []
+    assert stream.progress().scanned_segments == 8
+    assert stream.progress().skipped_rows == 8_000
+
+
+def test_stream_and_materialized_agree_on_events_and_progress() -> None:
+    """流式与全量物化必须给出完全相同的结果 —— 改造不得改变语义。"""
+    source_rows = [CompareRow(pk=(idx,), values=(idx,), row_hash64=idx) for idx in range(20_000)]
+    target_rows = list(source_rows)
+    target_rows[17_001] = CompareRow(pk=(17_001,), values=("changed",), row_hash64=100)
+    target_rows.append(CompareRow(pk=(20_001,), values=("new",), row_hash64=20_001))
+    root_segment = CompareSegment(key_column="id", start=0, end=20_002)
+    limits = RunLimits(bisection_factor=8, bisection_threshold=500)
+
+    materialized = recursive_hashdiff(
+        _MemorySegmentReader(source_rows),
+        _MemorySegmentReader(target_rows),
+        root_segment,
+        limits,
+    )
+    stream = recursive_hashdiff_stream(
+        _MemorySegmentReader(source_rows),
+        _MemorySegmentReader(target_rows),
+        root_segment,
+        limits,
+    )
+    streamed_events = list(stream.events)
+
+    assert streamed_events == materialized.events
+    assert stream.progress() == materialized.progress
+
+
+def test_diff_stream_from_events_marks_row_mode_segment_lazily() -> None:
+    """空流不记 row-mode 段,有事件才记 —— 与旧的 `1 if events else 0` 等价。"""
+    empty = diff_stream_from_events(iter(()))
+    assert list(empty.events) == []
+    assert empty.progress().row_mode_segments == 0
+
+    event = CompareDiffEvent(bucket=CompareDiffBucket.DIFF, pk=(1,))
+    non_empty = diff_stream_from_events(iter([event]))
+    assert non_empty.progress().row_mode_segments == 0
+    assert list(non_empty.events) == [event]
+    assert non_empty.progress().row_mode_segments == 1
 
 
 def test_recursive_and_disabled_prefilter_return_same_diff_set() -> None:

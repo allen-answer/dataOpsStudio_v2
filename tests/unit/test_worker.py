@@ -1011,6 +1011,52 @@ def test_worker_non_compare_job_does_not_receive_query_timeout() -> None:
     assert seen == [None]
 
 
+def test_worker_compare_counts_skipped_rows_into_same_bucket() -> None:
+    """分段被整段跳过的行仍要计入 SAME 桶。
+
+    流式改造把这笔账从「消费前读 progress」挪到了「消费后读」——
+    因为惰性流在消费完之前 skipped_rows 还是 0。这条守着那次搬迁。
+    """
+    job = _string_key_compare_job(
+        run_id="run-skipped-rows",
+        # 阈值压到 1 才会真的分段,两侧数据相同 -> 段指纹相等 -> 整段跳过
+        run_limits={"bisection_threshold": 1},
+        key_type="integer",
+    )
+    backend = _FakeBackend([job])
+    compare_catalog = _FakeCompareRunCatalog()
+    rows = [
+        Row(values=[1, 1, "one"]),
+        Row(values=[2, 2, "two"]),
+        Row(values=[3, 3, "three"]),
+    ]
+    adapters = [
+        _FakeAdapter(list(rows), bounds=(1, 3)),
+        _FakeAdapter(list(rows), bounds=(1, 3)),
+    ]
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size, **_: adapters.pop(0),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=compare_catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.failed == []
+    completed = compare_catalog.completed[0]
+    bucket_counts = completed["bucket_counts"]
+    progress = completed["progress"]
+    assert isinstance(bucket_counts, dict)
+    assert isinstance(progress, dict)
+    assert progress["skipped_rows"] > 0
+    assert bucket_counts["same"] == progress["skipped_rows"]
+    assert bucket_counts["diff"] == 0
+
+
 def test_worker_sample_quick_check_unsupported_key_fails_instead_of_reporting_success() -> None:
     """抽样快检遇上非单整数主键必须 failed。
 

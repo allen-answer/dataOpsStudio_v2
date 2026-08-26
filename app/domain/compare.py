@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import date, datetime, time
 from decimal import ROUND_HALF_UP, Decimal
 from enum import StrEnum
@@ -213,57 +213,118 @@ class _MutableProgress:
         )
 
 
+class CompareDiffStream:
+    """惰性差异事件流。
+
+    存在的理由:差异事件此前是一次性攒进 list 再交给 worker 落盘,而单条
+    CompareDiffEvent(16 列、diff 桶带两侧值)约 1.7KB —— 百万级差异就是 1.6GB
+    常驻内存,且这个量与总行数无关(两侧只差一百万行的十亿行表照样会爆)。
+    改成边算边吐后,worker 按 compare_batch_size 冲刷,内存与差异条数解耦。
+
+    ★ progress() 随消费推进,只有 events 耗尽后才是终值 —— 这是流式的代价。
+      调用方必须先消费完 events 再读 progress(尤其 skipped_rows)。
+    """
+
+    __slots__ = ("_progress", "events")
+
+    def __init__(
+        self,
+        events: Iterator[CompareDiffEvent],
+        progress: _MutableProgress | None = None,
+    ) -> None:
+        self.events = events
+        self._progress = progress if progress is not None else _MutableProgress()
+
+    def progress(self) -> HashdiffProgress:
+        return self._progress.freeze()
+
+    def materialize(self) -> HashdiffResult:
+        """消费完并打包成旧的 HashdiffResult(给测试与有界调用方用)。"""
+        events = list(self.events)
+        return HashdiffResult(events=events, progress=self.progress())
+
+
+def diff_stream_from_events(events: Iterable[CompareDiffEvent]) -> CompareDiffStream:
+    """把一段事件序列包成流,首个事件出现时记一个 row-mode 段。
+
+    与既有 `HashdiffProgress(row_mode_segments=1 if events else 0)` 等价,
+    只是改成惰性判定 —— 流式下「有没有事件」要到消费时才知道。
+    """
+    progress = _MutableProgress()
+
+    def _generate() -> Iterator[CompareDiffEvent]:
+        for event in events:
+            progress.row_mode_segments = 1
+            yield event
+
+    return CompareDiffStream(_generate(), progress)
+
+
+def recursive_hashdiff_stream(
+    source: CompareSegmentReader,
+    target: CompareSegmentReader,
+    root_segment: CompareSegment,
+    limits: RunLimits | None = None,
+) -> CompareDiffStream:
+    """recursive_hashdiff 的流式版:边分段边吐事件,不攒全量。"""
+
+    actual_limits = limits or RunLimits()
+    progress = _MutableProgress()
+
+    def _generate() -> Iterator[CompareDiffEvent]:
+        if not actual_limits.recursive_checksum or root_segment.estimated_rows <= (
+            actual_limits.bisection_threshold
+        ):
+            progress.row_mode_segments += 1
+            yield from _row_level_diff(source, target, root_segment)
+            return
+
+        initial_segments = _split_segment(root_segment, actual_limits.bisection_factor)
+        stack: list[tuple[CompareSegment, int]] = [
+            (segment, 0) for segment in reversed(initial_segments)
+        ]
+
+        while stack:
+            segment, depth = stack.pop()
+            progress.max_depth_seen = max(progress.max_depth_seen, depth)
+            source_fingerprint = source.segment_fingerprint(segment)
+            target_fingerprint = target.segment_fingerprint(segment)
+            progress.scanned_segments += 1
+            if source_fingerprint == target_fingerprint:
+                progress.skipped_segments += 1
+                progress.skipped_rows += source_fingerprint.row_count
+                continue
+
+            estimated_rows = max(source_fingerprint.row_count, target_fingerprint.row_count)
+            should_descend = (
+                estimated_rows > actual_limits.bisection_threshold
+                and depth < actual_limits.max_bisection_depth
+                and segment.estimated_rows > 1
+            )
+            if should_descend:
+                progress.recursed_segments += 1
+                children = _split_segment(segment, actual_limits.bisection_factor)
+                stack.extend((child, depth + 1) for child in reversed(children))
+                continue
+
+            progress.row_mode_segments += 1
+            yield from _row_level_diff(source, target, segment)
+
+    return CompareDiffStream(_generate(), progress)
+
+
 def recursive_hashdiff(
     source: CompareSegmentReader,
     target: CompareSegmentReader,
     root_segment: CompareSegment,
     limits: RunLimits | None = None,
 ) -> HashdiffResult:
-    """Compare two sorted PK ranges with recursive aggregate-hash prefiltering."""
+    """Compare two sorted PK ranges with recursive aggregate-hash prefiltering.
 
-    actual_limits = limits or RunLimits()
-    progress = _MutableProgress()
-    events: list[CompareDiffEvent] = []
+    全量物化版,保留给测试与有界调用方;生产路径走 recursive_hashdiff_stream。
+    """
 
-    if not actual_limits.recursive_checksum or root_segment.estimated_rows <= (
-        actual_limits.bisection_threshold
-    ):
-        events.extend(_row_level_diff(source, target, root_segment))
-        progress.row_mode_segments += 1
-        return HashdiffResult(events=events, progress=progress.freeze())
-
-    initial_segments = _split_segment(root_segment, actual_limits.bisection_factor)
-    stack: list[tuple[CompareSegment, int]] = [
-        (segment, 0) for segment in reversed(initial_segments)
-    ]
-
-    while stack:
-        segment, depth = stack.pop()
-        progress.max_depth_seen = max(progress.max_depth_seen, depth)
-        source_fingerprint = source.segment_fingerprint(segment)
-        target_fingerprint = target.segment_fingerprint(segment)
-        progress.scanned_segments += 1
-        if source_fingerprint == target_fingerprint:
-            progress.skipped_segments += 1
-            progress.skipped_rows += source_fingerprint.row_count
-            continue
-
-        estimated_rows = max(source_fingerprint.row_count, target_fingerprint.row_count)
-        should_descend = (
-            estimated_rows > actual_limits.bisection_threshold
-            and depth < actual_limits.max_bisection_depth
-            and segment.estimated_rows > 1
-        )
-        if should_descend:
-            progress.recursed_segments += 1
-            children = _split_segment(segment, actual_limits.bisection_factor)
-            stack.extend((child, depth + 1) for child in reversed(children))
-            continue
-
-        progress.row_mode_segments += 1
-        events.extend(_row_level_diff(source, target, segment))
-
-    return HashdiffResult(events=events, progress=progress.freeze())
+    return recursive_hashdiff_stream(source, target, root_segment, limits).materialize()
 
 
 def _split_segment(segment: CompareSegment, factor: int) -> list[CompareSegment]:
@@ -284,28 +345,25 @@ def _row_level_diff(
     source: CompareSegmentReader,
     target: CompareSegmentReader,
     segment: CompareSegment,
-) -> list[CompareDiffEvent]:
+) -> Iterator[CompareDiffEvent]:
+    # 单段内仍需两侧全量物化(段大小由 bisection_threshold 钳住),但段与段之间
+    # 不再累积 —— 事件逐条 yield 给调用方落盘。
     source_rows = _row_map(source.fetch_rows(segment))
     target_rows = _row_map(target.fetch_rows(segment))
-    events: list[CompareDiffEvent] = []
     for pk in sorted(source_rows.keys() | target_rows.keys()):
         source_row = source_rows.get(pk)
         target_row = target_rows.get(pk)
         if source_row is None and target_row is not None:
-            events.append(
-                CompareDiffEvent(
-                    bucket=CompareDiffBucket.ONLY_TARGET,
-                    pk=pk,
-                    target_values=target_row.raw_values or target_row.values,
-                )
+            yield CompareDiffEvent(
+                bucket=CompareDiffBucket.ONLY_TARGET,
+                pk=pk,
+                target_values=target_row.raw_values or target_row.values,
             )
         elif target_row is None and source_row is not None:
-            events.append(
-                CompareDiffEvent(
-                    bucket=CompareDiffBucket.ONLY_SOURCE,
-                    pk=pk,
-                    source_values=source_row.raw_values or source_row.values,
-                )
+            yield CompareDiffEvent(
+                bucket=CompareDiffBucket.ONLY_SOURCE,
+                pk=pk,
+                source_values=source_row.raw_values or source_row.values,
             )
         elif source_row is not None and target_row is not None:
             bucket = (
@@ -313,15 +371,12 @@ def _row_level_diff(
                 if _rows_equivalent(source_row, target_row)
                 else CompareDiffBucket.DIFF
             )
-            events.append(
-                CompareDiffEvent(
-                    bucket=bucket,
-                    pk=pk,
-                    source_values=source_row.raw_values or source_row.values,
-                    target_values=target_row.raw_values or target_row.values,
-                )
+            yield CompareDiffEvent(
+                bucket=bucket,
+                pk=pk,
+                source_values=source_row.raw_values or source_row.values,
+                target_values=target_row.raw_values or target_row.values,
             )
-    return events
 
 
 def _row_map(rows: Iterable[CompareRow]) -> dict[tuple[Any, ...], CompareRow]:
@@ -536,6 +591,7 @@ __all__ = [
     "CompareColumn",
     "CompareDiffBucket",
     "CompareDiffEvent",
+    "CompareDiffStream",
     "CompareHashExecutionMode",
     "CompareHashLevel",
     "CompareHashPlan",
@@ -551,7 +607,9 @@ __all__ = [
     "SegmentFingerprint",
     "compare_row_hash64",
     "compare_rows_without_prefilter",
+    "diff_stream_from_events",
     "normalized_compare_identity",
     "normalized_compare_payload",
     "recursive_hashdiff",
+    "recursive_hashdiff_stream",
 ]
