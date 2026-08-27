@@ -148,6 +148,11 @@ def configure_logging(level: str = "INFO") -> None:
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),
         structlog.dev.set_exc_info,
+        # exc_info 必须在脱敏之前渲染成字符串:否则 JSON 里只剩一个裸
+        # "exc_info": true,traceback 彻底丢失(现场排 TypeError 时只能
+        # 在另一个进程里重跑才拿到堆栈)。放在 redact 之前 = 堆栈文本同样
+        # 过 R5 脱敏,不会把 SQL / 行数据漏出去。
+        structlog.processors.format_exc_info,
         redact_processor,  # ★ R5,不可移除
         structlog.processors.JSONRenderer(),
     ]

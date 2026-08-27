@@ -21,6 +21,7 @@ from app.observability.logging import (
     SENSITIVE_KEY_FRAGMENTS,
     _is_sensitive_key,
     _redact_value,
+    configure_logging,
     redact_processor,
 )
 
@@ -248,3 +249,27 @@ def test_sensitive_fragments_set_contains_baseline() -> None:
     """守护性测试:确保关键敏感片段没被人误删。"""
     must_have = {"password", "secret", "token", "api_key", "mfa", "ciphertext"}
     assert must_have.issubset(SENSITIVE_KEY_FRAGMENTS)
+
+
+def test_exception_rendering_is_wired_before_redaction() -> None:
+    """exc_info 必须先渲染成字符串、再过脱敏,最后才 JSON。
+
+    回归:此前管道缺 format_exc_info,JSON 里只剩裸 "exc_info": true,
+    traceback 彻底丢失 —— 现场排一个 TypeError 只能另起进程重跑才拿到堆栈。
+    顺序还必须在 redact_processor 之前,否则堆栈文本不过 R5 脱敏,
+    可能把 SQL / 行数据漏出去。
+    """
+    try:
+        configure_logging("INFO")
+        names = [
+            getattr(proc, "__name__", type(proc).__name__)
+            for proc in structlog.get_config()["processors"]
+        ]
+
+        # structlog 现代版本里 format_exc_info 是 ExceptionRenderer 实例
+        renderers = [n for n in names if n in ("format_exc_info", "ExceptionRenderer")]
+        assert renderers, names
+        assert "redact_processor" in names, names
+        assert names.index(renderers[0]) < names.index("redact_processor"), names
+    finally:
+        structlog.reset_defaults()

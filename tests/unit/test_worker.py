@@ -1011,6 +1011,66 @@ def test_worker_non_compare_job_does_not_receive_query_timeout() -> None:
     assert seen == [None]
 
 
+def test_worker_compare_null_key_column_does_not_crash() -> None:
+    """主键列含 NULL 的对比要能正常跑完,而不是崩成 sql_failed。"""
+    job = _string_key_compare_job(run_id="run-null-key", run_limits={"max_rows": 100})
+    backend = _FakeBackend([job])
+    compare_catalog = _FakeCompareRunCatalog()
+    rows = [
+        Row(values=["a", "a", "one"]),
+        Row(values=[None, None, "two"]),
+        Row(values=["b", "b", "three"]),
+    ]
+    adapters = [_FakeAdapter(list(rows)), _FakeAdapter(list(rows))]
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size, **_: adapters.pop(0),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=compare_catalog,
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.failed == []
+    bucket_counts = compare_catalog.completed[0]["bucket_counts"]
+    assert isinstance(bucket_counts, dict)
+    assert bucket_counts["same"] == 3
+
+
+def test_worker_compare_duplicate_key_fails_with_dedicated_code() -> None:
+    """主键重复 -> failed + compare_duplicate_key,而不是给出折叠后的错误行数。"""
+    job = _string_key_compare_job(run_id="run-dup-key", run_limits={"max_rows": 100})
+    backend = _FakeBackend([job])
+    error_writer = _FakeErrorCodeWriter()
+    compare_catalog = _FakeCompareRunCatalog()
+    dup_rows = [
+        Row(values=["a", "a", "one"]),
+        Row(values=["a", "a", "two"]),
+        Row(values=["a", "a", "three"]),
+    ]
+    adapters = [_FakeAdapter(list(dup_rows)), _FakeAdapter(list(dup_rows))]
+
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        lambda conn_info, cancel_check, column_sink, fetch_chunk_size, **_: adapters.pop(0),
+        WorkerRunnerConfig(worker_id="worker-1"),
+        compare_run_catalog=compare_catalog,
+        job_error_code_writer=error_writer,
+    )
+
+    assert runner.run_once() is True
+
+    assert backend.completed == []
+    assert backend.failed == [("job-1", "duplicate_compare_key")]
+    assert error_writer.error_codes == [("job-1", JobErrorCode.COMPARE_DUPLICATE_KEY)]
+    assert compare_catalog.terminal == [{"run_id": "run-dup-key", "status": "failed"}]
+
+
 def test_worker_compare_counts_skipped_rows_into_same_bucket() -> None:
     """分段被整段跳过的行仍要计入 SAME 桶。
 
