@@ -4148,13 +4148,15 @@ def test_create_compare_export_enqueues_four_bucket_export_and_token() -> None:
     assert payload["job_id"]
     assert payload["download_token"]
     assert payload["format"] == "excel"
-    assert payload["filename"] == "run-1.xlsx"
+    # 文件名改为「任务名_时间戳_run短码.xlsx」;这里断言形状,不写死时间戳
+    assert payload["filename"].endswith("_run-1.xlsx")
+    assert payload["filename"].count("_") >= 2
     job = job_backend.enqueued[0]
     assert job.kind is JobKind.RESULT_EXPORT
     assert job.payload["compare_run_id"] == "run-1"
     assert job.payload["bucket_result_set_ids"] == bucket_spools
     assert job.payload["format"] == "excel"
-    assert job.payload["filename"] == "run-1.xlsx"
+    assert job.payload["filename"] == payload["filename"]
     assert any(audit["action"] == "compare_export" for audit in services.audits)
     assert "download_token" not in str(services.audits[-1])
 
@@ -4287,7 +4289,10 @@ def test_export_download_token_is_one_time() -> None:
 
     assert first.status_code == 200
     assert first.body == b"value\n1\n"
-    assert first.headers["content-disposition"] == 'attachment; filename="job-source.csv"'
+    # 响应头同时带 ASCII 回退与 RFC 5987 的 filename*(支持中文任务名)
+    disposition = first.headers["content-disposition"]
+    assert disposition.startswith('attachment; filename="job-source.csv"')
+    assert "filename*=UTF-8''job-source.csv" in disposition
     assert second.status_code == 410
     assert second.json()["error"] == "download_token_consumed"
 

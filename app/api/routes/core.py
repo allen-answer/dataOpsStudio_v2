@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -10,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from secrets import token_urlsafe
 from typing import Any, BinaryIO, Literal, cast
+from urllib.parse import quote
 
 import sqlglot
 import structlog
@@ -4023,7 +4025,14 @@ def create_compare_run_export(
     _enforce_export_rate_limit(services, user.id)
 
     export_job_id = new_id()
-    filename = _compare_export_filename(str(run_row["run_id"]))
+    task_name: str | None = None
+    task_id = _optional_str(run_row["task_id"]) if "task_id" in run_row else None
+    if task_id:
+        with services.engine.connect() as conn:
+            task_name = conn.execute(
+                select(compare_tasks.c.name).where(compare_tasks.c.id == task_id)
+            ).scalar_one_or_none()
+    filename = _compare_export_filename(run_row, task_name)
     content_type = export_content_type(body.format)
     download_token = token_urlsafe(32)
     token_hash = _download_token_hash(download_token)
@@ -6973,7 +6982,7 @@ def download_export(token: str, request: Request) -> StreamingResponse:
             raise ApiError(410, "download_token_consumed", "Download token has been used")
 
     filename = str(row["filename"])
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    headers = {"Content-Disposition": _content_disposition(filename)}
     return StreamingResponse(
         stream,
         media_type=str(row["content_type"]),
@@ -9998,8 +10007,65 @@ def _export_filename(source_job_id: str, export_format: ExportFormat) -> str:
     return f"{source_job_id}.{export_extension(export_format)}"
 
 
-def _compare_export_filename(run_id: str) -> str:
-    return f"{run_id}.xlsx"
+# 文件名词干上限。留足余量给时间戳 + run_id 短码 + 扩展名,避免 Windows MAX_PATH。
+_EXPORT_STEM_MAX_CHARS = 60
+# 控制字符(含 CR/LF —— 响应头注入)、路径分隔符、以及 Windows 文件名非法字符。
+_EXPORT_ILLEGAL_CHARS = re.compile(r'[\x00-\x1f\x7f<>:"/\\|?*]')
+_EXPORT_WHITESPACE = re.compile(r"\s+")
+# Windows 保留设备名:即便带扩展名也不可用作文件名。
+_WINDOWS_RESERVED_STEMS = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
+
+
+def _safe_export_stem(raw: str | None, *, fallback: str) -> str:
+    """把用户起的任务名收敛成可安全落盘、可安全进响应头的文件名词干。
+
+    任务名是用户自由输入,直接拼进文件名有两处风险:落盘时的路径穿越,以及
+    Content-Disposition 里的响应头注入(CR/LF、引号)。这里一次性收敛掉。
+    保留中文等非 ASCII —— 可读性正是本次改动的目的,响应头侧用 RFC 5987 承载。
+    """
+    text_value = (raw or "").strip()
+    text_value = _EXPORT_ILLEGAL_CHARS.sub("_", text_value)
+    text_value = _EXPORT_WHITESPACE.sub("_", text_value)
+    # 首尾的点/空格在 Windows 上非法;首点还会变成隐藏文件
+    text_value = text_value.strip("._ ")
+    text_value = text_value[:_EXPORT_STEM_MAX_CHARS].strip("._ ")
+    if not text_value or text_value.lower() in _WINDOWS_RESERVED_STEMS:
+        return fallback
+    return text_value
+
+
+def _content_disposition(filename: str) -> str:
+    """attachment 响应头。
+
+    同时给 ASCII 回退与 RFC 5987 的 filename*:老客户端取前者,现代浏览器取后者
+    从而拿到中文原名。ASCII 回退里的引号/反斜杠必须转义 —— 否则用户在任务名里
+    写个引号就能截断响应头。
+    """
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii")
+    ascii_name = _EXPORT_ILLEGAL_CHARS.sub("_", ascii_name).replace('"', "").replace("\\", "")
+    if not ascii_name.strip("._ "):
+        ascii_name = "export"
+    encoded = quote(filename, safe="")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
+
+
+def _compare_export_filename(run_row: RowMapping, task_name: str | None) -> str:
+    """对比导出文件名:任务名 + 时间戳 + run 短码。
+
+    此前是裸 run_id(``d26a65e4-...-04806f01b233.xlsx``),下载一堆之后完全
+    分不清谁是谁。时间戳让同一任务的多次导出可排序,run 短码保证不撞名且能
+    追回具体那次 run。
+    """
+    run_id = str(run_row["run_id"])
+    stem = _safe_export_stem(task_name, fallback="compare")
+    created = run_row["created_at"] if "created_at" in run_row else None
+    moment = created if isinstance(created, datetime) else datetime.now(UTC)
+    stamp = moment.strftime("%Y%m%d-%H%M%S")
+    return f"{stem}_{stamp}_{run_id[:8]}.xlsx"
 
 
 def _datasource_ids_from_row(row: RowMapping) -> list[str]:
