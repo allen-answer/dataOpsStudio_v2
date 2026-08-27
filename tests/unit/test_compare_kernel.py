@@ -6,12 +6,15 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+import pytest
+
 from app.dbclients.dm_compare import build_dm_compare_hash_plan
 from app.dbclients.mysql_compare import build_mysql_compare_hash_plan
 from app.domain.compare import (
     CompareColumn,
     CompareDiffBucket,
     CompareDiffEvent,
+    CompareDuplicateKeyError,
     CompareHashExecutionMode,
     CompareHashLevel,
     CompareHashRequest,
@@ -21,6 +24,7 @@ from app.domain.compare import (
     CompareTableRef,
     RunLimits,
     SegmentFingerprint,
+    compare_pk_sort_key,
     compare_row_hash64,
     compare_rows_without_prefilter,
     diff_stream_from_events,
@@ -28,6 +32,7 @@ from app.domain.compare import (
     normalized_compare_payload,
     recursive_hashdiff,
     recursive_hashdiff_stream,
+    sorted_compare_keys,
 )
 from app.domain.schema import ColumnType
 
@@ -326,6 +331,90 @@ def test_row_level_diff_does_not_use_hash_as_final_truth() -> None:
     )
 
     assert [(event.bucket, event.pk) for event in result.events] == [(CompareDiffBucket.DIFF, (1,))]
+
+
+def test_sorted_compare_keys_handles_null_in_key_columns() -> None:
+    """主键列含 NULL 时不得抛 TypeError。
+
+    回归一起真实事故:裸 sorted() 撞上 NULL 主键直接
+    ``TypeError: '<' not supported between 'NoneType' and 'str'``,
+    对比任务整个失败(现场 8020 行里 222 行主键列为空)。
+    """
+    keys = [("b", "x"), (None, "x"), ("a", None), (None, None)]
+
+    ordered = sorted_compare_keys(keys)
+
+    # NULL 排在同位非 NULL 之前,且结果是确定的全序
+    assert ordered == [(None, None), (None, "x"), ("a", None), ("b", "x")]
+    assert sorted_compare_keys(reversed(keys)) == ordered
+
+
+def test_sorted_compare_keys_keeps_numeric_order_and_mixes_types() -> None:
+    """整数主键仍按数值序(不是字符串序),且跨类型不炸。"""
+    assert sorted_compare_keys([(9,), (10,), (2,)]) == [(2,), (9,), (10,)]
+    # 一边 int 一边 str:分档保证不抛,顺序确定
+    mixed = sorted_compare_keys([("10",), (2,), (None,)])
+    assert mixed[0] == (None,)
+    assert len(mixed) == 3
+
+
+def test_compare_pk_sort_key_ranks_null_before_number_before_text() -> None:
+    assert compare_pk_sort_key((None,))[0][0] == 0
+    assert compare_pk_sort_key((7,))[0][0] == 1
+    assert compare_pk_sort_key(("7",))[0][0] == 2
+
+
+def test_row_level_diff_rejects_duplicate_keys() -> None:
+    """主键重复必须报错,不能静默折叠。
+
+    回归一起真实事故:32 行数据、主键只有 2 个唯一组合,对比结果报「2 条」,
+    30 行(93.8%)被字典覆盖丢弃 —— 一个看起来完全正常的错误答案。
+    """
+
+    class _RawReader:
+        """不去重的 reader —— _MemorySegmentReader 自己用字典存行,重复主键到不了被测代码。"""
+
+        def __init__(self, rows: list[CompareRow]) -> None:
+            self._rows = rows
+
+        def segment_fingerprint(self, segment: CompareSegment) -> SegmentFingerprint:
+            return SegmentFingerprint(
+                row_count=len(self._rows),
+                aggregate_hash=sum(r.row_hash64 or 0 for r in self._rows),
+            )
+
+        def fetch_rows(self, segment: CompareSegment) -> Iterable[CompareRow]:
+            return list(self._rows)
+
+    source = _RawReader(
+        [
+            CompareRow(pk=(1,), values=("a",), row_hash64=1),
+            CompareRow(pk=(1,), values=("b",), row_hash64=2),
+        ]
+    )
+    target = _RawReader([CompareRow(pk=(1,), values=("a",), row_hash64=1)])
+
+    with pytest.raises(CompareDuplicateKeyError) as excinfo:
+        recursive_hashdiff(
+            source,
+            target,
+            CompareSegment(key_column="id", start=1, end=2),
+            RunLimits(recursive_checksum=False),
+        )
+
+    assert excinfo.value.side == "source"
+    assert excinfo.value.duplicates == 1
+    # R5:异常信息只带计数与侧别,不得带主键值本身
+    assert "1" in str(excinfo.value)
+
+
+def test_duplicate_key_error_message_carries_no_key_values() -> None:
+    err = CompareDuplicateKeyError("target", 30, 32)
+
+    assert err.side == "target"
+    assert err.duplicates == 30
+    assert err.total == 32
+    assert "target" in str(err)
 
 
 def test_stream_does_not_fetch_every_segment_before_yielding_first_event() -> None:

@@ -50,6 +50,7 @@ from app.domain.compare import (
     CompareDiffBucket,
     CompareDiffEvent,
     CompareDiffStream,
+    CompareDuplicateKeyError,
     CompareHashLevel,
     CompareHashPlan,
     CompareHashRequest,
@@ -63,6 +64,7 @@ from app.domain.compare import (
     diff_stream_from_events,
     normalized_compare_identity,
     recursive_hashdiff_stream,
+    sorted_compare_keys,
 )
 from app.domain.compare_profile import (
     DEFAULT_SAMPLE_CONFIDENCE,
@@ -3738,14 +3740,31 @@ def _finish_diff_profile(
         return empty_diff_profile(reason=type(exc).__name__, sample_result=sample_result)
 
 
+def _index_rows_by_pk(
+    rows: list[CompareRow],
+    *,
+    side: str,
+) -> dict[tuple[Any, ...], CompareRow]:
+    """按主键建索引;主键不唯一即报错,不静默折叠(与 domain._row_map 同语义)。"""
+    out: dict[tuple[Any, ...], CompareRow] = {}
+    duplicates = 0
+    for row in rows:
+        if row.pk in out:
+            duplicates += 1
+        out[row.pk] = row
+    if duplicates:
+        raise CompareDuplicateKeyError(side, duplicates, len(rows))
+    return out
+
+
 def _diff_all_rows(
     source_rows: list[CompareRow],
     target_rows: list[CompareRow],
 ) -> CompareDiffStream:
     def _generate() -> Iterator[CompareDiffEvent]:
-        source_by_pk = {row.pk: row for row in source_rows}
-        target_by_pk = {row.pk: row for row in target_rows}
-        for pk in sorted(source_by_pk.keys() | target_by_pk.keys()):
+        source_by_pk = _index_rows_by_pk(source_rows, side="source")
+        target_by_pk = _index_rows_by_pk(target_rows, side="target")
+        for pk in sorted_compare_keys(source_by_pk.keys() | target_by_pk.keys()):
             source = source_by_pk.get(pk)
             target = target_by_pk.get(pk)
             if source is None and target is not None:
@@ -3866,15 +3885,27 @@ def _diff_materialized_rows(
 
     def _generate() -> Iterator[CompareDiffEvent]:
         source_by_key: dict[tuple[tuple[bool, str], ...], CompareRow] = {}
+        source_dups = 0
         for index, row in enumerate(source_rows):
             if cancel_check is not None and index % 1000 == 0:
                 cancel_check()
-            source_by_key[_match_key(row)] = row
+            match = _match_key(row)
+            if match in source_by_key:
+                source_dups += 1
+            source_by_key[match] = row
+        if source_dups:
+            raise CompareDuplicateKeyError("source", source_dups, len(source_rows))
         target_by_key: dict[tuple[tuple[bool, str], ...], CompareRow] = {}
+        target_dups = 0
         for index, row in enumerate(target_rows):
             if cancel_check is not None and index % 1000 == 0:
                 cancel_check()
-            target_by_key[_match_key(row)] = row
+            match = _match_key(row)
+            if match in target_by_key:
+                target_dups += 1
+            target_by_key[match] = row
+        if target_dups:
+            raise CompareDuplicateKeyError("target", target_dups, len(target_rows))
         for index, key in enumerate(sorted(source_by_key.keys() | target_by_key.keys())):
             if cancel_check is not None and index % 1000 == 0:
                 cancel_check()
@@ -4133,6 +4164,8 @@ def _public_error_message(exc: Exception, kind: JobKind) -> str:
         return "compare_limit_exceeded"
     if isinstance(exc, CompareSampleUnsupportedKeyError):
         return "single_integer_pk_required"
+    if isinstance(exc, CompareDuplicateKeyError):
+        return "duplicate_compare_key"
     if isinstance(exc, UnsupportedJobKindError):
         return "internal"
     if isinstance(exc, WorkflowRunFailedError):
@@ -4159,6 +4192,8 @@ def _job_error_code(exc: Exception, kind: JobKind) -> JobErrorCode:
         return JobErrorCode.COMPARE_LIMIT_EXCEEDED
     if isinstance(exc, CompareSampleUnsupportedKeyError):
         return JobErrorCode.COMPARE_SAMPLE_UNSUPPORTED_KEY
+    if isinstance(exc, CompareDuplicateKeyError):
+        return JobErrorCode.COMPARE_DUPLICATE_KEY
     if _is_timeout_error(exc):
         return JobErrorCode.TIMEOUT
     if _is_cancel_error(exc):
