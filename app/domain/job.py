@@ -63,6 +63,8 @@ class JobErrorCode(StrEnum):
     COMPARE_LIMIT_EXCEEDED = "compare_limit_exceeded"
     # 抽样快检要求单一整数主键;联合/非整数主键直接 failed,不再返回空结果假成功
     COMPARE_SAMPLE_UNSUPPORTED_KEY = "compare_sample_unsupported_key"
+    # 主键在数据中不唯一;重复行会被静默折叠丢弃,故直接 failed
+    COMPARE_DUPLICATE_KEY = "compare_duplicate_key"
     INTERNAL = "internal"
 
 

@@ -348,9 +348,9 @@ def _row_level_diff(
 ) -> Iterator[CompareDiffEvent]:
     # 单段内仍需两侧全量物化(段大小由 bisection_threshold 钳住),但段与段之间
     # 不再累积 —— 事件逐条 yield 给调用方落盘。
-    source_rows = _row_map(source.fetch_rows(segment))
-    target_rows = _row_map(target.fetch_rows(segment))
-    for pk in sorted(source_rows.keys() | target_rows.keys()):
+    source_rows = _row_map(source.fetch_rows(segment), side="source")
+    target_rows = _row_map(target.fetch_rows(segment), side="target")
+    for pk in sorted_compare_keys(source_rows.keys() | target_rows.keys()):
         source_row = source_rows.get(pk)
         target_row = target_rows.get(pk)
         if source_row is None and target_row is not None:
@@ -379,8 +379,67 @@ def _row_level_diff(
             )
 
 
-def _row_map(rows: Iterable[CompareRow]) -> dict[tuple[Any, ...], CompareRow]:
-    return {row.pk: row for row in rows}
+class CompareDuplicateKeyError(RuntimeError):
+    """主键在数据中不唯一。
+
+    对比按主键建字典对齐两侧,重复主键会被后来的行覆盖 —— 静默丢数据,
+    而且结果里的行数看起来完全正常(现场遇到过 32 行只报 2 条)。
+    宁可明确失败,也不能给出一个看似正常的错误答案。
+
+    ★ R5:异常信息只带计数与侧别,绝不带主键值本身(业务数据)。
+    """
+
+    def __init__(self, side: str, duplicates: int, total: int) -> None:
+        super().__init__(f"duplicate compare key on {side}: {duplicates}/{total} rows")
+        self.side = side
+        self.duplicates = duplicates
+        self.total = total
+
+
+def compare_pk_sort_key(pk: Sequence[Any]) -> tuple[tuple[int, float, str], ...]:
+    """主键排序键:NULL 安全 + 跨类型总序。
+
+    裸 sorted() 在主键列含 NULL 时直接抛
+    ``TypeError: '<' not supported between 'NoneType' and 'str'``。数仓维度/代码列
+    有 NULL 极常见(现场 8020 行里 222 行主键列为空),对比不该因此崩掉。
+    两侧类型不一致(一边 int 一边 str)同理。
+
+    分档 NULL < 数值 < 其它:数值按数值序(保住整数主键的自然顺序),其余按
+    字符串序;同档内再用字符串形式兜底,保证是确定的全序而非偶然相等。
+    """
+    key: list[tuple[int, float, str]] = []
+    for value in pk:
+        if value is None:
+            key.append((0, 0.0, ""))
+        elif isinstance(value, (int, float, Decimal)):
+            try:
+                key.append((1, float(value), str(value)))
+            except (OverflowError, ValueError):
+                # 超出 float 表示范围的 Decimal:退到字符串序,仍是确定的
+                key.append((2, 0.0, str(value)))
+        else:
+            key.append((2, 0.0, str(value)))
+    return tuple(key)
+
+
+def sorted_compare_keys(keys: Iterable[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
+    """按 compare_pk_sort_key 排序主键集合。"""
+    return sorted(keys, key=compare_pk_sort_key)
+
+
+def _row_map(rows: Iterable[CompareRow], *, side: str) -> dict[tuple[Any, ...], CompareRow]:
+    """按主键建行字典;主键不唯一即报错,不静默折叠。"""
+    out: dict[tuple[Any, ...], CompareRow] = {}
+    total = 0
+    duplicates = 0
+    for row in rows:
+        total += 1
+        if row.pk in out:
+            duplicates += 1
+        out[row.pk] = row
+    if duplicates:
+        raise CompareDuplicateKeyError(side, duplicates, total)
+    return out
 
 
 def _rows_equivalent(source: CompareRow, target: CompareRow) -> bool:
@@ -592,6 +651,7 @@ __all__ = [
     "CompareDiffBucket",
     "CompareDiffEvent",
     "CompareDiffStream",
+    "CompareDuplicateKeyError",
     "CompareHashExecutionMode",
     "CompareHashLevel",
     "CompareHashPlan",
@@ -605,6 +665,7 @@ __all__ = [
     "HashdiffResult",
     "RunLimits",
     "SegmentFingerprint",
+    "compare_pk_sort_key",
     "compare_row_hash64",
     "compare_rows_without_prefilter",
     "diff_stream_from_events",
@@ -612,4 +673,5 @@ __all__ = [
     "normalized_compare_payload",
     "recursive_hashdiff",
     "recursive_hashdiff_stream",
+    "sorted_compare_keys",
 ]
