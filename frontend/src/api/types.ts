@@ -38,10 +38,10 @@ export interface OperationPolicy {
   allow_record_task: boolean
 }
 
-/** 后端默认值(app/domain/datasource.py):仅 allow_select 开。 */
+/** 后端默认值(app/domain/datasource.py):allow_select + allow_explain 开。 */
 export const DEFAULT_OPERATION_POLICY: OperationPolicy = {
   allow_select: true,
-  allow_explain: false,
+  allow_explain: true,
   allow_dm_explain: false,
   allow_oracle_plan_table: false,
   allow_schema_import: false,

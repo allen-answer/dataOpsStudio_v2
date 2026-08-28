@@ -325,8 +325,12 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 1.75rem;
-  height: 1.75rem;
+  /* ★ 固定 width/height 会把"图标 + 中文"按钮压成一字一行的竖排(28px 宽装不下
+     两个汉字)。改 min-*:纯图标按钮仍是 28×28,带文字的按钮按内容横向撑开。 */
+  gap: 0.25rem;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
+  white-space: nowrap;
   color: rgb(var(--text-muted));
   background-color: transparent;
   border-radius: var(--radius-input);

@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.domain.ai import EgressLevel
 from app.domain.compare_infer import (
     ColumnMappingCandidate,
     PrimaryKeyCandidate,
@@ -555,6 +556,102 @@ class CompareDiffSqlResponse(BaseModel):
     cap: int
     source: CompareDiffSqlSide
     target: CompareDiffSqlSide
+
+
+class CompareUpstreamEdge(BaseModel):
+    """反推链上用到的一条列级血缘边(前端逐边明细 / "去审核"入口用)。"""
+
+    edge_id: str
+    run_id: str
+    source_table: str
+    source_column: str
+    target_table: str
+    target_column: str
+    transformation_subtype: str
+    inference_status: str
+    confidence: float
+
+
+class CompareUpstreamHop(BaseModel):
+    """某一跳某张上游表的反推结果。
+
+    ``available=False`` 时 ``sql`` 为空,``reason`` 说明为什么断在这
+    (``non_invertible_transformation`` / ``unconfirmed_inferred_edge`` /
+    ``rejected_edge`` / ``unsupported_identifier``)。
+    """
+
+    depth: int
+    table: str
+    available: bool
+    sql: str | None = None
+    reason: str | None = None
+    blocked_by: str | None = None
+    key_columns: list[str] = Field(default_factory=list)
+    missing_key_columns: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    # 风险点码(前端按码取文案并要求用户勾选确认;<100% 必非空)
+    risks: list[str] = Field(default_factory=list)
+    confidence: float
+    edges: list[CompareUpstreamEdge] = Field(default_factory=list)
+
+
+class CompareTraceSqlResponse(BaseModel):
+    """定位 SQL 血缘反推:沿列级血缘上游逐跳生成上游表定位 SQL(仅文本,不执行)。
+
+    ``lineage_run_id`` 是**溯源出处**(哪条解析记录把对比表认成写入目标);逐跳行走用的
+    是项目内当前生效的血缘图。``dialect_assumed`` 提示:整条链按被追溯侧数据源方言渲染,
+    上游表若物理在别的库,引用风格需自行调整(血缘边不携带 datasource,不硬猜)。
+    """
+
+    run_id: str
+    bucket: CompareBucket
+    focus_table: str | None = None
+    key_columns: list[str]
+    pk_count: int
+    truncated: bool
+    cap: int
+    lineage_run_id: str | None = None
+    lineage_source_ref: str | None = None
+    lineage_matched_by: str | None = None
+    include_inferred: bool = False
+    dialect: str | None = None
+    dialect_assumed: bool = True
+    available: bool
+    reason: str | None = None
+    hops: list[CompareUpstreamHop] = Field(default_factory=list)
+
+
+class CompareTraceSqlAiRequest(BaseModel):
+    """AI 组装某个断链跳的上游定位 SQL(受约束单轮管道)。"""
+
+    bucket: CompareBucket = "diff"
+    # 断链跳的上游表名(来自 trace-sql 响应里 available=false 的那一跳)
+    upstream_table: str = Field(min_length=1)
+    lineage_run_id: str | None = None
+    include_inferred: bool = True
+    max_depth: int = Field(default=3, ge=1, le=5)
+
+
+class CompareTraceSqlAiResponse(BaseModel):
+    """AI 产出永远单独标记,不与确定性结果混排(设计稿 §4.5 信任边界)。
+
+    ``ok=false`` 时 ``sql`` 恒为空 —— 校验不过 / 超预算 / 出网被拦一律不给半成品。
+    """
+
+    run_id: str
+    upstream_table: str
+    ok: bool
+    error: str | None = None
+    sql: str | None = None
+    explanation: str | None = None
+    confidence: float | None = None
+    risks: list[str] = Field(default_factory=list)
+    # 逐步过程(前端"执行过程"展示):本地步骤与出网步骤如实区分
+    steps: list[str] = Field(default_factory=list)
+    provider: str | None = None
+    model: str | None = None
+    egress_level: int = int(EgressLevel.L3)
+    context_truncated: bool = False
 
 
 class ComparePkPrecheckRequest(BaseModel):
