@@ -50,7 +50,8 @@ class OperationPolicy(BaseModel):
     """
 
     allow_select: bool = True
-    allow_explain: bool = False
+    # EXPLAIN 与 SELECT 同为只读操作、同风险级,默认放开(0031)
+    allow_explain: bool = True
     allow_dm_explain: bool = False
     allow_oracle_plan_table: bool = False
     allow_schema_import: bool = False

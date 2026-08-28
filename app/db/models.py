@@ -213,7 +213,7 @@ datasources = Table(
         server_default=text(
             """'{
             "allow_select": true,
-            "allow_explain": false,
+            "allow_explain": true,
             "allow_dm_explain": false,
             "allow_oracle_plan_table": false,
             "allow_schema_import": false,
