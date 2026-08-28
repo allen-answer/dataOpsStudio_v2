@@ -1464,3 +1464,141 @@ test('Escape closes the expanded SQL editor', async ({ page }) => {
   ).toContainText('ESC_EXPANDED')
   expectNoConsoleErrors()
 })
+
+test('lineage trace section reverses the diff pk onto the upstream table with a risk gate', async ({
+  page,
+}) => {
+  await mockBase(page)
+  const bucketCounts = { only_source: 0, only_target: 0, diff: 1, same: 0 }
+  const progress = {}
+  const diffProfile = { generated: false, columns: {} }
+  await page.route('**/api/compare/tasks/task-1/run', (r) =>
+    json(r, 202, { job_id: 'job-1', run_id: 'run-1' }),
+  )
+  await page.route('**/api/jobs/job-1', (r) =>
+    json(r, 200, {
+      id: 'job-1',
+      kind: 'compare_run',
+      status: 'success',
+      created_at: now,
+      finished_at: now,
+      error: null,
+      error_code: null,
+      message: null,
+      result_set_id: null,
+    }),
+  )
+  const resultPayload = {
+    job_id: 'job-1',
+    run_id: 'run-1',
+    bucket_counts: bucketCounts,
+    progress,
+    diff_profile: diffProfile,
+    sample_result: null,
+  }
+  await page.route(/\/api\/compare\/runs\/run-1\/results/, (r) =>
+    json(r, 200, {
+      ...resultPayload,
+      bucket: 'diff',
+      offset: 0,
+      limit: 100,
+      rows: [
+        {
+          pk: { id: 3 },
+          source: { id: 3, amount: '10.00' },
+          target: { id: 3, amount: '11.00' },
+          cells: [{ column: 'amount', source: '10.00', target: '11.00' }],
+        },
+      ],
+    }),
+  )
+  await page.route(/\/api\/compare\/runs\/run-1\/profile/, (r) => json(r, 200, resultPayload))
+  await page.route(/\/api\/compare\/runs\/run-1\/diff-sql/, (r) =>
+    json(r, 200, {
+      run_id: 'run-1',
+      bucket: 'diff',
+      key_columns: ['id'],
+      pk_count: 1,
+      truncated: false,
+      cap: 500,
+      source: { available: true, sql: 'SELECT * FROM app.orders WHERE id IN (3)', reason: null },
+      target: { available: true, sql: 'SELECT 1', reason: null },
+    }),
+  )
+
+  const upstreamSql =
+    '-- 血缘溯源 · run 0c3f42aa · hop1 · dwd.orders_clean\nSELECT * FROM `dwd`.`orders_clean` WHERE `order_id` IN (3)'
+  let traceCalls = 0
+  await page.route(/\/api\/compare\/runs\/run-1\/trace-sql/, (r) => {
+    traceCalls += 1
+    return json(r, 200, {
+      run_id: 'run-1',
+      bucket: 'diff',
+      focus_table: 'ads.orders_agg',
+      key_columns: ['id'],
+      pk_count: 1,
+      truncated: false,
+      cap: 500,
+      lineage_run_id: '0c3f42aa-9a1b-4d21-8c66-1f2e3d4a5b6c',
+      lineage_source_ref: 'etl/orders_daily.sql',
+      lineage_matched_by: 'target_table',
+      include_inferred: false,
+      dialect: 'mysql',
+      dialect_assumed: true,
+      available: true,
+      reason: null,
+      hops: [
+        {
+          depth: 1,
+          table: 'dwd.orders_clean',
+          available: true,
+          sql: upstreamSql,
+          reason: null,
+          blocked_by: null,
+          key_columns: ['order_id'],
+          missing_key_columns: [],
+          warnings: ['cast_value_mismatch_risk'],
+          risks: ['cast_value_mismatch_risk', 'pk_name_stability_assumed'],
+          confidence: 0.9,
+          edges: [],
+        },
+        {
+          depth: 2,
+          table: 'ods.orders_raw',
+          available: false,
+          sql: null,
+          reason: 'non_invertible_transformation',
+          blocked_by: 'EXPRESSION',
+          key_columns: [],
+          missing_key_columns: ['id'],
+          warnings: [],
+          risks: [],
+          confidence: 1,
+          edges: [],
+        },
+      ],
+    })
+  })
+
+  await page.goto('/projects/project-1/compare')
+  await page.getByRole('button', { name: 'Start compare' }).click()
+  await page.getByRole('button', { name: 'Locate rows SQL' }).click()
+  await page.getByTestId('compare-trace-sql-load').click()
+
+  const trace = page.getByTestId('compare-trace-sql')
+  await expect(trace.getByText('Auto-matched lineage record 0c3f42aa')).toBeVisible()
+  await expect(trace.getByText('Hop 1 · dwd.orders_clean')).toBeVisible()
+  await expect(trace.getByText('Confidence 90%')).toBeVisible()
+  await expect(trace.getByText(upstreamSql.split('\n')[1])).toBeVisible()
+  // 断链跳如实说明为什么到此为止,不伪造 SQL
+  await expect(trace.getByText(/non-invertible transformation \(EXPRESSION\)/)).toBeVisible()
+
+  // 风险确认门:勾选前复制 / 在 SQL 打开都是禁用的
+  const copyButton = trace.getByRole('button', { name: 'Copy' })
+  await expect(copyButton).toBeDisabled()
+  await trace.getByText('I understand the risks above').click()
+  await expect(copyButton).toBeEnabled()
+
+  expect(traceCalls).toBe(1)
+  expectNoConsoleErrors()
+})

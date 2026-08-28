@@ -24,6 +24,7 @@ import {
   Download,
   Eye,
   FileCode2,
+  GitBranch,
   GitCompareArrows,
   History,
   ListPlus,
@@ -51,6 +52,7 @@ import {
   draftCompareTask,
   explainCompareRun,
   getCompareRunDiffSql,
+  getCompareRunTraceSql,
   getCompareRunProfile,
   getCompareRunResults,
   getCompareRunsDashboard,
@@ -71,6 +73,8 @@ import {
   type CompareCellDiff,
   type CompareDataRef,
   type CompareDiffSqlResponse,
+  type CompareTraceSqlResponse,
+  type CompareUpstreamHop,
   type CompareFileFormat,
   type CompareFilePreviewResponse,
   type CompareInferResponse,
@@ -1925,6 +1929,91 @@ async function openDiffSql(): Promise<void> {
 
 function closeDiffSql(): void {
   diffSqlOpen.value = false
+  traceSqlData.value = null
+  traceSqlError.value = null
+  traceAcked.value = {}
+}
+
+// ── 血缘溯源:反推上游源表定位 SQL ────────────────────────────────────
+// 本表两侧 SQL(上方)零改动;这里是新增区,AI 未启用也完整可用(纯确定性反推)。
+const traceSqlLoading = ref(false)
+const traceSqlError = ref<string | null>(null)
+const traceSqlData = ref<CompareTraceSqlResponse | null>(null)
+const traceIncludeInferred = ref(false)
+const traceCopied = ref<string | null>(null)
+/** 每跳的风险确认状态:有风险点的跳必须勾选后才放开复制 / 在 SQL 打开。 */
+const traceAcked = ref<Record<string, boolean>>({})
+
+function hopKey(hop: CompareUpstreamHop): string {
+  return `${hop.depth}:${hop.table}`
+}
+
+function hopUnlocked(hop: CompareUpstreamHop): boolean {
+  return hop.risks.length === 0 || traceAcked.value[hopKey(hop)] === true
+}
+
+function hopConfidencePercent(hop: CompareUpstreamHop): number {
+  return Math.round(hop.confidence * 100)
+}
+
+/** 风险点码 -> 文案;partial_key 带列名参数(`partial_key:a,b`)。 */
+function traceRiskText(risk: string): string {
+  if (risk.startsWith('partial_key:')) {
+    return t('compare.trace_sql_risk_partial_key', { columns: risk.slice('partial_key:'.length) })
+  }
+  return t(`compare.trace_sql_risk_${risk}`)
+}
+
+function traceHopReasonText(hop: CompareUpstreamHop): string {
+  return t(`compare.trace_sql_reason_${hop.reason ?? 'no_upstream_lineage'}`, {
+    subtype: hop.blocked_by ?? '',
+  })
+}
+
+async function loadTraceSql(): Promise<void> {
+  if (!run.runId) return
+  traceSqlLoading.value = true
+  traceSqlError.value = null
+  traceAcked.value = {}
+  try {
+    traceSqlData.value = await getCompareRunTraceSql(run.runId, resultBucket.value, {
+      includeInferred: traceIncludeInferred.value,
+    })
+  } catch (e) {
+    traceSqlError.value = errorMessage(e)
+  } finally {
+    traceSqlLoading.value = false
+  }
+}
+
+async function copyTraceSql(hop: CompareUpstreamHop): Promise<void> {
+  if (!hop.sql || !hopUnlocked(hop)) return
+  try {
+    await navigator.clipboard.writeText(hop.sql)
+    traceCopied.value = hopKey(hop)
+    window.setTimeout(() => {
+      if (traceCopied.value === hopKey(hop)) traceCopied.value = null
+    }, 1500)
+  } catch {
+    traceSqlError.value = t('compare.diff_sql_copy_failed')
+  }
+}
+
+async function openTraceSqlInWorkspace(hop: CompareUpstreamHop): Promise<void> {
+  const datasourceId = activeTask.value?.source_id
+  if (!hop.sql || !hopUnlocked(hop) || !datasourceId) return
+  try {
+    const token = createWorkspaceHandoff({
+      kind: 'compare_to_sql',
+      projectId: projectId.value,
+      datasourceId,
+      sql: hop.sql,
+      consoleName: `trace_hop${hop.depth}_${hop.table}.sql`,
+    })
+    await router.push({ name: 'sql', params: { id: projectId.value }, query: { handoff: token } })
+  } catch (error) {
+    traceSqlError.value = errorMessage(error)
+  }
 }
 
 async function copyDiffSql(side: 'source' | 'target'): Promise<void> {
@@ -3915,6 +4004,155 @@ const missingTarget = computed(
               <div v-else class="text-[11px] chrome-text-muted rounded-card border chrome-border-subtle p-2">
                 {{ t(`compare.diff_sql_reason_${diffSqlData[side].reason ?? 'unavailable'}`) }}
               </div>
+            </div>
+
+            <!-- ── 血缘溯源:反推上游源表定位 SQL ──────────────────── -->
+            <div class="pt-2 border-t chrome-border-subtle space-y-2" data-testid="compare-trace-sql">
+              <div class="flex items-center gap-2">
+                <GitBranch class="w-3.5 h-3.5 chrome-accent" />
+                <span class="text-xs font-medium chrome-text-heading">
+                  {{ t('compare.trace_sql_section') }}
+                </span>
+                <span class="text-[10px] px-1 rounded chrome-accent-light-bg chrome-accent">
+                  {{ t('compare.trace_sql_new') }}
+                </span>
+                <div class="flex-1" />
+                <label class="flex items-center gap-1 text-[11px] chrome-text-muted">
+                  <input v-model="traceIncludeInferred" type="checkbox" @change="loadTraceSql" />
+                  {{ t('compare.trace_sql_include_inferred') }}
+                </label>
+                <button
+                  type="button"
+                  class="chrome-btn-secondary text-[11px]"
+                  data-testid="compare-trace-sql-load"
+                  :disabled="traceSqlLoading"
+                  @click="loadTraceSql"
+                >
+                  {{ t('compare.trace_sql_load') }}
+                </button>
+              </div>
+
+              <div v-if="traceSqlLoading" class="chrome-text-muted text-xs"><LoadingDots /></div>
+              <p v-else-if="traceSqlError" class="text-[11px] text-red-600 dark:text-red-400">
+                {{ traceSqlError }}
+              </p>
+              <template v-else-if="traceSqlData">
+                <p v-if="traceSqlData.lineage_run_id" class="text-[11px] chrome-text-muted">
+                  {{
+                    t(
+                      traceSqlData.lineage_matched_by === 'manual'
+                        ? 'compare.trace_sql_matched_manual'
+                        : 'compare.trace_sql_matched',
+                      { id: traceSqlData.lineage_run_id.slice(0, 8) },
+                    )
+                  }}
+                  · {{ traceSqlData.lineage_source_ref }}
+                  <span v-if="traceSqlData.focus_table">
+                    ·
+                    {{
+                      t('compare.trace_sql_matched_hint', { table: traceSqlData.focus_table })
+                    }}
+                  </span>
+                </p>
+                <p
+                  v-if="!traceSqlData.available && traceSqlData.reason"
+                  class="text-[11px] chrome-text-muted rounded-card border chrome-border-subtle p-2"
+                >
+                  {{
+                    t(`compare.trace_sql_reason_${traceSqlData.reason}`, {
+                      table: traceSqlData.focus_table ?? '',
+                    })
+                  }}
+                </p>
+
+                <div v-for="hop in traceSqlData.hops" :key="hopKey(hop)" class="space-y-1">
+                  <div class="flex items-center gap-2">
+                    <span class="text-[11px] font-medium chrome-text-heading">
+                      {{ t('compare.trace_sql_hop', { depth: hop.depth, table: hop.table }) }}
+                    </span>
+                    <span
+                      v-if="hop.available"
+                      class="text-[10px] px-1 rounded chrome-accent-light-bg chrome-accent"
+                    >
+                      {{ t('compare.trace_sql_confidence', { percent: hopConfidencePercent(hop) }) }}
+                    </span>
+                    <div class="flex-1" />
+                    <button
+                      v-if="hop.available"
+                      type="button"
+                      class="chrome-btn-ghost text-[11px]"
+                      :disabled="!hopUnlocked(hop)"
+                      @click="openTraceSqlInWorkspace(hop)"
+                    >
+                      <ArrowRight class="w-3.5 h-3.5" />
+                      {{ t('compare.diff_sql_open_workspace') }}
+                    </button>
+                    <button
+                      v-if="hop.available"
+                      type="button"
+                      class="chrome-btn-ghost text-[11px]"
+                      :disabled="!hopUnlocked(hop)"
+                      @click="copyTraceSql(hop)"
+                    >
+                      <Copy class="w-3.5 h-3.5" />
+                      {{
+                        traceCopied === hopKey(hop)
+                          ? t('compare.diff_sql_copied')
+                          : t('compare.diff_sql_copy')
+                      }}
+                    </button>
+                  </div>
+
+                  <pre
+                    v-if="hop.available"
+                    class="text-[11px] font-mono whitespace-pre-wrap break-all rounded-card border chrome-border chrome-bg-elevated p-2 chrome-text-heading"
+                  >{{ hop.sql }}</pre>
+                  <div
+                    v-else
+                    class="text-[11px] chrome-text-muted rounded-card border chrome-border-subtle p-2"
+                  >
+                    {{ traceHopReasonText(hop) }}
+                  </div>
+
+                  <div
+                    v-if="hop.available && hop.risks.length > 0"
+                    class="rounded-card border border-amber-300 dark:border-amber-500/40 bg-amber-50 dark:bg-amber-500/10 p-2 space-y-1"
+                  >
+                    <p class="text-[11px] font-medium text-amber-800 dark:text-amber-200">
+                      {{ t('compare.trace_sql_risks', { count: hop.risks.length }) }}
+                    </p>
+                    <p
+                      v-for="risk in hop.risks"
+                      :key="risk"
+                      class="text-[11px] text-amber-800 dark:text-amber-200"
+                    >
+                      · {{ traceRiskText(risk) }}
+                    </p>
+                    <label
+                      class="flex items-center gap-1.5 text-[11px] text-amber-800 dark:text-amber-200"
+                    >
+                      <input
+                        type="checkbox"
+                        :checked="traceAcked[hopKey(hop)] === true"
+                        @change="traceAcked[hopKey(hop)] = ($event.target as HTMLInputElement).checked"
+                      />
+                      {{ t('compare.trace_sql_ack') }}
+                    </label>
+                    <p class="text-[10px] text-amber-700 dark:text-amber-300">
+                      {{ t('compare.trace_sql_ack_hint') }}
+                    </p>
+                  </div>
+                </div>
+
+                <p
+                  v-if="traceSqlData.available && traceSqlData.dialect"
+                  class="text-[10px] chrome-text-muted"
+                >
+                  {{
+                    t('compare.trace_sql_dialect_assumed', { dialect: traceSqlData.dialect })
+                  }}
+                </p>
+              </template>
             </div>
           </template>
         </div>

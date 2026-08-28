@@ -78,6 +78,9 @@ from app.api.schemas import (
     CompareTaskRunsResponse,
     CompareTaskSuggestionResponse,
     CompareTaskUpdateRequest,
+    CompareTraceSqlResponse,
+    CompareUpstreamEdge,
+    CompareUpstreamHop,
     DatasourceCreateRequest,
     DatasourceDeleteBlockedResponse,
     DatasourceListItem,
@@ -254,6 +257,16 @@ from app.domain.compare_sql import (
     inspect_compare_sql,
     legacy_generated_aliases,
     normalize_compare_sql,
+)
+from app.domain.compare_upstream_sql import (
+    MAX_UPSTREAM_DEPTH,
+    UpstreamEdge,
+    UpstreamHop,
+    build_upstream_hops,
+    dedupe_pk_rows,
+    hop_risks,
+    render_upstream_sql,
+    upstream_header_comment,
 )
 from app.domain.console_session import ConsoleStatementState
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
@@ -4038,6 +4051,316 @@ def get_compare_run_diff_sql(
         cap=_DIFF_SQL_PK_CAP,
         source=_compare_diff_sql_side(source_db_type, source_ref, key_columns, pk_values),
         target=_compare_diff_sql_side(target_db_type, target_ref, target_columns, pk_values),
+    )
+
+
+def _compare_focus_table(ref: dict[str, object]) -> str | None:
+    """对比一侧的物理表名(schema.table);sql / file / 快照源没有可锚定的表名。"""
+    if str(ref.get("kind") or "table") != "table":
+        return None
+    table = _optional_str(ref.get("table_name"))
+    if not table:
+        return None
+    schema_name = _optional_str(ref.get("schema_name"))
+    return f"{schema_name}.{table}" if schema_name else table
+
+
+def _lineage_run_for_focus_table(
+    conn: Connection, *, project_id: str, focus_table: str
+) -> RowMapping | None:
+    """按"对比表是该记录的写入目标"自动匹配最新生效血缘记录(设计稿 D2)。
+
+    表名大小写按各库书写习惯不一(DM/Oracle 常大写),故精确匹配未命中时回退到
+    大小写不敏感匹配 —— 不做更强的归一化,那会牵动整个血缘域的存储口径。
+    """
+    for predicate in (
+        lineage_edges.c.target_table == focus_table,
+        func.lower(lineage_edges.c.target_table) == focus_table.lower(),
+    ):
+        row = (
+            conn.execute(
+                select(lineage_runs)
+                .select_from(
+                    lineage_runs.join(lineage_edges, lineage_edges.c.run_id == lineage_runs.c.id)
+                )
+                .where(
+                    and_(
+                        lineage_runs.c.project_id == project_id,
+                        lineage_runs.c.superseded_at.is_(None),
+                        lineage_runs.c.status == "success",
+                        lineage_edges.c.inference_status != "rejected",
+                        predicate,
+                    )
+                )
+                .order_by(lineage_runs.c.created_at.desc(), lineage_runs.c.id.desc())
+                .limit(1)
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is not None:
+            return row
+    return None
+
+
+def _compare_upstream_edges(
+    conn: Connection, *, project_id: str, tables: list[str]
+) -> list[UpstreamEdge]:
+    """取这些表作为**下游**的列级边(仅生效 run);逐跳调用,规模随链长而非全图。"""
+    if not tables:
+        return []
+    rows = (
+        conn.execute(
+            select(lineage_column_edges).where(
+                and_(
+                    lineage_column_edges.c.project_id == project_id,
+                    lineage_column_edges.c.target_table.in_(tables),
+                    lineage_column_edges.c.inference_status != "rejected",
+                    _lineage_active_run_clause(lineage_column_edges),
+                )
+            )
+        )
+        .mappings()
+        .all()
+    )
+    return [
+        UpstreamEdge(
+            edge_id=str(row["id"]),
+            run_id=str(row["run_id"]),
+            source_table=str(row["source_table"]),
+            source_column=str(row["source_column"]),
+            target_table=str(row["target_table"]),
+            target_column=str(row["target_column"]),
+            transformation=str(row["transformation"]),
+            transformation_subtype=str(row["transformation_subtype"]),
+            inference_status=str(row["inference_status"]),
+            confidence=float(row["confidence"]),
+        )
+        for row in rows
+    ]
+
+
+def _compare_trace_sql_hop(
+    hop: UpstreamHop,
+    *,
+    db_type: DbType | None,
+    key_columns: list[str],
+    pk_values: list[list[object]],
+    lineage_run_id: str | None,
+) -> CompareUpstreamHop:
+    missing = [key_columns[i] for i, col in enumerate(hop.key_columns) if col is None]
+    edges = [
+        CompareUpstreamEdge(
+            edge_id=edge.edge_id,
+            run_id=edge.run_id,
+            source_table=edge.source_table,
+            source_column=edge.source_column,
+            target_table=edge.target_table,
+            target_column=edge.target_column,
+            transformation_subtype=edge.transformation_subtype,
+            inference_status=edge.inference_status,
+            confidence=edge.confidence,
+        )
+        for edge in hop.edges
+    ]
+    if not hop.available:
+        return CompareUpstreamHop(
+            depth=hop.depth,
+            table=hop.table,
+            available=False,
+            reason=hop.reason,
+            blocked_by=hop.blocked_by,
+            missing_key_columns=missing,
+            confidence=hop.confidence,
+            edges=edges,
+        )
+
+    # 追不到的位置整列丢掉 -> 剩余元组必然出现重复,去重(设计稿 §2.2 partial_key)
+    kept = [i for i, col in enumerate(hop.key_columns) if col is not None]
+    rows = dedupe_pk_rows([[row[i] for i in kept] for row in pk_values])
+    risks = hop_risks(hop, missing_columns=missing)
+    sql = (
+        None
+        if db_type is None
+        else render_upstream_sql(
+            db_type,
+            table=hop.table,
+            columns=hop.resolved_columns,
+            pk_rows=rows,
+        )
+    )
+    if sql is None:
+        return CompareUpstreamHop(
+            depth=hop.depth,
+            table=hop.table,
+            available=False,
+            reason="unknown_datasource" if db_type is None else "unsupported_identifier",
+            missing_key_columns=missing,
+            warnings=hop.warnings,
+            confidence=hop.confidence,
+            edges=edges,
+        )
+    header = upstream_header_comment(hop, lineage_run_id=lineage_run_id, risks=risks)
+    return CompareUpstreamHop(
+        depth=hop.depth,
+        table=hop.table,
+        available=True,
+        sql=f"{header}\n{sql}",
+        key_columns=hop.resolved_columns,
+        missing_key_columns=missing,
+        warnings=hop.warnings,
+        risks=risks,
+        confidence=hop.confidence,
+        edges=edges,
+    )
+
+
+@router.get("/compare/runs/{run_id}/trace-sql", response_model=CompareTraceSqlResponse)
+def get_compare_run_trace_sql(
+    run_id: str,
+    request: Request,
+    bucket: CompareBucket = _COMPARE_BUCKET_QUERY,
+    lineage_run_id: str | None = Query(default=None),
+    include_inferred: bool = Query(default=False),
+    max_depth: int = Query(default=3, ge=1, le=MAX_UPSTREAM_DEPTH),
+) -> CompareTraceSqlResponse:
+    """沿列级血缘上游反推:把桶内主键逐跳映射到上游表,每跳每表一条只读 SELECT。
+
+    与 C-3 定位 SQL 同一逃生口哲学:**只生成文本,平台永不执行**。
+    ``lineage_run_id`` 省略时按"对比表是谁的写入目标"自动匹配最新生效记录。
+    """
+    services = services_from(request)
+    run_row = _compare_run_for_current_user(request, run_id)
+    task_row = _compare_task_for_current_user(request, str(run_row["task_id"]))
+    project_id = str(task_row["project_id"])
+    rules = dict(task_row["compare_rules"] or {})
+    key_columns_raw = rules.get("key_columns")
+    if not isinstance(key_columns_raw, list) or not key_columns_raw:
+        raise ApiError(400, "missing_compare_key", "Compare run has no key columns")
+    key_columns = [str(col) for col in key_columns_raw]
+    source_ref = dict(task_row["source_ref"] or {})
+    db_type = _compare_side_db_type(services, task_row["source_id"], source_ref)
+    focus_table = _compare_focus_table(source_ref)
+
+    empty = CompareTraceSqlResponse(
+        run_id=str(run_row["run_id"]),
+        bucket=bucket,
+        focus_table=focus_table,
+        key_columns=key_columns,
+        pk_count=0,
+        truncated=False,
+        cap=_DIFF_SQL_PK_CAP,
+        include_inferred=include_inferred,
+        dialect=db_type.value if db_type is not None else None,
+        available=False,
+    )
+    if focus_table is None:
+        # sql / file / 快照源没有可锚定的物理表名 —— 血缘图无从下手
+        return empty.model_copy(update={"reason": "unsupported_ref"})
+
+    bucket_spools = dict(run_row["bucket_spools"] or {})
+    result_set_id = bucket_spools.get(bucket)
+    pk_dicts: list[dict[str, object]] = []
+    truncated = False
+    if isinstance(result_set_id, str) and services.result_store.spool_exists(result_set_id):
+        raw = services.result_store.fetch_range(result_set_id, 0, _DIFF_SQL_PK_CAP + 1)
+        if len(raw) > _DIFF_SQL_PK_CAP:
+            truncated = True
+            raw = raw[:_DIFF_SQL_PK_CAP]
+        pk_dicts = [decode_compare_result_row(row)["pk"] for row in raw]
+    if not pk_dicts:
+        return empty.model_copy(update={"reason": "empty_bucket", "truncated": truncated})
+    pk_values = [[pk.get(col) for col in key_columns] for pk in pk_dicts]
+
+    with services.engine.connect() as conn:
+        lineage_row: RowMapping | None
+        if lineage_run_id is not None:
+            lineage_row = _lineage_run_for_project(
+                conn,
+                project_id=project_id,
+                run_id=lineage_run_id,
+                user_id=current_user_from(request).id,
+            )
+            matched_by = "manual"
+        else:
+            lineage_row = _lineage_run_for_focus_table(
+                conn, project_id=project_id, focus_table=focus_table
+            )
+            matched_by = "target_table"
+        if lineage_row is None:
+            return empty.model_copy(
+                update={
+                    "reason": "no_lineage_run",
+                    "pk_count": len(pk_dicts),
+                    "truncated": truncated,
+                }
+            )
+        # 逐跳取边:规模随链长增长,不把整个项目的列级边捞进内存
+        hops: list[UpstreamHop] = []
+        edges: list[UpstreamEdge] = []
+        frontier = [focus_table]
+        seen_tables = {focus_table}
+        for _ in range(max_depth):
+            batch = _compare_upstream_edges(conn, project_id=project_id, tables=frontier)
+            if not batch:
+                break
+            edges.extend(batch)
+            frontier = [edge.source_table for edge in batch if edge.source_table not in seen_tables]
+            seen_tables.update(frontier)
+            if not frontier:
+                break
+
+    hops = build_upstream_hops(
+        focus_table=focus_table,
+        key_columns=key_columns,
+        edges=edges,
+        include_inferred=include_inferred,
+        max_depth=max_depth,
+    )
+    lineage_run_ref = str(lineage_row["id"])
+    hop_models = [
+        _compare_trace_sql_hop(
+            hop,
+            db_type=db_type,
+            key_columns=key_columns,
+            pk_values=pk_values,
+            lineage_run_id=lineage_run_ref,
+        )
+        for hop in hops
+    ]
+    _audit_business(
+        services,
+        request,
+        user_id=current_user_from(request).id,
+        project_id=project_id,
+        action="compare_trace_sql",
+        resource_type="compare_run",
+        resource_id=str(run_row["run_id"]),
+        result="success",
+        # R5:只记结构性计数,SQL 文本与主键值绝不进日志
+        detail={
+            "bucket": bucket,
+            "hop_count": len(hop_models),
+            "available_hops": sum(1 for hop in hop_models if hop.available),
+            "include_inferred": include_inferred,
+        },
+    )
+    return CompareTraceSqlResponse(
+        run_id=str(run_row["run_id"]),
+        bucket=bucket,
+        focus_table=focus_table,
+        key_columns=key_columns,
+        pk_count=len(pk_dicts),
+        truncated=truncated,
+        cap=_DIFF_SQL_PK_CAP,
+        lineage_run_id=lineage_run_ref,
+        lineage_source_ref=str(lineage_row["source_ref"]),
+        lineage_matched_by=matched_by,
+        include_inferred=include_inferred,
+        dialect=db_type.value if db_type is not None else None,
+        available=any(hop.available for hop in hop_models),
+        reason=None if hop_models else "no_upstream_lineage",
+        hops=hop_models,
     )
 
 

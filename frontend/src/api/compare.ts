@@ -648,6 +648,77 @@ export function getCompareRunDiffSql(
   return apiClient.get<CompareDiffSqlResponse>(`/compare/runs/${runId}/diff-sql?${qs.toString()}`)
 }
 
+// ── 血缘反推上游定位 SQL(schemas.py CompareTraceSqlResponse)────────────
+// GET /compare/runs/{run_id}/trace-sql?bucket=&lineage_run_id=&include_inferred=&max_depth=
+//   沿列级血缘上游逐跳把桶内主键映射到上游表,每跳每表一条只读 SELECT(只生成不执行)。
+//   lineage_run_id 省略时按"对比表是谁的写入目标"自动匹配最新生效解析记录。
+//   available=false 时 reason ∈ unsupported_ref / empty_bucket / no_lineage_run /
+//   no_upstream_lineage;逐跳 reason ∈ non_invertible_transformation /
+//   unconfirmed_inferred_edge / rejected_edge / unsupported_identifier / unknown_datasource。
+
+export interface CompareUpstreamEdge {
+  edge_id: string
+  run_id: string
+  source_table: string
+  source_column: string
+  target_table: string
+  target_column: string
+  transformation_subtype: string
+  inference_status: string
+  confidence: number
+}
+
+export interface CompareUpstreamHop {
+  depth: number
+  table: string
+  available: boolean
+  sql: string | null
+  reason: string | null
+  blocked_by: string | null
+  key_columns: string[]
+  missing_key_columns: string[]
+  warnings: string[]
+  /** 风险点码;<100% 置信度必非空,前端要求用户勾选确认后才放开复制。 */
+  risks: string[]
+  /** 该跳所用边 confidence 的最小值,已 clamp 到 [0.5, 1.0]。 */
+  confidence: number
+  edges: CompareUpstreamEdge[]
+}
+
+export interface CompareTraceSqlResponse {
+  run_id: string
+  bucket: CompareBucket
+  focus_table: string | null
+  key_columns: string[]
+  pk_count: number
+  truncated: boolean
+  cap: number
+  lineage_run_id: string | null
+  lineage_source_ref: string | null
+  lineage_matched_by: string | null
+  include_inferred: boolean
+  dialect: string | null
+  /** 整条链按被追溯侧方言渲染;上游表若在别的库,引用风格需自行调整。 */
+  dialect_assumed: boolean
+  available: boolean
+  reason: string | null
+  hops: CompareUpstreamHop[]
+}
+
+export function getCompareRunTraceSql(
+  runId: string,
+  bucket: CompareBucket,
+  options: { lineageRunId?: string; includeInferred?: boolean; maxDepth?: number } = {},
+): Promise<CompareTraceSqlResponse> {
+  const qs = new URLSearchParams({ bucket })
+  if (options.lineageRunId) qs.set('lineage_run_id', options.lineageRunId)
+  if (options.includeInferred !== undefined) {
+    qs.set('include_inferred', String(options.includeInferred))
+  }
+  if (options.maxDepth !== undefined) qs.set('max_depth', String(options.maxDepth))
+  return apiClient.get<CompareTraceSqlResponse>(`/compare/runs/${runId}/trace-sql?${qs.toString()}`)
+}
+
 /**
  * POST /projects/{pid}/compare/pk-precheck —— UX-2 C-4:建任务前主键唯一性/空值预检(单侧)。
  * 错误码:400 invalid_sql / invalid_identifier / precheck_unsupported_file / precheck_failed、
