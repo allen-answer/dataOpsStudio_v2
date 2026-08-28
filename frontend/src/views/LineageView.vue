@@ -1852,8 +1852,8 @@ onBeforeUnmount(stopBatchPolling)
               :key="item.run_id"
               class="border-t chrome-border-subtle align-middle"
             >
-              <td class="py-2 pr-3 font-mono">{{ item.run_id.slice(0, 8) }}</td>
-              <td class="py-2 pr-3">{{ item.source_ref }}</td>
+              <td class="py-2 pr-3 font-mono chrome-text-normal">{{ item.run_id.slice(0, 8) }}</td>
+              <td class="py-2 pr-3 chrome-text-normal">{{ item.source_ref }}</td>
               <td class="py-2 pr-3 chrome-text-muted">
                 {{ item.datasource_name ?? item.datasource_id.slice(0, 8) }} · {{ item.dialect }}
               </td>
@@ -1865,7 +1865,7 @@ onBeforeUnmount(stopBatchPolling)
                   })
                 }}
               </td>
-              <td class="py-2 pr-3">
+              <td class="py-2 pr-3 chrome-text-normal">
                 {{ runsConfidenceText(item) }}
                 <span
                   v-if="item.unconfirmed_inferred_count > 0"
@@ -1876,7 +1876,7 @@ onBeforeUnmount(stopBatchPolling)
                   }}
                 </span>
               </td>
-              <td class="py-2 pr-3">
+              <td class="py-2 pr-3 chrome-text-normal">
                 <span v-if="item.status === 'failed'" class="chrome-text-danger">
                   {{ t('lineage.runs_state_failed') }}
                 </span>
@@ -1895,7 +1895,7 @@ onBeforeUnmount(stopBatchPolling)
               <td class="py-2">
                 <button
                   type="button"
-                  class="chrome-link text-xs"
+                  class="chrome-accent text-xs hover:underline disabled:opacity-40"
                   :disabled="item.target_tables.length === 0"
                   @click="openSubgraphFromRun(item)"
                 >

@@ -24,6 +24,9 @@ def upgrade() -> None:
         "lineage_runs",
         sa.Column("superseded_by", sa.String(length=36), nullable=True),
     )
+    # DEFERRABLE INITIALLY DEFERRED:refresh 在同一事务里"先标记旧行被 X 取代、再插入 X"
+    # (顺序不能反 —— partial unique index 要求先让出生效位),即时校验会在插入前就报
+    # ForeignKeyViolation。延迟到提交时校验,两行都已就位。
     op.create_foreign_key(
         op.f("fk_lineage_runs_superseded_by_lineage_runs"),
         "lineage_runs",
@@ -31,6 +34,8 @@ def upgrade() -> None:
         ["superseded_by"],
         ["id"],
         ondelete="SET NULL",
+        deferrable=True,
+        initially="DEFERRED",
     )
     # 留痕后同一 cache key 可以有多行(历史 + 生效),唯一性只约束"生效中"那一行。
     op.drop_constraint("uq_lineage_runs_cache_key", "lineage_runs", type_="unique")

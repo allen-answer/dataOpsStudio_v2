@@ -825,7 +825,13 @@ lineage_runs = Table(
     Column(
         "superseded_by",
         String(36),
-        ForeignKey("lineage_runs.id", ondelete="SET NULL"),
+        # 延迟校验:refresh 同事务内先标记旧行、后插入新行(见 migration 0030 注释)
+        ForeignKey(
+            "lineage_runs.id",
+            ondelete="SET NULL",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         nullable=True,
     ),
     CheckConstraint(

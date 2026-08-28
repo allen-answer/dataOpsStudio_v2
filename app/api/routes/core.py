@@ -4689,14 +4689,19 @@ def _lineage_run_edge_stats(conn: Connection, run_ids: list[str]) -> dict[str, d
     最低置信度取列级边(定位 SQL 反推吃的就是列级边,与 D4 置信度口径一致);
     没有列级边时为 None,前端显示 "—"。
     """
-    empty: dict[str, Any] = {
-        "table_edge_count": 0,
-        "column_edge_count": 0,
-        "min_confidence": None,
-        "unconfirmed_inferred_count": 0,
-        "target_tables": [],
-    }
-    stats: dict[str, dict[str, Any]] = {run_id: dict(empty) for run_id in run_ids}
+
+    def empty() -> dict[str, Any]:
+        # ★ 每个 run 一份全新的 dict —— target_tables 是可变 list,共享同一个模板对象
+        # 会让所有 run 往同一个列表里 append(真机验证抓到:两条 run 各带两份写入表)。
+        return {
+            "table_edge_count": 0,
+            "column_edge_count": 0,
+            "min_confidence": None,
+            "unconfirmed_inferred_count": 0,
+            "target_tables": [],
+        }
+
+    stats: dict[str, dict[str, Any]] = {run_id: empty() for run_id in run_ids}
     if not run_ids:
         return stats
     table_rows = (
