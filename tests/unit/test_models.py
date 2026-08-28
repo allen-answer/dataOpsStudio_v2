@@ -266,6 +266,8 @@ def test_lineage_edge_store_schema_supports_adjacency_traversal() -> None:
         "parse_summary",
         "created_at",
         "updated_at",
+        "superseded_at",  # 0030:留痕历史 —— refresh 标记取代而非删除
+        "superseded_by",
     }
     assert edge_cols == {
         "id",
@@ -296,8 +298,11 @@ def test_lineage_edge_store_schema_supports_adjacency_traversal() -> None:
         "sql_hash",
         "created_at",
     }
-    assert "uq_lineage_runs_cache_key" in run_constraints
+    # 0030:cache key 唯一性从表约束改为 partial unique index(只约束生效行)
+    assert "uq_lineage_runs_cache_key" not in run_constraints
+    assert "uq_lineage_runs_cache_key_active" in run_indexes
     assert "ix_lineage_runs_project_hash" in run_indexes
+    assert "ix_lineage_runs_project_created" in run_indexes
     assert "ix_lineage_edges_source_table" in edge_indexes
     assert "ix_lineage_edges_target_table" in edge_indexes
     assert "ix_lineage_column_edges_source" in column_edge_indexes

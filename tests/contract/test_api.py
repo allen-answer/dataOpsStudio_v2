@@ -4,6 +4,7 @@ import io
 import json
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any, cast
 
 import pytest
@@ -4424,6 +4425,116 @@ def test_lineage_analyze_persists_edges_and_returns_cache_contract() -> None:
     assert any("INSERT INTO lineage_runs" in statement for statement in engine.statements)
     assert any("INSERT INTO lineage_edges" in statement for statement in engine.statements)
     assert any("INSERT INTO lineage_column_edges" in statement for statement in engine.statements)
+
+
+def test_lineage_analyze_refresh_supersedes_old_run_instead_of_deleting() -> None:
+    """0030:refresh 重解析把旧 run 标"已被取代"——解析历史永久留痕,不再 DELETE。"""
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            _datasource_row(),
+            [
+                {
+                    "cache_level": "columns",
+                    "schema_name": "app",
+                    "table_name": "src",
+                    "payload": [{"name": "id", "type": "integer"}],
+                },
+                {
+                    "cache_level": "columns",
+                    "schema_name": "app",
+                    "table_name": "tgt",
+                    "payload": [{"name": "id", "type": "integer"}],
+                },
+            ],
+            {
+                "id": "run-2",
+                "project_id": "project-1",
+                "datasource_id": "ds-1",
+                "dialect": "mysql",
+                "source_ref": "script.sql",
+                "sql_hash": "hash-1",
+                "parser_version": "sqlglot-w1-v1",
+                "status": "success",
+                "parse_summary": {"table_edge_count": 1, "column_mapping_count": 1},
+            },
+            1,
+            1,
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).post(
+        "/api/projects/project-1/lineage/analyze?refresh=true",
+        headers=_auth_headers(),
+        json_body={
+            "datasource_id": "ds-1",
+            "source_ref": "script.sql",
+            "default_schema": "app",
+            "sql_text": "INSERT INTO app.tgt (id) SELECT id FROM app.src",
+        },
+    )
+
+    assert response.status_code == 201
+    assert not any("DELETE FROM lineage_runs" in stmt for stmt in engine.statements)
+    assert any("UPDATE lineage_runs SET superseded_at" in stmt for stmt in engine.statements)
+
+
+def test_list_project_lineage_runs_returns_history_with_edge_stats() -> None:
+    """解析历史列表:逐行带边数 / 最低置信度 / 未确认推断边数,并透出 has_more。"""
+    engine = _FakeEngine(
+        [
+            {"id": "project-1"},
+            [
+                {
+                    "id": "run-1",
+                    "project_id": "project-1",
+                    "datasource_id": "ds-1",
+                    "datasource_name": "prod-mysql",
+                    "dialect": "mysql",
+                    "source_ref": "etl/orders_daily.sql",
+                    "sql_hash": "hash-1",
+                    "sql_text": "INSERT INTO app.tgt SELECT * FROM app.src",
+                    "parser_version": "sqlglot-w1-v1",
+                    "status": "success",
+                    "parse_summary": {},
+                    "superseded_at": None,
+                    "superseded_by": None,
+                    "created_at": datetime(2026, 8, 28, 9, 12, tzinfo=UTC),
+                    "updated_at": datetime(2026, 8, 28, 9, 12, tzinfo=UTC),
+                }
+            ],
+            [{"run_id": "run-1", "edge_count": 12}],
+            [
+                {
+                    "run_id": "run-1",
+                    "edge_count": 38,
+                    "min_confidence": Decimal("0.7400"),
+                    "unconfirmed_count": 2,
+                }
+            ],
+            [{"run_id": "run-1", "target_table": "ads.orders_agg"}],
+        ]
+    )
+    app = create_app(services=cast(ApiServices, _Services(engine)))
+
+    response = AsgiClient(app).get(
+        "/api/projects/project-1/lineage/runs?limit=1",
+        headers=_auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["has_more"] is False
+    item = payload["items"][0]
+    assert item["run_id"] == "run-1"
+    assert item["datasource_name"] == "prod-mysql"
+    assert item["table_edge_count"] == 12
+    assert item["column_edge_count"] == 38
+    assert item["min_confidence"] == 0.74
+    assert item["unconfirmed_inferred_count"] == 2
+    assert item["target_tables"] == ["ads.orders_agg"]
+    assert item["active"] is True
 
 
 def test_lineage_analyze_cache_hit_does_not_reinsert_edges() -> None:
