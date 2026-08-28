@@ -236,6 +236,7 @@ def test_recursive_parse_error_does_not_abort_other_statements() -> None:
             "statement_index": 0,
             "error_type": "parse_error",
             "message": "RecursionError",
+            "detail": None,
             "unsupported": True,
             "statement_type": None,
         }
@@ -962,3 +963,45 @@ def _schema() -> dict[str, dict[str, dict[str, str]]]:
             "customers": {"id": "integer", "name": "string"},
         }
     }
+
+
+def test_non_sql_document_is_reported_as_not_sql_not_a_token_level_parse_error() -> None:
+    """任务导出文档(注释头 + ==== 分隔线)不该报 sqlglot 的 token 级错误。
+
+    真实案例:批量分析扫到调度平台导出的 .sql,整段只有 `-- 任务名称:` 之类的注释
+    与一行 80 个 `=`;sqlglot 把 `====` 读成 `==` 运算符,报
+    "Required keyword: 'expression' missing for EQ (line 7, col 4, token='==')",
+    同一条错误在界面上重复十几遍,用户以为解析器坏了。
+    """
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text="-- 任务名称: 阻塞节点\n\n-- 任务描述:\n\n" + "=" * 80,
+            dialect="mysql",
+            schema=_schema(),
+        )
+    )
+
+    assert report.parse_errors, "不可解析的内容仍要如实报出来"
+    error = report.parse_errors[0]
+    assert error["error_type"] == "not_sql"
+    assert "不是可解析的 SQL" in error["message"]
+    assert "任务导出文档" in error["message"]
+    # 原始 sqlglot 细节保留但不做主文案
+    assert error["detail"] and "ParseError" in error["detail"]
+    assert "ParseError" not in error["message"]
+
+
+def test_malformed_sql_still_reports_the_token_level_detail() -> None:
+    """真的是 SQL 但写错了 —— 位置与 token 仍要给出来,不能一律"不是 SQL"糊过去。"""
+    report = analyze_sql_lineage(
+        LineageParseRequest(
+            sql_text="SELECT FROM WHERE app.orders",
+            dialect="mysql",
+            schema=_schema(),
+        )
+    )
+
+    assert report.parse_errors
+    error = report.parse_errors[0]
+    assert error["error_type"] == "parse_error"
+    assert "ParseError" in error["message"]

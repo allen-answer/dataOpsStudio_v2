@@ -49,6 +49,8 @@ class LineageParseError(BaseModel):
     statement_index: int
     error_type: str
     message: str
+    # 人话消息之外的原始诊断(如 sqlglot 的 token 级错误);排查时才展开
+    detail: str | None = None
     unsupported: bool = False
     statement_type: str | None = None
 
