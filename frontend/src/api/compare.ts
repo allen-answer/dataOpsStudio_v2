@@ -719,6 +719,44 @@ export function getCompareRunTraceSql(
   return apiClient.get<CompareTraceSqlResponse>(`/compare/runs/${runId}/trace-sql?${qs.toString()}`)
 }
 
+// ── AI 组装断链跳的上游定位 SQL(受约束单轮管道)───────────────────────
+// POST /compare/runs/{run_id}/trace-sql/ai —— 锚 schemas.py CompareTraceSqlAiRequest /
+// CompareTraceSqlAiResponse。AI 关闭 → 409 ai_disabled;校验不过 / 超预算 / 出网被拦
+// → 200 但 ok:false + error,且 sql 恒为空(绝不给半成品)。
+// 主键值(L4)永不出网:prompt 里是占位符,字面量由后端本地回填。
+
+export interface CompareTraceSqlAiRequest {
+  bucket: CompareBucket
+  upstream_table: string
+  lineage_run_id?: string | null
+  include_inferred?: boolean
+  max_depth?: number
+}
+
+export interface CompareTraceSqlAiResponse {
+  run_id: string
+  upstream_table: string
+  ok: boolean
+  error: string | null
+  sql: string | null
+  explanation: string | null
+  confidence: number | null
+  risks: string[]
+  /** 逐步过程:本地步骤与出网步骤如实区分,前端按码取文案。 */
+  steps: string[]
+  provider: string | null
+  model: string | null
+  egress_level: number
+  context_truncated: boolean
+}
+
+export function createCompareTraceSqlAi(
+  runId: string,
+  req: CompareTraceSqlAiRequest,
+): Promise<CompareTraceSqlAiResponse> {
+  return apiClient.post<CompareTraceSqlAiResponse>(`/compare/runs/${runId}/trace-sql/ai`, req)
+}
+
 /**
  * POST /projects/{pid}/compare/pk-precheck —— UX-2 C-4:建任务前主键唯一性/空值预检(单侧)。
  * 错误码:400 invalid_sql / invalid_identifier / precheck_unsupported_file / precheck_failed、

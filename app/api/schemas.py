@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.domain.ai import EgressLevel
 from app.domain.compare_infer import (
     ColumnMappingCandidate,
     PrimaryKeyCandidate,
@@ -618,6 +619,39 @@ class CompareTraceSqlResponse(BaseModel):
     available: bool
     reason: str | None = None
     hops: list[CompareUpstreamHop] = Field(default_factory=list)
+
+
+class CompareTraceSqlAiRequest(BaseModel):
+    """AI 组装某个断链跳的上游定位 SQL(受约束单轮管道)。"""
+
+    bucket: CompareBucket = "diff"
+    # 断链跳的上游表名(来自 trace-sql 响应里 available=false 的那一跳)
+    upstream_table: str = Field(min_length=1)
+    lineage_run_id: str | None = None
+    include_inferred: bool = True
+    max_depth: int = Field(default=3, ge=1, le=5)
+
+
+class CompareTraceSqlAiResponse(BaseModel):
+    """AI 产出永远单独标记,不与确定性结果混排(设计稿 §4.5 信任边界)。
+
+    ``ok=false`` 时 ``sql`` 恒为空 —— 校验不过 / 超预算 / 出网被拦一律不给半成品。
+    """
+
+    run_id: str
+    upstream_table: str
+    ok: bool
+    error: str | None = None
+    sql: str | None = None
+    explanation: str | None = None
+    confidence: float | None = None
+    risks: list[str] = Field(default_factory=list)
+    # 逐步过程(前端"执行过程"展示):本地步骤与出网步骤如实区分
+    steps: list[str] = Field(default_factory=list)
+    provider: str | None = None
+    model: str | None = None
+    egress_level: int = int(EgressLevel.L3)
+    context_truncated: bool = False
 
 
 class ComparePkPrecheckRequest(BaseModel):

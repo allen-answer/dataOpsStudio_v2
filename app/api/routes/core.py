@@ -78,6 +78,8 @@ from app.api.schemas import (
     CompareTaskRunsResponse,
     CompareTaskSuggestionResponse,
     CompareTaskUpdateRequest,
+    CompareTraceSqlAiRequest,
+    CompareTraceSqlAiResponse,
     CompareTraceSqlResponse,
     CompareUpstreamEdge,
     CompareUpstreamHop,
@@ -212,7 +214,7 @@ from app.dbclients.query_limit import (
     analyze_database_row_limit,
     supports_ordered_pagination,
 )
-from app.dbclients.sql_build import limit_clause, quote_identifier
+from app.dbclients.sql_build import limit_clause, quote_identifier, sql_literal
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.domain.ai import AiContext, AiOptions, ContextItem, EgressLevel, ReasoningMode
 from app.domain.ai_compare_map import (
@@ -238,6 +240,14 @@ from app.domain.ai_slowsql import (
     mask_sql,
     summarize_baseline,
 )
+from app.domain.ai_upstream_locator import (
+    build_ai_upstream_prompt,
+    build_lineage_context_payload,
+    combine_confidence,
+    fill_pk_placeholder,
+    parse_ai_upstream_response,
+    validate_ai_sql,
+)
 from app.domain.compare_diff_sql import build_diff_row_select
 from app.domain.compare_infer import (
     CompareInferenceDraft,
@@ -259,6 +269,7 @@ from app.domain.compare_sql import (
     normalize_compare_sql,
 )
 from app.domain.compare_upstream_sql import (
+    CONFIDENCE_CEILING,
     MAX_UPSTREAM_DEPTH,
     UpstreamEdge,
     UpstreamHop,
@@ -4361,6 +4372,237 @@ def get_compare_run_trace_sql(
         available=any(hop.available for hop in hop_models),
         reason=None if hop_models else "no_upstream_lineage",
         hops=hop_models,
+    )
+
+
+@router.post(
+    "/compare/runs/{run_id}/trace-sql/ai",
+    response_model=CompareTraceSqlAiResponse,
+)
+def create_compare_trace_sql_ai(
+    run_id: str,
+    body: CompareTraceSqlAiRequest,
+    request: Request,
+) -> CompareTraceSqlAiResponse:
+    """AI 组装某个断链跳的上游定位 SQL(受约束单轮管道,设计稿 Q5 形态 A)。
+
+    确定性反推能算的绝不交给模型:图遍历、主键谓词拼接都在本地。AI 只做"读血缘边 +
+    存档 SQL,组装该跳查询模板"这一件事,恰好调 gateway 一次。
+
+    **主键值(L4)永不出网** —— prompt 里是 ``{{PK_TUPLES}}`` 占位符,字面量在
+    校验通过之后由本地 ``sql_literal`` 回填。AI 关闭 → 409 ``ai_disabled``;
+    gateway 故障 / 校验不过 → ``ok=false`` + error(不 500、不给半成品 SQL)。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    run_row = _compare_run_for_current_user(request, run_id)
+    task_row = _compare_task_for_current_user(request, str(run_row["task_id"]))
+    project_id = str(task_row["project_id"])
+    rules = dict(task_row["compare_rules"] or {})
+    key_columns_raw = rules.get("key_columns")
+    if not isinstance(key_columns_raw, list) or not key_columns_raw:
+        raise ApiError(400, "missing_compare_key", "Compare run has no key columns")
+    key_columns = [str(col) for col in key_columns_raw]
+    source_ref = dict(task_row["source_ref"] or {})
+    focus_table = _compare_focus_table(source_ref)
+    if focus_table is None:
+        raise ApiError(400, "unsupported_ref", "Compare source is not a physical table")
+    db_type = _compare_side_db_type(services, task_row["source_id"], source_ref)
+    if db_type is None:
+        raise ApiError(400, "unknown_datasource", "Compare source dialect is unknown")
+
+    with services.engine.connect() as conn:
+        ai_row = _ai_config_row_or_none(conn)
+    runtime = _ai_runtime_config(services, ai_row)
+    if not runtime.enabled:
+        raise ApiError(409, "ai_disabled", "AI is disabled")
+
+    def fail(error: str, steps: list[str]) -> CompareTraceSqlAiResponse:
+        _audit_business(
+            services,
+            request,
+            user_id=user.id,
+            project_id=project_id,
+            action="compare_trace_sql_ai",
+            resource_type="compare_run",
+            resource_id=str(run_row["run_id"]),
+            result="failed",
+            detail={"upstream_table": body.upstream_table, "error": error},
+        )
+        return CompareTraceSqlAiResponse(
+            run_id=str(run_row["run_id"]),
+            upstream_table=body.upstream_table,
+            ok=False,
+            error=error,
+            steps=steps,
+        )
+
+    steps = ["read_lineage_edges_local"]
+    bucket_spools = dict(run_row["bucket_spools"] or {})
+    result_set_id = bucket_spools.get(body.bucket)
+    pk_dicts: list[dict[str, object]] = []
+    if isinstance(result_set_id, str) and services.result_store.spool_exists(result_set_id):
+        raw = services.result_store.fetch_range(result_set_id, 0, _DIFF_SQL_PK_CAP)
+        pk_dicts = [decode_compare_result_row(row)["pk"] for row in raw]
+    if not pk_dicts:
+        return fail("empty_bucket", steps)
+    pk_values = [[pk.get(col) for col in key_columns] for pk in pk_dicts]
+
+    with services.engine.connect() as conn:
+        if body.lineage_run_id is not None:
+            lineage_row: RowMapping | None = _lineage_run_for_project(
+                conn, project_id=project_id, run_id=body.lineage_run_id, user_id=user.id
+            )
+        else:
+            lineage_row = _lineage_run_for_focus_table(
+                conn, project_id=project_id, focus_table=focus_table
+            )
+        if lineage_row is None:
+            return fail("no_lineage_run", steps)
+        edges: list[UpstreamEdge] = []
+        frontier = [focus_table]
+        seen_tables = {focus_table}
+        for _ in range(body.max_depth):
+            batch = _compare_upstream_edges(conn, project_id=project_id, tables=frontier)
+            if not batch:
+                break
+            edges.extend(batch)
+            frontier = [edge.source_table for edge in batch if edge.source_table not in seen_tables]
+            seen_tables.update(frontier)
+            if not frontier:
+                break
+
+    # 确定性能算到哪儿就算到哪儿:AI 只接手断链的那一跳
+    hops = build_upstream_hops(
+        focus_table=focus_table,
+        key_columns=key_columns,
+        edges=edges,
+        include_inferred=body.include_inferred,
+        max_depth=body.max_depth,
+    )
+    steps.append("deterministic_mapping_local")
+    target_hop = next((hop for hop in hops if hop.table == body.upstream_table), None)
+    if target_hop is None:
+        return fail("hop_not_found", steps)
+    if target_hop.available:
+        # 确定性已经能生成 —— 不浪费一次出网调用
+        return fail("hop_already_deterministic", steps)
+    steps.append(f"blocked_by:{target_hop.blocked_by or 'unknown'}")
+
+    hop_edges = [edge for edge in edges if edge.source_table == body.upstream_table]
+    lineage_payload, payload_truncated = build_lineage_context_payload(
+        focus_table=focus_table,
+        blocked_table=body.upstream_table,
+        key_columns=key_columns,
+        edges=hop_edges or edges,
+    )
+    archived_sql = _optional_str(lineage_row["sql_text"])
+    prompt, sql_text_for_egress, sql_truncated = build_ai_upstream_prompt(
+        dialect=db_type.value,
+        lineage_payload=lineage_payload,
+        archived_sql=archived_sql,
+    )
+    # 出网级别按内容如实标注:边结构是 L2,SQL 原文是 L3。
+    context_items = [
+        ContextItem(
+            content=json.dumps(lineage_payload, ensure_ascii=False, sort_keys=True),
+            egress_level=EgressLevel.L2,
+        )
+    ]
+    if sql_text_for_egress:
+        context_items.append(ContextItem(content=sql_text_for_egress, egress_level=EgressLevel.L3))
+    steps.append("ai_gateway_complete_once")
+    try:
+        ai_response = build_gateway_from_runtime_config(runtime).complete(
+            prompt,
+            AiContext(items=context_items),
+            AiOptions(purpose="compare_trace_sql_ai", max_tokens=800),
+        )
+    except AiGatewayError as exc:
+        return fail(type(exc).__name__, steps)
+
+    parsed = parse_ai_upstream_response(ai_response.content)
+    if parsed is None:
+        return fail("invalid_ai_sql", steps)
+    steps.append("validate_local")
+    allowed = {focus_table.lower(), body.upstream_table.lower()}
+    for edge in edges:
+        allowed.update(
+            {
+                edge.source_table.lower(),
+                edge.target_table.lower(),
+                edge.source_column.lower(),
+                edge.target_column.lower(),
+            }
+        )
+    allowed.update(col.lower() for col in key_columns)
+    reason = validate_ai_sql(
+        parsed.sql_template, dialect=db_type.value, allowed_identifiers=allowed
+    )
+    if reason is not None:
+        return fail(reason, steps)
+
+    # ★ 字面量在这里才拼:模型既没见过值,也没机会写值。
+    deduped = dedupe_pk_rows(pk_values)
+    if len(key_columns) == 1:
+        pk_tuples_sql = "(" + ", ".join(sql_literal(row[0]) for row in deduped) + ")"
+    else:
+        pk_tuples_sql = (
+            "("
+            + ", ".join(
+                "(" + ", ".join(sql_literal(value) for value in row) + ")" for row in deduped
+            )
+            + ")"
+        )
+    filled = fill_pk_placeholder(parsed.sql_template, pk_tuples_sql=pk_tuples_sql)
+    steps.append("fill_pk_local")
+
+    deterministic_min = min((edge.confidence for edge in hop_edges), default=CONFIDENCE_CEILING)
+    confidence = combine_confidence(deterministic_min, parsed.ai_confidence)
+    risks = ["ai_generated_needs_review", "pk_name_stability_assumed"]
+    if any(edge.inference_status == "inferred" for edge in hop_edges):
+        risks.append("inferred_edge_used")
+    if payload_truncated or sql_truncated:
+        risks.append("context_truncated")
+    header = "\n".join(
+        [
+            f"-- 血缘溯源(AI 组装)· run {lineage_row['id']} · {body.upstream_table}",
+            f"-- 整体置信度 {round(confidence * 100)}%"
+            f"(确定性 {round(deterministic_min * 100)}%"
+            f" x AI 自报 {round(parsed.ai_confidence * 100)}%)",
+            "-- AI 推断,未执行;字面量由系统本地回填。请自行核对后再运行。",
+        ]
+    )
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="compare_trace_sql_ai",
+        resource_type="compare_run",
+        resource_id=str(run_row["run_id"]),
+        result="success",
+        # R5:只记结构性字段,SQL 文本与主键值绝不进日志
+        detail={
+            "upstream_table": body.upstream_table,
+            "provider": ai_response.provider,
+            "egress_level": int(EgressLevel.L3 if sql_text_for_egress else EgressLevel.L2),
+            "confidence": round(confidence, 4),
+        },
+    )
+    return CompareTraceSqlAiResponse(
+        run_id=str(run_row["run_id"]),
+        upstream_table=body.upstream_table,
+        ok=True,
+        sql=f"{header}\n{filled}",
+        explanation=parsed.explanation,
+        confidence=confidence,
+        risks=risks,
+        steps=steps,
+        provider=ai_response.provider,
+        model=ai_response.model,
+        egress_level=int(EgressLevel.L3 if sql_text_for_egress else EgressLevel.L2),
+        context_truncated=payload_truncated or sql_truncated,
     )
 
 

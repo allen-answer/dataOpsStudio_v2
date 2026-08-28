@@ -52,7 +52,9 @@ import {
   draftCompareTask,
   explainCompareRun,
   getCompareRunDiffSql,
+  createCompareTraceSqlAi,
   getCompareRunTraceSql,
+  type CompareTraceSqlAiResponse,
   getCompareRunProfile,
   getCompareRunResults,
   getCompareRunsDashboard,
@@ -1993,6 +1995,61 @@ async function copyTraceSql(hop: CompareUpstreamHop): Promise<void> {
     traceCopied.value = hopKey(hop)
     window.setTimeout(() => {
       if (traceCopied.value === hopKey(hop)) traceCopied.value = null
+    }, 1500)
+  } catch {
+    traceSqlError.value = t('compare.diff_sql_copy_failed')
+  }
+}
+
+// ── AI 组装断链跳(受约束单轮管道)────────────────────────────────
+// 确定性路径不依赖它:AI 未启用 / 失败时,上方逐跳结果照常可用。
+const traceAiLoading = ref<string | null>(null)
+const traceAiResults = ref<Record<string, CompareTraceSqlAiResponse>>({})
+const traceAiAcked = ref<Record<string, boolean>>({})
+
+function aiUnlocked(key: string): boolean {
+  const result = traceAiResults.value[key]
+  if (!result?.ok) return false
+  return result.risks.length === 0 || traceAiAcked.value[key] === true
+}
+
+/** 过程步骤码 -> 文案;blocked_by:X 带子类型参数。 */
+function traceAiStepText(step: string): string {
+  if (step.startsWith('blocked_by:')) {
+    return t('compare.trace_ai_step_blocked_by', { subtype: step.slice('blocked_by:'.length) })
+  }
+  return t(`compare.trace_ai_step_${step}`)
+}
+
+async function askTraceAi(hop: CompareUpstreamHop): Promise<void> {
+  if (!run.runId) return
+  const key = hopKey(hop)
+  traceAiLoading.value = key
+  try {
+    traceAiResults.value = {
+      ...traceAiResults.value,
+      [key]: await createCompareTraceSqlAi(run.runId, {
+        bucket: resultBucket.value,
+        upstream_table: hop.table,
+        lineage_run_id: traceSqlData.value?.lineage_run_id ?? undefined,
+        include_inferred: traceIncludeInferred.value,
+      }),
+    }
+  } catch (e) {
+    traceSqlError.value = errorMessage(e)
+  } finally {
+    traceAiLoading.value = null
+  }
+}
+
+async function copyTraceAiSql(key: string): Promise<void> {
+  const sql = traceAiResults.value[key]?.sql
+  if (!sql || !aiUnlocked(key)) return
+  try {
+    await navigator.clipboard.writeText(sql)
+    traceCopied.value = `ai:${key}`
+    window.setTimeout(() => {
+      if (traceCopied.value === `ai:${key}`) traceCopied.value = null
     }, 1500)
   } catch {
     traceSqlError.value = t('compare.diff_sql_copy_failed')
@@ -4109,9 +4166,117 @@ const missingTarget = computed(
                   >{{ hop.sql }}</pre>
                   <div
                     v-else
-                    class="text-[11px] chrome-text-muted rounded-card border chrome-border-subtle p-2"
+                    class="text-[11px] chrome-text-muted rounded-card border chrome-border-subtle p-2 space-y-1.5"
                   >
-                    {{ traceHopReasonText(hop) }}
+                    <p>{{ traceHopReasonText(hop) }}</p>
+                    <button
+                      type="button"
+                      class="chrome-btn-secondary text-[11px]"
+                      :data-testid="`compare-trace-ai-${hop.depth}`"
+                      :disabled="traceAiLoading !== null"
+                      @click="askTraceAi(hop)"
+                    >
+                      <Sparkles class="w-3.5 h-3.5" />
+                      {{ t('compare.trace_ai_action') }}
+                    </button>
+                  </div>
+
+                  <!-- AI 展开态:过程可见 + 结果单独标记,不与确定性结果混排 -->
+                  <div
+                    v-if="traceAiLoading === hopKey(hop)"
+                    class="text-[11px] chrome-text-muted"
+                  >
+                    <LoadingDots />
+                  </div>
+                  <div
+                    v-else-if="traceAiResults[hopKey(hop)]"
+                    class="rounded-card border border-violet-300 dark:border-violet-500/40 bg-violet-50 dark:bg-violet-500/10 p-2 space-y-1.5"
+                    :data-testid="`compare-trace-ai-result-${hop.depth}`"
+                  >
+                    <div class="flex items-center gap-2">
+                      <Sparkles class="w-3.5 h-3.5 text-violet-600 dark:text-violet-300" />
+                      <span class="text-[11px] font-medium text-violet-800 dark:text-violet-200">
+                        {{ t('compare.trace_ai_title', { table: hop.table }) }}
+                      </span>
+                      <span
+                        class="text-[10px] px-1 rounded bg-violet-200 text-violet-900 dark:bg-violet-500/30 dark:text-violet-100"
+                      >
+                        {{ t('compare.trace_ai_badge') }}
+                      </span>
+                      <div class="flex-1" />
+                      <span
+                        v-if="traceAiResults[hopKey(hop)].ok"
+                        class="text-[10px] text-violet-800 dark:text-violet-200"
+                        :title="t('compare.trace_ai_confidence_hint')"
+                      >
+                        {{
+                          t('compare.trace_ai_confidence', {
+                            percent: Math.round(
+                              (traceAiResults[hopKey(hop)].confidence ?? 0) * 100,
+                            ),
+                          })
+                        }}
+                      </span>
+                    </div>
+
+                    <details class="text-[10px] text-violet-800 dark:text-violet-200">
+                      <summary class="cursor-pointer">{{ t('compare.trace_ai_steps') }}</summary>
+                      <p v-for="step in traceAiResults[hopKey(hop)].steps" :key="step">
+                        · {{ traceAiStepText(step) }}
+                      </p>
+                    </details>
+
+                    <template v-if="traceAiResults[hopKey(hop)].ok">
+                      <pre
+                        class="text-[11px] font-mono whitespace-pre-wrap break-all rounded-card border chrome-border chrome-bg-elevated p-2 chrome-text-heading"
+                      >{{ traceAiResults[hopKey(hop)].sql }}</pre>
+                      <p
+                        v-if="traceAiResults[hopKey(hop)].explanation"
+                        class="text-[10px] text-violet-800 dark:text-violet-200"
+                      >
+                        {{ traceAiResults[hopKey(hop)].explanation }}
+                      </p>
+                      <p
+                        v-for="risk in traceAiResults[hopKey(hop)].risks"
+                        :key="risk"
+                        class="text-[10px] text-amber-700 dark:text-amber-300"
+                      >
+                        · {{ t(`compare.trace_ai_risk_${risk}`) }}
+                      </p>
+                      <label
+                        class="flex items-center gap-1.5 text-[11px] text-violet-800 dark:text-violet-200"
+                      >
+                        <input
+                          type="checkbox"
+                          :checked="traceAiAcked[hopKey(hop)] === true"
+                          @change="traceAiAcked[hopKey(hop)] = ($event.target as HTMLInputElement).checked"
+                        />
+                        {{ t('compare.trace_sql_ack') }}
+                      </label>
+                      <button
+                        type="button"
+                        class="chrome-btn-ghost text-[11px]"
+                        :disabled="!aiUnlocked(hopKey(hop))"
+                        @click="copyTraceAiSql(hopKey(hop))"
+                      >
+                        <Copy class="w-3.5 h-3.5" />
+                        {{
+                          traceCopied === `ai:${hopKey(hop)}`
+                            ? t('compare.diff_sql_copied')
+                            : t('compare.diff_sql_copy')
+                        }}
+                      </button>
+                      <p class="text-[10px] chrome-text-muted">
+                        {{
+                          t('compare.trace_ai_disclaimer', {
+                            level: traceAiResults[hopKey(hop)].egress_level,
+                          })
+                        }}
+                      </p>
+                    </template>
+                    <p v-else class="text-[11px] text-red-600 dark:text-red-400">
+                      {{ t(`compare.trace_ai_error_${traceAiResults[hopKey(hop)].error}`) }}
+                    </p>
                   </div>
 
                   <div

@@ -1602,3 +1602,135 @@ test('lineage trace section reverses the diff pk onto the upstream table with a 
   expect(traceCalls).toBe(1)
   expectNoConsoleErrors()
 })
+
+test('AI hop assembly shows its steps and never renders partial SQL on failure', async ({
+  page,
+}) => {
+  await mockBase(page)
+  const bucketCounts = { only_source: 0, only_target: 0, diff: 1, same: 0 }
+  await page.route('**/api/compare/tasks/task-1/run', (r) =>
+    json(r, 202, { job_id: 'job-1', run_id: 'run-1' }),
+  )
+  await page.route('**/api/jobs/job-1', (r) =>
+    json(r, 200, {
+      id: 'job-1',
+      kind: 'compare_run',
+      status: 'success',
+      created_at: now,
+      finished_at: now,
+      error: null,
+      error_code: null,
+      message: null,
+      result_set_id: null,
+    }),
+  )
+  const resultPayload = {
+    job_id: 'job-1',
+    run_id: 'run-1',
+    bucket_counts: bucketCounts,
+    progress: {},
+    diff_profile: { generated: false, columns: {} },
+    sample_result: null,
+  }
+  await page.route(/\/api\/compare\/runs\/run-1\/results/, (r) =>
+    json(r, 200, {
+      ...resultPayload,
+      bucket: 'diff',
+      offset: 0,
+      limit: 100,
+      rows: [{ pk: { id: 3 }, source: { id: 3 }, target: { id: 3 }, cells: [] }],
+    }),
+  )
+  await page.route(/\/api\/compare\/runs\/run-1\/profile/, (r) => json(r, 200, resultPayload))
+  await page.route(/\/api\/compare\/runs\/run-1\/diff-sql/, (r) =>
+    json(r, 200, {
+      run_id: 'run-1',
+      bucket: 'diff',
+      key_columns: ['id'],
+      pk_count: 1,
+      truncated: false,
+      cap: 500,
+      source: { available: true, sql: 'SELECT 1', reason: null },
+      target: { available: true, sql: 'SELECT 1', reason: null },
+    }),
+  )
+  await page.route(/\/api\/compare\/runs\/run-1\/trace-sql\?/, (r) =>
+    json(r, 200, {
+      run_id: 'run-1',
+      bucket: 'diff',
+      focus_table: 'ads.orders_agg',
+      key_columns: ['id'],
+      pk_count: 1,
+      truncated: false,
+      cap: 500,
+      lineage_run_id: '0c3f42aa-9a1b-4d21-8c66-1f2e3d4a5b6c',
+      lineage_source_ref: 'etl/orders_daily.sql',
+      lineage_matched_by: 'target_table',
+      include_inferred: false,
+      dialect: 'mysql',
+      dialect_assumed: true,
+      available: false,
+      reason: null,
+      hops: [
+        {
+          depth: 1,
+          table: 'ods.orders_raw',
+          available: false,
+          sql: null,
+          reason: 'non_invertible_transformation',
+          blocked_by: 'EXPRESSION',
+          key_columns: [],
+          missing_key_columns: ['id'],
+          warnings: [],
+          risks: [],
+          confidence: 1,
+          edges: [],
+        },
+      ],
+    }),
+  )
+  // AI 返回不可用内容 → 后端整体判失败;前端必须只显示原因,不显示任何 SQL
+  await page.route('**/api/compare/runs/run-1/trace-sql/ai', (r) =>
+    json(r, 200, {
+      run_id: 'run-1',
+      upstream_table: 'ods.orders_raw',
+      ok: false,
+      error: 'not_read_only_select',
+      sql: null,
+      explanation: null,
+      confidence: null,
+      risks: [],
+      steps: [
+        'read_lineage_edges_local',
+        'deterministic_mapping_local',
+        'blocked_by:EXPRESSION',
+        'ai_gateway_complete_once',
+        'validate_local',
+      ],
+      provider: 'mock',
+      model: 'mock',
+      egress_level: 3,
+      context_truncated: false,
+    }),
+  )
+
+  await page.goto('/projects/project-1/compare')
+  await page.getByRole('button', { name: 'Start compare' }).click()
+  await page.getByRole('button', { name: 'Locate rows SQL' }).click()
+  await page.getByTestId('compare-trace-sql-load').click()
+  await page.getByTestId('compare-trace-ai-1').click()
+
+  const aiBlock = page.getByTestId('compare-trace-ai-result-1')
+  await expect(aiBlock).toBeVisible()
+  await expect(
+    aiBlock.getByText('The AI returned something other than a read-only SELECT; rejected.'),
+  ).toBeVisible()
+  // 失败态绝不出现 SQL,也不出现复制入口
+  await expect(aiBlock.locator('pre')).toHaveCount(0)
+  await expect(aiBlock.getByRole('button', { name: 'Copy' })).toHaveCount(0)
+  // 过程仍然可见:哪些步骤在本地、哪一步出网
+  await aiBlock.getByText('Steps').click()
+  await expect(aiBlock.getByText(/no egress/)).toBeVisible()
+
+  expectNoConsoleErrors()
+})
