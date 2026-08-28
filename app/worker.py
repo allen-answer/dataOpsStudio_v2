@@ -20,7 +20,7 @@ from typing import Any, BinaryIO, Protocol, cast
 from uuid import uuid4
 
 import structlog
-from sqlalchemy import URL, and_, create_engine, insert, or_, select, update
+from sqlalchemy import URL, and_, create_engine, delete, insert, or_, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
@@ -153,6 +153,11 @@ from app.services.notify import RevealSecret, WorkflowNotifyService
 from app.services.workflow_scheduler import build_workflow_run_job
 
 logger = structlog.get_logger(__name__)
+
+# metadata_sync 限额:一轮最多同步多少张表(防止误对超大库发起几十分钟的长跑),
+# 失败明细采样上限(权限全无的库不该把 artifact 撑爆),以及缓存有效期。
+METADATA_SYNC_MAX_TABLES = 5000
+METADATA_SYNC_FAILED_SAMPLE = 50
 
 # lineage_batch ZIP 安全限额(zip 炸弹 / 超量防护)
 _LINEAGE_BATCH_MAX_FILES = 500
@@ -347,6 +352,14 @@ class ActiveConsoleResultSetsLike(Protocol):
 class DatabaseAdapterLike(Protocol):
     def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]: ...
 
+    # metadata_sync 用:遍历库结构。适配器本就实现了这三个方法(元数据接口在用),
+    # 这里补进 Protocol 让 worker 侧也能类型安全地调用。
+    def list_schemas(self) -> list[Any]: ...
+
+    def list_tables(self, schema: str) -> list[Any]: ...
+
+    def list_columns(self, schema: str, table: str) -> list[Any]: ...
+
     def explain(self, sql: str) -> PlanNode: ...
 
     def test_connection(self) -> bool: ...
@@ -428,6 +441,17 @@ class JobErrorCodeWriterLike(Protocol):
 
 
 class LineageCatalogLike(Protocol):
+    def write_columns_cache(
+        self,
+        datasource_id: str,
+        *,
+        schema_name: str,
+        table_name: str,
+        payload: list[dict[str, Any]],
+    ) -> None:
+        """metadata_sync 用:覆盖写单表列缓存。"""
+        ...
+
     """lineage_analyze 子 job 的落库依赖(workflow 节点执行用,2.4.0 PR-4)。"""
 
     def schema_context(
@@ -632,6 +656,8 @@ class WorkerRunner:
                 outcome = self._execute_lineage_analyze(job)
             elif job.kind is JobKind.LINEAGE_BATCH:
                 outcome = self._execute_lineage_batch(job)
+            elif job.kind is JobKind.METADATA_SYNC:
+                outcome = self._execute_metadata_sync(job)
             elif job.kind is JobKind.WORKFLOW_RUN:
                 outcome = self._execute_workflow_run(job)
             elif job.kind is JobKind.BRANCH:
@@ -1534,6 +1560,96 @@ class WorkerRunner:
                 },
             )
         )
+
+    def _execute_metadata_sync(self, job: Job) -> _ExecutionOutcome:
+        """数据源元数据预热:遍历 schema → 表 → 列,写 metadata_caches。
+
+        为什么要有它:列级血缘依赖 ``metadata_caches`` 里的列信息,而在此之前这份缓存
+        **只在用户手点某张表时**才被动写入。批量分析扫几百个 ETL 脚本时,涉及的表
+        基本都没被点开过,于是全部降级成表级边 —— 用户看到的就是"没有列级血缘"。
+
+        纪律:
+        - 逐表增量写,失败的表**跳过并计数**,不让一张坏表毁掉整轮(库里权限不全、
+          视图失效都是常态)。
+        - 每张表都查一次取消位:这是可能跑几分钟的循环,必须能中途停。
+        - 表数上限 ``METADATA_SYNC_MAX_TABLES`` 兜底,避免误对超大库发起长跑。
+        """
+        if self._lineage_catalog is None:
+            raise UnsupportedJobKindError("metadata_sync requires a metadata catalog")
+        datasource_id = _payload_datasource_id(job)
+        only_schemas = [
+            str(item)
+            for item in (job.payload.get("schemas") or [])
+            if isinstance(item, str) and item.strip()
+        ]
+        datasource = self._datasource_loader(datasource_id)
+        adapter = self._adapter_factory(
+            datasource,
+            lambda: self._backend.is_cancel_requested(job.id),
+            lambda columns: None,
+            self._config.sql_spool_batch_size,
+        )
+
+        schemas = [schema.name for schema in adapter.list_schemas()]
+        if only_schemas:
+            wanted = {name.lower() for name in only_schemas}
+            schemas = [name for name in schemas if name.lower() in wanted]
+
+        synced_tables = 0
+        synced_columns = 0
+        failed: list[dict[str, str]] = []
+        truncated = False
+        for schema_name in schemas:
+            self._check_cancel(job.id)
+            try:
+                tables = [table.name for table in adapter.list_tables(schema_name)]
+            except Exception as exc:
+                failed.append({"schema": schema_name, "table": "", "error": type(exc).__name__})
+                continue
+            for table_name in tables:
+                if synced_tables >= METADATA_SYNC_MAX_TABLES:
+                    truncated = True
+                    break
+                self._check_cancel(job.id)
+                try:
+                    columns = adapter.list_columns(schema_name, table_name)
+                except Exception as exc:
+                    failed.append(
+                        {"schema": schema_name, "table": table_name, "error": type(exc).__name__}
+                    )
+                    continue
+                payload = [column.model_dump(mode="json") for column in columns]
+                self._lineage_catalog.write_columns_cache(
+                    datasource_id,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    payload=payload,
+                )
+                synced_tables += 1
+                synced_columns += len(payload)
+                if synced_tables % 20 == 0:
+                    self._heartbeat(job.id)
+            if truncated:
+                break
+
+        report = {
+            "datasource_id": datasource_id,
+            "schema_count": len(schemas),
+            "synced_tables": synced_tables,
+            "synced_columns": synced_columns,
+            "failed_count": len(failed),
+            # 失败明细封顶:诊断够用即可,不让一个权限全无的库把 artifact 撑爆
+            "failed": failed[:METADATA_SYNC_FAILED_SAMPLE],
+            "truncated": truncated,
+            "max_tables": METADATA_SYNC_MAX_TABLES,
+        }
+        artifact_ref = self._result_store.put_artifact(
+            job.id,
+            "metadata_sync_report.json",
+            io.BytesIO(json.dumps(report, ensure_ascii=False).encode("utf-8")),
+        )
+        self._heartbeat(job.id)
+        return _ExecutionOutcome(result_ref=artifact_ref)
 
     def _execute_lineage_batch(self, job: Job) -> _ExecutionOutcome:
         """ZIP 批量血缘分析(L-2):逐文件宽松解析 + 落边 + 汇总报告。
@@ -2600,9 +2716,46 @@ class PostgresLineageCatalog:
     """worker 侧 lineage_analyze 落库(与 API analyze 同表同缓存语义;无 AI 兜底)。"""
 
     _METADATA_LEVEL_COLUMNS = "columns"
+    _METADATA_CACHE_TTL = timedelta(hours=24)
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
+
+    def write_columns_cache(
+        self,
+        datasource_id: str,
+        *,
+        schema_name: str,
+        table_name: str,
+        payload: list[dict[str, Any]],
+    ) -> None:
+        """覆盖写单表列缓存(与 API 侧 _write_metadata_cache 同口径:先删后插)。"""
+        now = datetime.now(UTC)
+        with self._engine.begin() as conn:
+            conn.execute(
+                delete(metadata_caches).where(
+                    and_(
+                        metadata_caches.c.datasource_id == datasource_id,
+                        metadata_caches.c.cache_level == self._METADATA_LEVEL_COLUMNS,
+                        metadata_caches.c.schema_name == schema_name,
+                        metadata_caches.c.table_name == table_name,
+                    )
+                )
+            )
+            conn.execute(
+                insert(metadata_caches).values(
+                    id=str(uuid4()),
+                    datasource_id=datasource_id,
+                    cache_level=self._METADATA_LEVEL_COLUMNS,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    payload=payload,
+                    refreshed_at=now,
+                    expires_at=now + self._METADATA_CACHE_TTL,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
 
     def schema_context(
         self,

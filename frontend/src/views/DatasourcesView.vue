@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/vue-query'
 import {
   Database,
+  DatabaseZap,
   Plus,
   AlertTriangle,
   CheckCircle2,
@@ -24,6 +25,7 @@ import {
   deleteDatasource,
   testDatasource,
 } from '../api/datasources'
+import { getMetadataSync, startMetadataSync } from '../api/metadata'
 import {
   ApiError,
   DEFAULT_OPERATION_POLICY,
@@ -78,6 +80,72 @@ const TEST_ERROR_I18N: Record<DatasourceTestErrorCode, string> = {
 function testFailedText(code: DatasourceTestErrorCode | null): string {
   return t(code ? TEST_ERROR_I18N[code] : 'datasources.test_err_unknown')
 }
+
+// ── 元数据预热(后台 job)────────────────────────────────────────────
+// 列级血缘依赖 metadata_caches,而它原本只在手点某张表时被动写入 —— 批量分析扫到的
+// 表几乎都缺列元数据,只能降级出表级边。这里一次性把库结构拉全。
+const syncJobs = reactive<Record<string, string>>({})
+const syncStates = reactive<Record<string, 'running' | 'done' | 'failed'>>({})
+const syncSummary = reactive<Record<string, string>>({})
+const syncTimers: Record<string, number> = {}
+
+function stopSyncPoll(datasourceId: string): void {
+  const timer = syncTimers[datasourceId]
+  if (timer) {
+    window.clearTimeout(timer)
+    delete syncTimers[datasourceId]
+  }
+}
+
+async function pollMetadataSync(ds: DatasourceListItem): Promise<void> {
+  const jobId = syncJobs[ds.id]
+  if (!jobId) return
+  try {
+    const res = await getMetadataSync(ds.id, jobId)
+    if (res.status === 'success') {
+      syncStates[ds.id] = 'done'
+      const report = res.report
+      syncSummary[ds.id] = report
+        ? t('datasources.sync_done', {
+            tables: report.synced_tables,
+            columns: report.synced_columns,
+            failed: report.failed_count,
+          })
+        : ''
+      stopSyncPoll(ds.id)
+      return
+    }
+    if (res.status === 'failed' || res.status === 'cancelled' || res.status === 'timeout') {
+      syncStates[ds.id] = 'failed'
+      syncSummary[ds.id] = res.error ?? t(`datasources.sync_state_${res.status}`)
+      stopSyncPoll(ds.id)
+      return
+    }
+    syncTimers[ds.id] = window.setTimeout(() => void pollMetadataSync(ds), 2000)
+  } catch (e) {
+    syncStates[ds.id] = 'failed'
+    syncSummary[ds.id] = errorMessage(e)
+    stopSyncPoll(ds.id)
+  }
+}
+
+async function onSyncMetadata(ds: DatasourceListItem): Promise<void> {
+  if (writesBlocked.value || syncStates[ds.id] === 'running') return
+  syncStates[ds.id] = 'running'
+  syncSummary[ds.id] = ''
+  try {
+    const res = await startMetadataSync(ds.id)
+    syncJobs[ds.id] = res.job_id
+    syncTimers[ds.id] = window.setTimeout(() => void pollMetadataSync(ds), 1500)
+  } catch (e) {
+    syncStates[ds.id] = 'failed'
+    syncSummary[ds.id] = errorMessage(e)
+  }
+}
+
+onBeforeUnmount(() => {
+  for (const id of Object.keys(syncTimers)) stopSyncPoll(id)
+})
 
 async function onTest(ds: DatasourceListItem): Promise<void> {
   if (writesBlocked.value) return
@@ -638,6 +706,33 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
                   {{ t('datasources.testing') }}
                 </span>
 
+                <!-- 元数据同步状态:与连接测试并列,长跑过程要看得见 -->
+                <span
+                  v-if="syncStates[ds.id] === 'running'"
+                  class="text-xs chrome-text-muted inline-flex items-center gap-1"
+                  :data-testid="`datasource-sync-state-${ds.id}`"
+                >
+                  <LoadingDots />
+                  {{ t('datasources.sync_running') }}
+                </span>
+                <span
+                  v-else-if="syncStates[ds.id] === 'done'"
+                  class="text-xs text-emerald-600 dark:text-emerald-400 inline-flex items-center gap-1"
+                  :data-testid="`datasource-sync-state-${ds.id}`"
+                >
+                  <CheckCircle2 class="w-3.5 h-3.5" />
+                  {{ syncSummary[ds.id] }}
+                </span>
+                <span
+                  v-else-if="syncStates[ds.id] === 'failed'"
+                  class="text-xs text-red-600 dark:text-red-400 inline-flex items-center gap-1"
+                  :data-testid="`datasource-sync-state-${ds.id}`"
+                  :title="syncSummary[ds.id]"
+                >
+                  <XCircle class="w-3.5 h-3.5" />
+                  {{ syncSummary[ds.id] || t('datasources.sync_state_failed') }}
+                </span>
+
                 <!-- hover 才出现的图标操作行 -->
                 <div
                   class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
@@ -650,6 +745,18 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
                     :title="writesBlocked ? t('license.writes_blocked') : t('datasources.test_connection')"
                   >
                     <Zap class="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    @click="onSyncMetadata(ds)"
+                    class="chrome-btn-ghost"
+                    :disabled="writesBlocked || syncStates[ds.id] === 'running'"
+                    :data-testid="`datasource-sync-${ds.id}`"
+                    :title="
+                      writesBlocked ? t('license.writes_blocked') : t('datasources.sync_metadata')
+                    "
+                  >
+                    <DatabaseZap class="w-3.5 h-3.5" />
                   </button>
                   <button
                     type="button"

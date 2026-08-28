@@ -133,6 +133,10 @@ from app.api.schemas import (
     MetadataColumnItem,
     MetadataIndexItem,
     MetadataSchemaItem,
+    MetadataSyncCreateResponse,
+    MetadataSyncReport,
+    MetadataSyncRequest,
+    MetadataSyncStatusResponse,
     MetadataTableItem,
     NotifyTargetCreateRequest,
     NotifyTargetResponse,
@@ -5745,6 +5749,100 @@ def create_lineage_batch(
         detail={"upload_id": body.upload_id, "datasource_id": body.datasource_id},
     )
     return LineageBatchCreateResponse(job_id=job_id)
+
+
+@router.post(
+    "/datasources/{datasource_id}/metadata/sync",
+    response_model=MetadataSyncCreateResponse,
+    status_code=202,
+)
+def create_metadata_sync(
+    datasource_id: str,
+    body: MetadataSyncRequest,
+    request: Request,
+) -> MetadataSyncCreateResponse:
+    """数据源元数据预热:后台 job 遍历 schema → 表 → 列,写满 metadata_caches。
+
+    为什么需要:列级血缘依赖这份缓存,而在此之前缓存**只在用户手点某张表时**被动写入,
+    于是批量分析扫到的表几乎都缺列元数据,只能降级出表级边。这个 job 把它一次拉全。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    datasource_row = _datasource_for_current_user(request, datasource_id)
+    project_id = str(datasource_row["project_id"])
+    job_id = new_id()
+    job = Job(
+        id=job_id,
+        kind=JobKind.METADATA_SYNC,
+        status=JobStatus.PENDING,
+        owner_user_id=user.id,
+        project_id=project_id,
+        datasource_ids=[datasource_id],
+        priority=0,
+        # 大库遍历可能几分钟起步;worker 侧另有表数上限兜底
+        timeout_seconds=1800,
+        resource_profile=ResourceProfile(timeout_seconds=1800),
+        audit_id=new_id(),
+        payload={"datasource_id": datasource_id, "schemas": list(body.schemas)},
+    )
+    with services.engine.begin() as conn:
+        _enqueue_job_txn(conn, services, job)
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=project_id,
+        action="metadata_sync_create",
+        resource_type="datasource",
+        resource_id=datasource_id,
+        result="accepted",
+        detail={"schemas": len(body.schemas)},
+    )
+    return MetadataSyncCreateResponse(job_id=job_id)
+
+
+@router.get(
+    "/datasources/{datasource_id}/metadata/sync/{job_id}",
+    response_model=MetadataSyncStatusResponse,
+)
+def get_metadata_sync(
+    datasource_id: str,
+    job_id: str,
+    request: Request,
+) -> MetadataSyncStatusResponse:
+    """同步状态 + success 后回读汇总(worker 落的 job artifact)。"""
+    services = services_from(request)
+    _datasource_for_current_user(request, datasource_id)
+    with services.engine.connect() as conn:
+        row = (
+            conn.execute(
+                select(jobs).where(
+                    and_(jobs.c.id == job_id, jobs.c.kind == JobKind.METADATA_SYNC.value)
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    if row is None or datasource_id not in list(row["datasource_ids"] or []):
+        raise ApiError(404, "not_found", "Metadata sync job not found")
+    status = JobStatus(str(row["status"]))
+    report: MetadataSyncReport | None = None
+    if status is JobStatus.SUCCESS:
+        result_ref = dict(row["result_ref"] or {})
+        report_uri = str((result_ref.get("metadata") or {}).get("report_uri") or "")
+        if report_uri:
+            with services.result_store.open_download(
+                ResultRef(backend="local_fs", uri=report_uri)
+            ) as stream:
+                report = MetadataSyncReport.model_validate(
+                    json.loads(stream.read().decode("utf-8"))
+                )
+    return MetadataSyncStatusResponse(
+        job_id=job_id,
+        status=status,
+        error=_optional_str(row["error"]),
+        report=report,
+    )
 
 
 @router.get(
