@@ -3050,6 +3050,15 @@ function parseVariables(value: string): string[] {
             <Network class="w-3.5 h-3.5" />
             {{ toolBusy === 'explain' ? t('common.submitting') : t('sql.tool_explain') }}
           </button>
+          <!-- ★ 禁用按钮的 title 在多数浏览器上不触发 tooltip,用户只看到"点了没反应"。
+               EXPLAIN 被数据源策略挡住时,把原因和去哪儿开就地写出来。 -->
+          <span
+            v-if="selectedDsId && toolsSupported && !explainSupported && !writesBlocked"
+            class="text-[11px] chrome-text-muted"
+            data-testid="sql-explain-blocked-hint"
+          >
+            {{ t('sql.explain_not_allowed_hint') }}
+          </span>
           <button
             type="button"
             class="chrome-btn-secondary"

@@ -648,6 +648,115 @@ export function getCompareRunDiffSql(
   return apiClient.get<CompareDiffSqlResponse>(`/compare/runs/${runId}/diff-sql?${qs.toString()}`)
 }
 
+// ── 血缘反推上游定位 SQL(schemas.py CompareTraceSqlResponse)────────────
+// GET /compare/runs/{run_id}/trace-sql?bucket=&lineage_run_id=&include_inferred=&max_depth=
+//   沿列级血缘上游逐跳把桶内主键映射到上游表,每跳每表一条只读 SELECT(只生成不执行)。
+//   lineage_run_id 省略时按"对比表是谁的写入目标"自动匹配最新生效解析记录。
+//   available=false 时 reason ∈ unsupported_ref / empty_bucket / no_lineage_run /
+//   no_upstream_lineage;逐跳 reason ∈ non_invertible_transformation /
+//   unconfirmed_inferred_edge / rejected_edge / unsupported_identifier / unknown_datasource。
+
+export interface CompareUpstreamEdge {
+  edge_id: string
+  run_id: string
+  source_table: string
+  source_column: string
+  target_table: string
+  target_column: string
+  transformation_subtype: string
+  inference_status: string
+  confidence: number
+}
+
+export interface CompareUpstreamHop {
+  depth: number
+  table: string
+  available: boolean
+  sql: string | null
+  reason: string | null
+  blocked_by: string | null
+  key_columns: string[]
+  missing_key_columns: string[]
+  warnings: string[]
+  /** 风险点码;<100% 置信度必非空,前端要求用户勾选确认后才放开复制。 */
+  risks: string[]
+  /** 该跳所用边 confidence 的最小值,已 clamp 到 [0.5, 1.0]。 */
+  confidence: number
+  edges: CompareUpstreamEdge[]
+}
+
+export interface CompareTraceSqlResponse {
+  run_id: string
+  bucket: CompareBucket
+  focus_table: string | null
+  key_columns: string[]
+  pk_count: number
+  truncated: boolean
+  cap: number
+  lineage_run_id: string | null
+  lineage_source_ref: string | null
+  lineage_matched_by: string | null
+  include_inferred: boolean
+  dialect: string | null
+  /** 整条链按被追溯侧方言渲染;上游表若在别的库,引用风格需自行调整。 */
+  dialect_assumed: boolean
+  available: boolean
+  reason: string | null
+  hops: CompareUpstreamHop[]
+}
+
+export function getCompareRunTraceSql(
+  runId: string,
+  bucket: CompareBucket,
+  options: { lineageRunId?: string; includeInferred?: boolean; maxDepth?: number } = {},
+): Promise<CompareTraceSqlResponse> {
+  const qs = new URLSearchParams({ bucket })
+  if (options.lineageRunId) qs.set('lineage_run_id', options.lineageRunId)
+  if (options.includeInferred !== undefined) {
+    qs.set('include_inferred', String(options.includeInferred))
+  }
+  if (options.maxDepth !== undefined) qs.set('max_depth', String(options.maxDepth))
+  return apiClient.get<CompareTraceSqlResponse>(`/compare/runs/${runId}/trace-sql?${qs.toString()}`)
+}
+
+// ── AI 组装断链跳的上游定位 SQL(受约束单轮管道)───────────────────────
+// POST /compare/runs/{run_id}/trace-sql/ai —— 锚 schemas.py CompareTraceSqlAiRequest /
+// CompareTraceSqlAiResponse。AI 关闭 → 409 ai_disabled;校验不过 / 超预算 / 出网被拦
+// → 200 但 ok:false + error,且 sql 恒为空(绝不给半成品)。
+// 主键值(L4)永不出网:prompt 里是占位符,字面量由后端本地回填。
+
+export interface CompareTraceSqlAiRequest {
+  bucket: CompareBucket
+  upstream_table: string
+  lineage_run_id?: string | null
+  include_inferred?: boolean
+  max_depth?: number
+}
+
+export interface CompareTraceSqlAiResponse {
+  run_id: string
+  upstream_table: string
+  ok: boolean
+  error: string | null
+  sql: string | null
+  explanation: string | null
+  confidence: number | null
+  risks: string[]
+  /** 逐步过程:本地步骤与出网步骤如实区分,前端按码取文案。 */
+  steps: string[]
+  provider: string | null
+  model: string | null
+  egress_level: number
+  context_truncated: boolean
+}
+
+export function createCompareTraceSqlAi(
+  runId: string,
+  req: CompareTraceSqlAiRequest,
+): Promise<CompareTraceSqlAiResponse> {
+  return apiClient.post<CompareTraceSqlAiResponse>(`/compare/runs/${runId}/trace-sql/ai`, req)
+}
+
 /**
  * POST /projects/{pid}/compare/pk-precheck —— UX-2 C-4:建任务前主键唯一性/空值预检(单侧)。
  * 错误码:400 invalid_sql / invalid_identifier / precheck_unsupported_file / precheck_failed、
