@@ -347,6 +347,66 @@ export function getLineageImpact(
 //   POST /projects/{pid}/lineage/trace-compare (201;dry_run=true 只预览不落库)
 
 /** 链上一跳字段(node 为本跳字段,from_node 为它经由的上一跳字段)。 */
+// ── 0030 解析历史(留痕后的 lineage_runs 列表)────────────────────────
+// 锚 schemas.py LineageRunListItem / LineageRunListResponse;
+// GET /projects/{pid}/lineage/runs?datasource_id=&source_ref=&status=&active_only=&limit=&offset=
+//   active_only 默认 true(历史噪音不进首屏);source_ref 子串匹配。
+//   min_confidence 取该 run 全部列级边 confidence 的最小值(无列级边时 null)。
+
+export interface LineageRunListItem {
+  run_id: string
+  project_id: string
+  datasource_id: string
+  datasource_name: string | null
+  dialect: string
+  source_ref: string
+  sql_hash: string
+  status: 'success' | 'failed'
+  table_edge_count: number
+  column_edge_count: number
+  min_confidence: number | null
+  unconfirmed_inferred_count: number
+  /** 该 run 写入的表(后端截断);列表页跳子图与按表名匹配血缘记录都用它。 */
+  target_tables: string[]
+  /** superseded_at 为空即"生效中";只有生效记录能用于定位 SQL 溯源。 */
+  active: boolean
+  superseded_at: string | null
+  superseded_by: string | null
+  created_at: string
+}
+
+export interface LineageRunListResponse {
+  project_id: string
+  items: LineageRunListItem[]
+  has_more: boolean
+}
+
+export interface LineageRunListParams {
+  datasourceId?: string
+  sourceRef?: string
+  status?: 'success' | 'failed'
+  activeOnly?: boolean
+  limit?: number
+  offset?: number
+}
+
+export function listLineageRuns(
+  projectId: string,
+  params: LineageRunListParams = {},
+): Promise<LineageRunListResponse> {
+  const qs = new URLSearchParams()
+  if (params.datasourceId) qs.set('datasource_id', params.datasourceId)
+  if (params.sourceRef) qs.set('source_ref', params.sourceRef)
+  if (params.status) qs.set('status', params.status)
+  if (params.activeOnly !== undefined) qs.set('active_only', String(params.activeOnly))
+  if (params.limit !== undefined) qs.set('limit', String(params.limit))
+  if (params.offset !== undefined) qs.set('offset', String(params.offset))
+  const query = qs.toString()
+  return apiClient.get<LineageRunListResponse>(
+    `/projects/${projectId}/lineage/runs${query ? `?${query}` : ''}`,
+  )
+}
+
 export interface LineageColumnTraceItem {
   node: string
   table: string

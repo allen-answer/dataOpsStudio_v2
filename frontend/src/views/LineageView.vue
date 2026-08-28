@@ -26,6 +26,7 @@ import {
   FileSearch,
   FileStack,
   GitCompareArrows,
+  History,
   Lightbulb,
   Network,
   Play,
@@ -48,6 +49,7 @@ import {
   getLineageEdgeDetail,
   getLineageImpact,
   getLineageSubgraph,
+  listLineageRuns,
   updateLineageEdge,
   weightedLineageImpact,
   type LineageAiImpactResponse,
@@ -61,6 +63,7 @@ import {
   type LineageImpactItem,
   type LineageImpactResponse,
   type LineageInferenceDecision,
+  type LineageRunListItem,
   type LineageSubgraphEdge,
   type LineageSubgraphNode,
   type LineageSubgraphResponse,
@@ -75,7 +78,7 @@ import LineageDdlInput from '../components/LineageDdlInput.vue'
 import TraceCompareDialog from '../components/TraceCompareDialog.vue'
 import { createUserErrorMessage } from '../utils/userErrorMessage'
 
-type Tab = 'subgraph' | 'impact' | 'analyze' | 'batch'
+type Tab = 'subgraph' | 'impact' | 'analyze' | 'batch' | 'runs'
 
 // 血缘解析器支持的方言(app/domain/lineage/dialects.py normalize_lineage_dialect);
 // 'auto' 是自动识别哨兵(L-1),非真实 db_type,但作为合法方言不触发 unsupported 提示。
@@ -110,6 +113,61 @@ const dsQuery = useQuery({
   enabled: computed(() => Boolean(projectId.value)),
 })
 const datasources = computed<DatasourceListItem[]>(() => dsQuery.data.value ?? [])
+
+// ── 解析历史 tab(0030 留痕)───────────────────────────────────────
+// 列表即定位 SQL "手动选择血缘记录" 的数据来源;默认只看生效记录。
+const RUNS_PAGE_SIZE = 20
+const runsDatasourceId = ref('')
+const runsSearch = ref('')
+const runsStatus = ref<'' | 'success' | 'failed'>('')
+const runsActiveOnly = ref(true)
+const runsLoading = ref(false)
+const runsError = ref<string | null>(null)
+const runsItems = ref<LineageRunListItem[]>([])
+const runsHasMore = ref(false)
+
+async function loadRuns(append = false): Promise<void> {
+  if (!projectId.value) return
+  runsLoading.value = true
+  runsError.value = null
+  try {
+    const response = await listLineageRuns(projectId.value, {
+      datasourceId: runsDatasourceId.value || undefined,
+      sourceRef: runsSearch.value.trim() || undefined,
+      status: runsStatus.value || undefined,
+      activeOnly: runsActiveOnly.value,
+      limit: RUNS_PAGE_SIZE,
+      offset: append ? runsItems.value.length : 0,
+    })
+    runsItems.value = append ? [...runsItems.value, ...response.items] : response.items
+    runsHasMore.value = response.has_more
+  } catch (error) {
+    runsError.value = errorMessage(error)
+  } finally {
+    runsLoading.value = false
+  }
+}
+
+function runsConfidenceText(item: LineageRunListItem): string {
+  return item.min_confidence === null ? '—' : `${Math.round(item.min_confidence * 100)}%`
+}
+
+/** 历史行 →「查看子图」:以该 run 写入的第一张表作焦点(target_tables 后端已截断)。 */
+function openSubgraphFromRun(item: LineageRunListItem): void {
+  const focus = item.target_tables[0]
+  if (!focus) return
+  subgraphFocus.value = focus
+  subgraphDirection.value = 'upstream'
+  tab.value = 'subgraph'
+  void runSubgraph()
+}
+
+watch(
+  [tab, projectId, runsDatasourceId, runsStatus, runsActiveOnly],
+  ([nextTab]) => {
+    if (nextTab === 'runs') void loadRuns(false)
+  },
+)
 
 // ── 子图查询 ────────────────────────────────────────────────────────
 const subgraphFocus = ref('')
@@ -958,6 +1016,15 @@ onBeforeUnmount(stopBatchPolling)
       >
         <FileArchive class="w-4 h-4" /> {{ t('lineage.tab_batch') }}
       </button>
+      <button
+        type="button"
+        class="chrome-tab"
+        :class="tab === 'runs' && 'chrome-accent-light-bg chrome-accent'"
+        data-testid="lineage-runs-tab"
+        @click="tab = 'runs'"
+      >
+        <History class="w-4 h-4" /> {{ t('lineage.tab_runs') }}
+      </button>
     </div>
 
     <div class="flex-1 min-h-0 overflow-auto">
@@ -1723,6 +1790,136 @@ onBeforeUnmount(stopBatchPolling)
             </div>
           </div>
         </template>
+      </div>
+
+      <!-- ============ 解析历史 tab(0030 留痕)============ -->
+      <div v-show="tab === 'runs'" data-testid="lineage-runs-body" class="p-4 space-y-3 w-full">
+        <p class="text-xs chrome-text-muted">{{ t('lineage.runs_hint') }}</p>
+
+        <div class="flex flex-wrap items-center gap-2">
+          <select v-model="runsDatasourceId" class="chrome-input text-xs">
+            <option value="">{{ t('lineage.runs_all_datasources') }}</option>
+            <option v-for="ds in datasources" :key="ds.id" :value="ds.id">{{ ds.name }}</option>
+          </select>
+          <input
+            v-model="runsSearch"
+            type="search"
+            class="chrome-input text-xs flex-1 min-w-[180px]"
+            :placeholder="t('lineage.runs_search')"
+            @keyup.enter="loadRuns(false)"
+          />
+          <select v-model="runsStatus" class="chrome-input text-xs">
+            <option value="">{{ t('lineage.runs_all_status') }}</option>
+            <option value="success">success</option>
+            <option value="failed">failed</option>
+          </select>
+          <label class="flex items-center gap-1.5 text-xs chrome-text-muted">
+            <input v-model="runsActiveOnly" type="checkbox" />
+            {{ t('lineage.runs_active_only') }}
+          </label>
+          <button
+            type="button"
+            class="chrome-btn-secondary text-xs"
+            :disabled="runsLoading"
+            @click="loadRuns(false)"
+          >
+            <RefreshCw class="w-3.5 h-3.5" />
+          </button>
+        </div>
+
+        <p v-if="runsError" class="text-xs chrome-text-danger">{{ runsError }}</p>
+        <LoadingDots v-else-if="runsLoading && runsItems.length === 0" />
+        <p v-else-if="runsItems.length === 0" class="text-xs chrome-text-muted">
+          {{ t('lineage.runs_empty') }}
+        </p>
+
+        <table v-else class="w-full text-xs">
+          <thead>
+            <tr class="chrome-text-muted text-left">
+              <th class="py-1.5 pr-3 font-medium">{{ t('lineage.runs_col_id') }}</th>
+              <th class="py-1.5 pr-3 font-medium">{{ t('lineage.runs_col_source_ref') }}</th>
+              <th class="py-1.5 pr-3 font-medium">{{ t('lineage.runs_col_datasource') }}</th>
+              <th class="py-1.5 pr-3 font-medium">{{ t('lineage.runs_col_edges') }}</th>
+              <th class="py-1.5 pr-3 font-medium">{{ t('lineage.runs_col_confidence') }}</th>
+              <th class="py-1.5 pr-3 font-medium">{{ t('lineage.runs_col_status') }}</th>
+              <th class="py-1.5 pr-3 font-medium">{{ t('lineage.runs_col_created') }}</th>
+              <th class="py-1.5 font-medium">{{ t('lineage.runs_col_actions') }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="item in runsItems"
+              :key="item.run_id"
+              class="border-t chrome-border-subtle align-middle"
+            >
+              <td class="py-2 pr-3 font-mono">{{ item.run_id.slice(0, 8) }}</td>
+              <td class="py-2 pr-3">{{ item.source_ref }}</td>
+              <td class="py-2 pr-3 chrome-text-muted">
+                {{ item.datasource_name ?? item.datasource_id.slice(0, 8) }} · {{ item.dialect }}
+              </td>
+              <td class="py-2 pr-3 chrome-text-muted">
+                {{
+                  t('lineage.runs_edges', {
+                    tables: item.table_edge_count,
+                    columns: item.column_edge_count,
+                  })
+                }}
+              </td>
+              <td class="py-2 pr-3">
+                {{ runsConfidenceText(item) }}
+                <span
+                  v-if="item.unconfirmed_inferred_count > 0"
+                  class="block chrome-text-muted"
+                >
+                  {{
+                    t('lineage.runs_unconfirmed', { edges: item.unconfirmed_inferred_count })
+                  }}
+                </span>
+              </td>
+              <td class="py-2 pr-3">
+                <span v-if="item.status === 'failed'" class="chrome-text-danger">
+                  {{ t('lineage.runs_state_failed') }}
+                </span>
+                <span v-else-if="item.active" class="chrome-accent">
+                  {{ t('lineage.runs_state_active') }}
+                </span>
+                <span v-else class="chrome-text-muted">
+                  {{
+                    t('lineage.runs_state_superseded', {
+                      id: (item.superseded_by ?? '').slice(0, 8),
+                    })
+                  }}
+                </span>
+              </td>
+              <td class="py-2 pr-3 chrome-text-muted">{{ item.created_at.slice(0, 16) }}</td>
+              <td class="py-2">
+                <button
+                  type="button"
+                  class="chrome-link text-xs"
+                  :disabled="item.target_tables.length === 0"
+                  @click="openSubgraphFromRun(item)"
+                >
+                  {{ t('lineage.runs_action_subgraph') }}
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div v-if="runsItems.length > 0" class="flex items-center gap-3">
+          <button
+            v-if="runsHasMore"
+            type="button"
+            class="chrome-btn-secondary text-xs"
+            :disabled="runsLoading"
+            @click="loadRuns(true)"
+          >
+            {{ t('lineage.runs_load_more') }}
+          </button>
+          <span class="text-xs chrome-text-muted">
+            {{ t('lineage.runs_loaded', { loaded: runsItems.length }) }}
+          </span>
+        </div>
       </div>
 
       <!-- ============ 批量分析 tab(L-2:ZIP → job → 报告)============ -->

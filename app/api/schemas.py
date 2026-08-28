@@ -713,6 +713,39 @@ class LineageAnalyzeResponse(BaseModel):
     ai_fallback: LineageAiFallbackResult | None = None
 
 
+class LineageRunListItem(BaseModel):
+    """解析历史一行(0030 留痕后 lineage_runs 的列表投影)。
+
+    min_confidence / unconfirmed_inferred_count 取该 run 全部列级边:一眼判断这条
+    记录拿去溯源靠不靠谱(与定位 SQL 置信度 D4 同一口径 —— 取最小值)。
+    """
+
+    run_id: str
+    project_id: str
+    datasource_id: str
+    datasource_name: str | None = None
+    dialect: str
+    source_ref: str
+    sql_hash: str
+    status: Literal["success", "failed"]
+    table_edge_count: int
+    column_edge_count: int
+    min_confidence: float | None = None
+    unconfirmed_inferred_count: int = 0
+    # 该 run 写入的表(截断,见 _LINEAGE_RUN_TARGET_TABLE_CAP):子图跳转焦点 / 溯源匹配锚点
+    target_tables: list[str] = Field(default_factory=list)
+    active: bool
+    superseded_at: datetime | None = None
+    superseded_by: str | None = None
+    created_at: datetime
+
+
+class LineageRunListResponse(BaseModel):
+    project_id: str
+    items: list[LineageRunListItem]
+    has_more: bool
+
+
 class LineageAiEnrichmentResponse(BaseModel):
     """L-7 整份血缘报告的 AI 解读结果(纯追加;标注 AI 生成)。"""
 

@@ -19,7 +19,19 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy import Table as SqlaTable
-from sqlalchemy import and_, delete, func, insert, or_, select, text, union_all, update
+from sqlalchemy import (
+    and_,
+    delete,
+    exists,
+    func,
+    insert,
+    literal,
+    or_,
+    select,
+    text,
+    union_all,
+    update,
+)
 from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError
 from sqlglot import exp
@@ -107,6 +119,8 @@ from app.api.schemas import (
     LineageImpactItem,
     LineageImpactResponse,
     LineageImpactSignal,
+    LineageRunListItem,
+    LineageRunListResponse,
     LineageSubgraphEdge,
     LineageSubgraphNode,
     LineageSubgraphResponse,
@@ -444,6 +458,10 @@ _LINEAGE_TABLE_DOWNSTREAM_SQL = text(
         WHERE e.project_id = :project_id
           AND e.source_table = :focus_table
           AND e.inference_status <> 'rejected'
+          AND NOT EXISTS (
+              SELECT 1 FROM lineage_runs r
+              WHERE r.id = e.run_id AND r.superseded_at IS NOT NULL
+          )
         UNION ALL
         SELECT
             e.id,
@@ -465,6 +483,10 @@ _LINEAGE_TABLE_DOWNSTREAM_SQL = text(
         JOIN walk ON e.source_table = walk.target_table
         WHERE e.project_id = :project_id
           AND e.inference_status <> 'rejected'
+          AND NOT EXISTS (
+              SELECT 1 FROM lineage_runs r
+              WHERE r.id = e.run_id AND r.superseded_at IS NOT NULL
+          )
           AND walk.depth < :query_depth
           AND NOT e.target_table = ANY(walk.path)
     )
@@ -495,6 +517,10 @@ _LINEAGE_TABLE_UPSTREAM_SQL = text(
         WHERE e.project_id = :project_id
           AND e.target_table = :focus_table
           AND e.inference_status <> 'rejected'
+          AND NOT EXISTS (
+              SELECT 1 FROM lineage_runs r
+              WHERE r.id = e.run_id AND r.superseded_at IS NOT NULL
+          )
         UNION ALL
         SELECT
             e.id,
@@ -516,6 +542,10 @@ _LINEAGE_TABLE_UPSTREAM_SQL = text(
         JOIN walk ON e.target_table = walk.source_table
         WHERE e.project_id = :project_id
           AND e.inference_status <> 'rejected'
+          AND NOT EXISTS (
+              SELECT 1 FROM lineage_runs r
+              WHERE r.id = e.run_id AND r.superseded_at IS NOT NULL
+          )
           AND walk.depth < :query_depth
           AND NOT e.source_table = ANY(walk.path)
     )
@@ -550,6 +580,10 @@ _LINEAGE_COLUMN_DOWNSTREAM_SQL = text(
           AND e.source_table = :focus_table
           AND e.source_column = :focus_column
           AND e.inference_status <> 'rejected'
+          AND NOT EXISTS (
+              SELECT 1 FROM lineage_runs r
+              WHERE r.id = e.run_id AND r.superseded_at IS NOT NULL
+          )
         UNION ALL
         SELECT
             e.id,
@@ -573,6 +607,10 @@ _LINEAGE_COLUMN_DOWNSTREAM_SQL = text(
          AND e.source_column = walk.target_column
         WHERE e.project_id = :project_id
           AND e.inference_status <> 'rejected'
+          AND NOT EXISTS (
+              SELECT 1 FROM lineage_runs r
+              WHERE r.id = e.run_id AND r.superseded_at IS NOT NULL
+          )
           AND walk.depth < :query_depth
           AND NOT (e.target_table || '.' || e.target_column) = ANY(walk.path)
     )
@@ -607,6 +645,10 @@ _LINEAGE_COLUMN_UPSTREAM_SQL = text(
           AND e.target_table = :focus_table
           AND e.target_column = :focus_column
           AND e.inference_status <> 'rejected'
+          AND NOT EXISTS (
+              SELECT 1 FROM lineage_runs r
+              WHERE r.id = e.run_id AND r.superseded_at IS NOT NULL
+          )
         UNION ALL
         SELECT
             e.id,
@@ -630,6 +672,10 @@ _LINEAGE_COLUMN_UPSTREAM_SQL = text(
          AND e.target_column = walk.source_column
         WHERE e.project_id = :project_id
           AND e.inference_status <> 'rejected'
+          AND NOT EXISTS (
+              SELECT 1 FROM lineage_runs r
+              WHERE r.id = e.run_id AND r.superseded_at IS NOT NULL
+          )
           AND walk.depth < :query_depth
           AND NOT (e.source_table || '.' || e.source_column) = ANY(walk.path)
     )
@@ -4267,15 +4313,6 @@ def analyze_project_lineage(
                         requested=True, executed=False, reason="cached_run"
                     )
                 return cached_response
-        else:
-            _delete_lineage_cache(
-                conn,
-                project_id=project_id,
-                datasource_id=body.datasource_id,
-                dialect=dialect,
-                source_ref=body.source_ref,
-                sql_hash=sql_hash,
-            )
 
         # ★ 缓存未命中之后才解析 DDL:解析在查缓存之前的话,命中缓存也要在
         # engine.begin() 事务内、占着连接池连接,把最多 1 MB 文本全额解析一遍再丢弃。
@@ -4308,6 +4345,18 @@ def analyze_project_lineage(
 
         run_id = new_id()
         now = datetime.now(UTC)
+        if refresh:
+            # 0030:标记旧 run 被本次取代(不删除),让出 partial unique index 上的生效位。
+            # 放在解析成功之后:解析失败时整事务回滚,历史与生效标记都不动。
+            _supersede_lineage_cache(
+                conn,
+                project_id=project_id,
+                datasource_id=body.datasource_id,
+                dialect=dialect,
+                source_ref=body.source_ref,
+                sql_hash=sql_hash,
+                superseded_by=run_id,
+            )
         parse_summary = dict(report.report or {})
         parse_summary["parser_version"] = LINEAGE_PARSER_VERSION
         if detection.auto_detected:
@@ -4551,6 +4600,170 @@ def enrich_lineage_run_with_ai(
         egress_level=egress,
         created_at=now,
     )
+
+
+@router.get(
+    "/projects/{project_id}/lineage/runs",
+    response_model=LineageRunListResponse,
+)
+def list_project_lineage_runs(
+    project_id: str,
+    request: Request,
+    datasource_id: str | None = Query(default=None),
+    source_ref: str | None = Query(default=None),
+    status: Literal["success", "failed"] | None = Query(default=None),
+    active_only: bool = Query(default=True),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> LineageRunListResponse:
+    """0030 解析历史列表:留痕后的 lineage_runs 入口,也是定位 SQL 手动选记录的数据源。
+
+    ``active_only`` 默认 true —— 历史噪音不进首屏;``source_ref`` 是子串匹配(前端
+    "按来源标识 / 表名搜索")。每行带该 run 的边数、最低置信度与未确认推断边数。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    with services.engine.connect() as conn:
+        _require_project_access(conn, project_id, user.id)
+        conditions = [lineage_runs.c.project_id == project_id]
+        if datasource_id is not None:
+            conditions.append(lineage_runs.c.datasource_id == datasource_id)
+        if source_ref:
+            conditions.append(lineage_runs.c.source_ref.ilike(f"%{source_ref}%"))
+        if status is not None:
+            conditions.append(lineage_runs.c.status == status)
+        if active_only:
+            conditions.append(lineage_runs.c.superseded_at.is_(None))
+        rows = (
+            conn.execute(
+                select(lineage_runs, datasources.c.name.label("datasource_name"))
+                .select_from(
+                    lineage_runs.outerjoin(
+                        datasources, datasources.c.id == lineage_runs.c.datasource_id
+                    )
+                )
+                .where(and_(*conditions))
+                .order_by(lineage_runs.c.created_at.desc(), lineage_runs.c.id.desc())
+                .limit(limit + 1)
+                .offset(offset)
+            )
+            .mappings()
+            .all()
+        )
+        page = rows[:limit]
+        stats = _lineage_run_edge_stats(conn, [str(row["id"]) for row in page])
+    items = [
+        LineageRunListItem(
+            run_id=str(row["id"]),
+            project_id=str(row["project_id"]),
+            datasource_id=str(row["datasource_id"]),
+            datasource_name=(
+                str(row["datasource_name"]) if row["datasource_name"] is not None else None
+            ),
+            dialect=str(row["dialect"]),
+            source_ref=str(row["source_ref"]),
+            sql_hash=str(row["sql_hash"]),
+            status=cast(Literal["success", "failed"], str(row["status"])),
+            table_edge_count=stats[str(row["id"])]["table_edge_count"],
+            column_edge_count=stats[str(row["id"])]["column_edge_count"],
+            min_confidence=stats[str(row["id"])]["min_confidence"],
+            unconfirmed_inferred_count=stats[str(row["id"])]["unconfirmed_inferred_count"],
+            target_tables=stats[str(row["id"])]["target_tables"],
+            active=row["superseded_at"] is None,
+            superseded_at=row["superseded_at"],
+            superseded_by=(str(row["superseded_by"]) if row["superseded_by"] is not None else None),
+            created_at=row["created_at"],
+        )
+        for row in page
+    ]
+    return LineageRunListResponse(project_id=project_id, items=items, has_more=len(rows) > limit)
+
+
+# 列表页每行只展示前几张写入表(避免一个大脚本把行撑爆);超出部分前端显示 "+N"。
+_LINEAGE_RUN_TARGET_TABLE_CAP = 5
+
+
+def _lineage_run_edge_stats(conn: Connection, run_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """逐 run 汇总边数 / 最低置信度 / 未确认推断边数(rejected 边不计)。
+
+    最低置信度取列级边(定位 SQL 反推吃的就是列级边,与 D4 置信度口径一致);
+    没有列级边时为 None,前端显示 "—"。
+    """
+    empty: dict[str, Any] = {
+        "table_edge_count": 0,
+        "column_edge_count": 0,
+        "min_confidence": None,
+        "unconfirmed_inferred_count": 0,
+        "target_tables": [],
+    }
+    stats: dict[str, dict[str, Any]] = {run_id: dict(empty) for run_id in run_ids}
+    if not run_ids:
+        return stats
+    table_rows = (
+        conn.execute(
+            select(lineage_edges.c.run_id, func.count().label("edge_count"))
+            .where(
+                and_(
+                    lineage_edges.c.run_id.in_(run_ids),
+                    lineage_edges.c.inference_status != "rejected",
+                )
+            )
+            .group_by(lineage_edges.c.run_id)
+        )
+        .mappings()
+        .all()
+    )
+    for row in table_rows:
+        stats[str(row["run_id"])]["table_edge_count"] = int(row["edge_count"])
+    column_rows = (
+        conn.execute(
+            select(
+                lineage_column_edges.c.run_id,
+                func.count().label("edge_count"),
+                func.min(lineage_column_edges.c.confidence).label("min_confidence"),
+                func.count()
+                .filter(lineage_column_edges.c.inference_status == "inferred")
+                .label("unconfirmed_count"),
+            )
+            .where(
+                and_(
+                    lineage_column_edges.c.run_id.in_(run_ids),
+                    lineage_column_edges.c.inference_status != "rejected",
+                )
+            )
+            .group_by(lineage_column_edges.c.run_id)
+        )
+        .mappings()
+        .all()
+    )
+    for row in column_rows:
+        entry = stats[str(row["run_id"])]
+        entry["column_edge_count"] = int(row["edge_count"])
+        entry["min_confidence"] = (
+            float(row["min_confidence"]) if row["min_confidence"] is not None else None
+        )
+        entry["unconfirmed_inferred_count"] = int(row["unconfirmed_count"])
+    # 该 run 写入了哪些表 —— 列表页"查看子图"的焦点,也是后续按对比表名反查血缘记录的锚点。
+    target_rows = (
+        conn.execute(
+            select(lineage_edges.c.run_id, lineage_edges.c.target_table)
+            .where(
+                and_(
+                    lineage_edges.c.run_id.in_(run_ids),
+                    lineage_edges.c.inference_status != "rejected",
+                )
+            )
+            .distinct()
+            .order_by(lineage_edges.c.run_id, lineage_edges.c.target_table)
+        )
+        .mappings()
+        .all()
+    )
+    for row in target_rows:
+        targets = stats[str(row["run_id"])]["target_tables"]
+        if len(targets) < _LINEAGE_RUN_TARGET_TABLE_CAP:
+            targets.append(str(row["target_table"]))
+    return stats
 
 
 @router.get(
@@ -8590,6 +8803,7 @@ def _lineage_cached_run(
                     lineage_runs.c.source_ref == source_ref,
                     lineage_runs.c.sql_hash == sql_hash,
                     lineage_runs.c.parser_version == LINEAGE_PARSER_VERSION,
+                    lineage_runs.c.superseded_at.is_(None),
                 )
             )
         )
@@ -8598,7 +8812,7 @@ def _lineage_cached_run(
     )
 
 
-def _delete_lineage_cache(
+def _supersede_lineage_cache(
     conn: Connection,
     *,
     project_id: str,
@@ -8606,9 +8820,16 @@ def _delete_lineage_cache(
     dialect: str,
     source_ref: str,
     sql_hash: str,
+    superseded_by: str,
 ) -> None:
+    """0030:refresh 重解析把旧 run 标"已被取代"而不是删除——解析历史永久留痕。
+
+    生效行(superseded_at IS NULL)最多一条(partial unique index),标记后新行才插得进去;
+    旧行的边留在表里但被血缘图遍历的 NOT EXISTS 过滤掉,子图/影响/列级追溯行为不变。
+    """
     conn.execute(
-        delete(lineage_runs).where(
+        update(lineage_runs)
+        .where(
             and_(
                 lineage_runs.c.project_id == project_id,
                 lineage_runs.c.datasource_id == datasource_id,
@@ -8616,8 +8837,10 @@ def _delete_lineage_cache(
                 lineage_runs.c.source_ref == source_ref,
                 lineage_runs.c.sql_hash == sql_hash,
                 lineage_runs.c.parser_version == LINEAGE_PARSER_VERSION,
+                lineage_runs.c.superseded_at.is_(None),
             )
         )
+        .values(superseded_at=func.now(), superseded_by=superseded_by)
     )
 
 
@@ -9137,6 +9360,7 @@ def _lineage_table_reference_frequency(
                 lineage_edges.c.project_id == project_id,
                 lineage_edges.c.source_table.in_(tables),
                 lineage_edges.c.inference_status != "rejected",
+                _lineage_active_run_clause(lineage_edges),
             )
         ),
         select(
@@ -9147,6 +9371,7 @@ def _lineage_table_reference_frequency(
                 lineage_edges.c.project_id == project_id,
                 lineage_edges.c.target_table.in_(tables),
                 lineage_edges.c.inference_status != "rejected",
+                _lineage_active_run_clause(lineage_edges),
             )
         ),
     ).subquery("edge_refs")
@@ -9327,6 +9552,24 @@ def _lineage_focus_ref(
     return {"kind": "table", "table": focus, "column": "", "node": focus}
 
 
+def _lineage_active_run_clause(edge_table: SqlaTable) -> Any:
+    """0030:边所属 lineage_run 必须"生效中"——已被取代的历史边不参与任何图查询。
+
+    留痕前旧 run 会被 DELETE(边随 CASCADE 消失),留痕后必须显式过滤,否则同一脚本
+    改版后新旧两版的边会同时出现在子图 / 影响 / 列级追溯里。
+    """
+    return ~exists(
+        select(literal(1))
+        .select_from(lineage_runs)
+        .where(
+            and_(
+                lineage_runs.c.id == edge_table.c.run_id,
+                lineage_runs.c.superseded_at.is_not(None),
+            )
+        )
+    )
+
+
 def _lineage_table_exists(conn: Connection, project_id: str, table_name: str) -> bool:
     exists = conn.execute(
         select(lineage_edges.c.id)
@@ -9337,6 +9580,7 @@ def _lineage_table_exists(conn: Connection, project_id: str, table_name: str) ->
                     lineage_edges.c.source_table == table_name,
                     lineage_edges.c.target_table == table_name,
                 ),
+                _lineage_active_run_clause(lineage_edges),
             )
         )
         .limit(1)
@@ -9352,6 +9596,7 @@ def _lineage_table_exists(conn: Connection, project_id: str, table_name: str) ->
                     lineage_column_edges.c.source_table == table_name,
                     lineage_column_edges.c.target_table == table_name,
                 ),
+                _lineage_active_run_clause(lineage_column_edges),
             )
         )
         .limit(1)
@@ -9433,6 +9678,7 @@ def _lineage_column_expansion_rows(
                         lineage_column_edges.c.source_table == source_table,
                         lineage_column_edges.c.target_table == target_table,
                         lineage_column_edges.c.inference_status != "rejected",
+                        _lineage_active_run_clause(lineage_column_edges),
                     )
                 )
             )

@@ -383,3 +383,73 @@ test('batch tab sends ddl_text and shows the summary from the report', async ({ 
   expect(sentDdl).toBe(DDL_TEXT)
   expectNoConsoleErrors()
 })
+
+test('lineage parse history lists runs with confidence and supersede state', async ({
+  page,
+}) => {
+  await mockBase(page)
+  let requestedUrl = ''
+  await page.route(/\/api\/projects\/project-1\/lineage\/runs\?/, (r) => {
+    requestedUrl = r.request().url()
+    return json(r, 200, {
+      project_id: 'project-1',
+      has_more: false,
+      items: [
+        {
+          run_id: '0c3f42aa-9a1b-4d21-8c66-1f2e3d4a5b6c',
+          project_id: 'project-1',
+          datasource_id: 'ds-1',
+          datasource_name: 'prod-mysql',
+          dialect: 'mysql',
+          source_ref: 'etl/orders_daily.sql',
+          sql_hash: 'hash-1',
+          status: 'success',
+          table_edge_count: 12,
+          column_edge_count: 38,
+          min_confidence: 0.74,
+          unconfirmed_inferred_count: 2,
+          target_tables: ['ads.orders_agg'],
+          active: true,
+          superseded_at: null,
+          superseded_by: null,
+          created_at: '2026-08-28T09:12:00Z',
+        },
+        {
+          run_id: '9d11f8bb-02aa-4c10-9e55-7a8b9c0d1e2f',
+          project_id: 'project-1',
+          datasource_id: 'ds-1',
+          datasource_name: 'prod-mysql',
+          dialect: 'mysql',
+          source_ref: 'etl/orders_daily.sql',
+          sql_hash: 'hash-0',
+          status: 'success',
+          table_edge_count: 11,
+          column_edge_count: 35,
+          min_confidence: 0.91,
+          unconfirmed_inferred_count: 0,
+          target_tables: ['ads.orders_agg'],
+          active: false,
+          superseded_at: '2026-08-28T09:12:00Z',
+          superseded_by: '0c3f42aa-9a1b-4d21-8c66-1f2e3d4a5b6c',
+          created_at: '2026-08-25T14:03:00Z',
+        },
+      ],
+    })
+  })
+
+  await page.goto('/projects/project-1/lineage')
+  await page.getByTestId('lineage-runs-tab').click()
+
+  const body = page.getByTestId('lineage-runs-body')
+  await expect(body.getByText('etl/orders_daily.sql').first()).toBeVisible()
+  // 置信度按血缘边最小值展示为百分比;未确认推断边数量单独提示
+  await expect(body.getByText('74%')).toBeVisible()
+  await expect(body.getByText('2 unconfirmed inferred edge(s)')).toBeVisible()
+  // 留痕:旧记录不消失,标"已被取代"并指向取代者
+  await expect(body.getByText('Superseded → 0c3f42aa')).toBeVisible()
+  await expect(body.getByText('Active', { exact: true })).toBeVisible()
+  // 首屏默认只看生效记录
+  expect(requestedUrl).toContain('active_only=true')
+
+  expectNoConsoleErrors()
+})
