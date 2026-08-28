@@ -819,21 +819,40 @@ lineage_runs = Table(
     Column("parse_summary", JSONB(), nullable=False, server_default=text("'{}'::jsonb")),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=text("now()")),
+    # 0030:refresh 重解析不再删除旧 run,改标"已被取代"——血缘解析历史永久留痕。
+    # superseded_at IS NULL 即"生效中";生效行才参与缓存命中与血缘图遍历。
+    Column("superseded_at", DateTime(timezone=True), nullable=True),
+    Column(
+        "superseded_by",
+        String(36),
+        # 延迟校验:refresh 同事务内先标记旧行、后插入新行(见 migration 0030 注释)
+        ForeignKey(
+            "lineage_runs.id",
+            ondelete="SET NULL",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
+        nullable=True,
+    ),
     CheckConstraint(
         "status IN ('success', 'failed')",
         name="status_is_valid",
     ),
-    UniqueConstraint(
+    # 0030:唯一性只约束生效行(历史行同 cache key 可有多条)。
+    Index(
+        "uq_lineage_runs_cache_key_active",
         "project_id",
         "datasource_id",
         "dialect",
         "source_ref",
         "sql_hash",
         "parser_version",
-        name="uq_lineage_runs_cache_key",
+        unique=True,
+        postgresql_where=text("superseded_at IS NULL"),
     ),
     Index("ix_lineage_runs_project_hash", "project_id", "sql_hash"),
     Index("ix_lineage_runs_datasource_created", "datasource_id", "created_at"),
+    Index("ix_lineage_runs_project_created", "project_id", "created_at"),
 )
 
 
