@@ -255,12 +255,21 @@ def _analyze_statement(
         # 仅在直解失败时尝试剥别名重写再解一次(限定爆炸半径)
         rewritten = _rewrite_insert_alias(statement) if isinstance(exc, ParseError) else None
         if rewritten is None:
-            _append_parse_error(report, context, "parse_error", exc, statement_type=None)
+            _append_parse_error(
+                report, context, "parse_error", exc, statement_type=None, statement=statement
+            )
             return
         try:
             expression = cast(exp.Expression, sqlglot.parse_one(rewritten, read=context.dialect))
         except (SqlglotError, RecursionError) as rewritten_exc:
-            _append_parse_error(report, context, "parse_error", rewritten_exc, statement_type=None)
+            _append_parse_error(
+                report,
+                context,
+                "parse_error",
+                rewritten_exc,
+                statement_type=None,
+                statement=statement,
+            )
             return
     statement_type = expression.key.upper()
     report.statements.append({"index": context.index, "type": statement_type})
@@ -1423,6 +1432,24 @@ def _case_get(mapping: Mapping[str, Any], key: str) -> Any:
     return None
 
 
+# 一段文本要被当作 SQL 看待,至少得出现一个 DML/DDL 关键字。都没有的多半是
+# 说明文档 / 任务导出件 / 分隔线,报 sqlglot 的 token 级错误对用户毫无意义。
+_SQL_KEYWORD_RE = re.compile(
+    r"\b(select|insert|update|delete|merge|create|alter|drop|truncate|with|call|grant)\b",
+    re.IGNORECASE,
+)
+# 纯符号分隔线(=== / --- / *** …):sqlglot 会把 `====` 读成 `==` 运算符然后报
+# "Required keyword: 'expression' missing for EQ",对用户是纯噪音。
+_SEPARATOR_LINE_RE = re.compile(r"^\s*([=\-*_#~+])\1{5,}\s*$", re.MULTILINE)
+
+
+def looks_like_sql(statement: str) -> bool:
+    """去掉注释后是否还剩 SQL 关键字。用于把"根本不是 SQL"与"SQL 写错了"分开。"""
+    body = re.sub(r"--[^\n]*", " ", statement)
+    body = re.sub(r"/\*.*?\*/", " ", body, flags=re.DOTALL)
+    return bool(_SQL_KEYWORD_RE.search(body))
+
+
 def _append_parse_error(
     report: LineageReport,
     context: _StatementContext,
@@ -1430,13 +1457,34 @@ def _append_parse_error(
     exc: Exception,
     *,
     statement_type: str | None,
+    statement: str | None = None,
 ) -> None:
-    message = _parse_error_message(exc) if isinstance(exc, ParseError) else type(exc).__name__
+    """把解析失败落成诊断。
+
+    ★ 不是所有失败都值得把 sqlglot 的 token 级细节甩给用户:当这段文本压根不含
+    SQL 关键字(整段是注释头 + `====` 分隔线的任务导出件是最常见的一种),报
+    "Required keyword: 'expression' missing for EQ (line 7, col 4, token='==')"
+    只会让人以为是解析器坏了。这种归为 ``not_sql`` 并说人话,原始细节仍保留在
+    ``detail`` 里供排查。
+    """
+    raw = _parse_error_message(exc) if isinstance(exc, ParseError) else type(exc).__name__
+    message = raw
+    detail: str | None = None
+    if statement is not None and not looks_like_sql(statement):
+        error_type = "not_sql"
+        hint = (
+            "(疑似任务导出文档:整段由注释与分隔线组成)"
+            if _SEPARATOR_LINE_RE.search(statement)
+            else "(整段未出现 SQL 关键字)"
+        )
+        message = f"这段内容不是可解析的 SQL,已跳过{hint}"
+        detail = raw
     report.parse_errors.append(
         LineageParseError(
             statement_index=context.index,
             error_type=error_type,
             message=message,
+            detail=detail,
             unsupported=True,
             statement_type=statement_type,
         ).model_dump(mode="json")

@@ -233,7 +233,6 @@ function onGraphEdgeClick(edgeId: string): void {
 // 复用 LineageGraphCanvas:把 semantic_view.targets(源表→目标表)映射成
 // 子图同形的扁平 nodes/edges(表级),让批量分析也有一张流向图。dagre 按边
 // 拓扑排秩,node.depth 仅装饰、不影响布局。
-const showBatchGraph = ref(true)
 const batchGraphData = computed<{
   nodes: LineageSubgraphNode[]
   edges: LineageSubgraphEdge[]
@@ -752,6 +751,35 @@ const batchError = ref<string | null>(null)
 const batchJobId = ref<string | null>(null)
 const batchJobStatus = ref<LineageBatchJobStatus | null>(null)
 const batchReport = ref<LineageBatchReport | null>(null)
+
+/**
+ * 风险提示按「level + type + 文案」聚合计数。
+ * 一个非 SQL 文件里每条语句都会撞同一个错,原样铺开就是十几行一模一样的红字 ——
+ * 聚合后一行带 ×N,真正不同的问题才看得见。
+ */
+const batchRiskGroups = computed(() => {
+  const groups = new Map<string, { level: string; type: string; message: string; count: number }>()
+  for (const risk of batchReport.value?.semantic_view?.risks ?? []) {
+    const key = `${risk.level}|${risk.type}|${risk.message}`
+    const hit = groups.get(key)
+    if (hit) hit.count += 1
+    else groups.set(key, { level: risk.level, type: risk.type, message: risk.message, count: 1 })
+  }
+  // high 在前,同级按出现次数降序
+  const order: Record<string, number> = { high: 0, medium: 1, low: 2 }
+  return [...groups.values()].sort(
+    (a, b) => (order[a.level] ?? 9) - (order[b.level] ?? 9) || b.count - a.count,
+  )
+})
+
+// 报告不再堆成一条长滚动:每个维度一页,图那页铺满可视区(设计反馈)。
+type BatchPane = 'overview' | 'graph' | 'files' | 'semantic'
+const batchPane = ref<BatchPane>('overview')
+
+watch(batchReport, (report) => {
+  // 有图就默认落在图那页 —— 它是看批量结果时最先要看的东西
+  batchPane.value = report && batchGraphData.value ? 'graph' : 'overview'
+})
 const expandedFiles = ref<Set<string>>(new Set())
 let batchPollTimer: ReturnType<typeof setTimeout> | null = null
 let batchPollGeneration = 0
@@ -2048,8 +2076,25 @@ onBeforeUnmount(stopBatchPolling)
             <LoadingDots v-if="batchBusy" />
           </div>
 
-          <!-- 报告 -->
-          <div v-if="batchReport" class="space-y-4">
+          <!-- 报告:按维度分页,图独占一页铺满 -->
+          <div v-if="batchReport" class="flex flex-1 min-h-0 flex-col gap-3">
+            <div class="flex items-center gap-1 shrink-0">
+              <button
+                v-for="pane in (['overview', 'graph', 'files', 'semantic'] as const)"
+                :key="pane"
+                type="button"
+                class="chrome-tab"
+                :class="batchPane === pane && 'chrome-accent-light-bg chrome-accent'"
+                :disabled="pane === 'graph' && !batchGraphData"
+                :data-testid="`lineage-batch-pane-${pane}`"
+                @click="batchPane = pane"
+              >
+                {{ t(`lineage.batch_pane_${pane}`) }}
+              </button>
+            </div>
+
+            <!-- ============ 概览 ============ -->
+            <div v-show="batchPane === 'overview'" class="space-y-4 overflow-auto">
             <!-- 统计卡 -->
             <div class="grid grid-cols-2 sm:grid-cols-5 gap-2">
               <div class="rounded-card border chrome-border px-3 py-2">
@@ -2101,12 +2146,18 @@ onBeforeUnmount(stopBatchPolling)
               }}
             </div>
 
-            <!-- 文件明细表 -->
-            <div class="rounded-card border chrome-border overflow-hidden">
-              <div class="px-3 py-2 text-xs font-medium chrome-text-heading border-b chrome-border-subtle">
+            </div>
+
+            <!-- ============ 文件明细(铺满)============ -->
+            <div
+              v-show="batchPane === 'files'"
+              class="flex flex-1 min-h-0 flex-col gap-3 overflow-hidden"
+            >
+            <div class="rounded-card border chrome-border overflow-hidden flex flex-1 min-h-0 flex-col">
+              <div class="px-3 py-2 text-xs font-medium chrome-text-heading border-b chrome-border-subtle shrink-0">
                 {{ t('lineage.batch_files_title') }}
               </div>
-              <div class="max-h-80 overflow-auto divide-y chrome-border-subtle">
+              <div class="flex-1 min-h-0 overflow-auto divide-y chrome-border-subtle">
                 <div v-for="file in batchReport.files" :key="file.source_ref" class="text-xs">
                   <div
                     class="flex items-center gap-2 px-3 py-1.5"
@@ -2205,30 +2256,29 @@ onBeforeUnmount(stopBatchPolling)
               </div>
             </div>
 
-            <!-- L-4 语义视图 / 目标表整合 -->
-            <div v-if="batchReport.semantic_view" class="space-y-4">
-              <!-- L-9 整合数据流图(源表 → 目标表,表级;复用 G6 canvas)-->
-              <div
+            </div>
+
+            <!-- ============ 数据流图(独占一页,铺满可视区)============ -->
+            <div
+              v-show="batchPane === 'graph'"
+              class="flex flex-1 min-h-0 flex-col overflow-hidden"
+              data-testid="lineage-batch-graph-pane"
+            >
+              <LineageGraphCanvas
                 v-if="batchGraphData"
-                class="rounded-card border chrome-border overflow-hidden"
-              >
-                <button
-                  type="button"
-                  class="flex w-full items-center gap-2 px-3 py-2 text-xs font-medium chrome-text-heading border-b chrome-border-subtle"
-                  @click="showBatchGraph = !showBatchGraph"
-                >
-                  <Waypoints class="w-3.5 h-3.5 shrink-0" />
-                  {{ t('lineage.batch_graph_title') }}
-                  <span class="chrome-text-muted ml-auto">{{ showBatchGraph ? '▾' : '▸' }}</span>
-                </button>
-                <div v-show="showBatchGraph" class="p-3">
-                  <LineageGraphCanvas
-                    :nodes="batchGraphData.nodes"
-                    :edges="batchGraphData.edges"
-                    :focus="''"
-                  />
-                </div>
-              </div>
+                :nodes="batchGraphData.nodes"
+                :edges="batchGraphData.edges"
+                :focus="''"
+                height="fill"
+              />
+            </div>
+
+            <!-- ============ 语义与风险 ============ -->
+            <div
+              v-show="batchPane === 'semantic'"
+              class="flex flex-1 min-h-0 flex-col overflow-auto"
+            >
+            <div v-if="batchReport.semantic_view" class="space-y-4">
 
               <!-- observations:人话观察 -->
               <div
@@ -2264,9 +2314,9 @@ onBeforeUnmount(stopBatchPolling)
                   <AlertTriangle class="w-3.5 h-3.5 shrink-0" />
                   {{ t('lineage.semantic_risks_title') }}
                 </div>
-                <div class="divide-y chrome-border-subtle">
+                <div class="divide-y chrome-border-subtle" data-testid="lineage-batch-risks">
                   <div
-                    v-for="(risk, ri) in batchReport.semantic_view.risks"
+                    v-for="(risk, ri) in batchRiskGroups"
                     :key="ri"
                     class="flex items-start gap-2 px-3 py-1.5 text-xs"
                     :class="
@@ -2279,6 +2329,9 @@ onBeforeUnmount(stopBatchPolling)
                   >
                     <AlertTriangle class="w-3.5 h-3.5 shrink-0 mt-0.5" />
                     <span class="flex-1 min-w-0">{{ risk.message }}</span>
+                    <span v-if="risk.count > 1" class="shrink-0 tabular-nums opacity-70">
+                      × {{ risk.count }}
+                    </span>
                   </div>
                 </div>
               </div>
@@ -2335,6 +2388,7 @@ onBeforeUnmount(stopBatchPolling)
                   </table>
                 </div>
               </div>
+            </div>
             </div>
           </div>
       </div>

@@ -6,7 +6,7 @@ import threading
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -591,6 +591,17 @@ class _SlowAdapter:
     def build_compare_hash_query(self, request: CompareHashRequest) -> CompareHashPlan:
         del request
         raise NotImplementedError
+
+    def list_schemas(self) -> list[Any]:
+        return []
+
+    def list_tables(self, schema: str) -> list[Any]:
+        del schema
+        return []
+
+    def list_columns(self, schema: str, table: str) -> list[Any]:
+        del schema, table
+        return []
 
 
 def _slow_adapter_factory(

@@ -19,6 +19,12 @@ const props = defineProps<{
   nodes: LineageSubgraphNode[]
   edges: LineageSubgraphEdge[]
   focus: string
+  /**
+   * 画布高度模式。`fixed`(默认)= 560px 固定高,保持既有调用点行为不变;
+   * `fill` = 撑满父容器 —— 图独占一页时用,父级必须给得出高度
+   * (`flex-1 min-h-0` 或显式高度),否则会塌成 0。
+   */
+  height?: 'fixed' | 'fill'
 }>()
 
 const emit = defineEmits<{
@@ -254,7 +260,28 @@ function zoomBy(ratio: number): void {
   if (g) void g.zoomBy(ratio)
 }
 
-onMounted(buildGraph)
+// fill 模式下容器高度随窗口/布局变化,G6 画布不会自己跟随 —— 观察容器尺寸并同步。
+// fixed 模式高度恒定,不装观察器(省一个常驻回调)。
+let sizeObserver: ResizeObserver | null = null
+
+onMounted(async () => {
+  await buildGraph()
+  if (props.height !== 'fill' || !container.value || typeof ResizeObserver === 'undefined') return
+  sizeObserver = new ResizeObserver(() => {
+    const el = container.value
+    const g = graph.value
+    if (!el || !g) return
+    const width = el.clientWidth
+    const height = el.clientHeight
+    if (width <= 0 || height <= 0) return
+    try {
+      g.setSize(width, height)
+    } catch {
+      // 画布已销毁 / 尚未就绪:尺寸同步失败不该冒泡成渲染错误
+    }
+  })
+  sizeObserver.observe(container.value)
+})
 
 // 父组件每次查询都替换整个 subgraphData → nodes/edges 是新数组引用,
 // 用引用比较即可(不 deep watch,避免大数组 diff 开销)。
@@ -266,6 +293,8 @@ watch(
 )
 
 onBeforeUnmount(() => {
+  sizeObserver?.disconnect()
+  sizeObserver = null
   if (searchTimer) clearTimeout(searchTimer)
   graph.value?.destroy()
   graph.value = null
@@ -291,7 +320,7 @@ defineExpose({ fitView })
       <button type="button" class="graph-btn" title="适应视图" @click="fitView">⤢</button>
     </div>
 
-    <div ref="container" class="graph-stage">
+    <div ref="container" class="graph-stage" :class="props.height === 'fill' && 'graph-stage-fill'">
       <div v-if="loading" class="graph-overlay">加载血缘图引擎…</div>
       <div v-else-if="loadError" class="graph-overlay graph-error">图渲染失败:{{ loadError }}</div>
     </div>
@@ -359,6 +388,12 @@ defineExpose({ fitView })
   border-radius: 8px;
   background: rgb(var(--bg-main));
   overflow: hidden;
+}
+/* 图独占一页时铺满父容器(父级需 flex-1 min-h-0)。 */
+.graph-stage-fill {
+  height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 .graph-overlay {
   position: absolute;
