@@ -441,6 +441,8 @@ class JobErrorCodeWriterLike(Protocol):
 
 
 class LineageCatalogLike(Protocol):
+    """lineage_analyze 子 job 的落库依赖(workflow 节点执行用,2.4.0 PR-4)。"""
+
     def write_columns_cache(
         self,
         datasource_id: str,
@@ -451,8 +453,6 @@ class LineageCatalogLike(Protocol):
     ) -> None:
         """metadata_sync 用:覆盖写单表列缓存。"""
         ...
-
-    """lineage_analyze 子 job 的落库依赖(workflow 节点执行用,2.4.0 PR-4)。"""
 
     def schema_context(
         self,

@@ -2364,6 +2364,17 @@ class _FakeAdapter:
         del request
         return CompareHashPlan(execution_mode=CompareHashExecutionMode.CLIENT_ROW_HASH)
 
+    def list_schemas(self) -> list[Any]:
+        return []
+
+    def list_tables(self, schema: str) -> list[Any]:
+        del schema
+        return []
+
+    def list_columns(self, schema: str, table: str) -> list[Any]:
+        del schema, table
+        return []
+
 
 class _DbHashFallbackAdapter:
     def __init__(
@@ -2399,6 +2410,17 @@ class _DbHashFallbackAdapter:
 
     def test_connection(self) -> bool:
         return True
+
+    def list_schemas(self) -> list[Any]:
+        return []
+
+    def list_tables(self, schema: str) -> list[Any]:
+        del schema
+        return []
+
+    def list_columns(self, schema: str, table: str) -> list[Any]:
+        del schema, table
+        return []
 
 
 def _database_compare_reader(adapter: _DbHashFallbackAdapter) -> _DatabaseCompareReader:
@@ -2469,6 +2491,17 @@ class _RangeAdapter:
     def build_compare_hash_query(self, request: object) -> CompareHashPlan:
         del request
         return CompareHashPlan(execution_mode=CompareHashExecutionMode.CLIENT_ROW_HASH)
+
+    def list_schemas(self) -> list[Any]:
+        return []
+
+    def list_tables(self, schema: str) -> list[Any]:
+        del schema
+        return []
+
+    def list_columns(self, schema: str, table: str) -> list[Any]:
+        del schema, table
+        return []
 
 
 class _TimedRangeAdapter(_RangeAdapter):
@@ -2561,6 +2594,12 @@ class _ColumnSinkAdapter(Protocol):
     def test_connection(self) -> bool: ...
 
     def build_compare_hash_query(self, request: object) -> CompareHashPlan: ...
+
+    def list_schemas(self) -> list[Any]: ...
+
+    def list_tables(self, schema: str) -> list[Any]: ...
+
+    def list_columns(self, schema: str, table: str) -> list[Any]: ...
 
     def with_column_sink(
         self,
@@ -4969,6 +5008,24 @@ class _FakeLineageCatalog:
     def __init__(self, cached_run_id: str | None = None) -> None:
         self._cached_run_id = cached_run_id
         self.persisted: list[dict[str, object]] = []
+        self.columns_cache: list[dict[str, Any]] = []
+
+    def write_columns_cache(
+        self,
+        datasource_id: str,
+        *,
+        schema_name: str,
+        table_name: str,
+        payload: list[dict[str, Any]],
+    ) -> None:
+        self.columns_cache.append(
+            {
+                "datasource_id": datasource_id,
+                "schema_name": schema_name,
+                "table_name": table_name,
+                "payload": payload,
+            }
+        )
 
     def schema_context(
         self,
