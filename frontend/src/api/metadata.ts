@@ -144,3 +144,47 @@ export function createExport(
 export function downloadExport(token: string, fallbackFilename: string): Promise<void> {
   return downloadTokenizedExport(token, fallbackFilename)
 }
+
+// ── 元数据预热(后台 job)────────────────────────────────────────────
+// POST /datasources/{id}/metadata/sync -> 202 { job_id };
+// GET  /datasources/{id}/metadata/sync/{job_id} -> 状态 + success 后的汇总。
+// 锚 schemas.py MetadataSyncRequest / MetadataSyncCreateResponse /
+// MetadataSyncStatusResponse / MetadataSyncReport。
+// 列级血缘依赖 metadata_caches,而该缓存原本只在手点某张表时被动写入 ——
+// 这个 job 把库里的表/列一次性拉全。
+
+export interface MetadataSyncReport {
+  datasource_id: string
+  schema_count: number
+  synced_tables: number
+  synced_columns: number
+  failed_count: number
+  /** 失败明细采样(权限不足 / 视图失效是常态,跳过并计数)。 */
+  failed: Record<string, string>[]
+  /** 命中表数上限提前收尾。 */
+  truncated: boolean
+  max_tables: number
+}
+
+export interface MetadataSyncStatus {
+  job_id: string
+  status: 'pending' | 'running' | 'success' | 'failed' | 'cancelled' | 'timeout'
+  error: string | null
+  report: MetadataSyncReport | null
+}
+
+export function startMetadataSync(
+  datasourceId: string,
+  schemas: string[] = [],
+): Promise<{ job_id: string }> {
+  return apiClient.post<{ job_id: string }>(`/datasources/${datasourceId}/metadata/sync`, {
+    schemas,
+  })
+}
+
+export function getMetadataSync(
+  datasourceId: string,
+  jobId: string,
+): Promise<MetadataSyncStatus> {
+  return apiClient.get<MetadataSyncStatus>(`/datasources/${datasourceId}/metadata/sync/${jobId}`)
+}

@@ -39,6 +39,10 @@ class JobKind(StrEnum):
     AI_COPILOT_RUN = "ai_copilot_run"
     LINEAGE_ANALYZE = "lineage_analyze"
     LINEAGE_BATCH = "lineage_batch"
+    # 数据源级元数据预热:把库里的表/列一次性拉进 metadata_caches。
+    # 血缘的列级精度依赖这份缓存 —— 在此之前缓存只在用户手点某张表时才被动写入,
+    # 于是批量分析扫到的表几乎都缺列元数据,只能降级出表级边。
+    METADATA_SYNC = "metadata_sync"
 
 
 class JobStatus(StrEnum):

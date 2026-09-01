@@ -368,7 +368,16 @@ def build_risks(reports: list[tuple[str, LineageReport]], view: SemanticView) ->
     for _file, report in reports:
         for err in report.parse_errors:
             message = err.get("message") or "解析失败"
-            risks.append(SemanticRisk(level="high", type="parse_error", message=message))
+            # not_sql = 这份文件压根不是 SQL(调度任务导出件等):跳过它本身是正确行为,
+            # 不该与"SQL 写错了 / 元数据缺失"同列为 high —— 否则一屏红字淹掉真问题。
+            error_type = str(err.get("error_type") or "parse_error")
+            risks.append(
+                SemanticRisk(
+                    level="low" if error_type == "not_sql" else "high",
+                    type=error_type,
+                    message=message,
+                )
+            )
         for segment in report.dynamic_sql_segments:
             confidence = segment.get("confidence")
             # 置信越低风险越高:low→medium、medium→low;high/unresolved 跳过。

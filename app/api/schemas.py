@@ -654,6 +654,37 @@ class CompareTraceSqlAiResponse(BaseModel):
     context_truncated: bool = False
 
 
+class MetadataSyncRequest(BaseModel):
+    """数据源元数据预热:把库里的表/列一次性拉进缓存(列级血缘依赖这份缓存)。"""
+
+    # 留空 = 全部 schema;给了就只同步这些(大库先拉关心的那几个)
+    schemas: list[str] = Field(default_factory=list)
+
+
+class MetadataSyncCreateResponse(BaseModel):
+    job_id: str
+
+
+class MetadataSyncReport(BaseModel):
+    datasource_id: str
+    schema_count: int
+    synced_tables: int
+    synced_columns: int
+    failed_count: int
+    # 失败明细采样(schema/table/error),权限不足或视图失效是常态,跳过并计数
+    failed: list[dict[str, str]] = Field(default_factory=list)
+    # 命中表数上限而提前收尾
+    truncated: bool = False
+    max_tables: int = 0
+
+
+class MetadataSyncStatusResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    error: str | None = None
+    report: MetadataSyncReport | None = None
+
+
 class ComparePkPrecheckRequest(BaseModel):
     """UX-2 C-4:建任务前主键健康预检(单侧)——唯一性 / 空值。"""
 
