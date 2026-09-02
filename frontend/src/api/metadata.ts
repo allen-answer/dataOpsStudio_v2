@@ -152,6 +152,7 @@ export function downloadExport(token: string, fallbackFilename: string): Promise
 // MetadataSyncStatusResponse / MetadataSyncReport。
 // 列级血缘依赖 metadata_caches,而该缓存原本只在手点某张表时被动写入 ——
 // 这个 job 把库里的表/列一次性拉全。
+// schemas 留空 = 只同步数据源账号自身 schema;["*"] = 全部;给名单则只同步名单。
 
 export interface MetadataSyncReport {
   datasource_id: string

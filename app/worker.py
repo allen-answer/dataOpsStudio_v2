@@ -10,6 +10,7 @@ import threading
 import time
 import zipfile
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -1590,47 +1591,83 @@ class WorkerRunner:
             self._config.sql_spool_batch_size,
         )
 
-        schemas = [schema.name for schema in adapter.list_schemas()]
-        if only_schemas:
-            wanted = {name.lower() for name in only_schemas}
-            schemas = [name for name in schemas if name.lower() in wanted]
+        # 留空默认只同步数据源账号自身 schema:共享实例上"全部"意味着遍历所有
+        # 用户的对象(DM 上 schema 即用户),走隧道时一轮就是几十分钟,还把队列
+        # 堵死。要全量必须显式传 ["*"]。
+        sync_all = only_schemas == ["*"]
+        if not sync_all and not only_schemas:
+            fallback = (datasource.database or datasource.username or "").strip()
+            if fallback:
+                only_schemas = [fallback]
 
         synced_tables = 0
         synced_columns = 0
         failed: list[dict[str, str]] = []
         truncated = False
-        for schema_name in schemas:
-            self._check_cancel(job.id)
-            try:
-                tables = [table.name for table in adapter.list_tables(schema_name)]
-            except Exception as exc:
-                failed.append({"schema": schema_name, "table": "", "error": type(exc).__name__})
-                continue
-            for table_name in tables:
-                if synced_tables >= METADATA_SYNC_MAX_TABLES:
-                    truncated = True
-                    break
+        # 提速两板斧(走 SSH 隧道时建连握手 1-2s,是逐表 introspection 的主要开销):
+        # 1) reuse_connection:同步全程复用一条连接,2N 次握手 → 1 次;
+        # 2) list_columns_bulk:整 schema 一次拉全部列,2N 条 SQL → 2 条。
+        # 两者都按适配器能力探测,未提供的适配器(mysql/pg/oracle 等)走原逐表路径。
+        reuse = getattr(adapter, "reuse_connection", None)
+        with reuse() if callable(reuse) else nullcontext():
+            schemas = [schema.name for schema in adapter.list_schemas()]
+            if not sync_all and only_schemas:
+                wanted = {name.lower() for name in only_schemas}
+                schemas = [name for name in schemas if name.lower() in wanted]
+
+            bulk = getattr(adapter, "list_columns_bulk", None)
+            for schema_name in schemas:
                 self._check_cancel(job.id)
-                try:
-                    columns = adapter.list_columns(schema_name, table_name)
-                except Exception as exc:
-                    failed.append(
-                        {"schema": schema_name, "table": table_name, "error": type(exc).__name__}
+                tables_columns: list[tuple[str, Any]]
+                if callable(bulk):
+                    try:
+                        tables_columns = list(bulk(schema_name).items())
+                    except Exception as exc:
+                        failed.append(
+                            {"schema": schema_name, "table": "", "error": type(exc).__name__}
+                        )
+                        continue
+                else:
+                    try:
+                        table_names = [table.name for table in adapter.list_tables(schema_name)]
+                    except Exception as exc:
+                        failed.append(
+                            {"schema": schema_name, "table": "", "error": type(exc).__name__}
+                        )
+                        continue
+                    tables_columns = [(name, None) for name in table_names]
+                for table_name, prefetched in tables_columns:
+                    if synced_tables >= METADATA_SYNC_MAX_TABLES:
+                        truncated = True
+                        break
+                    self._check_cancel(job.id)
+                    if prefetched is not None:
+                        columns = prefetched
+                    else:
+                        try:
+                            columns = adapter.list_columns(schema_name, table_name)
+                        except Exception as exc:
+                            failed.append(
+                                {
+                                    "schema": schema_name,
+                                    "table": table_name,
+                                    "error": type(exc).__name__,
+                                }
+                            )
+                            continue
+                    payload = [column.model_dump(mode="json") for column in columns]
+                    self._lineage_catalog.write_columns_cache(
+                        datasource_id,
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        payload=payload,
                     )
-                    continue
-                payload = [column.model_dump(mode="json") for column in columns]
-                self._lineage_catalog.write_columns_cache(
-                    datasource_id,
-                    schema_name=schema_name,
-                    table_name=table_name,
-                    payload=payload,
-                )
-                synced_tables += 1
-                synced_columns += len(payload)
-                if synced_tables % 20 == 0:
-                    self._heartbeat(job.id)
-            if truncated:
-                break
+                    synced_tables += 1
+                    synced_columns += len(payload)
+                    if synced_tables % 20 == 0:
+                        self._heartbeat(job.id)
+                if truncated:
+                    break
 
         report = {
             "datasource_id": datasource_id,
