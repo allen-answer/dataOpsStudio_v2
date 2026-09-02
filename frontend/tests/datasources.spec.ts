@@ -144,9 +144,14 @@ test('metadata sync runs as a background job and reports what it pulled', async 
       },
     ]),
   )
+  await page.route('**/api/datasources/ds-1/metadata/schemas**', (r) =>
+    json(r, 200, [{ name: 'dataops' }, { name: 'ods' }, { name: 'dw' }]),
+  )
   let started = 0
+  let syncBody: unknown = null
   await page.route('**/api/datasources/ds-1/metadata/sync', (r) => {
     started += 1
+    syncBody = r.request().postDataJSON()
     return json(r, 202, { job_id: 'sync-job-1' })
   })
   let polls = 0
@@ -174,6 +179,10 @@ test('metadata sync runs as a background job and reports what it pulled', async 
   await page.goto('/projects/project-1/datasources')
   await page.getByTestId('datasource-sync-ds-1').click()
 
+  // 新交互:先弹同步范围选择(多选);列出可见 schema,默认不勾选 = 仅本账号
+  await expect(page.getByRole('checkbox')).toHaveCount(3)
+  await page.getByRole('button', { name: 'Sync own schema only' }).click()
+
   const state = page.getByTestId('datasource-sync-state-ds-1')
   await expect(state).toBeVisible()
   // 长跑过程要看得见,不能点完没反应
@@ -181,5 +190,7 @@ test('metadata sync runs as a background job and reports what it pulled', async 
   // 完成后如实报出拉到多少、失败多少(失败的表跳过而不是整轮失败)
   await expect(state).toContainText('Synced 128 tables / 1642 columns, 2 failed')
   expect(started).toBe(1)
+  // 留空 = 后端默认仅同步数据源账号自身 schema
+  expect(syncBody).toEqual({ schemas: [] })
   expect(consoleErrors, consoleErrors.join('\n')).toEqual([])
 })
