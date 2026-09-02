@@ -73,7 +73,10 @@ COPY --from=builder --chown=dataops:dataops /app/alembic.ini /app/alembic.ini
 COPY --from=builder --chown=dataops:dataops /app/pyproject.toml /app/pyproject.toml
 
 # Put the venv on PATH so `python -m app.main` resolves the locked interpreter.
+# LD_LIBRARY_PATH: dmPython(达梦驱动)的加密库随 wheel 装在 site-packages/dmssl,
+# 不在默认链接路径;缺了它任何 DM 连接都报 [CODE:-70089] Encryption module failed to load。
 ENV PATH="/app/.venv/bin:$PATH" \
+    LD_LIBRARY_PATH="/app/.venv/lib/python3.12/site-packages/dmssl" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DATAOPS_BUILD_VERSION="${DATAOPS_BUILD_VERSION}" \

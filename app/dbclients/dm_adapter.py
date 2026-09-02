@@ -4,6 +4,7 @@ import importlib
 import re
 import time
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 from app.dbclients.dm_compare import (
@@ -143,6 +144,8 @@ class DMAdapter(DatabaseAdapter):
             configured if configured in HEX_TO_UINT64_MODES else None
         )
         self._resolved_hex_mode: str | None = None
+        # reuse_connection() 生效期间持有的共享连接;None = 每条查询独立建连。
+        self._shared_conn: Any | None = None
 
     @property
     def last_server_version(self) -> str | None:
@@ -281,6 +284,89 @@ class DMAdapter(DatabaseAdapter):
             for row in rows
         ]
 
+    @contextmanager
+    def reuse_connection(self) -> Iterator[None]:
+        """作用域内所有查询复用同一条连接(元数据同步等批量场景)。
+
+        走 SSH 隧道时每次建连+登录握手要 1-2s,逐表 introspection 的耗时几乎
+        全在建连上;复用后 N 张表从 2N 次握手降到 1 次。嵌套调用复用最外层连接。
+        """
+        if self._shared_conn is not None:
+            yield
+            return
+        conn = self._connect()
+        self._shared_conn = conn
+        try:
+            yield
+        finally:
+            self._shared_conn = None
+            _safe_close(conn)
+
+    def list_columns_bulk(self, schema: str) -> dict[str, list[Column]]:
+        """一次拉整个 schema 所有表的列(元数据同步用):2 条 SQL 替代逐表 2N 条。
+
+        返回 {table_name: [Column, ...]},列序按 COLUMN_ID,与 list_columns 一致。
+        """
+        _validate_identifier(schema)
+        # 刻意拆成 3 条无 JOIN 的简单查询、Python 侧合并:DM 的 ALL_* 字典视图
+        # 每行走权限检查,整 owner 的 JOIN + ORDER BY 会退化成嵌套循环,实测
+        # 分钟级不返回;拆开后各自一遍扫描,秒级。
+        rows = self._query_dicts(
+            """
+            SELECT
+                c.TABLE_NAME AS table_name,
+                c.COLUMN_NAME AS name,
+                c.DATA_TYPE AS data_type,
+                c.NULLABLE AS nullable,
+                c.COLUMN_ID AS column_id
+            FROM ALL_TAB_COLUMNS c
+            WHERE c.OWNER = UPPER(?)
+            """,
+            (schema,),
+        )
+        comment_rows = self._query_dicts(
+            """
+            SELECT cc.TABLE_NAME AS table_name, cc.COLUMN_NAME AS name, cc.COMMENTS AS "COMMENT"
+            FROM ALL_COL_COMMENTS cc
+            WHERE cc.OWNER = UPPER(?) AND cc.COMMENTS IS NOT NULL
+            """,
+            (schema,),
+        )
+        pk_rows = self._query_dicts(
+            """
+            SELECT cc.TABLE_NAME AS table_name, cc.COLUMN_NAME AS name
+            FROM ALL_CONSTRAINTS c
+            JOIN ALL_CONS_COLUMNS cc
+              ON cc.OWNER = c.OWNER AND cc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
+            WHERE c.CONSTRAINT_TYPE = 'P' AND c.OWNER = UPPER(?)
+            """,
+            (schema,),
+        )
+        primary_keys: dict[str, set[str]] = {}
+        for row in pk_rows:
+            primary_keys.setdefault(str(row["table_name"]), set()).add(str(row["name"]))
+        comments: dict[tuple[str, str], str | None] = {
+            (str(row["table_name"]), str(row["name"])): _optional_str(row.get("comment"))
+            for row in comment_rows
+        }
+        rows.sort(key=lambda row: (str(row["table_name"]), int(row["column_id"] or 0)))
+        result: dict[str, list[Column]] = {}
+        for row in rows:
+            table_name = str(row["table_name"])
+            column_name = str(row["name"])
+            result.setdefault(table_name, []).append(
+                Column(
+                    name=column_name,
+                    type=data_type_string_to_column_type(row["data_type"]),
+                    driver_type=str(row["data_type"]) if row["data_type"] is not None else None,
+                    # Oracle/DM NULLABLE 编码 'Y'/'N'(V1_AS_IS §2.4)
+                    nullable=str(row["nullable"]).upper() == "Y",
+                    primary_key=column_name in primary_keys.get(table_name, set()),
+                    comment=comments.get((table_name, column_name)),
+                )
+            )
+        return result
+
     def list_indexes(self, schema: str, table: str) -> list[Index]:
         _validate_identifier(schema)
         _validate_identifier(table)
@@ -413,10 +499,11 @@ class DMAdapter(DatabaseAdapter):
         sql: str,
         params: Sequence[Any] | dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
+        shared = self._shared_conn
         conn = None
         cursor = None
         try:
-            conn = self._connect()
+            conn = shared if shared is not None else self._connect()
             cursor = conn.cursor()
             cursor.execute(sql, params)
             rows = cursor.fetchall()
@@ -428,17 +515,19 @@ class DMAdapter(DatabaseAdapter):
             return [_row_to_dict(row, columns) for row in rows]
         finally:
             _safe_close(cursor)
-            _safe_close(conn)
+            if shared is None:
+                _safe_close(conn)
 
     def _query_tuples(
         self,
         sql: str,
         params: Sequence[Any] | None = None,
     ) -> list[Sequence[Any]]:
+        shared = self._shared_conn
         conn = None
         cursor = None
         try:
-            conn = self._connect()
+            conn = shared if shared is not None else self._connect()
             cursor = conn.cursor()
             cursor.execute(sql, params)
             return [
@@ -447,7 +536,8 @@ class DMAdapter(DatabaseAdapter):
             ]
         finally:
             _safe_close(cursor)
-            _safe_close(conn)
+            if shared is None:
+                _safe_close(conn)
 
     def _primary_key_columns(self, schema: str, table: str) -> set[str]:
         rows = self._query_dicts(
