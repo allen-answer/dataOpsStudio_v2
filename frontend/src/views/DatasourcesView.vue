@@ -25,7 +25,7 @@ import {
   deleteDatasource,
   testDatasource,
 } from '../api/datasources'
-import { getMetadataSync, startMetadataSync } from '../api/metadata'
+import { getMetadataSync, listMetadataSchemas, startMetadataSync } from '../api/metadata'
 import {
   ApiError,
   DEFAULT_OPERATION_POLICY,
@@ -129,12 +129,42 @@ async function pollMetadataSync(ds: DatasourceListItem): Promise<void> {
   }
 }
 
+// ── 同步范围选择弹窗:多选 schema(用户);不选 = 仅数据源账号自身,"*" = 全部 ──
+const syncPickerDs = ref<DatasourceListItem | null>(null)
+const syncPickerSchemas = ref<string[]>([])
+const syncPickerSelected = ref<string[]>([])
+const syncPickerLoading = ref(false)
+const syncPickerError = ref('')
+
 async function onSyncMetadata(ds: DatasourceListItem): Promise<void> {
   if (writesBlocked.value || syncStates[ds.id] === 'running') return
+  syncPickerDs.value = ds
+  syncPickerSchemas.value = []
+  syncPickerSelected.value = []
+  syncPickerError.value = ''
+  syncPickerLoading.value = true
+  try {
+    const schemas = await listMetadataSchemas(ds.id)
+    syncPickerSchemas.value = schemas.map((s) => s.name)
+  } catch (e) {
+    syncPickerError.value = errorMessage(e)
+  } finally {
+    syncPickerLoading.value = false
+  }
+}
+
+function closeSyncPicker(): void {
+  syncPickerDs.value = null
+}
+
+async function startSyncWith(schemas: string[]): Promise<void> {
+  const ds = syncPickerDs.value
+  if (!ds) return
+  closeSyncPicker()
   syncStates[ds.id] = 'running'
   syncSummary[ds.id] = ''
   try {
-    const res = await startMetadataSync(ds.id)
+    const res = await startMetadataSync(ds.id, schemas)
     syncJobs[ds.id] = res.job_id
     syncTimers[ds.id] = window.setTimeout(() => void pollMetadataSync(ds), 1500)
   } catch (e) {
@@ -1097,6 +1127,66 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
               <span>{{ t('common.submitting') }}</span>
             </template>
             <span v-else>{{ t('datasources.delete_submit') }}</span>
+          </button>
+        </div>
+      </div>
+    </Modal>
+
+    <!-- 同步范围选择:多选 schema(用户);不选 = 仅本账号,全部 = ["*"] -->
+    <Modal
+      :open="syncPickerDs !== null"
+      :title="t('datasources.sync_pick_title')"
+      :subtitle="syncPickerDs?.name"
+      @close="closeSyncPicker"
+    >
+      <div class="space-y-3">
+        <div
+          v-if="syncPickerLoading"
+          class="flex items-center justify-center gap-2 py-8 text-sm chrome-text-muted"
+        >
+          <LoadingDots />
+          {{ t('common.loading') }}
+        </div>
+        <div v-else-if="syncPickerError" class="text-xs text-red-500 dark:text-red-400">
+          {{ syncPickerError }}
+        </div>
+        <template v-else>
+          <p class="text-xs chrome-text-muted">{{ t('datasources.sync_pick_hint') }}</p>
+          <div class="max-h-64 overflow-y-auto border chrome-border rounded-input divide-y chrome-border-subtle">
+            <label
+              v-for="name in syncPickerSchemas"
+              :key="name"
+              class="flex items-center gap-2 px-3 py-1.5 text-sm chrome-text-normal cursor-pointer hover:bg-black/5 dark:hover:bg-white/5"
+            >
+              <input type="checkbox" :value="name" v-model="syncPickerSelected" />
+              <span class="font-mono">{{ name }}</span>
+            </label>
+          </div>
+        </template>
+
+        <div class="flex justify-end gap-2 pt-1">
+          <button type="button" @click="closeSyncPicker" class="chrome-btn-secondary">
+            {{ t('common.cancel') }}
+          </button>
+          <button
+            type="button"
+            @click="startSyncWith(['*'])"
+            class="chrome-btn-secondary"
+            :disabled="syncPickerLoading || writesBlocked"
+          >
+            {{ t('datasources.sync_pick_all') }}
+          </button>
+          <button
+            type="button"
+            @click="startSyncWith(syncPickerSelected)"
+            class="chrome-btn-primary"
+            :disabled="syncPickerLoading || writesBlocked"
+          >
+            {{
+              syncPickerSelected.length
+                ? t('datasources.sync_pick_selected', { count: syncPickerSelected.length })
+                : t('datasources.sync_pick_own')
+            }}
           </button>
         </div>
       </div>

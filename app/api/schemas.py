@@ -657,7 +657,8 @@ class CompareTraceSqlAiResponse(BaseModel):
 class MetadataSyncRequest(BaseModel):
     """数据源元数据预热:把库里的表/列一次性拉进缓存(列级血缘依赖这份缓存)。"""
 
-    # 留空 = 全部 schema;给了就只同步这些(大库先拉关心的那几个)
+    # 留空 = 只同步数据源账号自身 schema;["*"] = 全部;给了名单就只同步这些。
+    # (共享实例上默认全量会遍历所有用户的对象,又慢又堵队列,见 worker 侧注释)
     schemas: list[str] = Field(default_factory=list)
 
 
