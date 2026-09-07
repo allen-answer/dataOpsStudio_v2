@@ -1132,6 +1132,14 @@ class WorkerRunner:
         compare_columns = _effective_compare_columns(columns, rules)
         if not compare_columns:
             raise ValueError("compare_run requires at least one compare column")
+        # 「忽略某列」= 该列不参与哈希 / 差异判定,不等于该列从结果里消失。
+        # 展示列取全量配置列(含被忽略列):两侧值照常 SELECT 回来、照常落进结果行
+        # 与导出,只是永远不进 cells(不标红)、不影响 same/diff 归桶。
+        display_columns = list(columns)
+        diff_column_names = frozenset(column.name for column in compare_columns)
+        ignored_column_names = frozenset(
+            column.name for column in display_columns if column.name not in diff_column_names
+        )
 
         for result_set_id in bucket_spools.values():
             self._result_store.set_spool_columns(result_set_id, compare_result_columns())
@@ -1165,9 +1173,10 @@ class WorkerRunner:
             data_ref=source_ref,
             datasource_id=source_id,
             key_columns=key_columns,
-            value_columns=compare_columns,
+            value_columns=display_columns,
+            hash_columns=compare_columns,
             select_key_names=[column.name for column in key_columns],
-            select_value_names=[column.name for column in compare_columns],
+            select_value_names=[column.name for column in display_columns],
             rules=rules,
             max_rows=max_rows,
             query_timeout_seconds=query_timeout_seconds,
@@ -1177,12 +1186,13 @@ class WorkerRunner:
             data_ref=target_ref,
             datasource_id=target_id,
             key_columns=key_columns,
-            value_columns=compare_columns,
+            value_columns=display_columns,
+            hash_columns=compare_columns,
             select_key_names=[
                 rules.column_mappings.get(column.name, column.name) for column in key_columns
             ],
             select_value_names=[
-                rules.column_mappings.get(column.name, column.name) for column in compare_columns
+                rules.column_mappings.get(column.name, column.name) for column in display_columns
             ],
             rules=rules,
             max_rows=max_rows,
@@ -1224,7 +1234,8 @@ class WorkerRunner:
         bucket_counts = empty_bucket_counts()
         profile_builder: DiffProfileBuilder | None = DiffProfileBuilder(
             key_columns=key_columns,
-            value_columns=compare_columns,
+            value_columns=display_columns,
+            ignored_columns=ignored_column_names,
             rules=rules,
         )
         profile_error: str | None = None
@@ -1256,7 +1267,8 @@ class WorkerRunner:
                 _compare_event_to_spool_row(
                     event,
                     key_columns=key_columns,
-                    value_columns=compare_columns,
+                    value_columns=display_columns,
+                    diff_column_names=diff_column_names,
                     rules=rules,
                 )
             )
@@ -1337,6 +1349,7 @@ class WorkerRunner:
         select_value_names: list[str],
         rules: CompareRules,
         max_rows: int,
+        hash_columns: list[CompareColumn] | None = None,
         query_timeout_seconds: int | None = None,
     ) -> _DatabaseCompareReader | _FileCompareReader:
         """按 ref.kind 装配 reader:物化源读内存,table/sql 走 DB。"""
@@ -1346,6 +1359,7 @@ class WorkerRunner:
             return _FileCompareReader(
                 rows=rows,
                 value_columns=value_columns,
+                hash_columns=hash_columns,
                 select_key_names=select_key_names,
                 select_value_names=select_value_names,
                 rules=rules,
@@ -1356,6 +1370,7 @@ class WorkerRunner:
             return _FileCompareReader(
                 rows=rows,
                 value_columns=value_columns,
+                hash_columns=hash_columns,
                 select_key_names=select_key_names,
                 select_value_names=select_value_names,
                 rules=rules,
@@ -1378,6 +1393,7 @@ class WorkerRunner:
             data_ref=data_ref,
             key_columns=key_columns,
             value_columns=value_columns,
+            hash_columns=hash_columns,
             select_key_names=select_key_names,
             select_value_names=select_value_names,
             rules=rules,
@@ -3580,6 +3596,7 @@ class _DatabaseCompareReader:
         select_key_names: list[str],
         select_value_names: list[str],
         rules: CompareRules,
+        hash_columns: list[CompareColumn] | None = None,
     ) -> None:
         self._adapter = adapter
         self._datasource = datasource
@@ -3590,6 +3607,10 @@ class _DatabaseCompareReader:
         self._select_value_names = select_value_names
         self._rules = rules
         self._db_hash_disabled = False
+        # value_columns = 取回并展示的全部列;hash_columns = 其中参与哈希 / 判定的
+        # 子集(差集即被忽略列)。缺省两者相同 —— 无忽略列时与旧行为完全一致。
+        self._hash_columns, self._hash_indexes = _hash_column_slice(value_columns, hash_columns)
+        self._select_hash_names = [self._select_value_names[i] for i in self._hash_indexes]
 
     def bounds(self) -> tuple[int | None, int | None]:
         if len(self._key_columns) != 1:
@@ -3671,7 +3692,8 @@ class _DatabaseCompareReader:
             return False
         if self._select_key_names != [column.name for column in self._key_columns]:
             return False
-        if self._select_value_names != [column.name for column in self._value_columns]:
+        # 下推哈希只覆盖参与判定的列;被忽略列不进哈希,故只校验哈希列未被改名。
+        if self._select_hash_names != [column.name for column in self._hash_columns]:
             return False
         return self._datasource.db_type in {DbType.MYSQL, DbType.DM}
 
@@ -3685,7 +3707,7 @@ class _DatabaseCompareReader:
                 schema_name=schema_name if isinstance(schema_name, str) else None,
                 name=table_name,
             ),
-            columns=self._value_columns,
+            columns=self._hash_columns,
             key_columns=self._key_columns,
             rules=self._rules,
             segment=segment,
@@ -3751,11 +3773,12 @@ class _DatabaseCompareReader:
             raise ValueError("compare row shape does not match task columns")
         pk = tuple(row.values[:key_len])
         raw_values = tuple(row.values[key_len:])
+        hash_values = tuple(raw_values[index] for index in self._hash_indexes)
         return CompareRow(
             pk=pk,
-            values=normalized_compare_identity(self._value_columns, raw_values, self._rules),
+            values=normalized_compare_identity(self._hash_columns, hash_values, self._rules),
             raw_values=raw_values,
-            row_hash64=compare_row_hash64(self._value_columns, raw_values, self._rules),
+            row_hash64=compare_row_hash64(self._hash_columns, hash_values, self._rules),
         )
 
 
@@ -4026,6 +4049,7 @@ class _FileCompareReader:
         select_key_names: list[str],
         select_value_names: list[str],
         rules: CompareRules,
+        hash_columns: list[CompareColumn] | None = None,
         cancel_check: Callable[[], None] | None = None,
     ) -> None:
         self._rows = rows
@@ -4034,6 +4058,7 @@ class _FileCompareReader:
         self._select_value_names = select_value_names
         self._rules = rules
         self._cancel_check = cancel_check
+        self._hash_columns, self._hash_indexes = _hash_column_slice(value_columns, hash_columns)
 
     def fetch_all(self, *, max_rows: int | None = None) -> list[CompareRow]:
         if max_rows is not None and len(self._rows) > max_rows:
@@ -4044,12 +4069,13 @@ class _FileCompareReader:
                 self._cancel_check()
             key_raw = tuple(row.get(name) for name in self._select_key_names)
             value_raw = tuple(row.get(name) for name in self._select_value_names)
+            hash_raw = tuple(value_raw[index] for index in self._hash_indexes)
             out.append(
                 CompareRow(
                     pk=key_raw,
-                    values=normalized_compare_identity(self._value_columns, value_raw, self._rules),
+                    values=normalized_compare_identity(self._hash_columns, hash_raw, self._rules),
                     raw_values=value_raw,
-                    row_hash64=compare_row_hash64(self._value_columns, value_raw, self._rules),
+                    row_hash64=compare_row_hash64(self._hash_columns, hash_raw, self._rules),
                 )
             )
         return out
@@ -4237,19 +4263,45 @@ def _effective_compare_columns(
     return [column for column in columns if column.name not in ignored]
 
 
+def _hash_column_slice(
+    value_columns: list[CompareColumn],
+    hash_columns: list[CompareColumn] | None,
+) -> tuple[list[CompareColumn], list[int]]:
+    """把「参与哈希的列」定位成 value_columns 上的下标切片。
+
+    reader 取回的是 value_columns(展示列,含被忽略列),而行哈希 / 归一化身份
+    只能覆盖 hash_columns —— 否则被忽略列一变整行就判成 DIFF,忽略规则等于失效。
+    hash_columns 为 None 时退化成全列(旧行为)。
+    """
+
+    if hash_columns is None:
+        return list(value_columns), list(range(len(value_columns)))
+    index_by_name = {column.name: index for index, column in enumerate(value_columns)}
+    selected: list[CompareColumn] = []
+    indexes: list[int] = []
+    for column in hash_columns:
+        index = index_by_name.get(column.name)
+        if index is None:
+            raise ValueError("hash column is not part of compare value columns")
+        selected.append(column)
+        indexes.append(index)
+    return selected, indexes
+
+
 def _compare_event_to_spool_row(
     event: CompareDiffEvent,
     *,
     key_columns: list[CompareColumn],
     value_columns: list[CompareColumn],
     rules: CompareRules,
+    diff_column_names: frozenset[str] | None = None,
 ) -> Row:
     source_values = event.source_values
     target_values = event.target_values
     source = _values_dict(value_columns, source_values)
     target = _values_dict(value_columns, target_values)
     cells = (
-        _cell_diffs(value_columns, source_values, target_values, rules)
+        _cell_diffs(value_columns, source_values, target_values, rules, diff_column_names)
         if event.bucket is CompareDiffBucket.DIFF
         and source_values is not None
         and target_values is not None
@@ -4268,11 +4320,15 @@ def _cell_diffs(
     source_values: tuple[object, ...],
     target_values: tuple[object, ...],
     rules: CompareRules,
+    diff_column_names: frozenset[str] | None = None,
 ) -> list[dict[str, object]]:
     source_identity = normalized_compare_identity(columns, source_values, rules)
     target_identity = normalized_compare_identity(columns, target_values, rules)
     cells: list[dict[str, object]] = []
     for index, column in enumerate(columns):
+        # 被忽略列两侧值仍展示,但不产出 cell —— 前端按 cells 标红,故不会被标红。
+        if diff_column_names is not None and column.name not in diff_column_names:
+            continue
         if source_identity[index] == target_identity[index]:
             continue
         cells.append(

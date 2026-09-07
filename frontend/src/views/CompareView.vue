@@ -133,6 +133,8 @@ interface BucketStyle {
 interface ResultGridCell {
   column: string
   diff: CompareCellDiff | undefined
+  /** 被忽略列在 diff 桶里两侧值不同时的并排展示(中性色,不算差异)。 */
+  ignoredSplit: { source: unknown; target: unknown } | undefined
 }
 
 interface ResultGridRow {
@@ -482,11 +484,24 @@ function resultColumnDetail(name: string): CompareProjectionDetail | null {
 
 // 主键列固定左侧:diff tab 表头依推断/规则的 key_columns 决定。
 const keyColumns = computed<string[]>(() => draft.keyColumns)
+// 参与差异判定的列(去掉被忽略列)—— 只用于「能否发起对比」的前置校验。
 const compareColumns = computed<string[]>(() =>
   draft.columns
     .map((c) => c.name)
     .filter((name) => name.trim().length > 0 && !draft.ignoreColumns.includes(name)),
 )
+
+// 结果表展示列 = 全部配置列,含被忽略列 —— 忽略只表示「不参与判定」,
+// 不表示「从结果里消失」(后端同口径:忽略列照常取值、照常落进结果行与导出)。
+const resultColumns = computed<string[]>(() =>
+  draft.columns.map((c) => c.name).filter((name) => name.trim().length > 0),
+)
+
+const ignoredColumnSet = computed<ReadonlySet<string>>(() => new Set(draft.ignoreColumns))
+
+function isIgnoredColumn(name: string): boolean {
+  return ignoredColumnSet.value.has(name)
+}
 
 // ── P0-C1:四状态卡片占比 + 逐列匹配率(diff_profile 核心信息前置到 results)──
 const bucketTotal = computed<number>(() =>
@@ -555,12 +570,16 @@ const diffPageColumns = computed<Set<string>>(() => {
 })
 
 const visibleColumns = computed<string[]>(() => {
-  if (resultBucket.value !== 'diff') return compareColumns.value
-  if (focusColumn.value) return compareColumns.value.filter((c) => c === focusColumn.value)
-  if (showAllColumns.value) return compareColumns.value
-  const filtered = compareColumns.value.filter((c) => diffPageColumns.value.has(c))
+  if (resultBucket.value !== 'diff') return resultColumns.value
+  if (focusColumn.value) return resultColumns.value.filter((c) => c === focusColumn.value)
+  if (showAllColumns.value) return resultColumns.value
+  // 被忽略列永远不进 cells(不算差异),窄视图按 cells 过滤会把它挤掉 —— 显式保留,
+  // 否则「忽略某列后就看不到该列」的老毛病会在 diff 桶原样复现。
+  const filtered = resultColumns.value.filter(
+    (c) => diffPageColumns.value.has(c) || isIgnoredColumn(c),
+  )
   // 当前页无 cell 差异信息(极端降级)时回退全列,避免只剩主键列的空表头。
-  return filtered.length > 0 ? filtered : compareColumns.value
+  return filtered.length > 0 ? filtered : resultColumns.value
 })
 
 const resultCellDiffIndex = computed<
@@ -585,10 +604,29 @@ const resultGridRows = computed<ResultGridRow[]>(() => {
     const rowIndex = index.get(row)
     return {
       row,
-      cells: columns.map((column) => ({ column, diff: rowIndex?.get(column) })),
+      cells: columns.map((column) => ({
+        column,
+        diff: rowIndex?.get(column),
+        ignoredSplit: ignoredSplitFor(row, column),
+      })),
     }
   })
 })
+
+/**
+ * 被忽略列在 diff 桶里的两侧值:只在两边确有出入时并排展示。
+ * 单取 source 会误导(看着像两边一致),但它也不是差异 —— 中性色展示。
+ */
+function ignoredSplitFor(
+  row: CompareResultRow,
+  column: string,
+): { source: unknown; target: unknown } | undefined {
+  if (resultBucket.value !== 'diff' || !isIgnoredColumn(column)) return undefined
+  const source = row.source?.[column]
+  const target = row.target?.[column]
+  if (row.source == null || row.target == null) return undefined
+  return fmtCell(source) === fmtCell(target) ? undefined : { source, target }
+}
 
 function onToggleShowAllColumns(event: Event): void {
   showAllColumns.value = (event.target as HTMLInputElement).checked
@@ -3780,7 +3818,14 @@ const missingTarget = computed(
                     :key="`c-${col}`"
                     class="px-3 py-2 font-medium"
                   >
-                    <CompareExpressionLabel :name="col" :detail="resultColumnDetail(col)" />
+                    <span class="inline-flex items-center gap-1">
+                      <CompareExpressionLabel :name="col" :detail="resultColumnDetail(col)" />
+                      <span
+                        v-if="isIgnoredColumn(col)"
+                        class="text-[10px] uppercase chrome-text-muted border chrome-border rounded px-1 py-px"
+                        :title="t('compare.ignored_column_hint')"
+                      >{{ t('compare.column_ignored') }}</span>
+                    </span>
                   </th>
                 </tr>
               </thead>
@@ -3815,6 +3860,14 @@ const missingTarget = computed(
                       </div>
                       <div class="text-red-700 dark:text-red-300 font-semibold" :title="rawCellTitle(cell.diff.target)">
                         T: {{ fmtCell(cell.diff.target) }}
+                      </div>
+                    </template>
+                    <template v-else-if="cell.ignoredSplit">
+                      <div class="chrome-text-muted" :title="rawCellTitle(cell.ignoredSplit.source)">
+                        S: {{ fmtCell(cell.ignoredSplit.source) }}
+                      </div>
+                      <div class="chrome-text-muted" :title="rawCellTitle(cell.ignoredSplit.target)">
+                        T: {{ fmtCell(cell.ignoredSplit.target) }}
                       </div>
                     </template>
                     <template v-else-if="resultBucket === 'only_source'">
