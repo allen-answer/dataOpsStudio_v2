@@ -9074,11 +9074,8 @@ def _validate_result_snapshot_columns(
         return
     key_columns = compare_rules.get("key_columns")
     keys = [str(value) for value in key_columns] if isinstance(key_columns, list) else []
-    ignore_columns = compare_rules.get("ignore_columns")
-    ignored = (
-        {str(value) for value in ignore_columns} if isinstance(ignore_columns, list) else set()
-    )
-    required = set(keys) | {name for name in configured if name not in ignored}
+    # 被忽略列不参与差异判定,但仍要取值展示,故快照必须同样含有它们。
+    required = set(keys) | set(configured)
     if side_index == 1:
         raw_mappings = compare_rules.get("column_mappings")
         mappings = raw_mappings if isinstance(raw_mappings, dict) else {}

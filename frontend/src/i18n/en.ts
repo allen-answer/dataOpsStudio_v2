@@ -557,6 +557,7 @@ export default {
     compare_columns: 'Compare columns',
     column_ignored: 'Ignored',
     column_compared: 'Compared',
+    ignored_column_hint: 'This column is excluded from difference detection; both sides are shown for reference only.',
     toggle_ignore: 'Toggle ignore',
     // reason badges
     reason_exact: 'exact name',

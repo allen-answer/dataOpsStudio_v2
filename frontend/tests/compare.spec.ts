@@ -1734,3 +1734,98 @@ test('AI hop assembly shows its steps and never renders partial SQL on failure',
 
   expectNoConsoleErrors()
 })
+
+test('ignored columns stay visible in diff results without being flagged as differences', async ({
+  page,
+}) => {
+  // 回归:早先「勾了忽略」= 该列从 SELECT / 结果 / 导出里整个消失。忽略只应当
+  // 影响差异判定与标红,列本身必须照常展示两侧取值。
+  const task = compareTask({
+    columns: [
+      { name: 'id', type: 'integer', driver_type: 'INT', nullable: false, primary_key: true },
+      {
+        name: 'amount',
+        type: 'decimal',
+        driver_type: 'DECIMAL(12,2)',
+        nullable: true,
+        primary_key: false,
+      },
+      {
+        name: 'updated_at',
+        type: 'string',
+        driver_type: 'VARCHAR(32)',
+        nullable: true,
+        primary_key: false,
+      },
+    ],
+    compare_rules: {
+      ...compareTask().compare_rules,
+      ignore_columns: ['updated_at'],
+    },
+  })
+  await mockBase(page, [task])
+  await page.route('**/api/compare/tasks/task-1/run', (r) =>
+    json(r, 202, { job_id: 'job-1', run_id: 'run-1' }),
+  )
+  await page.route('**/api/jobs/job-1', (r) =>
+    json(r, 200, {
+      id: 'job-1',
+      kind: 'compare_run',
+      status: 'success',
+      created_at: now,
+      finished_at: now,
+      error: null,
+      error_code: null,
+      message: null,
+      result_set_id: null,
+    }),
+  )
+  await page.route(/\/api\/compare\/runs\/run-1\/results/, (r) =>
+    json(r, 200, {
+      job_id: 'job-1',
+      run_id: 'run-1',
+      bucket: 'diff',
+      offset: 0,
+      limit: 100,
+      bucket_counts: bucketCounts,
+      progress,
+      diff_profile: diffProfile,
+      sample_result: null,
+      rows: [
+        {
+          pk: { id: 3 },
+          // 忽略列两侧值不同,但后端不会为它产出 cell。
+          source: { id: 3, amount: '10.00', updated_at: '2026-09-01' },
+          target: { id: 3, amount: '11.00', updated_at: '2026-09-09' },
+          cells: [{ column: 'amount', source: '10.00', target: '11.00' }],
+        },
+      ],
+    }),
+  )
+  await page.route(/\/api\/compare\/runs\/run-1\/profile/, (r) =>
+    json(r, 200, {
+      job_id: 'job-1',
+      run_id: 'run-1',
+      bucket_counts: bucketCounts,
+      progress,
+      diff_profile: diffProfile,
+      sample_result: null,
+    }),
+  )
+
+  await page.goto('/projects/project-1/compare')
+  await page.getByRole('button', { name: 'Start compare' }).click()
+
+  // 表头出现忽略列并打上标记 —— 默认窄视图(只显示本页有差异的列)也不能把它挤掉。
+  const header = page.locator('thead').filter({ hasText: 'updated_at' })
+  await expect(header).toBeVisible()
+  await expect(header.getByText('Ignored', { exact: true })).toBeVisible()
+
+  // 忽略列两侧取值都在,且不带差异原因徽标(不标红)。
+  await expect(page.getByText('S: 2026-09-01', { exact: true })).toBeVisible()
+  await expect(page.getByText('T: 2026-09-09', { exact: true })).toBeVisible()
+  // 参与判定的列照常红/绿分裂。
+  await expect(page.getByText('S: 10.00', { exact: true })).toBeVisible()
+  await expect(page.getByText('T: 11.00', { exact: true })).toBeVisible()
+  expectNoConsoleErrors()
+})
