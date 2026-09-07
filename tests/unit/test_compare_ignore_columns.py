@@ -43,12 +43,7 @@ _BUCKET_SPOOLS = {
 
 # 源 CSV 与 DB 目标在 updated_at 上「每一行都不同」—— 若忽略列仍进哈希,
 # 四行会全部落进 diff 桶,断言会立刻炸。
-_SOURCE_CSV = (
-    b"id,name,updated_at\n"
-    b"1,same,2026-09-01\n"
-    b"2,left,2026-09-01\n"
-    b"3,old,2026-09-01\n"
-)
+_SOURCE_CSV = b"id,name,updated_at\n1,same,2026-09-01\n2,left,2026-09-01\n3,old,2026-09-01\n"
 _TARGET_ROWS = [
     Row(values=[1, 1, "same", "2026-09-09"]),
     Row(values=[3, 3, "new", "2026-09-09"]),
