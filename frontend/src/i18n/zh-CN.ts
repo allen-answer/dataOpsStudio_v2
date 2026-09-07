@@ -543,6 +543,7 @@ export default {
     compare_columns: '比较列',
     column_ignored: '已忽略',
     column_compared: '参与比较',
+    ignored_column_hint: '该列不参与差异判定,两侧取值仅作参考展示',
     toggle_ignore: '切换忽略',
     reason_exact: '同名',
     reason_normalized: '规范化同名',

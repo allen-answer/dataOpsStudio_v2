@@ -31,15 +31,23 @@ class DiffProfileBuilder:
         key_columns: list[CompareColumn],
         value_columns: list[CompareColumn],
         rules: CompareRules,
+        ignored_columns: frozenset[str] | set[str] | None = None,
     ) -> None:
         self._key_columns = list(key_columns)
+        # value_columns 与事件里的值一一对位(含被忽略列),不能只传参与判定的列 ——
+        # 否则下标错位,统计会落到错误的列上。被忽略列只是不出现在 columns 统计里。
         self._value_columns = list(value_columns)
+        self._ignored_columns = frozenset(ignored_columns or ())
         self._rules = rules
         self._events_seen = 0
         self._paired_rows = 0
         self._diff_rows = 0
         self._same_rows_observed = 0
-        self._columns = {column.name: _ColumnStats(column) for column in value_columns}
+        self._columns = {
+            column.name: _ColumnStats(column)
+            for column in value_columns
+            if column.name not in self._ignored_columns
+        }
         self._missing_source = _RangeCluster()
         self._missing_target = _RangeCluster()
 
@@ -73,6 +81,8 @@ class DiffProfileBuilder:
             self._rules,
         )
         for index, column in enumerate(self._value_columns):
+            if column.name in self._ignored_columns:
+                continue
             source = source_values[index] if index < len(source_values) else None
             target = target_values[index] if index < len(target_values) else None
             stats = self._columns[column.name]
