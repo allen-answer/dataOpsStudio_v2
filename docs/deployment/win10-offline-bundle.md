@@ -93,6 +93,11 @@ URL + sha256 在脚本内 pin(`PG_*` / `PYTHON_STANDALONE_*` / `UV_*` 常量),
 `DATAOPS_HOME`(默认 `<包>\home`)、`DATAOPS_ADMIN_USER`、`DATAOPS_ADMIN_PASSWORD`
 (设置则非交互创建管理员)。停止用 `stop.cmd`(`--force` 为紧急停止)。
 
+`stop.cmd` 的停止顺序:API 最多等 `DATAOPS_API_GRACEFUL_SHUTDOWN_SECONDS`(默认 10s)
+后由 uvicorn 自行收尾,30s 仍不退则 launcher 强杀 API;worker 等在跑的 job 跑完
+(默认上限 600s,`--grace-seconds` 可调);最后停 PG。worker 超时未退时 `stop.cmd`
+以非 0 退出并**保留** `home\data\worker.pid`,此时再跑 `stop.cmd --force` 即可整树强杀。
+
 Windows 内置 PostgreSQL 只监听 loopback TCP,launcher 不传 Unix-only `-k` socket 参数;
 因此 `DATAOPS_HOME` 可包含空格或较深路径。Linux Mint 仍受 Unix socket 107 字节上限约束。
 

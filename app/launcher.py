@@ -31,6 +31,7 @@ from app.infrastructure.secretstore.local_file import LocalFileSecretStore
 SECRET_FILE_MODE = 0o600
 SECRET_DIR_MODE = 0o700
 DEFAULT_PG_SUPERUSER = "postgres"
+_API_STOP_GRACE_SECONDS = 30.0
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
 
@@ -420,11 +421,23 @@ def command_stop(context: LauncherContext, args: argparse.Namespace) -> int:
                 force=force,
             )
         _unlink_if_exists(context.data_dir / "launcher.pid")
-        _unlink_child_pid_files(context)
-        return 0
+        leftovers = _live_child_names(context)
+        if not leftovers:
+            _unlink_child_pid_files(context)
+            return 0
+        # supervisor 异常退出(如子进程停不下来)时子进程和 PG 可能还活着:
+        # 保留 pid 文件,落到下面按 pid 文件逐个停,别把唯一的线索删掉。
+        print(
+            f"launcher exited but left {', '.join(leftovers)} running; stopping them via pid files."
+        )
 
     print("Stopping API first so no new jobs are accepted.")
-    _terminate_pid_file(context.data_dir / "api.pid", "api", grace_seconds=30.0, force=force)
+    _terminate_pid_file(
+        context.data_dir / "api.pid",
+        "api",
+        grace_seconds=_API_STOP_GRACE_SECONDS,
+        force=True,
+    )
     print(
         "Stopping worker gracefully. Active queries run to completion; "
         "use --force only for emergency stop."
@@ -908,10 +921,21 @@ def _stop_children(
 ) -> None:
     api = children.get("api")
     if api is not None:
-        _terminate_process(api, "api", grace_seconds=30.0, force=force)
+        # API 不承载耐久工作(job 在 worker),uvicorn 自身有优雅停机上限;30s 仍不退
+        # 说明卡死。这里若抛错,worker 永远收不到停止信号,supervisor 退出后留下孤儿。
+        _terminate_process(api, "api", grace_seconds=_API_STOP_GRACE_SECONDS, force=True)
     worker = children.get("worker")
     if worker is not None:
         _terminate_process(worker, "worker", grace_seconds=grace_seconds, force=force)
+
+
+def _live_child_names(context: LauncherContext) -> list[str]:
+    names: list[str] = []
+    for name in ("api", "worker"):
+        pid = _read_pid(context.data_dir / f"{name}.pid")
+        if pid is not None and _pid_alive(pid):
+            names.append(name)
+    return names
 
 
 def _unlink_child_pid_files(context: LauncherContext) -> None:
@@ -973,6 +997,17 @@ def _terminate_pid(
     grace_seconds: float,
     force: bool,
 ) -> None:
+    if _is_windows():
+        # Windows 上 os.kill(SIGTERM) 就是 TerminateProcess:硬杀,不是优雅停止,
+        # 会把正在 drain 的 worker 直接杀掉还报 "stopped"。跨控制台又发不了
+        # CTRL_BREAK,所以非 force 只能等它自己退(supervisor 先前已发过停止信号),
+        # force 用 taskkill /T 整树强杀(pid 文件记的是 venv python.exe 转发壳)。
+        if force:
+            _kill_pid(pid)
+            print(f"{name} force-stopped.")
+            return
+        _wait_for_pid_exit(pid, name, grace_seconds=grace_seconds, force=False)
+        return
     os.kill(pid, signal.SIGTERM)
     _wait_for_pid_exit(
         pid,
