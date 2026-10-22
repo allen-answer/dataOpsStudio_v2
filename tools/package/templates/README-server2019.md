@@ -20,6 +20,12 @@ zip 若经浏览器 / 聊天工具 / 网盘传到服务器,会带「来自其他
 Unblock-File -LiteralPath .\dataops-studio-<ver>-server2019-x64-offline.zip
 ```
 
+## 解压到短路径
+
+Server 2019 默认没开长路径支持,首次运行装依赖时 DB2 驱动 wheel 里有约 90 字符的内部路径,
+解压目录过深会报 `WinError 3 系统找不到指定的路径`。请解压到短路径,包目录全路径
+**不超过 100 字符**,例如 `D:\DataOpsStudio\dataops-studio-<ver>-server2019-x64-offline`。
+
 ## 用哪个浏览器访问
 
 Server 2019 自带的 IE11 **打不开**本前端。二选一:
