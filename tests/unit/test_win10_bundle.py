@@ -321,6 +321,35 @@ def test_server2019_profile_rejects_gui_and_online() -> None:
         assert excinfo.value.code == 2
 
 
+def test_server2019_scripts_default_api_port_18020(tmp_path: Path) -> None:
+    server = tmp_path / "server2019"
+    win10 = tmp_path / "win10"
+    server.mkdir()
+    win10.mkdir()
+
+    build.write_scripts(server, _identity(), profile="server2019")
+    build.write_scripts(win10, _identity())
+
+    server_common = (server / "_common.ps1").read_text(encoding="ascii")
+    win10_common = (win10 / "_common.ps1").read_text(encoding="ascii")
+    assert "if (-not $env:DATAOPS_API_PORT)   { $env:DATAOPS_API_PORT = '18020' }" in server_common
+    assert "'8020'" not in server_common
+    assert "if (-not $env:DATAOPS_API_PORT)   { $env:DATAOPS_API_PORT = '8020' }" in win10_common
+    for name in ALL_SCRIPTS:
+        if name != "_common.ps1":
+            assert (server / name).read_bytes() == (win10 / name).read_bytes()
+
+
+def test_server2019_readme_uses_api_port_18020(tmp_path: Path) -> None:
+    build.write_readme(tmp_path, profile="server2019")
+
+    server_notes = (tmp_path / "README.md").read_text(encoding="utf-8").split("\n---\n")[0]
+    assert "http://127.0.0.1:18020/" in server_notes
+    assert "-LocalPort 18020" in server_notes
+    assert "127.0.0.1:8020" not in server_notes
+    assert "-LocalPort 8020" not in server_notes
+
+
 def test_server2019_readme_prepends_server_notes(tmp_path: Path) -> None:
     build.write_readme(tmp_path, profile="server2019")
 

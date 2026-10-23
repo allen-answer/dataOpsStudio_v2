@@ -3,6 +3,8 @@
 本包是 Win10 offline 包针对**干净的 Windows Server 2019** 裁剪出的版本,启动/停止/升级流程
 与下文的 Win10 说明完全一致,只有以下差别:
 
+- **API 默认端口 `18020`**(Win10 包是 `8020`):下文 Win10 说明里出现的 `8020` 在本包中
+  一律换成 `18020`。仍可用 `DATAOPS_API_PORT` 覆盖。
 - **不带桌面壳(没有 `DataOpsStudio.exe`)**:Server 2019 不自带 WebView2。双击 `start.cmd`
   启动,用浏览器访问。
 - **自带 VC++ 运行库**:`pgsql\bin` 内置 `vcruntime140.dll` / `vcruntime140_1.dll` /
@@ -30,7 +32,7 @@ Server 2019 默认没开长路径支持,首次运行装依赖时 DB2 驱动 whee
 
 Server 2019 自带的 IE11 **打不开**本前端。二选一:
 
-1. **在服务器上用**:另装 Edge 或 Chrome,打开 `http://127.0.0.1:8020/`。
+1. **在服务器上用**:另装 Edge 或 Chrome,打开 `http://127.0.0.1:18020/`。
 2. **从别的电脑访问**:启动前设置监听全部网卡,并只对内网放行端口:
 
    ```powershell
@@ -40,8 +42,8 @@ Server 2019 自带的 IE11 **打不开**本前端。二选一:
 
    ```powershell
    # 管理员 PowerShell;RemoteAddress 换成实际允许访问的网段
-   New-NetFirewallRule -DisplayName 'DataOpsStudio 8020' -Direction Inbound -Protocol TCP `
-     -LocalPort 8020 -RemoteAddress 10.0.0.0/8 -Action Allow
+   New-NetFirewallRule -DisplayName 'DataOpsStudio 18020' -Direction Inbound -Protocol TCP `
+     -LocalPort 18020 -RemoteAddress 10.0.0.0/8 -Action Allow
    ```
 
    内置 PostgreSQL 始终只监听 `127.0.0.1`,不需要也不要对外放行 `15432`。
