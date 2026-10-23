@@ -21,6 +21,7 @@ from app.launcher import (
     _child_env,
     _pg_ctl_start,
     _pid_alive,
+    _stop_children,
     _sync_license_state,
     _terminate_process,
     _which,
@@ -480,6 +481,134 @@ def test_windows_child_stop_uses_cooperative_console_signal(
     _terminate_process(RunningChild(), "worker", grace_seconds=7.0, force=False)  # type: ignore[arg-type]
 
     assert sent_signals == [21]
+
+
+def test_stop_children_force_kills_hung_api_and_still_stops_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    killed: list[int] = []
+    stopped: list[str] = []
+
+    class HungApi:
+        pid = 1001
+
+        def poll(self) -> None:
+            return None
+
+        def send_signal(self, signal_number: int) -> None:
+            del signal_number
+
+        def wait(self, timeout: float) -> int:
+            if not killed:
+                raise subprocess.TimeoutExpired(cmd="api", timeout=timeout)
+            return 1
+
+    class DrainingWorker:
+        pid = 1002
+
+        def poll(self) -> None:
+            return None
+
+        def send_signal(self, signal_number: int) -> None:
+            del signal_number
+            stopped.append("worker")
+
+        def wait(self, timeout: float) -> int:
+            assert timeout == 7.0
+            return 0
+
+    monkeypatch.setattr("app.launcher._is_windows", lambda: True)
+    monkeypatch.setattr("app.launcher.signal.CTRL_BREAK_EVENT", 21, raising=False)
+    monkeypatch.setattr("app.launcher._kill_pid", killed.append)
+
+    _stop_children(
+        {"api": HungApi(), "worker": DrainingWorker()},  # type: ignore[dict-item]
+        force=False,
+        grace_seconds=7.0,
+    )
+
+    assert killed == [1001]
+    assert stopped == ["worker"]
+
+
+def test_command_stop_force_finds_children_left_by_exited_supervisor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path)
+    context.data_dir.mkdir(parents=True)
+    (context.data_dir / "launcher.pid").write_text("4321\n", encoding="utf-8")
+    (context.data_dir / "api.pid").write_text("1001\n", encoding="utf-8")
+    (context.data_dir / "worker.pid").write_text("1002\n", encoding="utf-8")
+    alive = {4321, 1001, 1002}
+    killed: list[int] = []
+    pg_stop_calls: list[bool] = []
+
+    def fake_wait_for_pid_exit(pid: int, name: str, **kwargs: object) -> None:
+        del kwargs
+        assert (pid, name) == (4321, "launcher")
+        alive.discard(pid)  # supervisor exits non-zero, children keep running
+
+    def fake_kill(pid: int) -> None:
+        killed.append(pid)
+        alive.discard(pid)
+
+    def fake_pg_stop(unused_context: LauncherContext, args: Namespace) -> int:
+        del unused_context
+        pg_stop_calls.append(bool(args.force))
+        return 0
+
+    monkeypatch.setattr("app.launcher._is_windows", lambda: True)
+    monkeypatch.setattr("app.launcher._pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr("app.launcher._wait_for_pid_exit", fake_wait_for_pid_exit)
+    monkeypatch.setattr("app.launcher._kill_pid", fake_kill)
+    monkeypatch.setattr("app.launcher.command_pg_stop", fake_pg_stop)
+    monkeypatch.setattr(
+        "app.launcher.os.kill",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("os.kill(SIGTERM) is a bare TerminateProcess on Windows")
+        ),
+    )
+
+    assert command_stop(context, Namespace(force=True, grace_seconds=600.0)) == 0
+
+    assert killed == [1001, 1002]
+    assert pg_stop_calls == [True]
+    for name in ("launcher", "api", "worker"):
+        assert not (context.data_dir / f"{name}.pid").exists()
+
+
+def test_command_stop_keeps_worker_pid_file_while_worker_still_drains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path)
+    context.data_dir.mkdir(parents=True)
+    (context.data_dir / "launcher.pid").write_text("4321\n", encoding="utf-8")
+    (context.data_dir / "worker.pid").write_text("1002\n", encoding="utf-8")
+    launcher_checks = 0
+
+    def fake_pid_alive(pid: int) -> bool:
+        nonlocal launcher_checks
+        if pid == 4321:
+            launcher_checks += 1
+            return launcher_checks == 1
+        return pid == 1002
+
+    monkeypatch.setattr("app.launcher._is_windows", lambda: True)
+    monkeypatch.setattr("app.launcher._pid_alive", fake_pid_alive)
+    monkeypatch.setattr("app.launcher.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("app.launcher.time.monotonic", iter(range(0, 10_000, 100)).__next__)
+    monkeypatch.setattr(
+        "app.launcher.command_pg_stop",
+        lambda *args: (_ for _ in ()).throw(AssertionError("PG must outlive a draining worker")),
+    )
+
+    with pytest.raises(LauncherError, match="worker is still draining"):
+        command_stop(context, Namespace(force=False, grace_seconds=600.0))
+
+    assert (context.data_dir / "worker.pid").read_text(encoding="utf-8") == "1002\n"
+    assert not (context.data_dir / "launcher.pid").exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows console process groups")
