@@ -52,6 +52,33 @@ gracefully, waits at most 45 seconds, then kills the owned process tree if neede
 The verified Windows GUI baseline is exactly 198,142,107 bytes (reported as 189 MiB). The builder
 fails if the offline GUI zip grows beyond that value. Package size may decrease, not increase.
 
+## Windows Server 2019 x64 (lite)
+
+A clean Windows Server 2019 has neither the VC++ 2015-2022 runtime that the EDB PostgreSQL binaries
+import (`vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`; the binaries zip does not carry
+them) nor WebView2. Build the script-only offline variant on the same Windows build host with:
+
+```powershell
+uv run python tools/package/build_win10_bundle.py --profile server2019
+```
+
+It writes `dist-bundle/dataops-studio-<version>-server2019-x64-offline.zip` plus its MANIFEST. The
+profile is offline-only and rejects `--gui` / `--mode online`. Compared with the Win10 offline
+package it:
+
+- copies the three VC++ runtime DLLs app-locally into `pgsql/bin` from the newest x64
+  `Microsoft.VC14x.CRT` folder of any Visual Studio / Build Tools install found by vswhere (or
+  `VCToolsRedistDir`); override with `--vc-redist-dir`. The MSVC version and each DLL's SHA-256 are
+  recorded in the MANIFEST;
+- keeps only `initdb`, `pg_ctl`, `postgres` and the operator tools `psql`, `pg_dump`, `pg_dumpall`,
+  `pg_restore`, `pg_isready`, `pg_controldata`, `pg_resetwal` in `pgsql/bin`, dropping StackBuilder
+  and its wxWidgets/curl DLLs, ecpg, pgbench, the regression tools and the `lib/*.lib` import
+  libraries;
+- prepends `tools/package/templates/README-server2019.md` (unblocking the zip, browser access,
+  `DATAOPS_API_HOST=0.0.0.0` plus a firewall rule) to the package README.
+
+The runtime scripts, ports and payload-update platform (`win10-x64`) are unchanged.
+
 ## Linux Mint 21.3 x86_64
 
 Build on Linux Mint 21.3 x86_64, or another x86_64 host with glibc no newer than 2.35. Building on a

@@ -4,6 +4,8 @@ import json
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from tools.package import build_win10_bundle as build
 from tools.package.build_identity import BuildIdentity
 
@@ -218,3 +220,112 @@ def test_wheel_cache_is_bound_to_current_requirements(tmp_path: Path, monkeypatc
     assert (cache / "wheels.requirements.sha256").read_text(encoding="ascii").strip() == (
         build.sha256_file(requirements)
     )
+
+
+def _write_pg_zip(path: Path) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        for name in (
+            "bin/postgres.exe",
+            "bin/initdb.exe",
+            "bin/pg_ctl.exe",
+            "bin/psql.exe",
+            "bin/pg_dump.exe",
+            "bin/stackbuilder.exe",
+            "bin/pgbench.exe",
+            "bin/ecpg.exe",
+            "bin/libpq.dll",
+            "bin/icuuc67.dll",
+            "bin/wxbase3210u_vc_x64_custom.dll",
+            "bin/libcurl.dll",
+            "bin/libecpg.dll",
+            "bin/libpgtypes.dll",
+            "bin/testplug.dll",
+            "lib/plpgsql.dll",
+            "lib/postgres.lib",
+            "share/timezone/UTC",
+        ):
+            archive.writestr(f"pgsql/{name}", name.encode())
+        archive.writestr("pgsql/server_license.txt", b"license")
+
+
+def test_extract_pg_lite_drops_tools_the_launcher_never_runs(tmp_path: Path) -> None:
+    pg_zip = tmp_path / "pg.zip"
+    _write_pg_zip(pg_zip)
+
+    staging = tmp_path / "staging"
+    build.extract_pg(pg_zip, staging, lite=True)
+
+    pgsql = staging / "pgsql"
+    kept = {p.relative_to(pgsql).as_posix() for p in pgsql.rglob("*") if p.is_file()}
+    assert kept == {
+        "bin/postgres.exe",
+        "bin/initdb.exe",
+        "bin/pg_ctl.exe",
+        "bin/psql.exe",
+        "bin/pg_dump.exe",
+        "bin/libpq.dll",
+        "bin/icuuc67.dll",
+        "lib/plpgsql.dll",
+        "share/timezone/UTC",
+        "server_license.txt",
+    }
+
+
+def test_extract_pg_default_keeps_full_slim_set(tmp_path: Path) -> None:
+    pg_zip = tmp_path / "pg.zip"
+    _write_pg_zip(pg_zip)
+
+    staging = tmp_path / "staging"
+    build.extract_pg(pg_zip, staging)
+
+    assert (staging / "pgsql/bin/stackbuilder.exe").exists()
+    assert (staging / "pgsql/lib/postgres.lib").exists()
+
+
+def test_install_vc_runtime_copies_crt_next_to_postgres(tmp_path: Path) -> None:
+    redist = tmp_path / "14.50.35710" / "x64" / "Microsoft.VC145.CRT"
+    redist.mkdir(parents=True)
+    for name in build.VC_RUNTIME_DLLS:
+        (redist / name).write_bytes(name.encode())
+    staging = tmp_path / "staging"
+    (staging / "pgsql" / "bin").mkdir(parents=True)
+
+    copied = build.install_vc_runtime(redist, staging)
+
+    assert [name for name, _ in copied] == list(build.VC_RUNTIME_DLLS)
+    for name, digest in copied:
+        assert (staging / "pgsql/bin" / name).read_bytes() == name.encode()
+        assert digest == build.sha256_file(redist / name)
+
+
+def test_find_vc_redist_dir_picks_newest_complete_crt(tmp_path: Path, monkeypatch: object) -> None:
+    msvc = tmp_path / "Redist" / "MSVC"
+    for version, complete in (("14.38.33135", True), ("14.50.35710", True), ("14.99.1", False)):
+        crt = msvc / version / "x64" / "Microsoft.VC145.CRT"
+        crt.mkdir(parents=True)
+        names = build.VC_RUNTIME_DLLS if complete else build.VC_RUNTIME_DLLS[:1]
+        for name in names:
+            (crt / name).write_bytes(b"dll")
+    monkeypatch.setenv("VCToolsRedistDir", str(msvc / "14.50.35710") + "\\")  # type: ignore[attr-defined]
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "no-vs"))  # type: ignore[attr-defined]
+
+    found = build.find_vc_redist_dir(None)
+
+    assert found == msvc / "14.50.35710" / "x64" / "Microsoft.VC145.CRT"
+
+
+def test_server2019_profile_rejects_gui_and_online() -> None:
+    for extra in (["--gui"], ["--mode", "online"]):
+        with pytest.raises(SystemExit) as excinfo:
+            build.main(["--profile", "server2019", *extra])
+        assert excinfo.value.code == 2
+
+
+def test_server2019_readme_prepends_server_notes(tmp_path: Path) -> None:
+    build.write_readme(tmp_path, profile="server2019")
+
+    text = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert text.startswith("# DataOpsStudio 2.0 — Windows Server 2019")
+    assert "Unblock-File" in text
+    assert "DATAOPS_API_HOST" in text
+    assert "# DataOpsStudio 2.0 — Win10 x64 部署包" in text
