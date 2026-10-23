@@ -11,6 +11,13 @@ drift between an air-gapped and a network install:
   win_amd64, offline ``pip install --no-index`` installable), PostgreSQL 16
   server binaries (slim bin/lib/share), the built Vue SPA and the app source.
 
+* ``--profile server2019`` — ``dataops-studio-<ver>-server2019-x64-offline.zip``
+  is the offline bundle trimmed for a clean Windows Server 2019 host: no Tauri
+  shell (no WebView2 there; use a browser), the VC++ runtime PostgreSQL imports
+  shipped app-locally in ``pgsql/bin`` (Server 2019 has no VC++ 2015-2022
+  redistributable, and EDB's binaries zip does not carry it), and the PG
+  client/dev tooling the launcher never runs dropped.
+
 * ``--mode online`` — ``dataops-studio-<ver>-win10-x64-online.zip`` is light: it
   carries only the app source, ``frontend/dist``, the scripts, the pinned
   ``requirements-frozen.txt`` (with sha256), and ``download-manifest.json``
@@ -32,6 +39,7 @@ Usage (build host needs network + uv + Node/npm)::
     uv run python tools/package/build_win10_bundle.py                  # offline
     uv run python tools/package/build_win10_bundle.py --gui            # offline GUI
     uv run python tools/package/build_win10_bundle.py --mode online    # online
+    uv run python tools/package/build_win10_bundle.py --profile server2019  # Server 2019 lite
 
 Large artifacts land in ``dist-bundle/`` (git-ignored); the bundle itself never
 enters git.
@@ -43,6 +51,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tomllib
@@ -100,6 +109,27 @@ PG_SHA256 = "98af1417ba6a8dc30543e560e5407833a3b9e7cc7ed20e73b2006f3aa2f04663"
 # PG components to keep (server-only slim set). pgAdmin (~670MB), StackBuilder,
 # doc and include are dropped — the launcher only needs initdb/pg_ctl/postgres.
 PG_KEEP_DIRS = ("bin", "lib", "share")
+# server2019 profile: the only PG executables kept. The launcher runs initdb /
+# pg_ctl / postgres; the rest are for an operator's backup/restore and recovery.
+SERVER2019_PG_EXES = frozenset(
+    {
+        "initdb.exe",
+        "pg_ctl.exe",
+        "postgres.exe",
+        "psql.exe",
+        "pg_dump.exe",
+        "pg_dumpall.exe",
+        "pg_restore.exe",
+        "pg_isready.exe",
+        "pg_controldata.exe",
+        "pg_resetwal.exe",
+    }
+)
+# DLLs in pgsql/bin used only by dropped tools: StackBuilder (wxWidgets, curl),
+# ecpg and the regression-test plugin.
+SERVER2019_PG_DROP_DLL_PREFIXES = ("wx", "libcurl", "libecpg", "libpgtypes", "testplug")
+# VC++ runtime DLLs imported by postgres.exe / initdb / pg_ctl / libpq / ICU.
+VC_RUNTIME_DLLS = ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")
 # Exact last verified Win10 GUI package size (189 MiB rounded for display).
 MAX_GUI_ZIP_BYTES = 198_142_107
 
@@ -331,13 +361,29 @@ def build_desktop() -> Path:
     return executable
 
 
-def extract_pg(zip_path: Path, staging: Path) -> None:
+def _server2019_keeps(member: str) -> bool:
+    """Whether a slim-set member also survives the server2019 trim."""
+
+    name = Path(member).name.lower()
+    if member.startswith("pgsql/bin/"):
+        if name.endswith(".exe"):
+            return name in SERVER2019_PG_EXES
+        return not name.startswith(SERVER2019_PG_DROP_DLL_PREFIXES)
+    if member.startswith("pgsql/lib/"):
+        # MSVC import libraries are only for compiling extensions.
+        return not name.endswith(".lib")
+    return True
+
+
+def extract_pg(zip_path: Path, staging: Path, *, lite: bool = False) -> None:
     target = staging / "pgsql"
-    log("pg: extract slim server set (bin/lib/share)")
+    log(f"pg: extract slim server set (bin/lib/share){' + server2019 trim' if lite else ''}")
     keep_prefixes = tuple(f"pgsql/{name}/" for name in PG_KEEP_DIRS)
     with zipfile.ZipFile(zip_path) as archive:
         names = archive.namelist()
         members = [m for m in names if m.startswith(keep_prefixes) and not m.endswith("/")]
+        if lite:
+            members = [m for m in members if _server2019_keeps(m)]
         for member in members:
             rel = Path(member).relative_to("pgsql")
             out = target / rel
@@ -354,6 +400,76 @@ def extract_pg(zip_path: Path, staging: Path) -> None:
                 shutil.copyfileobj(src, dst)
 
 
+def _version_key(path: Path) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", path.name))
+
+
+def find_vc_redist_dir(explicit: str | None) -> Path:
+    """Locate the x64 ``Microsoft.VC14x.CRT`` app-local redistributable folder.
+
+    An explicit ``--vc-redist-dir`` wins; otherwise the newest MSVC redist of any
+    Visual Studio / Build Tools install found by vswhere (or ``VCToolsRedistDir``
+    from a developer prompt) is used.
+    """
+
+    if explicit:
+        return Path(explicit).resolve()
+    redist_roots: list[Path] = []
+    if os.environ.get("VCToolsRedistDir"):
+        redist_roots.append(Path(os.environ["VCToolsRedistDir"]).parent)
+    vswhere = (
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+        / "Microsoft Visual Studio/Installer/vswhere.exe"
+    )
+    if vswhere.exists():
+        result = subprocess.run(
+            [
+                str(vswhere),
+                "-all",
+                "-prerelease",
+                "-products",
+                "*",
+                "-property",
+                "installationPath",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        redist_roots.extend(
+            Path(line.strip()) / "VC" / "Redist" / "MSVC"
+            for line in result.stdout.splitlines()
+            if line.strip()
+        )
+    candidates = [
+        crt
+        for root in redist_roots
+        for crt in root.glob("*/x64/Microsoft.VC14*.CRT")
+        if all((crt / dll).exists() for dll in VC_RUNTIME_DLLS)
+    ]
+    if not candidates:
+        raise SystemExit(
+            "VC++ x64 redistributable not found; install the Visual Studio C++ build tools "
+            "or pass --vc-redist-dir <...\\x64\\Microsoft.VC14x.CRT>"
+        )
+    return max(candidates, key=lambda crt: _version_key(crt.parent.parent))
+
+
+def install_vc_runtime(redist_dir: Path, staging: Path) -> list[tuple[str, str]]:
+    """Copy the VC++ runtime next to postgres.exe; return (name, sha256) pairs."""
+
+    pg_bin = staging / "pgsql" / "bin"
+    log(f"assemble: VC++ runtime from {redist_dir}")
+    copied: list[tuple[str, str]] = []
+    for name in VC_RUNTIME_DLLS:
+        source = redist_dir / name
+        if not source.exists():
+            raise SystemExit(f"VC++ redistributable is missing {source}")
+        shutil.copy2(source, pg_bin / name)
+        copied.append((name, sha256_file(pg_bin / name)))
+    return copied
+
+
 def assemble(
     staging: Path,
     *,
@@ -365,8 +481,13 @@ def assemble(
     wheels: Path | None = None,
     pg_zip: Path | None = None,
     desktop_executable: Path | None = None,
+    vc_redist_dir: Path | None = None,
+    profile: str = "win10",
     identity: BuildIdentity,
-) -> None:
+) -> list[tuple[str, str]]:
+    """Assemble the staging tree; return the bundled VC++ runtime (name, sha256)."""
+
+    vc_runtime: list[tuple[str, str]] = []
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
@@ -398,7 +519,9 @@ def assemble(
         (runtime / "wheels").mkdir()
         for wheel in wheels.glob("*.whl"):
             shutil.copy2(wheel, runtime / "wheels" / wheel.name)
-        extract_pg(pg_zip, staging)
+        extract_pg(pg_zip, staging, lite=profile == "server2019")
+        if vc_redist_dir is not None:
+            vc_runtime = install_vc_runtime(vc_redist_dir, staging)
     else:
         log("assemble: online download-manifest.json (python/uv/pg pins)")
         write_download_manifest(staging)
@@ -408,7 +531,8 @@ def assemble(
         shutil.copy2(desktop_executable, staging / "DataOpsStudio.exe")
 
     write_scripts(staging, identity)
-    write_readme(staging)
+    write_readme(staging, profile=profile)
+    return vc_runtime
 
 
 def download_manifest() -> dict[str, object]:
@@ -504,8 +628,13 @@ def write_scripts(staging: Path, identity: BuildIdentity) -> None:
             _write_source(source, destination, encoding="ascii")
 
 
-def write_readme(staging: Path) -> None:
-    _write_source(TEMPLATES_DIR / "README.md", staging / "README.md", encoding="utf-8")
+def write_readme(staging: Path, *, profile: str = "win10") -> None:
+    text = (TEMPLATES_DIR / "README.md").read_text(encoding="utf-8")
+    if profile == "server2019":
+        # Server 2019 notes go first; the shared Win10 README still applies.
+        server = (TEMPLATES_DIR / "README-server2019.md").read_text(encoding="utf-8")
+        text = server + "\n" + text
+    (staging / "README.md").write_text(text, encoding="utf-8", newline="\r\n")
 
 
 def write_manifest(
@@ -515,8 +644,23 @@ def write_manifest(
     *,
     gui: bool,
     identity: BuildIdentity,
+    profile: str = "win10",
+    vc_runtime: list[tuple[str, str]] | None = None,
+    vc_redist_dir: Path | None = None,
 ) -> None:
-    if mode == "offline":
+    if profile == "server2019":
+        redist = "?"
+        if vc_redist_dir is not None:
+            redist = f"{vc_redist_dir.parent.parent.name}/{vc_redist_dir.name}"
+        runtime_lines = [
+            f"postgresql: {PG_VERSION} (EDB windows-x64 binaries, server2019 lite set, bundled)",
+            f"python: python-build-standalone {PYTHON_FULL_VERSION} (relocatable, bundled)",
+            "wheels: bundled (offline pip install --no-index)",
+            f"vc_runtime: MSVC {redist} (app-local in pgsql/bin)",
+            *(f"vc_runtime_sha256: {name} {digest}" for name, digest in vc_runtime or []),
+            "gui: none (browser access; Server 2019 ships no WebView2)",
+        ]
+    elif mode == "offline":
         runtime_lines = [
             f"postgresql: {PG_VERSION} (EDB windows-x64 binaries, slim bin/lib/share, bundled)",
             f"python: python-build-standalone {PYTHON_FULL_VERSION} (relocatable, bundled)",
@@ -529,8 +673,9 @@ def write_manifest(
             f"uv: {UV_VERSION} (downloaded, sha256 pinned)",
             "wheels: downloaded from PyPI on first run (--require-hashes)",
         ]
+    title = "Windows Server 2019 x64" if profile == "server2019" else "Win10 x64"
     lines = [
-        f"DataOpsStudio Win10 x64 {mode}{' GUI' if gui else ''} bundle",
+        f"DataOpsStudio {title} {mode}{' GUI' if gui else ''} bundle",
         f"bundle_version: {identity.version}",
         f"build_commit: {identity.commit}",
         f"image_version: {identity.image_version}",
@@ -589,7 +734,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="build the shared Tauri shell and include DataOpsStudio.exe",
     )
+    parser.add_argument(
+        "--profile",
+        choices=("win10", "server2019"),
+        default="win10",
+        help="server2019: offline script-only lite bundle with app-local VC++ runtime",
+    )
+    parser.add_argument(
+        "--vc-redist-dir",
+        default=None,
+        help="x64 Microsoft.VC14x.CRT folder for --profile server2019 (default: vswhere newest)",
+    )
     args = parser.parse_args(argv)
+    if args.profile == "server2019" and (args.gui or args.mode != "offline"):
+        parser.error("--profile server2019 is offline-only and has no GUI")
 
     if os.name != "nt":
         log("WARNING: not running on Windows; wheels/python will not match win_amd64")
@@ -600,7 +758,9 @@ def main(argv: list[str] | None = None) -> int:
     cache.mkdir(parents=True, exist_ok=True)
 
     version = bundle_version()
-    if args.gui and args.mode == "offline":
+    if args.profile == "server2019":
+        name = f"dataops-studio-{version}-server2019-x64-offline"
+    elif args.gui and args.mode == "offline":
         name = f"dataops-studio-{version}-win10-x64-gui"
     elif args.gui:
         name = f"dataops-studio-{version}-win10-x64-{args.mode}-gui"
@@ -612,18 +772,20 @@ def main(argv: list[str] | None = None) -> int:
         image_version=name.removeprefix("dataops-studio-"),
     )
     log(f"build identity: version={identity.version} commit={identity.commit}")
+    vc_redist_dir = find_vc_redist_dir(args.vc_redist_dir) if args.profile == "server2019" else None
 
     requirements = export_requirements(cache, args.uv)
     frontend_dist = build_frontend()
     desktop_executable = build_desktop() if args.gui else None
 
     staging = output_dir / name
+    vc_runtime: list[tuple[str, str]] = []
     if args.mode == "offline":
         python_dir = prepare_python(cache)
         uv_dir = prepare_uv(cache)
         wheels = download_wheels(cache, python_dir, requirements)
         pg_zip = download_pg(cache)
-        assemble(
+        vc_runtime = assemble(
             staging,
             mode="offline",
             requirements=requirements,
@@ -633,6 +795,8 @@ def main(argv: list[str] | None = None) -> int:
             wheels=wheels,
             pg_zip=pg_zip,
             desktop_executable=desktop_executable,
+            vc_redist_dir=vc_redist_dir,
+            profile=args.profile,
             identity=identity,
         )
     else:
@@ -646,7 +810,16 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     zip_path = make_zip(staging, output_dir, name)
-    write_manifest(output_dir, zip_path, args.mode, gui=args.gui, identity=identity)
+    write_manifest(
+        output_dir,
+        zip_path,
+        args.mode,
+        gui=args.gui,
+        identity=identity,
+        profile=args.profile,
+        vc_runtime=vc_runtime,
+        vc_redist_dir=vc_redist_dir,
+    )
     if not args.keep_staging:
         shutil.rmtree(staging)
     log("done")
