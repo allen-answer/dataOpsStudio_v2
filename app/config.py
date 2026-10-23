@@ -110,6 +110,12 @@ class ApiConfig(BaseSettings):
     metadata_probe_timeout_seconds: int = Field(default=5, ge=1, le=60)
     export_per_user_per_hour: int = Field(default=10, ge=1, le=1000)
     download_url_ttl_seconds: int = Field(default=300, ge=30, le=3600)
+    # uvicorn 优雅停机上限(timeout_graceful_shutdown)。不设则无限等:Windows Proactor
+    # 下浏览器 RST 掉的 keep-alive 连接会让 asyncio Server.wait_closed() 永不返回
+    # (CPython _call_connection_lost 在 sock.shutdown 抛错后跳过 _detach),
+    # stop 卡在 "Shutting down"。API 不承载耐久工作(job 在 worker),短上限即可;
+    # 须小于 launcher 等 API 的 30s,否则 launcher 会先超时强杀。
+    graceful_shutdown_seconds: int = Field(default=10, ge=1, le=25)
 
     # SQL 控制台会话(Session Broker,设计 §6)的上线保险丝。off = API 进程不装配
     # broker、会话端点如实 409 console_session_disabled,前端整体回落 job 路径。

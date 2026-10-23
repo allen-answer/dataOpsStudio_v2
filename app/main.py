@@ -15,6 +15,7 @@ def main() -> None:
         host=settings.api.host,
         port=settings.api.port,
         reload=False,
+        timeout_graceful_shutdown=settings.api.graceful_shutdown_seconds,
     )
 
 
