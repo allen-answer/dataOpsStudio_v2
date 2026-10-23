@@ -530,7 +530,7 @@ def assemble(
         log("assemble: Tauri desktop shell")
         shutil.copy2(desktop_executable, staging / "DataOpsStudio.exe")
 
-    write_scripts(staging, identity)
+    write_scripts(staging, identity, profile=profile)
     write_readme(staging, profile=profile)
     return vc_runtime
 
@@ -605,15 +605,26 @@ SCRIPT_TEMPLATES = (
     "stop.cmd",
 )
 BUILD_IDENTITY_MARKER = "# __DATAOPS_BUILD_IDENTITY__"
+# server2019 包的 API 默认端口;Win10 包(含 GUI 壳的 healthz 探测)仍是 8020。
+# 只改 _common.ps1 的默认值,DATAOPS_API_PORT 仍可覆盖;payload 升级不替换包根脚本。
+_DEFAULT_API_PORT_LINE = "if (-not $env:DATAOPS_API_PORT)   { $env:DATAOPS_API_PORT = '8020' }"
+SERVER2019_API_PORT = "18020"
 
 
-def write_scripts(staging: Path, identity: BuildIdentity) -> None:
+def write_scripts(staging: Path, identity: BuildIdentity, *, profile: str = "win10") -> None:
     log("assemble: PowerShell scripts + .cmd shims")
     for name in SCRIPT_TEMPLATES:
         source = SCRIPTS_ROOT / name
         destination = staging / name
         if name == "_common.ps1":
             text = source.read_text(encoding="utf-8")
+            if profile == "server2019":
+                if _DEFAULT_API_PORT_LINE not in text:
+                    raise SystemExit("_common.ps1 default API port line not found")
+                text = text.replace(
+                    _DEFAULT_API_PORT_LINE,
+                    _DEFAULT_API_PORT_LINE.replace("'8020'", f"'{SERVER2019_API_PORT}'"),
+                )
             destination.write_text(
                 inject_build_identity(
                     text,
@@ -633,7 +644,7 @@ def write_readme(staging: Path, *, profile: str = "win10") -> None:
     if profile == "server2019":
         # Server 2019 notes go first; the shared Win10 README still applies.
         server = (TEMPLATES_DIR / "README-server2019.md").read_text(encoding="utf-8")
-        text = server + "\n" + text
+        text = server + "\n" + text.replace("8020", SERVER2019_API_PORT)
     (staging / "README.md").write_text(text, encoding="utf-8", newline="\r\n")
 
 
@@ -659,6 +670,7 @@ def write_manifest(
             f"vc_runtime: MSVC {redist} (app-local in pgsql/bin)",
             *(f"vc_runtime_sha256: {name} {digest}" for name, digest in vc_runtime or []),
             "gui: none (browser access; Server 2019 ships no WebView2)",
+            f"api_port: {SERVER2019_API_PORT} (default; DATAOPS_API_PORT overrides)",
         ]
     elif mode == "offline":
         runtime_lines = [

@@ -74,10 +74,14 @@ package it:
   `pg_restore`, `pg_isready`, `pg_controldata`, `pg_resetwal` in `pgsql/bin`, dropping StackBuilder
   and its wxWidgets/curl DLLs, ecpg, pgbench, the regression tools and the `lib/*.lib` import
   libraries;
+- defaults the API port to `18020` instead of `8020` (only the default in the packaged
+  `_common.ps1`; `DATAOPS_API_PORT` still overrides it, and payload updates do not replace the
+  bundle-root scripts, so the port survives updates). The MANIFEST records it as `api_port`;
 - prepends `tools/package/templates/README-server2019.md` (unblocking the zip, browser access,
   `DATAOPS_API_HOST=0.0.0.0` plus a firewall rule) to the package README.
 
-The runtime scripts, ports and payload-update platform (`win10-x64`) are unchanged.
+The runtime scripts, the PostgreSQL port `15432` and the payload-update platform (`win10-x64`) are
+unchanged.
 
 ## Linux Mint 21.3 x86_64
 
