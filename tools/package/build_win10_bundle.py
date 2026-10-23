@@ -644,7 +644,7 @@ def write_readme(staging: Path, *, profile: str = "win10") -> None:
     if profile == "server2019":
         # Server 2019 notes go first; the shared Win10 README still applies.
         server = (TEMPLATES_DIR / "README-server2019.md").read_text(encoding="utf-8")
-        text = server + "\n" + text
+        text = server + "\n" + text.replace("8020", SERVER2019_API_PORT)
     (staging / "README.md").write_text(text, encoding="utf-8", newline="\r\n")
 
 

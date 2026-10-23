@@ -343,11 +343,14 @@ def test_server2019_scripts_default_api_port_18020(tmp_path: Path) -> None:
 def test_server2019_readme_uses_api_port_18020(tmp_path: Path) -> None:
     build.write_readme(tmp_path, profile="server2019")
 
-    server_notes = (tmp_path / "README.md").read_text(encoding="utf-8").split("\n---\n")[0]
+    text = (tmp_path / "README.md").read_text(encoding="utf-8")
+    server_notes, win10_notes = text.split("\n---\n", 1)
     assert "http://127.0.0.1:18020/" in server_notes
     assert "-LocalPort 18020" in server_notes
-    assert "127.0.0.1:8020" not in server_notes
-    assert "-LocalPort 8020" not in server_notes
+    assert "http://127.0.0.1:18020/" in win10_notes
+    assert "| `DATAOPS_API_PORT` | `18020` |" in win10_notes
+    stray = text.replace("18020", "").replace("Win10 包是 `8020`", "")
+    assert "8020" not in stray
 
 
 def test_server2019_readme_prepends_server_notes(tmp_path: Path) -> None:

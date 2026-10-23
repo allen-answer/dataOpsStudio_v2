@@ -3,8 +3,7 @@
 本包是 Win10 offline 包针对**干净的 Windows Server 2019** 裁剪出的版本,启动/停止/升级流程
 与下文的 Win10 说明完全一致,只有以下差别:
 
-- **API 默认端口 `18020`**(Win10 包是 `8020`):下文 Win10 说明里出现的 `8020` 在本包中
-  一律换成 `18020`。仍可用 `DATAOPS_API_PORT` 覆盖。
+- **API 默认端口 `18020`**(Win10 包是 `8020`),仍可用 `DATAOPS_API_PORT` 覆盖。
 - **不带桌面壳(没有 `DataOpsStudio.exe`)**:Server 2019 不自带 WebView2。双击 `start.cmd`
   启动,用浏览器访问。
 - **自带 VC++ 运行库**:`pgsql\bin` 内置 `vcruntime140.dll` / `vcruntime140_1.dll` /
