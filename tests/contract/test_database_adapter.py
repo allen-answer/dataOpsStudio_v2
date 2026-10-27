@@ -20,7 +20,7 @@ from app.dbclients.mysql_adapter import MySQLAdapter
 from app.dbclients.oracle_adapter import OracleAdapter
 from app.dbclients.protocol import DatabaseAdapter
 from app.domain.compare import CompareColumn, CompareHashRequest, CompareTableRef
-from app.domain.datasource import DatasourceConnInfo, DbType
+from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.schema import ColumnType
 from app.domain.secret import HashedRef, RotationReport, SecretKind, SecretRef
 from app.infrastructure.secretstore.protocol import SecretStore
@@ -45,8 +45,11 @@ def adapter(request: pytest.FixtureRequest) -> DatabaseAdapter:
             ibm_db_module=_FakeIbmDb(),
         )
     if request.param == "oracle":
+        # explain 另受 allow_oracle_plan_table 闸门(缺省关,单测覆盖);契约按"策略允许"验。
         return OracleAdapter(
-            _conn_info(DbType.ORACLE),
+            _conn_info(DbType.ORACLE).model_copy(
+                update={"operation_policy": OperationPolicy(allow_oracle_plan_table=True)}
+            ),
             secret_store,
             oracledb_module=_FakeOracleDb(),
         )

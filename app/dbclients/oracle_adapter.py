@@ -27,10 +27,11 @@ cp312 wheel 齐全,uv/pip 可直接装)。thin 只支持 Oracle 12.1+;11g 需 th
   软取消 + statement timeout 兜底(与 PG/DB2/DM 一致;真 server-side cancel 接入
   是 Certified 前置项,需另起线程,不在 Preview 范围)。
 
-Preview 范围(能力矩阵照 DB2 Preview 现档):execute_select / stream_rows /
-introspection(schemas/tables/columns/indexes,复用 DM 验证过的 Oracle 目录视图
-SQL)开;explain(依赖 PLAN_TABLE,真实例相关)/ get_table_ddl(DBMS_METADATA
-权限相关)/ compare 仍关,调用方按 capabilities 降级。
+Preview 范围:execute_select / stream_rows / introspection(schemas/tables/columns/
+indexes,目录视图 SQL 在 oracle_catalog,与 OB-Oracle 共用)开;get_table_ddl 走
+DBMS_METADATA(他人 schema 缺 SELECT_CATALOG_ROLE 报结构化错误);explain 走
+EXPLAIN PLAN + DBMS_XPLAN,会写会话临时表 PLAN_TABLE,另受数据源
+`allow_oracle_plan_table` 闸门(缺省关),结束即回滚;compare 仍关,调用方按 capabilities 降级。
 
 R1:oracledb 只允许在 app/dbclients/ import(banned-api 拦别处)。
 R2:密码只从 SecretStore 解出后进 password kwarg;DSN / 连接参数不落日志,
@@ -44,11 +45,13 @@ import decimal
 import importlib
 import os
 import re
+import secrets
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
+from app.dbclients import oracle_catalog
 from app.dbclients.oracle_types import (
     data_type_string_to_column_type,
     description_item_to_column_type,
@@ -131,6 +134,29 @@ _THIN_UNSUPPORTED_HINT = (
     "to enable thick mode (restart the API and worker afterwards)."
 )
 
+# DBMS_METADATA:表不存在与无权读他人 schema(缺 SELECT_CATALOG_ROLE)同报 ORA-31603。
+_DDL_UNAVAILABLE_CODE = "ORA-31603"
+_DDL_UNAVAILABLE_MESSAGE = (
+    "Oracle DDL unavailable (ORA-31603): the table does not exist, or reading DDL of "
+    "another schema requires SELECT_CATALOG_ROLE for this account"
+)
+# 只关物理存储 / 段属性与语句终止符,保留约束;设置失败不影响取 DDL。
+_DDL_TRANSFORM_SQL = """
+BEGIN
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'STORAGE', FALSE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', FALSE);
+  DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SQLTERMINATOR', FALSE);
+END;
+"""
+
+_PLAN_DISPLAY_SQL = (
+    "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY('PLAN_TABLE', :sid, 'TYPICAL'))"
+)
+_PLAN_TABLE_DISABLED_MESSAGE = (
+    "Oracle explain writes the session PLAN_TABLE; enable "
+    "operation_policy.allow_oracle_plan_table for this datasource to use it"
+)
+
 # init_oracle_client 每进程只能成功调一次;结果(含失败)缓存,失败时每次连接都如实报错。
 _client_init_lock = threading.Lock()
 _client_init_done = False
@@ -161,6 +187,10 @@ class OracleUnsupportedOperationError(OracleAdapterError, NotImplementedError):
     """Preview 未开的能力被调用(调用方应先查 capabilities)。"""
 
 
+class OracleDdlUnavailableError(OracleAdapterError):
+    """取不到 DDL:表不存在,或读他人 schema 缺 SELECT_CATALOG_ROLE(同为 ORA-31603)。"""
+
+
 class OracleClientInitError(OracleAdapterError):
     """设了 DATAOPS_ORACLE_CLIENT_DIR 但 thick mode 初始化失败(目录错 / 缺依赖 DLL 等)。"""
 
@@ -170,14 +200,15 @@ class OracleAdapter(DatabaseAdapter):
 
     capabilities = AdapterCapabilities(
         execute_select=True,
-        explain=False,  # 依赖 PLAN_TABLE(EXPLAIN PLAN FOR),真实例相关,Preview 不开
+        # EXPLAIN PLAN 写会话临时表 PLAN_TABLE;另受数据源 allow_oracle_plan_table 闸门
+        explain=True,
         stream_rows=True,
         server_side_cancel=False,  # thin 有 Connection.cancel(),但需另线程打断(见模块 docstring)
         list_schemas=True,
         list_tables=True,
         list_columns=True,
         list_indexes=True,
-        get_table_ddl=False,  # DBMS_METADATA.GET_DDL 权限相关,Preview 不开(DM 已开,Oracle 保守)
+        get_table_ddl=True,  # DBMS_METADATA.GET_DDL;他人 schema 缺权限报 OracleDdlUnavailableError
         compare_db_hash=False,
     )
 
@@ -238,7 +269,38 @@ class OracleAdapter(DatabaseAdapter):
         return self.execute_select(sql, {})
 
     def explain(self, sql: str) -> PlanNode:
-        raise self._unsupported("explain")
+        # EXPLAIN PLAN 会往会话级临时表 PLAN_TABLE 写行;数据源策略显式放开才做。
+        if not self._conn_info.operation_policy.allow_oracle_plan_table:
+            raise OracleUnsupportedOperationError(_PLAN_TABLE_DISABLED_MESSAGE)
+        guarded_sql = validate_readonly_sql(sql)
+        # STATEMENT_ID 只能是字面量;取纯十六进制随机串,不含引号,可安全内联。
+        statement_id = "DOPS_" + secrets.token_hex(8).upper()
+        conn = None
+        cursor = None
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            raise AdapterConnectionError("adapter connection failed") from exc
+        try:
+            self._apply_statement_timeout(conn)
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"EXPLAIN PLAN SET STATEMENT_ID = '{statement_id}' FOR {guarded_sql}"
+                )
+                cursor.execute(_PLAN_DISPLAY_SQL, {"sid": statement_id})
+                lines = [_first_cell(row) for row in cursor.fetchall()]
+            except Exception as exc:
+                raise self._driver_error("Oracle explain failed", exc) from exc
+            return PlanNode(
+                operation="EXPLAIN",
+                details={"rows": [{"plan_table_output": line} for line in lines]},
+            )
+        finally:
+            # PLAN_TABLE 的行随回滚撤销,不在会话临时表里留痕。
+            _safe_rollback(conn)
+            _safe_close(cursor)
+            _safe_close(conn)
 
     def test_connection(self) -> bool:
         conn = None
@@ -263,14 +325,7 @@ class OracleAdapter(DatabaseAdapter):
 
     def list_schemas(self) -> list[Schema]:
         # ALL_USERS 全列 + 客户端按系统 schema 清单排除(与 DB2 同款,SQL 里省一串 NOT IN)。
-        rows = self._query_dicts(
-            """
-            SELECT USERNAME AS name
-            FROM ALL_USERS
-            ORDER BY USERNAME
-            """,
-            None,
-        )
+        rows = self._query_dicts(oracle_catalog.LIST_SCHEMAS.render("named"), None)
         schemas: list[Schema] = []
         for row in rows:
             name = str(row["name"]).strip()
@@ -281,20 +336,7 @@ class OracleAdapter(DatabaseAdapter):
 
     def list_tables(self, schema: str) -> list[Table]:
         _validate_identifier(schema)
-        # ALL_TABLES UNION ALL_VIEWS(与 DM 一致连视图一起列);命名绑定 :owner 复用一次。
-        rows = self._query_dicts(
-            """
-            SELECT OWNER AS schema_name, TABLE_NAME AS name, 'TABLE' AS table_type
-            FROM ALL_TABLES
-            WHERE OWNER = UPPER(:owner)
-            UNION ALL
-            SELECT OWNER AS schema_name, VIEW_NAME AS name, 'VIEW' AS table_type
-            FROM ALL_VIEWS
-            WHERE OWNER = UPPER(:owner)
-            ORDER BY name
-            """,
-            {"owner": schema},
-        )
+        rows = self._query_dicts(oracle_catalog.LIST_TABLES.render("named"), {"owner": schema})
         return [
             Table(
                 schema_name=str(row["schema_name"]),
@@ -308,21 +350,7 @@ class OracleAdapter(DatabaseAdapter):
         _validate_identifier(schema)
         _validate_identifier(table)
         rows = self._query_dicts(
-            """
-            SELECT
-                c.COLUMN_NAME AS name,
-                c.DATA_TYPE AS data_type,
-                c.NULLABLE AS nullable,
-                cc.COMMENTS AS "COMMENT"
-            FROM ALL_TAB_COLUMNS c
-            LEFT JOIN ALL_COL_COMMENTS cc
-              ON cc.OWNER = c.OWNER
-             AND cc.TABLE_NAME = c.TABLE_NAME
-             AND cc.COLUMN_NAME = c.COLUMN_NAME
-            WHERE c.OWNER = UPPER(:owner) AND c.TABLE_NAME = UPPER(:tbl)
-            ORDER BY c.COLUMN_ID
-            """,
-            {"owner": schema, "tbl": table},
+            oracle_catalog.LIST_COLUMNS.render("named"), {"owner": schema, "tbl": table}
         )
         primary_keys = self._primary_key_columns(schema, table)
         return [
@@ -342,19 +370,7 @@ class OracleAdapter(DatabaseAdapter):
         _validate_identifier(schema)
         _validate_identifier(table)
         rows = self._query_dicts(
-            """
-            SELECT
-                i.INDEX_NAME AS name,
-                ic.COLUMN_NAME AS column_name,
-                i.UNIQUENESS AS uniqueness,
-                ic.COLUMN_POSITION AS column_position
-            FROM ALL_INDEXES i
-            JOIN ALL_IND_COLUMNS ic
-              ON ic.INDEX_OWNER = i.OWNER AND ic.INDEX_NAME = i.INDEX_NAME
-            WHERE i.TABLE_OWNER = UPPER(:owner) AND i.TABLE_NAME = UPPER(:tbl)
-            ORDER BY i.INDEX_NAME, ic.COLUMN_POSITION
-            """,
-            {"owner": schema, "tbl": table},
+            oracle_catalog.LIST_INDEXES.render("named"), {"owner": schema, "tbl": table}
         )
         primary_keys = self._primary_key_index_names(schema, table)
         grouped: dict[str, dict[str, Any]] = {}
@@ -380,7 +396,33 @@ class OracleAdapter(DatabaseAdapter):
         ]
 
     def get_table_ddl(self, schema: str, table: str) -> str:
-        raise self._unsupported("get_table_ddl")
+        _validate_identifier(schema)
+        _validate_identifier(table)
+        conn = None
+        cursor = None
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            raise AdapterConnectionError("adapter connection failed") from exc
+        try:
+            cursor = conn.cursor()
+            _apply_ddl_transforms(cursor)
+            try:
+                cursor.execute(
+                    oracle_catalog.TABLE_DDL.render("named"), {"tbl": table, "owner": schema}
+                )
+                row = cursor.fetchone()
+            except Exception as exc:
+                if _oracle_error_code(exc) == _DDL_UNAVAILABLE_CODE:
+                    raise OracleDdlUnavailableError(_DDL_UNAVAILABLE_MESSAGE) from exc
+                raise self._driver_error("Oracle DDL query failed", exc) from exc
+            ddl = _lob_text(_first_cell(row))
+            if not ddl:
+                raise OracleAdapterError("DBMS_METADATA.GET_DDL returned no DDL")
+            return ddl.strip()
+        finally:
+            _safe_close(cursor)
+            _safe_close(conn)
 
     def build_compare_hash_query(self, request: CompareHashRequest) -> CompareHashPlan:
         raise self._unsupported("build_compare_hash_query")
@@ -467,27 +509,13 @@ class OracleAdapter(DatabaseAdapter):
 
     def _primary_key_columns(self, schema: str, table: str) -> set[str]:
         rows = self._query_dicts(
-            """
-            SELECT cc.COLUMN_NAME AS name
-            FROM ALL_CONSTRAINTS c
-            JOIN ALL_CONS_COLUMNS cc
-              ON cc.OWNER = c.OWNER AND cc.CONSTRAINT_NAME = c.CONSTRAINT_NAME
-            WHERE c.CONSTRAINT_TYPE = 'P'
-              AND c.OWNER = UPPER(:owner) AND c.TABLE_NAME = UPPER(:tbl)
-            """,
-            {"owner": schema, "tbl": table},
+            oracle_catalog.PRIMARY_KEY_COLUMNS.render("named"), {"owner": schema, "tbl": table}
         )
         return {str(row["name"]) for row in rows}
 
     def _primary_key_index_names(self, schema: str, table: str) -> set[str]:
         rows = self._query_dicts(
-            """
-            SELECT c.INDEX_NAME AS name
-            FROM ALL_CONSTRAINTS c
-            WHERE c.CONSTRAINT_TYPE = 'P'
-              AND c.OWNER = UPPER(:owner) AND c.TABLE_NAME = UPPER(:tbl)
-              AND c.INDEX_NAME IS NOT NULL
-            """,
+            oracle_catalog.PRIMARY_KEY_INDEX_NAMES.render("named"),
             {"owner": schema, "tbl": table},
         )
         return {str(row["name"]) for row in rows}
@@ -693,6 +721,37 @@ def _build_output_type_handler(oracledb: Any) -> Callable[[Any, Any], Any] | Non
     return handler
 
 
+def _apply_ddl_transforms(cursor: Any) -> None:
+    try:
+        cursor.execute(_DDL_TRANSFORM_SQL)
+    except Exception:
+        return
+
+
+def _lob_text(value: object) -> str | None:
+    """GET_DDL 返回 CLOB:挂了 outputtypehandler 时已是 str,否则是 LOB 对象需 read()。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    read = getattr(value, "read", None)
+    if callable(read):
+        return str(read())
+    return str(value)
+
+
+def _safe_rollback(conn: object | None) -> None:
+    if conn is None:
+        return
+    rollback = getattr(conn, "rollback", None)
+    if rollback is None:
+        return
+    try:
+        rollback()
+    except Exception:
+        return
+
+
 def _validate_identifier(identifier: str) -> None:
     if not identifier or _IDENTIFIER_RE.fullmatch(identifier) is None:
         raise ValueError("Invalid database identifier")
@@ -842,6 +901,7 @@ __all__ = [
     "OracleAdapter",
     "OracleAdapterError",
     "OracleClientInitError",
+    "OracleDdlUnavailableError",
     "OracleDriverNotInstalledError",
     "OracleUnsupportedOperationError",
     "QueryCancelledError",

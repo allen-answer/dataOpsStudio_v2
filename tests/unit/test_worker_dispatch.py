@@ -55,14 +55,14 @@ def test_dispatch_postgresql_builds_postgresql_adapter_not_unsupported() -> None
 
 def test_dispatch_oracle_builds_oracle_adapter_not_unsupported() -> None:
     # Oracle Preview 核心验收:Oracle 数据源不再抛 UnsupportedDbTypeError,
-    # capabilities 按 Preview 范围声明(select/流式/introspection 开,
-    # explain/DDL/compare 关)。
+    # capabilities 按 Preview 范围声明(select/流式/introspection/DDL 开,explain 开但另受
+    # allow_oracle_plan_table 闸门,compare 关)。
     adapter = build_database_adapter(_conn_info(DbType.ORACLE), cast(SecretStore, _SecretStore()))
     assert isinstance(adapter, OracleAdapter)
     assert adapter.capabilities.execute_select is True
     assert adapter.capabilities.list_schemas is True
-    assert adapter.capabilities.explain is False
-    assert adapter.capabilities.get_table_ddl is False
+    assert adapter.capabilities.explain is True
+    assert adapter.capabilities.get_table_ddl is True
     assert adapter.capabilities.compare_db_hash is False
 
 
