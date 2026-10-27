@@ -1,7 +1,10 @@
 """Oracle DatabaseAdapter(Preview 档)。
 
 驱动:python-oracledb **thin mode**(纯 Python,免装 Oracle Instant Client;
-cp312 wheel 齐全,uv/pip 可直接装)。方言细节与同族 DM adapter 对齐
+cp312 wheel 齐全,uv/pip 可直接装)。thin 只支持 Oracle 12.1+;11g 需 thick mode:
+部署方放置 Oracle Instant Client 19c 并设环境变量 `DATAOPS_ORACLE_CLIENT_DIR` 指向其目录,
+进程内首次加载驱动时调一次 `init_oracle_client`(模式是进程级的,12c+ 实例在 thick 下照常可用)。
+方言细节与同族 DM adapter 对齐
 (DM 1.x 即 `DmDialect(OracleDialect)`,V1_AS_IS §2.3/§2.4):
 
 - 连接:Easy Connect DSN `host:port/service_name`(service_name 缺省取
@@ -12,6 +15,10 @@ cp312 wheel 齐全,uv/pip 可直接装)。方言细节与同族 DM adapter 对�
 - 流式读:普通 cursor + fetchmany(arraysize 对齐 chunk;非 MySQL SSCursor)。
 - 标识符:UPPER() 包裹(Oracle 默认大写),introspection SQL 用命名绑定,不拼字面量。
 - 列类型:oracledb DbType 对象 → 统一 ColumnType(oracle_types,NUMBER 按 scale 判别)。
+- 取值:连接挂 outputtypehandler。oracledb 缺省把带小数位 / 无约束的 NUMBER 取成 float,
+  会丢精度(实测 NUMBER(20,2) 的 12345678901234567.89 → 1.2345678901234568e+16),
+  故这类 NUMBER 取 Decimal(`NUMBER(p,0)` 缺省已是精确 int,不动);CLOB/NCLOB 取 str、
+  BLOB 取 bytes(缺省是 LOB 对象,还需再次往返)。不改进程级 `oracledb.defaults`。
 - 错误:oracledb.DatabaseError 的 `args[0]` 带 `.full_code`(ORA-xxxxx / DPY-xxxx)/
   `.code`,反查拼进结构化错误信息(脱敏后)。
 - 取消:oracledb thin 有 `Connection.cancel()`,但它须由**另一线程**在语句执行
@@ -33,8 +40,11 @@ R5:连接失败日志不得含密码 / DSN 敏感段(错误摘要经脱敏 helpe
 
 from __future__ import annotations
 
+import decimal
 import importlib
+import os
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
@@ -111,6 +121,21 @@ _DRIVER_INSTALL_HINT = (
     "python-oracledb runs in thin mode by default, so no Oracle Instant Client is required."
 )
 
+# thick mode 开关:指向 Oracle Instant Client 目录(11g 需要;19c 是支持 11.2 的最高客户端)。
+_CLIENT_DIR_ENV = "DATAOPS_ORACLE_CLIENT_DIR"
+# thin mode 握手阶段即报(认证之前):服务端低于 12.1。
+_THIN_UNSUPPORTED_CODE = "DPY-3010"
+_THIN_UNSUPPORTED_HINT = (
+    "Oracle server is older than 12.1 and python-oracledb thin mode cannot connect to it; "
+    f"install Oracle Instant Client 19c and set {_CLIENT_DIR_ENV} to its directory "
+    "to enable thick mode (restart the API and worker afterwards)."
+)
+
+# init_oracle_client 每进程只能成功调一次;结果(含失败)缓存,失败时每次连接都如实报错。
+_client_init_lock = threading.Lock()
+_client_init_done = False
+_client_init_error: str | None = None
+
 
 class OracleAdapterError(RuntimeError):
     """Oracle adapter 基础异常。错误信息不得包含密码或 SQL 原文。"""
@@ -134,6 +159,10 @@ class OracleDriverNotInstalledError(OracleAdapterError):
 
 class OracleUnsupportedOperationError(OracleAdapterError, NotImplementedError):
     """Preview 未开的能力被调用(调用方应先查 capabilities)。"""
+
+
+class OracleClientInitError(OracleAdapterError):
+    """设了 DATAOPS_ORACLE_CLIENT_DIR 但 thick mode 初始化失败(目录错 / 缺依赖 DLL 等)。"""
 
 
 class OracleAdapter(DatabaseAdapter):
@@ -479,7 +508,11 @@ class OracleAdapter(DatabaseAdapter):
             # python-oracledb thin:tcp_connect_timeout 单位秒。
             kwargs["tcp_connect_timeout"] = connect_timeout
         # DSN / kwargs 含主机与 service,但不含密码(密码单独 kwarg);仍不入日志。
-        return oracledb.connect(**kwargs)
+        conn = oracledb.connect(**kwargs)
+        handler = _build_output_type_handler(oracledb)
+        if handler is not None:
+            conn.outputtypehandler = handler
+        return conn
 
     def _build_dsn(self) -> str:
         # extra["dsn"] 整串覆盖(Easy Connect 或 TNS descriptor;不含密码,R2 无虞);
@@ -497,6 +530,7 @@ class OracleAdapter(DatabaseAdapter):
                 self._oracledb = importlib.import_module("oracledb")
             except ImportError as exc:
                 raise OracleDriverNotInstalledError(_DRIVER_INSTALL_HINT) from exc
+        _ensure_client_mode(self._oracledb)
         return self._oracledb
 
     def _apply_statement_timeout(self, conn: Any) -> None:
@@ -536,6 +570,8 @@ class OracleAdapter(DatabaseAdapter):
         message = _sanitize_error_text(str(exc))
         if message:
             parts.append(f"message={message}")
+        if code == _THIN_UNSUPPORTED_CODE:
+            parts.append(f"hint={_THIN_UNSUPPORTED_HINT}")
         return " ".join(parts)
 
     def _check_cancel(self) -> None:
@@ -590,6 +626,71 @@ class OracleAdapter(DatabaseAdapter):
             f"OracleAdapter does not support {operation} in this build "
             "(Oracle Preview). Check adapter.capabilities before calling."
         )
+
+
+def _ensure_client_mode(oracledb: Any) -> None:
+    """设了 DATAOPS_ORACLE_CLIENT_DIR 时,本进程首次加载驱动调一次 init_oracle_client。
+
+    oracledb 的 thin/thick 是进程级且只能定一次,必须在本进程第一个 Oracle 连接之前;
+    所有 Oracle 连接都经 _load_oracledb,故放在这里。失败结果缓存,之后每次连接都报同样
+    的结构化错误,不静默回落 thin(回落会让 11g 报更难懂的 DPY-3010)。
+    """
+    global _client_init_done, _client_init_error
+    lib_dir = os.environ.get(_CLIENT_DIR_ENV, "").strip()
+    if not lib_dir:
+        return
+    with _client_init_lock:
+        if not _client_init_done:
+            _client_init_done = True
+            try:
+                oracledb.init_oracle_client(lib_dir=lib_dir)
+            except Exception as exc:
+                parts = [type(exc).__name__]
+                code = _oracle_error_code(exc)
+                if code:
+                    parts.append(f"code={code}")
+                message = _sanitize_error_text(str(exc))
+                if message:
+                    parts.append(f"message={message}")
+                _client_init_error = " ".join(parts)
+        if _client_init_error is not None:
+            raise OracleClientInitError(
+                f"Oracle thick mode initialization failed ({_CLIENT_DIR_ENV}): {_client_init_error}"
+            )
+
+
+def _build_output_type_handler(oracledb: Any) -> Callable[[Any, Any], Any] | None:
+    """连接级 outputtypehandler:有小数位 / 无约束的 NUMBER → Decimal;LOB → str / bytes。
+
+    `NUMBER(p,0)`(precision>0、scale==0)缺省就取精确 int,不接管。驱动模块缺这些
+    DbType 常量时(单测 fake)返回 None,不挂 handler。
+    """
+    number_type = getattr(oracledb, "DB_TYPE_NUMBER", None)
+    lob_targets: dict[Any, Any] = {}
+    for source_name, target_name in (
+        ("DB_TYPE_CLOB", "DB_TYPE_LONG"),
+        ("DB_TYPE_NCLOB", "DB_TYPE_LONG_NVARCHAR"),
+        ("DB_TYPE_BLOB", "DB_TYPE_LONG_RAW"),
+    ):
+        source = getattr(oracledb, source_name, None)
+        target = getattr(oracledb, target_name, None)
+        if source is not None and target is not None:
+            lob_targets[source] = target
+    if number_type is None and not lob_targets:
+        return None
+
+    def handler(cursor: Any, metadata: Any) -> Any:
+        type_code = metadata.type_code
+        if number_type is not None and type_code is number_type:
+            if metadata.scale == 0 and (metadata.precision or 0) > 0:
+                return None
+            return cursor.var(decimal.Decimal, arraysize=cursor.arraysize)
+        target = lob_targets.get(type_code)
+        if target is not None:
+            return cursor.var(target, arraysize=cursor.arraysize)
+        return None
+
+    return handler
 
 
 def _validate_identifier(identifier: str) -> None:
@@ -740,6 +841,7 @@ __all__ = [
     "InvalidDatasourceError",
     "OracleAdapter",
     "OracleAdapterError",
+    "OracleClientInitError",
     "OracleDriverNotInstalledError",
     "OracleUnsupportedOperationError",
     "QueryCancelledError",

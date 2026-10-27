@@ -7,15 +7,18 @@ type_code 走 python-oracledb DbType(`.name` 形如 "DB_TYPE_NUMBER")的归一�
 
 from __future__ import annotations
 
+import decimal
 import importlib
 from typing import Any, cast
 
 import pytest
 
+from app.dbclients import oracle_adapter as oracle_adapter_module
 from app.dbclients.oracle_adapter import (
     InvalidDatasourceError,
     OracleAdapter,
     OracleAdapterError,
+    OracleClientInitError,
     OracleDriverNotInstalledError,
     OracleUnsupportedOperationError,
     QueryCancelledError,
@@ -505,6 +508,129 @@ def test_data_type_string_mapping_units() -> None:
     assert data_type_string_to_column_type("INTERVAL YEAR TO MONTH") is ColumnType.UNKNOWN
     assert data_type_string_to_column_type("SDO_GEOMETRY") is ColumnType.UNKNOWN
     assert data_type_string_to_column_type(None) is ColumnType.UNKNOWN
+    # 11g 真库目录里出现过 DATA_TYPE='UNDEFINED' 的列
+    assert data_type_string_to_column_type("UNDEFINED") is ColumnType.UNKNOWN
+
+
+# ─────────────── 取值处理器 / thick mode 开关 / DPY-3010 提示 ───────────────
+
+
+def test_connect_installs_output_type_handler_when_driver_has_db_types() -> None:
+    fake = _FakeTypedOracleDb()
+    adapter = _adapter(fake)
+
+    list(adapter.execute_select("SELECT 1 FROM dual", {}))
+
+    handler = getattr(fake.connections[0], "outputtypehandler", None)
+    assert callable(handler)
+
+
+def test_output_type_handler_fetches_inexact_numbers_as_decimal() -> None:
+    fake = _FakeTypedOracleDb()
+    handler = _installed_handler(fake)
+    cursor = _VarRecordingCursor()
+
+    # NUMBER(20,2):缺省会变 float 丢精度 → Decimal
+    handler(cursor, _Meta(fake.DB_TYPE_NUMBER, precision=20, scale=2))
+    # 无约束 NUMBER(precision=0, scale=-127)→ Decimal
+    handler(cursor, _Meta(fake.DB_TYPE_NUMBER, precision=0, scale=-127))
+    assert cursor.var_calls == [(decimal.Decimal, 50), (decimal.Decimal, 50)]
+
+
+def test_output_type_handler_leaves_exact_integers_and_other_types_alone() -> None:
+    fake = _FakeTypedOracleDb()
+    handler = _installed_handler(fake)
+    cursor = _VarRecordingCursor()
+
+    assert handler(cursor, _Meta(fake.DB_TYPE_NUMBER, precision=10, scale=0)) is None
+    assert handler(cursor, _Meta(fake.DB_TYPE_VARCHAR, precision=0, scale=0)) is None
+    assert cursor.var_calls == []
+
+
+def test_output_type_handler_fetches_lobs_as_values() -> None:
+    fake = _FakeTypedOracleDb()
+    handler = _installed_handler(fake)
+    cursor = _VarRecordingCursor()
+
+    handler(cursor, _Meta(fake.DB_TYPE_CLOB, precision=0, scale=0))
+    handler(cursor, _Meta(fake.DB_TYPE_NCLOB, precision=0, scale=0))
+    handler(cursor, _Meta(fake.DB_TYPE_BLOB, precision=0, scale=0))
+    assert cursor.var_calls == [
+        (fake.DB_TYPE_LONG, 50),
+        (fake.DB_TYPE_LONG_NVARCHAR, 50),
+        (fake.DB_TYPE_LONG_RAW, 50),
+    ]
+
+
+def test_connect_skips_handler_when_driver_lacks_db_types() -> None:
+    fake = _FakeOracleDb()
+    adapter = _adapter(fake)
+
+    list(adapter.execute_select("SELECT 1 FROM dual", {}))
+
+    assert not hasattr(fake.connections[0], "outputtypehandler")
+
+
+def test_thin_mode_by_default_never_initializes_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _reset_client_init(monkeypatch, lib_dir=None)
+    fake = _FakeTypedOracleDb()
+
+    assert _adapter(fake).test_connection() is True
+    assert fake.init_calls == []
+
+
+def test_thick_mode_initializes_client_once_per_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _reset_client_init(monkeypatch, lib_dir="C:/oracle/instantclient_19_29")
+    fake = _FakeTypedOracleDb()
+
+    assert _adapter(fake).test_connection() is True
+    assert _adapter(fake).test_connection() is True
+
+    assert fake.init_calls == ["C:/oracle/instantclient_19_29"]
+    assert len(fake.connections) == 2
+
+
+def test_thick_mode_init_failure_is_reported_on_every_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _reset_client_init(monkeypatch, lib_dir="C:/missing")
+    fake = _FakeTypedOracleDb(
+        init_exc=_make_db_error("DPI-1047", "Cannot locate a 64-bit Oracle Client library", 0)
+    )
+
+    first = _adapter(fake)
+    assert first.test_connection() is False
+    assert first.last_connection_error is not None
+    assert "OracleClientInitError" in first.last_connection_error
+    assert "DPI-1047" in first.last_connection_error
+    with pytest.raises(AdapterConnectionError) as excinfo:
+        list(_adapter(fake).execute_select("SELECT 1 FROM dual", {}))
+    assert isinstance(excinfo.value.__cause__, OracleClientInitError)
+
+    # 只尝试一次,不静默回落 thin、不连库
+    assert fake.init_calls == ["C:/missing"]
+    assert fake.connections == []
+
+
+def test_thin_unsupported_server_error_points_to_thick_mode() -> None:
+    fake = _FakeOracleDb(
+        connect_exc=_make_db_error(
+            "DPY-3010",
+            "connections to this database server version are not supported "
+            "by python-oracledb in thin mode",
+            0,
+        )
+    )
+    adapter = _adapter(fake)
+
+    assert adapter.test_connection() is False
+    assert adapter.last_connection_error is not None
+    assert "code=DPY-3010" in adapter.last_connection_error
+    assert "DATAOPS_ORACLE_CLIENT_DIR" in adapter.last_connection_error
 
 
 # ──────────────────────────── helpers / fakes ────────────────────────────
@@ -658,6 +784,64 @@ class _FakeOracleDb:
         )
         self.connections.append(conn)
         return conn
+
+
+class _FakeTypedOracleDb(_FakeOracleDb):
+    """带 DbType 常量与 init_oracle_client 的 fake 模块(取值处理器 / thick 开关单测用)。"""
+
+    DB_TYPE_NUMBER = _FakeDbType("DB_TYPE_NUMBER")
+    DB_TYPE_VARCHAR = _FakeDbType("DB_TYPE_VARCHAR")
+    DB_TYPE_CLOB = _FakeDbType("DB_TYPE_CLOB")
+    DB_TYPE_NCLOB = _FakeDbType("DB_TYPE_NCLOB")
+    DB_TYPE_BLOB = _FakeDbType("DB_TYPE_BLOB")
+    DB_TYPE_LONG = _FakeDbType("DB_TYPE_LONG")
+    DB_TYPE_LONG_NVARCHAR = _FakeDbType("DB_TYPE_LONG_NVARCHAR")
+    DB_TYPE_LONG_RAW = _FakeDbType("DB_TYPE_LONG_RAW")
+
+    def __init__(self, *, init_exc: Exception | None = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.init_calls: list[str] = []
+        self._init_exc = init_exc
+
+    def init_oracle_client(self, *, lib_dir: str) -> None:
+        self.init_calls.append(lib_dir)
+        if self._init_exc is not None:
+            raise self._init_exc
+
+
+class _Meta:
+    """python-oracledb outputtypehandler 的 metadata(FetchInfo)形态。"""
+
+    def __init__(self, type_code: object, *, precision: int, scale: int) -> None:
+        self.type_code = type_code
+        self.precision = precision
+        self.scale = scale
+
+
+class _VarRecordingCursor:
+    arraysize = 50
+
+    def __init__(self) -> None:
+        self.var_calls: list[tuple[object, int]] = []
+
+    def var(self, typ: object, *, arraysize: int) -> object:
+        self.var_calls.append((typ, arraysize))
+        return object()
+
+
+def _installed_handler(fake: _FakeTypedOracleDb) -> Any:
+    list(_adapter(fake).execute_select("SELECT 1 FROM dual", {}))
+    return getattr(fake.connections[-1], "outputtypehandler")  # noqa: B009 — fake 不声明该属性
+
+
+def _reset_client_init(monkeypatch: pytest.MonkeyPatch, *, lib_dir: str | None) -> None:
+    """thick 初始化是进程级缓存;每个用例从“未初始化”开始。"""
+    monkeypatch.setattr(oracle_adapter_module, "_client_init_done", False)
+    monkeypatch.setattr(oracle_adapter_module, "_client_init_error", None)
+    if lib_dir is None:
+        monkeypatch.delenv("DATAOPS_ORACLE_CLIENT_DIR", raising=False)
+    else:
+        monkeypatch.setenv("DATAOPS_ORACLE_CLIENT_DIR", lib_dir)
 
 
 class _FakeOracleConnection:

@@ -142,6 +142,23 @@ The desktop shell and scripts must preserve the following behaviors together:
 - the first-run password exists only in the child process environment;
 - window close performs graceful stop, bounded wait and platform-specific force-kill fallback.
 
+### Oracle 11g data sources (thick mode)
+
+python-oracledb runs in thin mode, which only supports Oracle Database 12.1 and later; an 11g
+server rejects it during the handshake with `DPY-3010` (the connection test reports this with a
+hint). Packages do not ship Oracle Instant Client (licence terms and the no-growth size baseline).
+On a site that has 11g, the deployer:
+
+1. downloads **Oracle Instant Client 19c Basic Light** for the target OS (19c is the newest client
+   that still connects to 11.2) and extracts it to a short local path;
+2. sets `DATAOPS_ORACLE_CLIENT_DIR` to that directory in the environment that starts the API and
+   worker, then restarts both.
+
+The first Oracle connection in each process then calls `oracledb.init_oracle_client` once; thick
+mode is process-wide and also serves 12c+ servers, so a mixed site simply runs everything in
+thick mode. A wrong directory or a missing client dependency is reported on every Oracle
+connection as `OracleClientInitError`; it never silently falls back to thin mode.
+
 ## Signed payload updates (stage 1)
 
 Stage 1 provides a platform-neutral, offline-verifiable update seam for the high-frequency
