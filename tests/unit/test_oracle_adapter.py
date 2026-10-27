@@ -604,6 +604,52 @@ def test_data_type_string_mapping_units() -> None:
     assert data_type_string_to_column_type("UNDEFINED") is ColumnType.UNKNOWN
 
 
+# ─────────────── 11g 分页:FETCH FIRST / OFFSET → ROWNUM ───────────────
+
+
+def test_pre12c_server_gets_rownum_rewrite_for_row_limit() -> None:
+    fake = _FakeOracleDb(server_version="11.2.0.4.0")
+    adapter = _adapter(fake)
+
+    list(adapter.execute_select("SELECT a FROM t ORDER BY a FETCH FIRST 101 ROWS ONLY", {}))
+
+    executed = fake.connections[0].cursors[0].executed_sql
+    assert executed == "SELECT * FROM (SELECT a FROM t ORDER BY a) WHERE ROWNUM <= 101"
+
+
+def test_pre12c_page_drops_the_row_number_column() -> None:
+    description = (
+        _FetchInfo("A", _FakeDbType("DB_TYPE_VARCHAR"), scale=None, null_ok=True),
+        _FetchInfo("DATAOPS_RN__", _FakeDbType("DB_TYPE_NUMBER"), scale=0, null_ok=True),
+    )
+    fake = _FakeOracleDb(
+        server_version="11.2.0.4.0",
+        default_rows=[("x", 201), ("y", 202)],
+        default_description=description,
+    )
+    captured: list[Column] = []
+    adapter = _adapter(fake, column_sink=captured.extend)
+
+    rows = list(
+        adapter.execute_select(
+            "SELECT a FROM t ORDER BY a OFFSET 200 ROWS FETCH FIRST 2 ROWS ONLY", {}
+        )
+    )
+
+    assert "ROWNUM AS DATAOPS_RN__" in fake.connections[0].cursors[0].executed_sql
+    assert [column.name for column in captured] == ["A"]
+    assert [row.values for row in rows] == [["x"], ["y"]]
+
+
+def test_12c_and_later_keep_fetch_first() -> None:
+    fake = _FakeOracleDb(server_version="19.0.0.0.0")
+    sql = "SELECT a FROM t ORDER BY a FETCH FIRST 101 ROWS ONLY"
+
+    list(_adapter(fake).execute_select(sql, {}))
+
+    assert fake.connections[0].cursors[0].executed_sql == sql
+
+
 # ─────────────── 取值处理器 / thick mode 开关 / DPY-3010 提示 ───────────────
 
 
@@ -864,9 +910,11 @@ class _FakeOracleDb:
         fetch_exc: Exception | None = None,
         call_timeout_raises: bool = False,
         execute_exc_needle: tuple[str, Exception] | None = None,
+        server_version: str | None = None,
     ) -> None:
         self.connect_kwargs: list[dict[str, Any]] = []
         self.connections: list[_FakeOracleConnection] = []
+        self._server_version = server_version
         self._default_rows = default_rows if default_rows is not None else [(1,)]
         self._default_description = default_description
         self._query_map = query_map or []
@@ -889,6 +937,9 @@ class _FakeOracleDb:
             call_timeout_raises=self._call_timeout_raises,
             execute_exc_needle=self._execute_exc_needle,
         )
+        if self._server_version is not None:
+            # python-oracledb Connection.version 形态,如 "11.2.0.4.0"
+            conn.version = self._server_version  # type: ignore[attr-defined]
         self.connections.append(conn)
         return conn
 

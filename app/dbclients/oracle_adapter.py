@@ -52,6 +52,11 @@ from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 from app.dbclients import oracle_catalog
+from app.dbclients.oracle_legacy_paging import (
+    LegacyPagingRewrite,
+    rewrite_for_pre12c,
+    server_major_version,
+)
 from app.dbclients.oracle_types import (
     data_type_string_to_column_type,
     description_item_to_column_type,
@@ -133,6 +138,9 @@ _THIN_UNSUPPORTED_HINT = (
     f"install Oracle Instant Client 19c and set {_CLIENT_DIR_ENV} to its directory "
     "to enable thick mode (restart the API and worker afterwards)."
 )
+
+# FETCH FIRST / OFFSET 自 12c 起支持;更早的库(11g)执行前改写为 ROWNUM。
+_FETCH_FIRST_MIN_MAJOR = 12
 
 # DBMS_METADATA:表不存在与无权读他人 schema(缺 SELECT_CATALOG_ROLE)同报 ORA-31603。
 _DDL_UNAVAILABLE_CODE = "ORA-31603"
@@ -447,16 +455,20 @@ class OracleAdapter(DatabaseAdapter):
         self._query_timing.record_connect(_elapsed_ms(connect_started))
         try:
             self._apply_statement_timeout(conn)
+            paging = _legacy_paging_for(conn, sql)
             cursor = conn.cursor()
             cursor.arraysize = self._fetch_chunk_size
             try:
                 self._query_timing.mark_execute_started()
                 execute_started = time.monotonic()
-                cursor.execute(sql, params or None)
+                cursor.execute(paging.sql, params or None)
                 self._query_timing.record_execute(_elapsed_ms(execute_started))
             except Exception as exc:
                 raise self._driver_error("Oracle execute failed", exc) from exc
-            self._emit_columns(getattr(cursor, "description", None))
+            description = getattr(cursor, "description", None)
+            if paging.drop_trailing_column and isinstance(description, Sequence):
+                description = list(description)[:-1]
+            self._emit_columns(description)
             while True:
                 self._check_cancel()
                 self._check_cursor_deadline(started_at)
@@ -471,7 +483,11 @@ class OracleAdapter(DatabaseAdapter):
                 if not batch:
                     break
                 for raw_row in batch:
-                    yield _to_row(raw_row)
+                    row = _to_row(raw_row)
+                    if paging.drop_trailing_column:
+                        # 去掉 11g 翻页改写带出的 ROWNUM 行号列(固定在最后)
+                        row = Row(values=row.values[:-1])
+                    yield row
         finally:
             _safe_close(cursor)
             _safe_close(conn)
@@ -719,6 +735,14 @@ def _build_output_type_handler(oracledb: Any) -> Callable[[Any, Any], Any] | Non
         return None
 
     return handler
+
+
+def _legacy_paging_for(conn: Any, sql: str) -> LegacyPagingRewrite:
+    """连到 12c 以前的库时,把最外层 FETCH FIRST / OFFSET 改写成 ROWNUM(11g 不认前者)。"""
+    major = server_major_version(getattr(conn, "version", None))
+    if major is None or major >= _FETCH_FIRST_MIN_MAJOR:
+        return LegacyPagingRewrite(sql)
+    return rewrite_for_pre12c(sql)
 
 
 def _apply_ddl_transforms(cursor: Any) -> None:
