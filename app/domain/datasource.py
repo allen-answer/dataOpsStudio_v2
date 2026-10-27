@@ -40,6 +40,9 @@ class DbType(StrEnum):
     DM = "dm"
     DB2 = "db2"
     POSTGRESQL = "postgresql"
+    # OceanBase Oracle 模式:MySQL 协议 + Oracle 方言(仅企业版有)。与 MySQL 模式是两个类型,
+    # 不复用 mysql、也不做单一 oceanbase + extra.mode(设计稿 §3.1)。
+    OCEANBASE_ORACLE = "oceanbase_oracle"
 
 
 class OperationPolicy(BaseModel):

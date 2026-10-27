@@ -31,8 +31,9 @@ def _good_conn_info(**overrides: Any) -> DatasourceConnInfo:
 # ─── DbType ───
 
 
-def test_dbtype_has_5_values() -> None:
-    expected = {"mysql", "oracle", "dm", "db2", "postgresql"}
+def test_dbtype_values_are_pinned() -> None:
+    # 新增类型须有意更新此清单(落库值,前端 / 方言表 / 适配器工厂都要同步登记)
+    expected = {"mysql", "oracle", "dm", "db2", "postgresql", "oceanbase_oracle"}
     assert {d.value for d in DbType} == expected
 
 

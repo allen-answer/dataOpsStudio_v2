@@ -67,6 +67,13 @@ DIALECT_TRAITS: dict[DbType, DialectTraits] = {
         sqlglot_dialect="postgres",
         row_limit_dialect="postgres",
     ),
+    # SQL 是 Oracle 方言(OB 4.x 实测支持 FETCH FIRST / OFFSET..FETCH,不支持 LIMIT)。
+    DbType.OCEANBASE_ORACLE: DialectTraits(
+        identifier_style=IdentifierStyle.DOUBLE_QUOTE_UPPER,
+        limit_style="fetch_first",
+        sqlglot_dialect="oracle",
+        row_limit_dialect="oracle",
+    ),
 }
 
 
