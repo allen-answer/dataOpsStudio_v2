@@ -10,6 +10,8 @@ R2:只传 `SecretRef`;明文口令只在会话缝 connect 内部短暂存在。
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
 
@@ -31,8 +33,17 @@ from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.secret import SecretKind, SecretRef
 from app.infrastructure.secretstore.protocol import SecretStore
 
+_ConnectionClass = Callable[[DatasourceConnInfo, SecretStore], InteractiveConnection]
+_CancelChannelClass = Callable[[DatasourceConnInfo, SecretStore], CancelChannel]
+
+# db_type -> (会话连接缝, 控制通道缝)。新方言在这里登记一行;范围线由本表派生。
+_SESSION_SEAMS: dict[DbType, tuple[_ConnectionClass, _CancelChannelClass]] = {
+    DbType.MYSQL: (MySQLInteractiveConnection, MySQLCancelChannel),
+    DbType.DM: (DMInteractiveConnection, DMCancelChannel),
+}
+
 # 会话纵切的方言范围线(设计 §6):其余方言整体回退 job 路径,不在此造会话。
-SESSION_CAPABLE_DB_TYPES: frozenset[DbType] = frozenset({DbType.MYSQL, DbType.DM})
+SESSION_CAPABLE_DB_TYPES: frozenset[DbType] = frozenset(_SESSION_SEAMS)
 
 
 def build_session_broker(
@@ -52,19 +63,17 @@ def build_session_broker(
 
     def connection_factory(session: ConsoleSession) -> InteractiveConnection:
         conn_info = load_datasource_conn_info(engine, session.datasource_id)
-        if conn_info.db_type is DbType.MYSQL:
-            return MySQLInteractiveConnection(conn_info, secret_store)
-        if conn_info.db_type is DbType.DM:
-            return DMInteractiveConnection(conn_info, secret_store)
-        raise InvalidDatasourceError(f"db_type has no interactive session: {conn_info.db_type}")
+        seams = _SESSION_SEAMS.get(conn_info.db_type)
+        if seams is None:
+            raise InvalidDatasourceError(f"db_type has no interactive session: {conn_info.db_type}")
+        return seams[0](conn_info, secret_store)
 
     def cancel_channel_factory(datasource_id: str) -> CancelChannel:
         conn_info = load_datasource_conn_info(engine, datasource_id)
-        if conn_info.db_type is DbType.MYSQL:
-            return MySQLCancelChannel(conn_info, secret_store)
-        if conn_info.db_type is DbType.DM:
-            return DMCancelChannel(conn_info, secret_store)
-        raise InvalidDatasourceError(f"db_type has no cancel channel: {conn_info.db_type}")
+        seams = _SESSION_SEAMS.get(conn_info.db_type)
+        if seams is None:
+            raise InvalidDatasourceError(f"db_type has no cancel channel: {conn_info.db_type}")
+        return seams[1](conn_info, secret_store)
 
     return SessionBroker(
         PostgresBrokerStore(engine),

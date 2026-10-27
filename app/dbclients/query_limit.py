@@ -9,6 +9,7 @@ from sqlglot.errors import ParseError
 
 from app.dbclients.sql_guard import validate_readonly_sql
 from app.domain.datasource import DbType
+from app.domain.dialect import traits
 
 
 class QueryLimitError(ValueError):
@@ -23,16 +24,7 @@ class QueryLimitAnalysis:
     output_limit_applied: bool = True
 
 
-_DIALECTS: dict[DbType, str] = {
-    DbType.MYSQL: "mysql",
-    DbType.POSTGRESQL: "postgres",
-    # DM is Oracle-compatible for SELECT pagination. DB2 has no sqlglot dialect;
-    # its supported FETCH FIRST syntax matches the Oracle generator for the
-    # read-only SELECT subset exposed by this project.
-    DbType.DM: "oracle",
-    DbType.ORACLE: "oracle",
-    DbType.DB2: "oracle",
-}
+# 渲染方言取 app/domain/dialect.py 的 row_limit_dialect(DM/DB2 按 Oracle 渲染,理由见该表)。
 _PYFORMAT_BIND_RE = re.compile(r"%\([A-Za-z_][A-Za-z0-9_]*\)s|%s")
 _DOLLAR_QUOTE_RE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$")
 _BIND_SENTINEL_PREFIX = "__dataops_safe_bind_"
@@ -50,7 +42,7 @@ def apply_database_row_limit(sql: str, db_type: DbType, row_limit: int) -> str:
     if row_limit <= 0:
         raise ValueError("row_limit must be positive")
     try:
-        dialect = _DIALECTS[db_type]
+        dialect = traits(db_type).row_limit_dialect
     except KeyError as exc:
         raise QueryLimitError("Unsupported database dialect for safe row limiting") from exc
 
@@ -193,7 +185,7 @@ def analyze_database_row_limit(sql: str, db_type: DbType) -> QueryLimitAnalysis:
 
 def _parse_query(sql: str, db_type: DbType) -> tuple[str, exp.Query, list[tuple[str, str]]]:
     try:
-        dialect = _DIALECTS[db_type]
+        dialect = traits(db_type).row_limit_dialect
     except KeyError as exc:
         raise QueryLimitError("Unsupported database dialect for safe row limiting") from exc
 

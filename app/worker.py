@@ -3695,7 +3695,9 @@ class _DatabaseCompareReader:
         # 下推哈希只覆盖参与判定的列;被忽略列不进哈希,故只校验哈希列未被改名。
         if self._select_hash_names != [column.name for column in self._hash_columns]:
             return False
-        return self._datasource.db_type in {DbType.MYSQL, DbType.DM}
+        # 以适配器声明的能力为准,新方言打开 compare_db_hash 即可,不再改 worker。
+        capabilities = getattr(self._adapter, "capabilities", None)
+        return capabilities is not None and capabilities.compare_db_hash is True
 
     def _db_segment_fingerprint(self, segment: CompareSegment) -> SegmentFingerprint:
         table_name = self._data_ref.get("table_name")
