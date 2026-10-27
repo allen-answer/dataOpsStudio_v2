@@ -92,6 +92,8 @@ JS 可能崩在 `main.ts` 顶层副作用(典型:Pinia 未注册时 store 被调
 - **不可逆操作必须先问** —— `git reset --hard` / `rm -rf` / `DROP TABLE` / 
   改防火墙 / 改 systemd / 撤销公网暴露
 - 所有 main commit 必须有 `Co-Authored-By: ...`,凭据为零
+- **不在项目目录外建文件** —— 不得在仓库上级目录等项目外位置自建文件夹 / `git worktree`;
+  另开分支先问人放哪;临时物放会话临时目录并说明位置(contract §5 本地工作区约定)
 
 ---
 
