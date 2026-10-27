@@ -30,6 +30,11 @@ _ADAPTER_CLASSES: dict[DbType, Callable[..., DatabaseAdapter]] = {
 }
 
 
+def adapter_class_for(db_type: DbType) -> Callable[..., DatabaseAdapter] | None:
+    """db_type 对应的适配器类(只读其类属性 capabilities 用,不实例化、不连库)。"""
+    return _ADAPTER_CLASSES.get(db_type)
+
+
 def build_database_adapter(
     conn_info: DatasourceConnInfo,
     secret_store: SecretStore,

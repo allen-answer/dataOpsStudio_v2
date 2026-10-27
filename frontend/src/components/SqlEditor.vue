@@ -14,6 +14,8 @@ const props = withDefaults(
     modelValue: string
     datasourceId?: string
     dbType?: string
+    /** 后端 capabilities.metadata;不传时按 dbType 回落。 */
+    metadataSupported?: boolean
     defaultSchema?: string
     theme?: string
     readOnly?: boolean
@@ -34,6 +36,7 @@ const props = withDefaults(
   {
     datasourceId: '',
     dbType: '',
+    metadataSupported: undefined,
     defaultSchema: '',
     theme: 'vs',
     readOnly: false,
@@ -150,6 +153,7 @@ function bindEditor(editor: monaco.editor.IStandaloneCodeEditor): monaco.IDispos
     datasourceId: () => props.datasourceId,
     dbType: () => props.dbType || undefined,
     defaultSchema: () => props.defaultSchema || undefined,
+    metadataSupported: () => props.metadataSupported,
   })
   editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => emit('execute'))
   return disposable

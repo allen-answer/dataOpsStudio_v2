@@ -694,6 +694,8 @@ def test_list_datasources_filters_by_authz_and_hides_secret_fields() -> None:
             "database": "app",
             "operation_policy": _policy(),
             "created_at": "2026-01-01T00:00:01Z",
+            # _policy() 缺省 allow_explain=False
+            "capabilities": _mysql_capabilities(explain=False),
         },
         {
             "id": "ds-no-database",
@@ -706,6 +708,8 @@ def test_list_datasources_filters_by_authz_and_hides_secret_fields() -> None:
             "database": None,
             "operation_policy": _policy(allow_select=False),
             "created_at": "2026-01-01T00:00:02Z",
+            # 能力表达类型是否开放,不随 allow_select 变;SELECT 权限由执行入口校验
+            "capabilities": _mysql_capabilities(explain=False),
         },
     ]
     assert "password" not in response.body.decode("utf-8")
@@ -933,6 +937,54 @@ def test_update_datasource_keeps_password_when_blank_and_returns_policy() -> Non
     assert "secret-old" not in response.body.decode("utf-8")
     assert any("UPDATE datasources" in statement for statement in engine.statements)
     assert any(audit["action"] == "datasource_update" for audit in services.audits)
+
+
+def _ob_oracle_create_body(**extra: str) -> dict[str, object]:
+    return {
+        "project_id": "project-1",
+        "name": "ob-risk",
+        "db_type": "oceanbase_oracle",
+        "host": "ob.internal",
+        "port": 2883,
+        "username": "app_user",
+        "password": "pw",
+        "extra": extra,
+    }
+
+
+def test_create_oceanbase_oracle_datasource_requires_tenant() -> None:
+    engine = _FakeEngine([])
+    services = _Services(engine, secret_store=_SecretStore())
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/datasources", headers=_auth_headers(), json_body=_ob_oracle_create_body()
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"] == "invalid_datasource_extra"
+    assert services.secret_store.stored == []  # 校验在落口令之前
+    assert not any("INSERT INTO datasources" in stmt for stmt in engine.statements)
+
+
+def test_create_oceanbase_oracle_datasource_returns_capabilities() -> None:
+    engine = _FakeEngine([{"id": "project-1"}])
+    services = _Services(engine, secret_store=_SecretStore())
+    app = create_app(services=cast(ApiServices, services))
+
+    response = AsgiClient(app).post(
+        "/api/datasources",
+        headers=_auth_headers(),
+        json_body=_ob_oracle_create_body(tenant="t1", cluster="c1"),
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["extra"] == {"tenant": "t1", "cluster": "c1"}
+    # Preview,执行待 PR-6 拍板;DDL 能力随适配器下发
+    assert payload["capabilities"]["maturity"] == "preview"
+    assert payload["capabilities"]["execute"] is False
+    assert payload["capabilities"]["ddl"] is True
 
 
 def test_update_datasource_clears_database_when_null_is_sent() -> None:
@@ -8320,6 +8372,21 @@ def _policy(**overrides: bool) -> dict[str, bool]:
         "allow_schema_save": False,
         "allow_scenario_write": False,
         "allow_record_task": False,
+    }
+    values.update(overrides)
+    return values
+
+
+def _mysql_capabilities(**overrides: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "execute": True,
+        "explain": True,
+        "ddl": True,
+        "metadata": True,
+        "sql_tools": True,
+        "session_console": True,
+        "compare_db_hash": True,
+        "maturity": "certified",
     }
     values.update(overrides)
     return values

@@ -116,6 +116,13 @@ import AiSqlAssistantPanel from '../components/AiSqlAssistantPanel.vue'
 import SqlEditor from '../components/SqlEditor.vue'
 import { useLicense } from '../composables/useLicense'
 import { useMetadataObjectOptions } from '../composables/useMetadataObjectOptions'
+import {
+  canExecuteSql,
+  supportsExplain,
+  supportsMetadataCompletion,
+  supportsSessionConsole,
+  supportsSqlTools,
+} from '../utils/datasourceCapabilities'
 import { clearSqlMetadataCache } from '../utils/sqlIntelligence'
 import { splitSqlStatements, statementAtOffset } from '../utils/sqlStatements'
 import { createUserErrorMessage } from '../utils/userErrorMessage'
@@ -142,10 +149,8 @@ const QUERY_POLL_HIDDEN_MS = 5000
 const QUERY_POLL_LEASE_MS = 15000
 const QUERY_POLL_LEASE_PREFIX = 'dataops-sql-progress-lease:'
 const SAVE_DEBOUNCE_MS = 650
-// db2 后端 adapter 已具备执行能力,但 GA 决策维持 Preview,放开执行需单独 PR 人拍板。
-const SUPPORTED_EXECUTION_DB_TYPES = new Set(['mysql', 'dm', 'postgresql', 'db2'])
-// EXPLAIN / expand-star 依赖 sqlglot 方言 + 元数据缓存,与执行同口径(mysql / dm / postgresql)。
-const SUPPORTED_TOOL_DB_TYPES = new Set(['mysql', 'dm', 'postgresql'])
+// 可执行 / 工具 / 补全 / 会话控制台按后端下发的 datasource.capabilities 判断
+// (放开 Preview 档执行的拍板点在后端 PREVIEW_EXECUTION_ALLOWED),见 utils/datasourceCapabilities。
 const EXPORT_FORMATS: ExportFormat[] = ['csv', 'excel', 'json', 'sql']
 
 type SidebarTab = 'consoles' | 'history' | 'templates' | 'metadata'
@@ -381,7 +386,7 @@ const {
 )
 const unsupportedDb = computed<string | null>(() => {
   const ds = selectedDs.value
-  return ds && !SUPPORTED_EXECUTION_DB_TYPES.has(ds.db_type) ? ds.db_type : null
+  return ds && !canExecuteSql(ds) ? ds.db_type : null
 })
 const queryMaxRows = computed<number | null>(() => {
   const value =
@@ -391,21 +396,16 @@ const queryMaxRows = computed<number | null>(() => {
   if (!Number.isInteger(value) || value < 1 || value > QUERY_MAX_ROWS_LIMIT) return null
   return value
 })
-// 工具能力门:db_type 在白名单内 + (EXPLAIN 还需 operation_policy.allow_explain)。
-const toolsSupported = computed<boolean>(() => {
-  const ds = selectedDs.value
-  return Boolean(ds && SUPPORTED_TOOL_DB_TYPES.has(ds.db_type))
-})
-const explainSupported = computed<boolean>(
-  () => toolsSupported.value && Boolean(selectedDs.value?.operation_policy.allow_explain),
+// 工具能力门:后端 capabilities.sql_tools(EXPLAIN 另需 allow_explain,后端已合并进 explain)。
+const toolsSupported = computed<boolean>(() => supportsSqlTools(selectedDs.value))
+const explainSupported = computed<boolean>(() => supportsExplain(selectedDs.value))
+const metadataCompletionSupported = computed<boolean>(() =>
+  supportsMetadataCompletion(selectedDs.value),
 )
 const metadataDs = computed<DatasourceListItem | undefined>(() =>
   datasources.value.find((d) => d.id === metadataDsId.value),
 )
-const metadataToolsSupported = computed<boolean>(() => {
-  const ds = metadataDs.value
-  return Boolean(ds && SUPPORTED_TOOL_DB_TYPES.has(ds.db_type))
-})
+const metadataToolsSupported = computed<boolean>(() => supportsSqlTools(metadataDs.value))
 /**
  * 可导出源。job 路径仅 success(后端 _require_exportable_source 只认 SQL_QUERY 且
  * success);会话路径追加 cancelled / timeout —— 取消保留的部分结果可读即可导出
@@ -1087,7 +1087,11 @@ async function onExecute(): Promise<void> {
   // 懒 attach:走到这里才建会话。返回 null = 该部署/方言没有会话,回落 job 路径。
   let session: ConsoleSessionState | null = null
   try {
-    session = await consoleSessions.ensureSession(consoleRow.id, selectedDs.value?.db_type ?? null)
+    session = await consoleSessions.ensureSession(
+      consoleRow.id,
+      selectedDs.value?.db_type ?? null,
+      selectedDs.value ? supportsSessionConsole(selectedDs.value) : undefined,
+    )
   } catch (e) {
     // attach 本身失败(建连失败 / 会话数护栏)——不静默降级成 job 路径,
     // 否则用户以为拿到的是会话语义,实际不是。
@@ -3002,6 +3006,7 @@ function parseVariables(value: string): string[] {
             v-model="editorSql"
             :datasource-id="selectedDsId"
             :db-type="selectedDs?.db_type"
+            :metadata-supported="metadataCompletionSupported"
             :default-schema="selectedSchema || selectedDs?.database || undefined"
             :path="`sql-console-${activeConsole.id}.sql`"
             :theme="editorTheme"

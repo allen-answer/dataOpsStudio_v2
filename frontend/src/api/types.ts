@@ -20,7 +20,23 @@ export interface Project {
   description: string | null
 }
 
-export type DbType = 'mysql' | 'oracle' | 'dm' | 'db2' | 'postgresql'
+export type DbType = 'mysql' | 'oracle' | 'dm' | 'db2' | 'postgresql' | 'oceanbase_oracle'
+
+/**
+ * 后端算好的数据源能力(源:app/api/schemas.py DatasourceCapabilities,
+ * 规则见 app/api/datasource_capabilities.py)。前端按它决定执行 / 工具 / 补全 / 会话控制台,
+ * 不再硬编码 db_type 白名单;老后端不返回时为 undefined,由 utils/datasourceCapabilities 回落。
+ */
+export interface DatasourceCapabilities {
+  execute: boolean
+  explain: boolean
+  ddl: boolean
+  metadata: boolean
+  sql_tools: boolean
+  session_console: boolean
+  compare_db_hash: boolean
+  maturity: 'certified' | 'preview'
+}
 
 /**
  * Datasource operation policy(8 个 allow_* 开关)。
@@ -61,6 +77,7 @@ export interface DatasourceListItem {
   database: string | null
   operation_policy: OperationPolicy
   created_at: string
+  capabilities?: DatasourceCapabilities
 }
 
 export interface DatasourceCreateRequest {

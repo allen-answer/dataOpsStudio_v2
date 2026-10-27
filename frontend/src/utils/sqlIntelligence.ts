@@ -7,14 +7,16 @@ import {
   type MetadataSchemaItem,
   type MetadataTableItem,
 } from '../api/metadata'
+import { metadataCompletionFallback } from './datasourceCapabilities'
 
 export interface SqlIntelligenceContext {
   datasourceId: () => string
   dbType: () => string | undefined
   defaultSchema: () => string | undefined
+  /** 后端 capabilities.metadata;undefined(老后端)时按 db_type 回落。 */
+  metadataSupported?: () => boolean | undefined
 }
 
-const METADATA_DB_TYPES = new Set(['mysql', 'dm', 'postgresql'])
 const SIMPLE_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_$#]*$/
 const IDENTIFIER_PATTERN = '(?:"(?:[^"]|"")*"|[A-Za-z_][A-Za-z0-9_$#]*)'
 const QUALIFIED_COLUMN_PREFIX = new RegExp(
@@ -353,7 +355,8 @@ function findTableReferences(sql: string): TableReference[] {
 }
 
 function metadataSupported(context: SqlIntelligenceContext): boolean {
-  return Boolean(context.datasourceId() && METADATA_DB_TYPES.has(context.dbType() ?? ''))
+  if (!context.datasourceId()) return false
+  return context.metadataSupported?.() ?? metadataCompletionFallback(context.dbType() ?? '')
 }
 
 function metadataSchemas(datasourceId: string): Promise<MetadataSchemaItem[]> {
