@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from typing import Any, cast
 
 import pytest
@@ -149,6 +150,30 @@ def test_stream_select_preserves_connection_error_cause() -> None:
 
     with pytest.raises(AdapterConnectionError) as excinfo:
         list(adapter.execute_select("SELECT 1", {}))
+
+    assert excinfo.value.__cause__ is original
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda a: a.list_schemas(),
+        lambda a: a.list_tables("public"),
+        lambda a: a.list_columns("public", "users"),
+        lambda a: a.list_indexes("public", "users"),
+        lambda a: a.explain("SELECT 1"),
+    ],
+    ids=["schemas", "tables", "columns", "indexes", "explain"],
+)
+def test_one_shot_queries_raise_adapter_connection_error_when_unreachable(
+    call: Callable[[PostgresqlAdapter], object],
+) -> None:
+    # 元数据 / explain 连不上库时须与执行路径同口径:API 据此回 503 而不是 500
+    original = RuntimeError("driver connect boom")
+    adapter = _adapter(_FailingPsycopg(original))
+
+    with pytest.raises(AdapterConnectionError) as excinfo:
+        call(adapter)
 
     assert excinfo.value.__cause__ is original
 
