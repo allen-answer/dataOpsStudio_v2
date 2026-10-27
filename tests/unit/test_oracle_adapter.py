@@ -19,6 +19,7 @@ from app.dbclients.oracle_adapter import (
     OracleAdapter,
     OracleAdapterError,
     OracleClientInitError,
+    OracleDdlUnavailableError,
     OracleDriverNotInstalledError,
     OracleUnsupportedOperationError,
     QueryCancelledError,
@@ -29,7 +30,8 @@ from app.dbclients.oracle_types import (
     description_type_to_driver_name,
 )
 from app.dbclients.protocol import AdapterConnectionError
-from app.domain.datasource import DatasourceConnInfo, DbType
+from app.dbclients.sql_guard import SqlGuardError
+from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.schema import Column, ColumnType, Index, Row, Schema, Table
 from app.domain.secret import HashedRef, RotationReport, SecretKind, SecretRef
 from app.infrastructure.secretstore.protocol import SecretStore
@@ -54,9 +56,9 @@ def test_capabilities_declare_preview_scope() -> None:
     assert caps.list_tables is True
     assert caps.list_columns is True
     assert caps.list_indexes is True
-    # Preview 仍关:explain(PLAN_TABLE 依赖)/ DDL(DBMS_METADATA 权限)/ compare
-    assert caps.explain is False
-    assert caps.get_table_ddl is False
+    # explain(另受 allow_oracle_plan_table 闸门)/ DDL(DBMS_METADATA)开;compare 仍关
+    assert caps.explain is True
+    assert caps.get_table_ddl is True
     assert caps.compare_db_hash is False
 
 
@@ -64,16 +66,105 @@ def test_kill_query_is_soft_cancel_false() -> None:
     assert _adapter(_FakeOracleDb()).kill_query("any-conn-id") is False
 
 
-def test_unsupported_operations_raise_not_implemented() -> None:
-    adapter = _adapter(_FakeOracleDb())
-    for call in (
-        lambda: adapter.explain("SELECT 1"),
-        lambda: adapter.get_table_ddl("S", "T"),
-    ):
-        with pytest.raises(OracleUnsupportedOperationError) as excinfo:
-            call()
-        # 调用方按 capabilities 降级的契约形态:NotImplementedError 家族
-        assert isinstance(excinfo.value, NotImplementedError)
+def test_explain_refused_unless_plan_table_policy_enabled() -> None:
+    fake = _FakeOracleDb()
+    adapter = _adapter(fake)
+
+    with pytest.raises(OracleUnsupportedOperationError) as excinfo:
+        adapter.explain("SELECT 1 FROM dual")
+
+    # 调用方按 capabilities 降级的契约形态:NotImplementedError 家族
+    assert isinstance(excinfo.value, NotImplementedError)
+    assert "allow_oracle_plan_table" in str(excinfo.value)
+    assert fake.connections == []  # 闸门在连库之前
+
+
+def test_explain_writes_plan_then_displays_and_rolls_back() -> None:
+    fake = _FakeOracleDb(
+        query_map=[
+            _Route(
+                "dbms_xplan.display",
+                (("PLAN_TABLE_OUTPUT",),),
+                [("Plan hash value: 1",), ("| 0 | SELECT STATEMENT |",)],
+            )
+        ]
+    )
+    adapter = _adapter(fake, policy=OperationPolicy(allow_oracle_plan_table=True))
+
+    plan = adapter.explain("SELECT id FROM app.orders")
+
+    assert plan.operation == "EXPLAIN"
+    assert plan.details["rows"] == [
+        {"plan_table_output": "Plan hash value: 1"},
+        {"plan_table_output": "| 0 | SELECT STATEMENT |"},
+    ]
+    cursor = fake.connections[0].cursors[0]
+    explain_sql, display_sql = cursor.executed_history
+    assert explain_sql.startswith("EXPLAIN PLAN SET STATEMENT_ID = 'DOPS_")
+    assert explain_sql.endswith("FOR SELECT id FROM app.orders")
+    statement_id = explain_sql.split("'")[1]
+    assert "DBMS_XPLAN.DISPLAY('PLAN_TABLE', :sid, 'TYPICAL')" in display_sql
+    assert cursor.params_history[1] == {"sid": statement_id}
+    assert fake.connections[0].rolled_back is True
+    assert fake.connections[0].closed is True
+
+
+def test_explain_rejects_non_select_before_connecting() -> None:
+    fake = _FakeOracleDb()
+    adapter = _adapter(fake, policy=OperationPolicy(allow_oracle_plan_table=True))
+
+    with pytest.raises(SqlGuardError):
+        adapter.explain("DELETE FROM app.orders")
+    assert fake.connections == []
+
+
+def test_get_table_ddl_uses_dbms_metadata_with_bound_names() -> None:
+    fake = _FakeOracleDb(
+        query_map=[
+            _Route(
+                "dbms_metadata.get_ddl",
+                (("DDL",),),
+                [('\n  CREATE TABLE "APP"."ORDERS" ("ID" NUMBER)  ',)],
+            )
+        ]
+    )
+    adapter = _adapter(fake)
+
+    ddl = adapter.get_table_ddl("app", "orders")
+
+    assert ddl == 'CREATE TABLE "APP"."ORDERS" ("ID" NUMBER)'
+    cursor = fake.connections[0].cursors[0]
+    transform_sql, ddl_sql = cursor.executed_history
+    assert "SET_TRANSFORM_PARAM" in transform_sql and "'STORAGE', FALSE" in transform_sql
+    assert "GET_DDL('TABLE', UPPER(:tbl), UPPER(:owner))" in ddl_sql
+    assert cursor.params_history[1] == {"tbl": "orders", "owner": "app"}
+    assert fake.connections[0].closed is True
+
+
+def test_get_table_ddl_reads_lob_objects() -> None:
+    fake = _FakeOracleDb(
+        query_map=[_Route("dbms_metadata.get_ddl", (("DDL",),), [(_FakeLob("CREATE TABLE T"),)])]
+    )
+
+    assert _adapter(fake).get_table_ddl("APP", "T") == "CREATE TABLE T"
+
+
+def test_get_table_ddl_permission_error_is_structured() -> None:
+    err = _make_db_error("ORA-31603", 'object "T" of type TABLE not found in schema "X"', 31603)
+    fake = _FakeOracleDb(execute_exc_needle=("dbms_metadata.get_ddl", err))
+
+    with pytest.raises(OracleDdlUnavailableError) as excinfo:
+        _adapter(fake).get_table_ddl("X", "T")
+
+    assert "SELECT_CATALOG_ROLE" in str(excinfo.value)
+    assert fake.connections[0].closed is True
+
+
+def test_get_table_ddl_validates_identifiers_before_connecting() -> None:
+    fake = _FakeOracleDb()
+    with pytest.raises(ValueError):
+        _adapter(fake).get_table_ddl("APP", "T; DROP TABLE X")
+    assert fake.connections == []
 
 
 def test_connect_builds_easy_connect_dsn_from_database_service() -> None:
@@ -458,7 +549,8 @@ def test_description_type_mapping_units() -> None:
     assert description_item_to_column_type(_FakeDbType("DB_TYPE_VARCHAR")) is ColumnType.STRING
     assert description_item_to_column_type(_FakeDbType("DB_TYPE_CLOB")) is ColumnType.STRING
     assert description_item_to_column_type(_FakeDbType("DB_TYPE_BINARY_DOUBLE")) is ColumnType.FLOAT
-    assert description_item_to_column_type(_FakeDbType("DB_TYPE_DATE")) is ColumnType.DATE
+    # Oracle DATE 带时分秒 → DATETIME(按日期归一会让只差时间的两行被判一致)
+    assert description_item_to_column_type(_FakeDbType("DB_TYPE_DATE")) is ColumnType.DATETIME
     assert description_item_to_column_type(_FakeDbType("DB_TYPE_TIMESTAMP")) is ColumnType.DATETIME
     assert (
         description_item_to_column_type(_FakeDbType("DB_TYPE_TIMESTAMP_LTZ")) is ColumnType.DATETIME
@@ -493,7 +585,7 @@ def test_data_type_string_mapping_units() -> None:
         "NCLOB": ColumnType.STRING,
         "LONG": ColumnType.STRING,
         "ROWID": ColumnType.STRING,
-        "DATE": ColumnType.DATE,
+        "DATE": ColumnType.DATETIME,
         "TIMESTAMP(6)": ColumnType.DATETIME,
         "TIMESTAMP(6) WITH TIME ZONE": ColumnType.DATETIME,
         "RAW": ColumnType.BYTES,
@@ -636,7 +728,7 @@ def test_thin_unsupported_server_error_points_to_thick_mode() -> None:
 # ──────────────────────────── helpers / fakes ────────────────────────────
 
 
-def _conn_info() -> DatasourceConnInfo:
+def _conn_info(policy: OperationPolicy | None = None) -> DatasourceConnInfo:
     return DatasourceConnInfo(
         host="127.0.0.1",
         port=1521,
@@ -644,6 +736,7 @@ def _conn_info() -> DatasourceConnInfo:
         database="FREEPDB1",
         password_ref=SecretRef(ref="secret-1", kind=SecretKind.DATASOURCE_PASSWORD),
         db_type=DbType.ORACLE,
+        operation_policy=policy or OperationPolicy(),
     )
 
 
@@ -651,14 +744,25 @@ def _adapter(
     fake: _FakeOracleDb | None,
     *,
     secret_store: _SecretStore | None = None,
+    policy: OperationPolicy | None = None,
     **kwargs: Any,
 ) -> OracleAdapter:
     return OracleAdapter(
-        _conn_info(),
+        _conn_info(policy),
         cast(SecretStore, secret_store or _SecretStore("pwd")),
         oracledb_module=fake,
         **kwargs,
     )
+
+
+class _FakeLob:
+    """python-oracledb LOB 形态(未挂 outputtypehandler 时 CLOB 返回它)。"""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def read(self) -> str:
+        return self._text
 
 
 def _block_oracledb_import(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -759,6 +863,7 @@ class _FakeOracleDb:
         execute_exc: Exception | None = None,
         fetch_exc: Exception | None = None,
         call_timeout_raises: bool = False,
+        execute_exc_needle: tuple[str, Exception] | None = None,
     ) -> None:
         self.connect_kwargs: list[dict[str, Any]] = []
         self.connections: list[_FakeOracleConnection] = []
@@ -769,6 +874,7 @@ class _FakeOracleDb:
         self._execute_exc = execute_exc
         self._fetch_exc = fetch_exc
         self._call_timeout_raises = call_timeout_raises
+        self._execute_exc_needle = execute_exc_needle
 
     def connect(self, **kwargs: Any) -> _FakeOracleConnection:
         if self._connect_exc is not None:
@@ -781,6 +887,7 @@ class _FakeOracleDb:
             execute_exc=self._execute_exc,
             fetch_exc=self._fetch_exc,
             call_timeout_raises=self._call_timeout_raises,
+            execute_exc_needle=self._execute_exc_needle,
         )
         self.connections.append(conn)
         return conn
@@ -854,8 +961,10 @@ class _FakeOracleConnection:
         execute_exc: Exception | None,
         fetch_exc: Exception | None,
         call_timeout_raises: bool,
+        execute_exc_needle: tuple[str, Exception] | None = None,
     ) -> None:
         self.closed = False
+        self.rolled_back = False
         self.cursors: list[_FakeOracleCursor] = []
         self._call_timeout: int | None = None
         self._default_rows = default_rows
@@ -864,6 +973,7 @@ class _FakeOracleConnection:
         self._execute_exc = execute_exc
         self._fetch_exc = fetch_exc
         self._call_timeout_raises = call_timeout_raises
+        self._execute_exc_needle = execute_exc_needle
 
     @property
     def call_timeout(self) -> int | None:
@@ -882,9 +992,13 @@ class _FakeOracleConnection:
             query_map=self._query_map,
             execute_exc=self._execute_exc,
             fetch_exc=self._fetch_exc,
+            execute_exc_needle=self._execute_exc_needle,
         )
         self.cursors.append(cursor)
         return cursor
+
+    def rollback(self) -> None:
+        self.rolled_back = True
 
     def close(self) -> None:
         self.closed = True
@@ -899,11 +1013,15 @@ class _FakeOracleCursor:
         query_map: list[_Route],
         execute_exc: Exception | None,
         fetch_exc: Exception | None,
+        execute_exc_needle: tuple[str, Exception] | None = None,
     ) -> None:
         self.closed = False
         self.arraysize = 100
         self.executed_sql = ""
         self.executed_params: object = None
+        self.executed_history: list[str] = []
+        self.params_history: list[object] = []
+        self._execute_exc_needle = execute_exc_needle
         self.fetchmany_sizes: list[int] = []
         self.description: tuple[Any, ...] = (("OK",),)
         self._default_rows = default_rows
@@ -917,9 +1035,13 @@ class _FakeOracleCursor:
     def execute(self, sql: str, params: object = None) -> None:
         self.executed_sql = sql
         self.executed_params = params
+        self.executed_history.append(sql)
+        self.params_history.append(params)
         if self._execute_exc is not None:
             raise self._execute_exc
         normalized = " ".join(sql.lower().split())
+        if self._execute_exc_needle is not None and self._execute_exc_needle[0] in normalized:
+            raise self._execute_exc_needle[1]
         # product_component_version 探活(test_connection 版本查询)
         if "product_component_version" in normalized:
             self.description = (("version",),)

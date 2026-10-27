@@ -12,8 +12,8 @@
   description 的 scale(元组 idx5 / FetchInfo.scale):scale==0 → INTEGER,
   scale>0 或缺失 → DECIMAL(保守默认,不丢精度)。
 
-★ Oracle DATE 实际带时分秒,但同族 DM adapter 一律把 DATE 归 DATE(统一 ColumnType
-  家族行为对齐),此处沿用 DM 口径归 DATE。
+★ Oracle DATE 带时分秒,归 DATETIME。此前沿用 DM 口径归 DATE,比对会按 YYYY-MM-DD
+  归一,两行只差时间会被判成一致(设计稿 §6.3)。DM 的 DATE 确实只有日期,DM 不跟改。
 
 ★ 无法识别一律 UNKNOWN(不臆造),原始类型由调用方塞进 Column.driver_type。
 
@@ -51,9 +51,9 @@ _NAME_TO_COLUMN_TYPE: dict[str, ColumnType] = {
     "DOUBLE": ColumnType.FLOAT,
     # 布尔(Oracle 23c 原生 BOOLEAN / PL/SQL BOOLEAN)
     "BOOLEAN": ColumnType.BOOLEAN,
-    # 时间 —— TIMESTAMP 家族归 DATETIME;DATE 沿用 DM 口径归 DATE
+    # 时间 —— TIMESTAMP 家族与 DATE(带时分秒)都归 DATETIME
     "TIMESTAMP": ColumnType.DATETIME,
-    "DATE": ColumnType.DATE,
+    "DATE": ColumnType.DATETIME,
     # 字符串
     "VARCHAR": ColumnType.STRING,
     "VARCHAR2": ColumnType.STRING,
