@@ -12,6 +12,7 @@ from itertools import chain
 from typing import IO, Any, BinaryIO, Literal, cast
 from xml.sax.saxutils import escape
 
+from app.domain.dialect import IdentifierStyle, traits_for_name
 from app.domain.schema import Column, Row
 
 ExportFormat = Literal["csv", "excel", "json", "sql"]
@@ -401,7 +402,9 @@ def _quote_table_name(table_name: str, db_type: str) -> str:
 
 
 def _quote_identifier(identifier: str, db_type: str) -> str:
-    if db_type == "mysql":
+    # 导出 INSERT 保留原大小写(与 sql_build 的大写引用不同);未知类型按双引号。
+    dialect = traits_for_name(db_type)
+    if dialect is not None and dialect.identifier_style is IdentifierStyle.BACKTICK:
         return "`" + identifier.replace("`", "``") + "`"
     return '"' + identifier.replace('"', '""') + '"'
 
