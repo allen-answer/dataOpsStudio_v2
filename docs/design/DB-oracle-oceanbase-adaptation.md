@@ -237,9 +237,43 @@ def traits(db_type: DbType | str) -> DialectTraits: ...
   - Instant Client **不进安装包**:包体有不许增长的基线门槛(`docs/packaging.md`),且许可
     条款需另行确认。由部署方自行放置,README 写明步骤。
   - thick 下 12c+ 实例照常可用,所以“有 11g 的现场整体开 thick”即可,不存在混用问题。
-  - 若现场没有 11g,本开关不实现,只在文档里记下限。**是否实现取决于你给的版本信息。**
+  - ~~若现场没有 11g,本开关不实现~~。**现场有 11g,开关必须实现**(见下方 POC 结论)。
 - 版本探测:`test_connection` 现已读 `product_component_version`,结果额外缓存主版本号,
   供分页语法(11g 用 `ROWNUM` 包裹)和哈希函数选型(§6.1.2)使用。
+
+> **11g POC 结论(2026-10-27,Oracle 11.2.0.4.0 EE,库字符集 ZHS16GBK,只读账号,全程只读)**
+>
+> - thin 模式握手即报 `DPY-3010`(在认证之前,用不存在的用户名即可探测,不会给业务账号
+>   记失败登录)。thick 模式 + Instant Client **19.29 basiclite**(约 39 MB)连接正常;19c 是
+>   支持 11.2 的最高客户端版本,README 里写死“用 19c”。thin 不可用时 `test_connection`
+>   把 `DPY-3010` 翻译成“该库低于 12.1,需部署方配置 `DATAOPS_ORACLE_CLIENT_DIR`”。
+> - 账号权限只有 `CREATE SESSION` + `CONNECT` 角色:`V$PARAMETER`、`V$SQL`、`V$SESSION`
+>   都读不到(942)。所有能力的设计都要按**这种最小权限账号**成立,读 V$ 的一律可选。
+> - `ALL_*` 目录视图(`ALL_TABLES/ALL_TAB_COLUMNS/ALL_TAB_COMMENTS/ALL_COL_COMMENTS/
+>   ALL_CONSTRAINTS/ALL_IND_COLUMNS/ALL_VIEWS/ALL_TAB_PARTITIONS/ALL_USERS`)都可读;
+>   11g 的 `COLUMN_ID` 从 1 起编(与 OB 的 16 不同)。业务库里出现了 `DATA_TYPE='UNDEFINED'`
+>   的列,类型映射必须落 `UNKNOWN` 而不是报错。
+> - 分页:`FETCH FIRST` 报 `ORA-00933`;只能用两层 `ROWNUM` 包裹(`ROWNUM <= hi` 在内、
+>   `rn > lo` 在外),实测正确。
+> - `DBMS_METADATA.GET_DDL` 取**他人 schema** 的表报 `ORA-31603`(缺 `SELECT_CATALOG_ROLE`),
+>   与 §4.1.2 的预判一致:返回结构化的 `ddl_permission_denied`。
+> - 执行计划:`PLAN_TABLE` 是 `PUBLIC` 同义词 → `SYS.PLAN_TABLE$`(会话级临时表),
+>   `DBMS_XPLAN` 对 PUBLIC 可执行;`DISPLAY_CURSOR` 因读不到 `V$SESSION` 不可用。
+>   `EXPLAIN PLAN` 会向会话临时表写行,**本次按“只读”约定未执行**,能否在只读账号下跑通
+>   留待现场确认;闸门 `allow_oracle_plan_table` 缺省 False 不变。
+> - **取消**:另一线程调 `Connection.cancel()` 实测得到 `ORA-01013`,连接**仍可继续用**;
+>   但从发出取消到调用返回用了约 10 秒(CPU 密集的笛卡尔积查询,经两级隧道),UI 文案不能
+>   承诺“立即停止”。
+> - **`call_timeout` 会毁掉连接**:thick 模式下到时报 `DPY-4011`,之后该连接 `DPY-1001`
+>   不可再用。现有 `_apply_statement_timeout`(`oracle_adapter.py:502`)把它当语句超时用,
+>   这意味着每次超时都要重建连接;会话控制台里尤其不能用它做常规超时,只能作最后的保险带,
+>   常规超时改为 broker 计时 + `local_cancel()`。
+> - **NUMBER 精度丢失(现有 bug,与 11g 无关)**:oracledb 缺省把 NUMBER 取成 `float`,
+>   实测 `NUMBER(20,2)` 的 `12345678901234567.89` 取回 `1.2345678901234568e+16`。现有
+>   适配器没有设 `fetch_decimals` 或输出类型处理器,SQL 工作台展示、导出、比对的客户端
+>   哈希都会受影响。修法:每个连接设 `outputtypehandler`,NUMBER 一律取 `Decimal`(不动
+>   进程级 `oracledb.defaults`,避免牵连其他模块);同时 CLOB/NCLOB 按 `str`、BLOB 按
+>   `bytes` 直接取(缺省是 LOB 对象,需再次往返)。这条单独拆成 PR-0.5 先修。
 
 #### 4.1.2 能力补齐
 
@@ -260,7 +294,9 @@ def traits(db_type: DbType | str) -> DialectTraits: ...
   DM 不跟改(DM 的 `DATE` 确实只有日期)。
 - **错误分类**:新增 `OracleErrorClassifier`,按 `ORA-` 数值码分类(登录失败 1017、
   监听不可达 12541/12514、取消 1013、超时 DPY-4024 / ORA-03156、连接死亡 3113/3114/3135
-  等),全集在 POC 中按真库回报核对〔待验证 V3〕。
+  等)。11g 实测:`942` 表不存在、`900` 语法错、`933` 语法未结束、`1476` 除零、`1017` 登录
+  失败、`1013` 取消、`31603` 无 DDL 权限、`28231` MD5 输入为空、`6502` RAW 超长;thick 模式
+  `call_timeout` 到时报 `DPY-4011`(连接已断)而不是 `DPY-4024`,分类器两者都要认。
 - **系统 schema 清单**(`oracle_adapter.py:69-105`)保留,补 `PDBADMIN`、`APEX_*` 前缀
   匹配。
 
@@ -470,7 +506,19 @@ arguments: (-\d+)`,取出数值再查码表:`-4012` 超时、`-5065` 取消、`-
 | MySQL | `CONCAT_WS` | `MD5()` | `CONV` | 现有 `mysql_compare` |
 | OB-MySQL | 同 MySQL | 同 | 同 | 复用,V11 验证 |
 | DM | `\|\|` | `DBMS_CRYPTO.HASH` | `TO_NUMBER(...,'XXXXXXXX')` / 展开式 | 现有 `dm_compare` |
-| Oracle | `\|\|` | `STANDARD_HASH(x,'MD5')`(12.1+,无需授权);11g 用 `DBMS_CRYPTO`(需授权)否则客户端 | 复用 DM 的 `hex_to_uint64_expression` | 新 `oracle_compare` |
+| Oracle | `\|\|` | `STANDARD_HASH(x,'MD5')`(12.1+,无需授权);**11g 用 `DBMS_OBFUSCATION_TOOLKIT.MD5(input=>UTL_RAW.CAST_TO_RAW(CONVERT(x,'AL32UTF8')))`**(见下) | 复用 DM 的 `hex_to_uint64_expression` | 新 `oracle_compare` |
+
+**11g 哈希实测**(11.2.0.4,最小权限账号):`STANDARD_HASH` 不存在(904);`DBMS_CRYPTO` 未授权
+(904);**`DBMS_OBFUSCATION_TOOLKIT` 对 PUBLIC 可执行**,`MD5` 结果与 Python 逐字节一致,
+取前 16 个十六进制位转 uint64 也一致。约束:
+
+- 输入 RAW 在 SQL 上下文里**上限 2000 字节**(2000 通过,2001 报 `6502`),所以 11g 的载荷
+  上限按 2000 字节估算,超过即降级客户端哈希(比 §6.1.2 的 4000 更紧);
+- 输入为空报 `ORA-28231`,载荷构造必须保证非空(规范的分隔符/长度前缀已保证,单测锁住);
+- GBK 库必须 `CONVERT(x,'AL32UTF8')`,实测后与 UTF-8 MD5 一致;
+- 速度:10 万行约 1 秒(`ORA_HASH` 约 0.15 秒),可用。该包在 Oracle 文档里标为已弃用,
+  但 11g 上是唯一免授权的 MD5;12c+ 一律用 `STANDARD_HASH`,不走它。
+- 探测顺序(§6.1.3):`STANDARD_HASH` → `DBMS_CRYPTO` → `DBMS_OBFUSCATION_TOOLKIT` → 客户端。
 | OB-Oracle | `\|\|` | **只有** `DBMS_CRYPTO.HASH(UTL_RAW.CAST_TO_RAW(CONVERT(x,'AL32UTF8')), 2)`(实测 `STANDARD_HASH`、`MD5()` 均不存在) | `TO_NUMBER(SUBSTR(RAWTOHEX(h),1,16),'XXXXXXXXXXXXXXXX')`,实测与 Python 端 uint64 一致 | 新 `oracle_compare`(variant) |
 
 **OB-Oracle 哈希下推的两条实测结论**(V11):
@@ -506,7 +554,9 @@ arguments: (-\d+)`,取出数值再查码表:`-4012` 超时、`-5065` 取消、`-
   的拼接仍会在 32767 处被**静默截断**——实测 `RPAD('x',40000,'x')` 只得到 32767 字节、
   不报错。所以拼接本身必须在 CLOB 上做(`TO_CLOB(a) || ...`),不能先拼 VARCHAR2 再转。)
 - **非 UTF-8 规范化字符集**:同 DM 现有规则。
-- 11g 且无 `DBMS_CRYPTO` 执行权限:整表降级。
+- 11g 且 `DBMS_CRYPTO`、`DBMS_OBFUSCATION_TOOLKIT` 都不可执行:整表降级。
+- `V$PARAMETER` 读不到(最小权限账号的常态,11g 实测 942):12c+ 按 `STANDARD` 即 4000 处理;
+  11g 本无 `max_string_size`,按 4000,但 MD5 输入受 2000 字节约束(见 §6.1.1)。
 
 #### 6.1.3 能力探测
 
@@ -656,6 +706,7 @@ DATAOPS_TEST_OBORACLE_HOST / _PORT / _USERNAME / _PASSWORD / _SCHEMA / _TENANT /
 | PR | 阶段 | 内容 | 依赖 | 规模 |
 |---|---|---|---|---|
 | PR-0 | 重构 | `app/domain/dialect.py` + §2.2 后端硬分支收敛;worker 改读 `compare_db_hash`;行为零变化 | — | M |
+| PR-0.5 | 修 bug | Oracle 连接设 `outputtypehandler`:NUMBER 取 `Decimal`、LOB 直接取值(§4.1.1 POC 结论);thick 开关 `DATAOPS_ORACLE_CLIENT_DIR`;`DPY-3010` 友好提示 | — | S |
 | PR-1 | 重构 | `DatasourceResponse.capabilities` + 前端改读能力(保留回落) | PR-0 | M |
 | PR-2 | P0 | POC 脚本(`tools/poc/db_probe.py`,不进运行时),逐项跑 §13;产出 POC 报告并回改本稿 | 实例 | S |
 | PR-3 | P1 | Oracle:`DATE` 映射修正、explain、DDL、错误分类、`oracle_catalog` 抽取 | PR-0 | M |
@@ -723,7 +774,9 @@ DATAOPS_TEST_OBORACLE_HOST / _PORT / _USERNAME / _PASSWORD / _SCHEMA / _TENANT /
 
 1. **OB-Oracle 驱动**:POC 已证明方案 A 可行(§4.3.1),建议定为 A、不引入 pyoceanbase。
    代价是 `oceanbase_oracle_driver` 要继承 PyMySQL 私有类接管字段解码(§4.3.4),PyMySQL 需锁版本。
-2. **11g**:现场有没有 11g。有的话才实现 thick 开关(Instant Client 由部署方放置)。
+2. **11g**:已确认现场有 11.2.0.4,thick 开关必须做(PR-0.5)。待定的是 Instant Client 19c
+   由谁放、放在哪:建议部署方自行下载放置,包内只带 README 步骤(许可与包体基线两方面都不宜内置)。
+   另外 PR-0.5 里的 NUMBER 精度修复是现有 bug,建议不等其他拍板先做。
 3. **新增 `rtrim_char` 比对规则**:改规范与三方实现,还是先只靠 `trim_strings`。
    (实测 OB-Oracle `CHAR` 返回带补齐空格,这条对跨族比对是实打实的问题。)
 4. **Oracle 前端放开执行**(PR-6):在升 Certified 之前,是否先以 Preview 档放开。
