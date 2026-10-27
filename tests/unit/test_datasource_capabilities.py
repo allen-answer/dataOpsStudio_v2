@@ -1,7 +1,8 @@
 """数据源能力下发 + extra 校验单测。
 
-能力表的期望值逐项照抄收敛前前端的硬编码白名单(SqlWorkspaceView /
-sqlIntelligence / useConsoleSessions),证明改读后端能力后各类型可用范围不变。
+期望值:mysql / dm / postgresql / db2 照抄收敛前前端的硬编码白名单(SqlWorkspaceView /
+sqlIntelligence / useConsoleSessions),证明改读后端能力后这几类可用范围不变;
+oracle / oceanbase_oracle 是 PR-6 以 Preview 档新放开的执行与 SQL 工具。
 """
 
 from __future__ import annotations
@@ -12,32 +13,38 @@ from app.api.datasource_capabilities import PREVIEW_EXECUTION_ALLOWED, datasourc
 from app.domain.datasource import DbType, OperationPolicy
 from app.domain.datasource_extra import DatasourceExtraError, validate_datasource_extra
 
-# 收敛前前端白名单
-_FRONTEND_EXECUTION = {"mysql", "dm", "postgresql", "db2"}
-_FRONTEND_TOOLS = {"mysql", "dm", "postgresql"}
-_FRONTEND_METADATA = {"mysql", "dm", "postgresql"}
-_FRONTEND_SESSION = {"mysql", "dm"}
+_EXECUTION = {"mysql", "dm", "postgresql", "db2", "oracle", "oceanbase_oracle"}
+_TOOLS = {"mysql", "dm", "postgresql", "oracle", "oceanbase_oracle"}
+_SESSION = {"mysql", "dm"}
+# 缺省策略下 explain 按钮:Oracle 另需 allow_oracle_plan_table(缺省关)
+_EXPLAIN_BY_DEFAULT = {"mysql", "dm", "postgresql", "oceanbase_oracle"}
 
 
 @pytest.mark.parametrize("db_type", list(DbType))
-def test_capabilities_match_former_frontend_whitelists(db_type: DbType) -> None:
+def test_capabilities_per_type(db_type: DbType) -> None:
     caps = datasource_capabilities(db_type, OperationPolicy())
 
-    assert caps.execute is (db_type.value in _FRONTEND_EXECUTION)
-    assert caps.sql_tools is (db_type.value in _FRONTEND_TOOLS)
-    assert caps.metadata is (db_type.value in _FRONTEND_METADATA)
-    assert caps.session_console is (db_type.value in _FRONTEND_SESSION)
-    # explain 按钮另需 allow_explain(缺省 True),与原前端一致
-    assert caps.explain is (db_type.value in _FRONTEND_TOOLS)
+    assert caps.execute is (db_type.value in _EXECUTION)
+    assert caps.sql_tools is (db_type.value in _TOOLS)
+    assert caps.metadata is (db_type.value in _TOOLS)
+    assert caps.session_console is (db_type.value in _SESSION)
+    assert caps.explain is (db_type.value in _EXPLAIN_BY_DEFAULT)
 
 
 def test_maturity_and_preview_execution_gate() -> None:
     assert datasource_capabilities(DbType.MYSQL, OperationPolicy()).maturity == "certified"
     assert datasource_capabilities(DbType.DM, OperationPolicy()).maturity == "certified"
     assert datasource_capabilities(DbType.ORACLE, OperationPolicy()).maturity == "preview"
-    # Oracle / OB-Oracle 放开执行须人拍板(PR-6),本 PR 不放
-    assert DbType.ORACLE not in PREVIEW_EXECUTION_ALLOWED
-    assert DbType.OCEANBASE_ORACLE not in PREVIEW_EXECUTION_ALLOWED
+    # PR-6:Oracle / OB-Oracle 以 Preview 档放开执行
+    assert DbType.ORACLE in PREVIEW_EXECUTION_ALLOWED
+    assert DbType.OCEANBASE_ORACLE in PREVIEW_EXECUTION_ALLOWED
+
+
+def test_oracle_explain_needs_plan_table_gate() -> None:
+    gated = datasource_capabilities(DbType.ORACLE, OperationPolicy(allow_oracle_plan_table=True))
+    assert gated.explain is True
+    no_explain = OperationPolicy(allow_oracle_plan_table=True, allow_explain=False)
+    assert datasource_capabilities(DbType.ORACLE, no_explain).explain is False
 
 
 def test_only_allow_explain_narrows_capabilities() -> None:
