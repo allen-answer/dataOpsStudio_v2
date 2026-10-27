@@ -18,7 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from structlog.testing import capture_logs
 
 from app.dbclients.factory import UnsupportedDbTypeError
-from app.dbclients.mysql_adapter import QueryCancelledError, QueryTimeoutError
+from app.dbclients.mysql_adapter import MySQLAdapter, QueryCancelledError, QueryTimeoutError
 from app.dbclients.protocol import AdapterConnectionError
 from app.domain.compare import (
     CompareColumn,
@@ -2312,6 +2312,9 @@ class _FakeErrorCodeWriter:
 
 
 class _FakeAdapter:
+    # worker 按适配器 capabilities.compare_db_hash 决定是否尝试库内哈希下推。
+    capabilities = MySQLAdapter.capabilities
+
     def __init__(
         self,
         rows: list[Row],
@@ -2377,6 +2380,8 @@ class _FakeAdapter:
 
 
 class _DbHashFallbackAdapter:
+    capabilities = MySQLAdapter.capabilities
+
     def __init__(
         self,
         hash_error: Exception | None,
@@ -2460,6 +2465,8 @@ def _filter_fake_compare_rows(sql: str, rows: list[Row]) -> list[Row]:
 
 
 class _RangeAdapter:
+    capabilities = MySQLAdapter.capabilities
+
     def __init__(self, row_count: int) -> None:
         self._row_count = row_count
         self.rows_yielded = 0

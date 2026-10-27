@@ -10,6 +10,7 @@ from sqlglot import exp
 from sqlglot.errors import ParseError
 
 from app.domain.datasource import DbType
+from app.domain.dialect import traits
 
 
 class CompareSqlProjectionError(ValueError):
@@ -35,15 +36,6 @@ class CompareSqlPlan:
     rewritten: bool
 
 
-_DIALECTS: dict[DbType, str | None] = {
-    DbType.MYSQL: "mysql",
-    DbType.DM: "oracle",
-    DbType.ORACLE: "oracle",
-    DbType.POSTGRESQL: "postgres",
-    DbType.DB2: None,
-}
-
-
 def inspect_compare_sql(sql: str) -> tuple[CompareSqlProjection, ...]:
     """Return deterministic output metadata without persisting rewritten SQL."""
 
@@ -53,7 +45,7 @@ def inspect_compare_sql(sql: str) -> tuple[CompareSqlProjection, ...]:
 def normalize_compare_sql(sql: str, db_type: DbType) -> CompareSqlPlan:
     """Alias unlabelled computed projections with collision-free ``RESULT_n`` names."""
 
-    return _build_plan(sql, dialect=_DIALECTS[db_type])
+    return _build_plan(sql, dialect=traits(db_type).sqlglot_dialect)
 
 
 def legacy_generated_aliases(

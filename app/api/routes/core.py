@@ -285,6 +285,7 @@ from app.domain.compare_upstream_sql import (
 )
 from app.domain.console_session import ConsoleStatementState
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
+from app.domain.dialect import traits_for_name
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.lineage import (
     LINEAGE_PARSER_VERSION,
@@ -8562,11 +8563,13 @@ def _audit_metadata(
 
 
 def _sqlglot_dialect(dialect: str) -> str:
+    # 入参既可能是 db_type 值,也可能是前端直接传的 sqlglot 方言名 "postgres"。
     normalized = dialect.lower()
-    if normalized in {"mysql", "oracle", "postgres", "postgresql"}:
-        return "postgres" if normalized == "postgresql" else normalized
-    if normalized == "dm":
-        return "oracle"
+    if normalized == "postgres":
+        return normalized
+    dialect_traits = traits_for_name(normalized)
+    if dialect_traits is not None and dialect_traits.sqlglot_dialect is not None:
+        return dialect_traits.sqlglot_dialect
     raise ApiError(
         400,
         "unsupported_dialect",
