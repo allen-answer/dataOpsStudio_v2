@@ -303,6 +303,11 @@ PyMySQL `SSCursor` 在 OB 上可用(协议层一致);OBProxy 对长时间不取�
 方案 A 若成立,与 B 本质相同,只是我们自己掌控那几行握手代码,不引入单人维护的依赖。
 B 作为 A 失败时的备选。C、D 不进本轮。
 
+> **POC 结论(2026-10-27,OB 4.3.5.4 企业版,经 OBProxy)**:方案 A 成立。不置 bit 27 登录
+> 报 `1235 Oracle tenant for current client driver is not supported`,置 `client_flag=1<<27`
+> 后正常登录、查询。读过 pyoceanbase 1.1.0 源码:与 PyMySQL 的差别只有这一位和若干上游
+> PyMySQL 的小修,**对扩展类型码、转义都没做任何处理**,不采用 B。
+
 为让 A/B 可替换,OB-Oracle 的驱动接线收在一个模块里:
 
 ```text
@@ -336,14 +341,14 @@ OB-Oracle 目录视图的列集合与 Oracle 不完全一致〔待验证 V6〕,�
 
 | 能力 | OB-Oracle 方案 |
 |---|---|
-| 测试连接 | `SELECT 1 FROM DUAL`;版本 `SELECT ob_version() FROM DUAL`〔待验证 V1〕 |
-| 元数据 | `oracle_catalog` 的 `pyformat` 渲染;系统 schema 加 `SYS`/`LBACSYS`/`ORAAUDITOR`/`PUBLIC` |
-| 语句超时 | `SET ob_query_timeout = <微秒>`(Oracle 模式下也是系统变量)〔待验证 V5〕 |
-| 流式读 | PyMySQL `SSCursor` |
-| `explain` | `EXPLAIN <sql>`(OB 两种模式通用);`EXPLAIN PLAN FOR` + `DBMS_XPLAN` 是否支持〔待验证 V10〕,不依赖 |
-| DDL | `DBMS_METADATA.GET_DDL` 〔待验证 V9〕,不行则 `SHOW CREATE TABLE`(OB 扩展) |
-| 哈希下推 | Oracle 族实现 + OB 函数可用性探测(§6.1.3) |
-| 分页 | `FETCH FIRST n ROWS ONLY`〔待验证 V7〕,不行则 `ROWNUM` |
+| 测试连接 | `SELECT 1 FROM DUAL`;版本 `SELECT ob_version() FROM DUAL`(实测 `4.3.5.4`;`VERSION()` 在 Oracle 模式**不存在**)。经 OBProxy 时握手里的 `server_version` 是代理的 `5.6.25`,不含 OceanBase 字样,**不能据握手判断**;模式用 `SHOW VARIABLES LIKE 'ob_compatibility_mode'`(两种模式都可用,返回 `ORACLE`/`MYSQL`)核对,填错类型时测试连接给出明确提示 |
+| 元数据 | `oracle_catalog` 的 `pyformat` 渲染;`ALL_TABLES/ALL_TAB_COLUMNS/ALL_CONSTRAINTS/ALL_CONS_COLUMNS/ALL_INDEXES/ALL_IND_COLUMNS/ALL_VIEWS/ALL_TAB_COMMENTS/ALL_COL_COMMENTS/ALL_OBJECTS/ALL_SYNONYMS/ALL_SEQUENCES/ALL_TAB_PARTITIONS/ALL_SOURCE` 实测都在,列名与 Oracle 一致。`COLUMN_ID` 从 16 起编(OB 内部列号),只能用于排序,不能当序号;`DATA_TYPE` 带精度(`TIMESTAMP(6)`),与 Oracle 相同。`SESSION_PRIVS`/`SESSION_ROLES` **不存在**,权限探测改用 `USER_TAB_PRIVS` 或直接试执行。系统 schema 排除 `SYS`/`LBACSYS`/`ORAAUDITOR`/`PUBLIC` |
+| 语句超时 | 实测 `SET ob_query_timeout = <微秒>`、`ALTER SESSION SET ob_query_timeout = ...`、hint `/*+ query_timeout(<微秒>) */` 三种都生效;超时报 `600` + 内部码 `-4012`。`MAX_EXECUTION_TIME` hint 不报错但**无效果**,不用。会话缺省值 604800 秒(7 天),必须显式设 |
+| 流式读 | PyMySQL `SSCursor`(OBProxy 空闲行为见 V8 结论) |
+| `explain` | `EXPLAIN <sql>` 返回单列 `Query Plan` 文本行;`EXPLAIN FORMAT=JSON <sql>` 返回逐行 JSON 文本。**`EXPLAIN PLAN FOR` 语法报错**,`DBMS_XPLAN.DISPLAY` 因无 `PLAN_TABLE` 报 942,二者都不用 |
+| DDL | `DBMS_METADATA.GET_DDL('TABLE'/'VIEW', name, owner)` 实测可用,表 DDL 尾部带 OB 专有子句(`COMPRESS FOR ARCHIVE REPLICA_NUM = 3 BLOCK_SIZE = ...`),原样返回;`SHOW CREATE TABLE owner.t` 输出相同,作备选。系统视图(`SYS.ALL_OBJECTS` 等)取 DDL 报 31603,前端只对用户对象提供 |
+| 哈希下推 | 见 §6.1.1:只有 `DBMS_CRYPTO.HASH`,且慢 |
+| 分页 | 实测 `OFFSET m ROWS FETCH NEXT n ROWS ONLY`、`FETCH FIRST n ROWS ONLY`、`ROWNUM` 都可用;`LIMIT` 语法报错。用 `FETCH FIRST` |
 
 #### 4.3.3 绑定参数转义(必须处理的坑)
 
@@ -353,23 +358,57 @@ Oracle 方言里反斜杠不是转义符,如果 OB-Oracle 不报这个状态位,
 (比对的分段边界、元数据查询的 owner 名都会受影响)。
 
 处理:`oceanbase_oracle_driver.escape_literal` 固定按 Oracle 规则转义(只双写单引号),连
-接建立后把 PyMySQL 连接的 `escape_string` 换成它;POC 里用含 `\`、`'`、`%`、中文的值往返
-验证〔待验证 V4〕。
+接建立后把 PyMySQL 连接的 `escape_string` 换成它。
+
+> **POC 结论(V4)**:坑是真的。服务端 `server_status` 里**不报** `NO_BACKSLASH_ESCAPES`
+> (`0x200` 位为 0),但 SQL 层把反斜杠当普通字符(`length('a\b') = 3`,`'a\'` 是合法字面量)。
+> PyMySQL 缺省把 `a'b\c` 转成 `'a\'b\\c'`,服务端直接报 900 语法错——即**所有含单引号的绑定值
+> 都会失败**,不只是反斜杠。按 Oracle 规则 `'a''b\c'` 往返正确(长度 5)。
 
 #### 4.3.4 扩展类型解码
 
-OB 在 MySQL 协议里给 Oracle 模式类型分配了扩展类型码(公开源码中约为 200–211:带时区/本地
-时区/纳秒时间戳、RAW、INTERVAL YM/DS、NUMBER_FLOAT、NVARCHAR2、NCHAR、UROWID、BLOB、
-CLOB)。PyMySQL 不认识这些码,会按文本或字节原样返回。
+POC(V2)在 `charset=utf8mb4` 与 `gbk` 两种连接字符集下逐类型抓了 `description` 与原始字节,
+结论如下(OB 4.3.5.4):
 
-新增 `app/dbclients/oceanbase_oracle_types.py`:
+| Oracle 类型 | 类型码 | 线上格式(文本协议) | 解码 |
+|---|---|---|---|
+| `NUMBER(p,s)` / `NUMBER` | 246 | 十进制文本 | PyMySQL 已解成 `Decimal`;`scale` 从 description 读 |
+| `FLOAT(b)` | 206 | 十进制文本 | 自解为 `Decimal` |
+| `BINARY_FLOAT` / `BINARY_DOUBLE` | 4 / 5 | 文本 | PyMySQL 已解成 `float` |
+| `VARCHAR2` / `CHAR` | 253 / 254 | 连接字符集文本(charsetnr 46/87) | PyMySQL 已解;`CHAR` **带补齐空格** |
+| `NVARCHAR2` / `NCHAR` | 207 / 208 | 连接字符集文本 | **必须自解**(见下) |
+| `DATE` | 12 | `YYYY-MM-DD HH24:MI:SS` 文本 | PyMySQL 已解成 `datetime`,时间部分保留 |
+| `TIMESTAMP(n)` | 202 | **二进制** 12 字节:世纪、年、月、日、时、分、秒各 1 字节,纳秒 4 字节小端,精度 1 字节 | 自解为 `datetime`(微秒截断,纳秒另存供比对) |
+| `TIMESTAMP WITH TIME ZONE` | 200 | 同上 12 字节 + 时区时(有符号 1 字节)+ 时区分(1 字节,符号随时)+ 区域名长度 1 字节 + 区域名 + 缩写长度 1 字节 + 缩写 | 自解为带 `tzinfo` 的 `datetime`;区域名(`Asia/Shanghai`)保留 |
+| `TIMESTAMP WITH LOCAL TIME ZONE` | 201 | 同 202,已换算到会话时区 | 自解;会话时区实测 `+08:00` |
+| `RAW` | 203 | 原始字节(charsetnr 63) | 返回 `bytes` |
+| `INTERVAL YEAR TO MONTH` | 204 | 符号 1 字节 + 年 4 字节小端 + 月 1 字节 + 年精度 1 字节 | 自解为规范文本 `-012-11`(与 `TO_CHAR` 一致) |
+| `INTERVAL DAY TO SECOND` | 205 | 符号 1 + 天 4 小端 + 时/分/秒各 1 + 纳秒 4 小端 + 天精度 1 + 秒精度 1 | 自解为 `timedelta` + 规范文本 |
+| `CLOB` / `BLOB` | 251 | 文本(charsetnr 46/87)/ 字节(63) | PyMySQL 已解(`str` / `bytes`) |
+| `NULL` 字面量 | 6 | — | `None` |
 
-- 类型码 → `ColumnType` 映射(与 `oracle_types` 的口径对齐,`DATE → DATETIME`);
-- 文本值 → Python 值的解码器(时间戳按 OB 返回格式解析,时区类保留偏移);
-- 具体码值、文本格式以 POC 抓到的 `cursor.description` 和返回值为准〔待验证 V2〕。
+以上解码器在 POC 里与同一值的 `TO_CHAR(...)` 逐项对过,包括 0001 年、9999 年、负时区
+`-03:30`、区域名时区、负 INTERVAL。未遇到 209–211(UROWID 等;`ROWID` 伪列对 `DUAL` 不可用,
+`TO_NCLOB` 函数不存在),留待有真实列时补。
 
-Oracle `NUMBER` 在 OB-Oracle 里走 `NEWDECIMAL`(246),PyMySQL 已解成 `Decimal`;
-`scale` 从 `description` 读,沿用 `oracle_types` 的“scale==0 归 INTEGER”规则。
+**必须接管 PyMySQL 的字段解码,不能只注册 converter**:PyMySQL 在 `MySQLResult._get_descriptions`
+里对不在 `TEXT_TYPES` 里的类型码一律按 `ascii` 解码,然后才交给 converter。实测后果:
+
+- `NVARCHAR2` 含中文 → `UnicodeDecodeError`,且**异常发生在读包中途,连接随即包序号错乱
+  (`Packet sequence number wrong`),后续所有语句都失败**;
+- 200–202/205 的二进制值里只要有 ≥0x80 的字节(纳秒字段几乎必然有)就同样崩。
+
+做法:`oceanbase_oracle_driver` 提供 `Connection` 子类,覆盖 `_read_query_result` 使用自己的
+`MySQLResult` 子类,在 `_get_descriptions` 里按类型码决定每列编码:207/208 用连接编码,
+200–205 置 `None`(拿原始字节),206 按文本;再由 `oceanbase_oracle_types` 的解码器转值。
+**不改** `pymysql.connections.TEXT_TYPES` 这类模块级全局(会波及同进程的 MySQL 连接)。
+子类依赖 PyMySQL 私有方法,锁死 PyMySQL 版本,并用单测快照字段解码路径。
+
+连接字符集:库字符集是 `ZHS16GBK`,连接用 `utf8mb4` 时服务端返回 UTF-8 字节(charsetnr 46),
+中文往返正确。固定用 `utf8mb4`,不随库字符集变。
+
+类型码 → `ColumnType` 映射放 `app/dbclients/oceanbase_oracle_types.py`,与 `oracle_types` 的
+口径对齐(`DATE → DATETIME`,NUMBER 的“scale==0 归 INTEGER”规则沿用)。
 
 ---
 
@@ -382,7 +421,7 @@ Oracle `NUMBER` 在 OB-Oracle 里走 `NEWDECIMAL`(246),PyMySQL 已解成 `Decima
 | 方言 | 会话标识(marker) | 硬取消 | 破坏性兜底 | 服务端语句超时 | 取消/超时确认码 |
 |---|---|---|---|---|---|
 | OB-MySQL | `SELECT CONNECTION_ID()` | `KILL QUERY <id>` | `KILL <id>` | `ob_query_timeout`(微秒) | 1317 取消;OB 超时码(4012 族)〔待验证 V3〕 |
-| OB-Oracle | `SELECT SYS_CONTEXT('USERENV','SID') FROM DUAL`〔待验证 V12〕 | `KILL QUERY <id>`(OB 扩展语法,Oracle 模式可用性待验证) | `ALTER SYSTEM KILL SESSION`〔待验证 V12〕 | `ob_query_timeout` | 按 POC |
+| OB-Oracle | `SELECT SYS_CONTEXT('USERENV','SID') FROM DUAL`(实测与 PyMySQL `thread_id()`、`GV$OB_PROCESSLIST.ID` 是同一个数;`CONNECTION_ID()` 不存在) | `KILL QUERY <id>`(实测可用,经 OBProxy,约 1 秒内打断,被打断连接**仍可继续用**) | `KILL <id>`(实测普通账号可用,目标连接收到 2013);`ALTER SYSTEM KILL SESSION` 报 1031 无权限,不用 | `ob_query_timeout` | 取消 `600`/内部码 `-5065`;超时 `600`/`-4012` |
 | Oracle | `SYS_CONTEXT('USERENV','SID')` + `SERIAL#` | **进程内** `Connection.cancel()`(见下) | `ALTER SYSTEM KILL SESSION 'sid,serial#'`,需权限,探测不通即 `DEGRADED` | 无语句级服务端超时;`call_timeout` 作保险带 | ORA-01013 取消;DPY-4024 超时 |
 
 **Oracle 的取消走进程内,不走控制连接 SQL**:
@@ -396,12 +435,23 @@ Oracle `NUMBER` 在 OB-Oracle 里走 `NEWDECIMAL`(246),PyMySQL 已解成 `Decima
 - `OracleCancelChannel` 只负责破坏性兜底(`KILL SESSION`)与权限探测;探测不通时如实上报
   `DEGRADED`,但由于 `local_cancel` 可用,前端提示文案区分“可取消,但兜底断开需 DBA 权限”。
 
-OB 经 OBProxy 时,`CONNECTION_ID()` 返回的是代理侧会话号;`KILL QUERY` 能否被代理正确路由
-到后端 observer〔待验证 V12〕。不行就只能在 `direct` 模式开硬取消,`proxy` 模式降级。
+OB 经 OBProxy 时,会话号是代理侧会话号,`KILL QUERY` 由代理路由到后端 observer。OB-Oracle
+在 proxy 模式下已实测可用;OB-MySQL 尚无实例,按同一机制预期可用,待验证。
 
 错误分类器:`OceanBaseMySQLErrorClassifier`(继承 MySQL 码表再补 OB 码)、
-`OceanBaseOracleErrorClassifier`、`OracleErrorClassifier`(与 §4.1.3 共用码表)。仍然**只按
+`OceanBaseOracleErrorClassifier`、`OracleErrorClassifier`(与 §4.1.3 共用码表)。原则是**只按
 数值码分类,不看消息文本**(`interactive/protocol.py` 的既定原则)。
+
+OB-Oracle 实测码(V3):`942` 表不存在、`900` 语法错、`1476` 除零、`1722` 无效数字、`1489`
+拼接过长、`1031` 无权限、`1045` 登录失败(密码错与租户不存在**同码**,消息里不区分)、`2013`
+连接被断(客户端码)。**超时、取消、函数不存在都报同一个 `600`**,区分它们的内部码只出现在
+消息的固定前缀 `OBE-00600: internal error code, arguments: -<n>` 里。只看外层码就无法区分
+“用户取消”和“语句超时”。
+
+处理:分类器对 `600` 一码放行一条**锚定前缀**的解析(只匹配 `^OBE-00600: internal error code,
+arguments: (-\d+)`,取出数值再查码表:`-4012` 超时、`-5065` 取消、`-5055` 对象不存在),
+其余情况仍只看数值码。这算对既定原则的一个窄口子,需要在 `protocol.py` 的注释里写明理由;
+你如果不接受,备选是 `600` 一律归“服务端错误”,取消/超时靠 broker 自己的状态判断。
 
 ---
 
@@ -421,7 +471,20 @@ OB 经 OBProxy 时,`CONNECTION_ID()` 返回的是代理侧会话号;`KILL QUERY`
 | OB-MySQL | 同 MySQL | 同 | 同 | 复用,V11 验证 |
 | DM | `\|\|` | `DBMS_CRYPTO.HASH` | `TO_NUMBER(...,'XXXXXXXX')` / 展开式 | 现有 `dm_compare` |
 | Oracle | `\|\|` | `STANDARD_HASH(x,'MD5')`(12.1+,无需授权);11g 用 `DBMS_CRYPTO`(需授权)否则客户端 | 复用 DM 的 `hex_to_uint64_expression` | 新 `oracle_compare` |
-| OB-Oracle | `\|\|` | `STANDARD_HASH` / `DBMS_CRYPTO` / `MD5()` 三选一,按探测〔待验证 V11〕 | 同上 | 新 `oracle_compare`(variant) |
+| OB-Oracle | `\|\|` | **只有** `DBMS_CRYPTO.HASH(UTL_RAW.CAST_TO_RAW(CONVERT(x,'AL32UTF8')), 2)`(实测 `STANDARD_HASH`、`MD5()` 均不存在) | `TO_NUMBER(SUBSTR(RAWTOHEX(h),1,16),'XXXXXXXXXXXXXXXX')`,实测与 Python 端 uint64 一致 | 新 `oracle_compare`(variant) |
+
+**OB-Oracle 哈希下推的两条实测结论**(V11):
+
+1. **字符集**:库字符集 `ZHS16GBK` 时,`UTL_RAW.CAST_TO_RAW('中文')` 得到的是 GBK 字节
+   `D6D0CEC4`,MD5 与 UTF-8 侧不同。必须先 `CONVERT(x,'AL32UTF8')`(或
+   `UTL_I18N.STRING_TO_RAW(x,'AL32UTF8')`),实测后与 Python `md5('中文'.encode('utf-8'))`
+   一致。这条同样适用于 GBK 字符集的 Oracle,并替代 §6.1.2 里“非 UTF-8 规范化字符集即降级”
+   的保守规则(Oracle 族可以库内转码)。
+2. **性能**:`DBMS_CRYPTO.HASH` 是 PL/SQL 包函数,逐行调用。在 `CONNECT BY` 生成的行上实测
+   约 **1 万行/秒**(20 万行 22 秒,100 万行 105 秒),同样数据 `ORA_HASH` 约 20 万行/秒。
+   规范禁用 `ORA_HASH`,所以库内下推在 OB-Oracle 上**可能比把行拉回客户端算还慢**。
+   设计改为:OB-Oracle 缺省 `CLIENT_ROW_HASH`,库内下推做成能力但默认关闭,待有真实大表时
+   对比两条路径(含网络)再决定缺省值。这一项列入 §14 待决。
 
 `oracle_compare.py` 从 `dm_compare.py` 抽公共部分(载荷拼接、数值 `TO_CHAR` 格式模型、时间
 格式化、hex→uint64),DM 与 Oracle 各自只保留 MD5 函数与降级原因。抽取后 DM 的输出 SQL
@@ -433,7 +496,15 @@ OB 经 OBProxy 时,`CONNECTION_ID()` 返回的是代理侧会话号;`KILL QUERY`
   最大字节数 + 分隔符 + 长度前缀),超过 4000(`MAX_STRING_SIZE=STANDARD`)即降级客户端哈希,
   原因写 `oracle payload may exceed VARCHAR2 limit`。适配器在首次构造计划时读一次
   `V$PARAMETER` 的 `max_string_size`(无权限则按 STANDARD 保守处理)。
-- **`CLOB`/`NCLOB`/`LONG` 列**:归 `STRING` 但不能进 `STANDARD_HASH`,降级。
+  OB-Oracle 的上限不同:实测 `||` 拼出 4001、6000 字节都正常,超过 32767 字节报 `1489`;
+  但 `UTL_RAW.CAST_TO_RAW` 对 32767 字符的串报 `6502`(RAW 变量超长)。OB-Oracle 的载荷上限按
+  `CAST_TO_RAW` 的实际上限保守取值,具体数值在实现 PR 里用二分探测定下并写进单测。
+- **`CLOB`/`NCLOB`/`LONG` 列**:归 `STRING` 但不能进 `STANDARD_HASH`,降级。(OB-Oracle 的
+  `DBMS_CRYPTO.HASH` 直接接受 CLOB:`HASH(TO_CLOB('abc'),2)` 与 VARCHAR2 结果相同;GBK 库上
+  `HASH(TO_CLOB('中文'),2)` 实测**自动按 AL32UTF8 取字节**,与 UTF-8 MD5 一致,不需要 `CONVERT`。
+  因此 OB-Oracle 的 CLOB 列和超长载荷可以走 `TO_CLOB(载荷)` 路径而不必降级;但规范化载荷
+  的拼接仍会在 32767 处被**静默截断**——实测 `RPAD('x',40000,'x')` 只得到 32767 字节、
+  不报错。所以拼接本身必须在 CLOB 上做(`TO_CLOB(a) || ...`),不能先拼 VARCHAR2 再转。)
 - **非 UTF-8 规范化字符集**:同 DM 现有规则。
 - 11g 且无 `DBMS_CRYPTO` 执行权限:整表降级。
 
@@ -604,33 +675,65 @@ DATAOPS_TEST_OBORACLE_HOST / _PORT / _USERNAME / _PASSWORD / _SCHEMA / _TENANT /
 
 ## 13. 待 POC 验证清单
 
-| 编号 | 问题 | 影响 |
-|---|---|---|
-| V1 | 各版本的版本串/`ob_version()` 输出;能否据此区分 3.x/4.x 与模式 | 测试连接、存量类型提示 |
-| V2 | OB-Oracle 扩展类型码与文本格式 | §4.3.4 |
-| V3 | 三种方言的取消、超时、登录失败、连接断开的数值错误码 | 错误分类器 |
-| V4 | PyMySQL 在 OB-Oracle 下的转义行为、`NO_BACKSLASH_ESCAPES` 状态位 | §4.3.3 |
-| V5 | `ob_query_timeout` 在两种模式下的设置方式与生效范围;`MAX_EXECUTION_TIME` 是否支持 | 超时 |
-| V6 | OB 两种模式的系统库/系统 schema 名单;OB-Oracle `ALL_*` 视图的列差异 | 元数据 |
-| V7 | OB-Oracle 是否支持 `FETCH FIRST n ROWS ONLY` | 分页 |
-| V8 | OBProxy 对流式结果集的空闲超时 | 大结果集、比对 |
-| V9 | OB 两种模式取 DDL 的方式 | DDL |
-| V10 | OB-Oracle 的 `EXPLAIN PLAN FOR` / `DBMS_XPLAN` | 执行计划 |
-| V11 | OB-MySQL 上 MySQL 哈希表达式的输出是否与 MySQL 逐字节一致;OB-Oracle 上可用的 MD5 函数 | 哈希下推 |
-| V12 | 经 OBProxy 的 `KILL QUERY` 路由;OB-Oracle 的会话标识与 `KILL` 语法 | 会话控制台硬取消 |
-| V13 | 方案 A(PyMySQL 置 bit 27)能否连上 OB-Oracle;不能则试方案 B | 驱动选型 |
+| 编号 | 问题 | 影响 | 状态(2026-10-27) |
+|---|---|---|---|
+| V1 | 各版本的版本串/`ob_version()` 输出;能否据此区分 3.x/4.x 与模式 | 测试连接、存量类型提示 | OB-Oracle 已测:`ob_version()`=4.3.5.4;`VERSION()` 不存在;握手版本是代理的 5.6.25;模式看 `ob_compatibility_mode`。3.x 未测 |
+| V2 | OB-Oracle 扩展类型码与文本格式 | §4.3.4 | OB-Oracle 已测,见 §4.3.4 |
+| V3 | 三种方言的取消、超时、登录失败、连接断开的数值错误码 | 错误分类器 | OB-Oracle 已测,见 §5;Oracle、OB-MySQL 未测 |
+| V4 | PyMySQL 在 OB-Oracle 下的转义行为、`NO_BACKSLASH_ESCAPES` 状态位 | §4.3.3 | OB-Oracle 已测:反斜杠是普通字符,PyMySQL 缺省转义会报 900 |
+| V5 | `ob_query_timeout` 在两种模式下的设置方式与生效范围;`MAX_EXECUTION_TIME` 是否支持 | 超时 | OB-Oracle 已测:SET/ALTER SESSION/hint 都生效;`MAX_EXECUTION_TIME` 无效。OB-MySQL 未测 |
+| V6 | OB 两种模式的系统库/系统 schema 名单;OB-Oracle `ALL_*` 视图的列差异 | 元数据 | OB-Oracle 已测,见 §4.3.2。OB-MySQL 未测 |
+| V7 | OB-Oracle 是否支持 `FETCH FIRST n ROWS ONLY` | 分页 | 已测:`FETCH FIRST`/`OFFSET..FETCH`/`ROWNUM` 可用,`LIMIT` 不可用 |
+| V8 | OBProxy 对流式结果集的空闲超时 | 大结果集、比对 | OB-Oracle 已测,见 §13.1 |
+| V9 | OB 两种模式取 DDL 的方式 | DDL | OB-Oracle 已测:`DBMS_METADATA.GET_DDL` 与 `SHOW CREATE TABLE` 都可用 |
+| V10 | OB-Oracle 的 `EXPLAIN PLAN FOR` / `DBMS_XPLAN` | 执行计划 | OB-Oracle 已测:只有 `EXPLAIN` / `EXPLAIN FORMAT=JSON` |
+| V11 | OB-MySQL 上 MySQL 哈希表达式的输出是否与 MySQL 逐字节一致;OB-Oracle 上可用的 MD5 函数 | 哈希下推 | OB-Oracle 已测:只有 `DBMS_CRYPTO`,需转 AL32UTF8,约 1 万行/秒。OB-MySQL 未测 |
+| V12 | 经 OBProxy 的 `KILL QUERY` 路由;OB-Oracle 的会话标识与 `KILL` 语法 | 会话控制台硬取消 | OB-Oracle 已测:SID=thread_id,经代理 `KILL QUERY`/`KILL` 可用 |
+| V13 | 方案 A(PyMySQL 置 bit 27)能否连上 OB-Oracle;不能则试方案 B | 驱动选型 | **已测:方案 A 成立** |
+
+### 13.1 V8:流式结果集的空闲断连(OB-Oracle 实测)
+
+环境:OB 4.3.5.4 企业版 Oracle 租户,经 OBProxy;服务端 `net_write_timeout=60`、
+`net_read_timeout=30`(秒)。用 `SSCursor` 读 `CONNECT BY` 生成的 200 字节宽行,读到第一行后
+停顿,再继续读完。
+
+| 行数 | 停顿 | `net_write_timeout` | 结果 |
+|---|---|---|---|
+| 60 000 | 75 秒 | 60(缺省) | 读完——剩余数据全部进了代理/网络缓冲,服务端没被写阻塞 |
+| 200 000 | 75 秒 | 60(缺省) | 先从缓冲读出约 2 万行,随后 `2013 Lost connection` |
+| 200 000 | 130 秒 | 60(缺省) | 同上,排空时 `2013` |
+| 200 000 | 75 秒 | 会话设 300 | **读完** |
+
+结论:**消费方停顿超过 `net_write_timeout`,且结果集大于沿途缓冲时,服务端会断开连接**;
+断开不会立刻被客户端发现,要等缓冲读空才报 `2013`。这不是 OBProxy 自己的空闲超时,而是
+服务端写超时。
+
+处理:
+- OB 两种模式的流式连接,在执行查询前 `SET net_write_timeout = <秒>`,取值不小于该连接的
+  `cursor_max_hold_seconds`(会话控制台)或比对 / 导出 worker 的单段最大处理时间;
+- 流式连接一律设 PyMySQL `read_timeout`,避免网络异常时永远挂住;
+- `2013` 归入“连接断开”,比对按段重试(现有分段重试逻辑),不当作数据差异。
+
+(顺带记录:本次 POC 经两级隧道访问,200 000 × 200 字节约 264 秒,约 160 KB/s,瓶颈在网络。
+所以 §6.1.1 里“客户端哈希可能比库内 `DBMS_CRYPTO` 快”的判断,要在部署现场的网络上重测。)
 
 ---
 
 ## 14. 待你拍板的事项
 
-1. **OB-Oracle 驱动**:同意先 POC 方案 A、失败再 B 吗?采用 B 即新增依赖。
+1. **OB-Oracle 驱动**:POC 已证明方案 A 可行(§4.3.1),建议定为 A、不引入 pyoceanbase。
+   代价是 `oceanbase_oracle_driver` 要继承 PyMySQL 私有类接管字段解码(§4.3.4),PyMySQL 需锁版本。
 2. **11g**:现场有没有 11g。有的话才实现 thick 开关(Instant Client 由部署方放置)。
 3. **新增 `rtrim_char` 比对规则**:改规范与三方实现,还是先只靠 `trim_strings`。
+   (实测 OB-Oracle `CHAR` 返回带补齐空格,这条对跨族比对是实打实的问题。)
 4. **Oracle 前端放开执行**(PR-6):在升 Certified 之前,是否先以 Preview 档放开。
 5. **PR-0 / PR-1 先行**:实例到位前先做这两个纯重构,可以吗。
-6. **测试实例**(评估时列过):Oracle 一套;OB 企业版两个租户;开发机能否直连;只读账号 +
-   可建表 schema;要核的组合与优先模块。
+6. **测试实例**:OB-Oracle 已有一套(4.3.5.4,经 OBProxy,账号名下无表、可读其他业务
+   schema)。还缺:Oracle 一套、OB-MySQL 租户一套;以及一个**可建表**的 schema,用来放类型
+   全集的黄金表(本次 POC 只能用 `DUAL` 上的表达式,没测真实列的 UROWID/NCLOB 等)。
+7. **OB-Oracle 哈希下推缺省关**(§6.1.1):`DBMS_CRYPTO` 约 1 万行/秒,建议缺省走客户端哈希,
+   有大表实测后再定。同意吗。
+8. **错误码 `600` 的内部码解析**(§5):是否接受分类器对 `600` 做锚定前缀解析这一个口子。
 
 ---
 
