@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -152,6 +153,35 @@ def test_stream_select_preserves_connection_error_cause() -> None:
 
     with pytest.raises(AdapterConnectionError) as excinfo:
         list(adapter.execute_select("SELECT 1", {}))
+
+    assert excinfo.value.__cause__ is original
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda a: a.list_schemas(),
+        lambda a: a.list_tables("app"),
+        lambda a: a.list_columns("app", "users"),
+        lambda a: a.list_indexes("app", "users"),
+        lambda a: a.explain("SELECT 1"),
+        lambda a: a.get_table_ddl("app", "users"),
+    ],
+    ids=["schemas", "tables", "columns", "indexes", "explain", "ddl"],
+)
+def test_one_shot_queries_raise_adapter_connection_error_when_unreachable(
+    call: Callable[[MySQLAdapter], object],
+) -> None:
+    # 元数据 / explain / DDL 连不上库时须与执行路径同口径:API 据此回 503 而不是 500
+    original = RuntimeError("driver connect boom")
+    adapter = MySQLAdapter(
+        _conn_info(),
+        cast(SecretStore, _SecretStore("pwd")),
+        pymysql_module=_FailingPyMySQL(original),
+    )
+
+    with pytest.raises(AdapterConnectionError) as excinfo:
+        call(adapter)
 
     assert excinfo.value.__cause__ is original
 
