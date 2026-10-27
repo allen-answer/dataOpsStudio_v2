@@ -380,7 +380,8 @@ jobs:
   #   断言 columns[0].name=='r' && rows[0].values[0]==2
   cold-start:
     name: Cold-start (T6 hard evidence)
-    runs-on: ubuntu-latest
+    # 固定 24.04:ubuntu-latest 已切到 26.04,其 apt 源没有 postgresql-16(launcher 锁定 PG16)
+    runs-on: ubuntu-24.04
     env:
       UV_NO_DEV: "1"
     services:
