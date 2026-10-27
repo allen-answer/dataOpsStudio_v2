@@ -40,6 +40,7 @@ from app.domain.compare_upstream_sql import (
     CONFIDENCE_FLOOR,
     UpstreamEdge,
 )
+from app.domain.dialect import traits_for_name
 
 __all__ = [
     "PK_PLACEHOLDER",
@@ -219,5 +220,5 @@ def combine_confidence(deterministic_min: float, ai_confidence: float) -> float:
 
 def _sqlglot_dialect(dialect: str) -> str | None:
     """方言映射到 sqlglot;未知方言用通用解析器(校验宁松勿崩)。"""
-    mapping = {"mysql": "mysql", "postgresql": "postgres", "dm": "oracle", "oracle": "oracle"}
-    return mapping.get(dialect.lower())
+    dialect_traits = traits_for_name(dialect)
+    return dialect_traits.sqlglot_dialect if dialect_traits is not None else None

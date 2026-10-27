@@ -17,6 +17,17 @@ class UnsupportedDbTypeError(RuntimeError):
     """Datasource db_type has no certified adapter in this build."""
 
 
+# db_type -> 适配器类。各适配器构造签名一致(conn_info, secret_store, **运行参数);
+# 新方言在这里登记一行即可。
+_ADAPTER_CLASSES: dict[DbType, Callable[..., DatabaseAdapter]] = {
+    DbType.MYSQL: MySQLAdapter,
+    DbType.DM: DMAdapter,
+    DbType.POSTGRESQL: PostgresqlAdapter,
+    DbType.ORACLE: OracleAdapter,
+    DbType.DB2: Db2Adapter,
+}
+
+
 def build_database_adapter(
     conn_info: DatasourceConnInfo,
     secret_store: SecretStore,
@@ -35,59 +46,16 @@ def build_database_adapter(
     unsupported errors instead of best-effort driver guesses.
     """
 
-    if conn_info.db_type is DbType.MYSQL:
-        return MySQLAdapter(
-            conn_info,
-            secret_store,
-            cancel_check=cancel_check,
-            column_sink=column_sink,
-            cursor_max_hold_seconds=cursor_max_hold_seconds,
-            statement_timeout_seconds=statement_timeout_seconds,
-            fetch_chunk_size=fetch_chunk_size,
-            connect_timeout_seconds=connect_timeout_seconds,
-        )
-    if conn_info.db_type is DbType.DM:
-        return DMAdapter(
-            conn_info,
-            secret_store,
-            cancel_check=cancel_check,
-            column_sink=column_sink,
-            cursor_max_hold_seconds=cursor_max_hold_seconds,
-            statement_timeout_seconds=statement_timeout_seconds,
-            fetch_chunk_size=fetch_chunk_size,
-            connect_timeout_seconds=connect_timeout_seconds,
-        )
-    if conn_info.db_type is DbType.POSTGRESQL:
-        return PostgresqlAdapter(
-            conn_info,
-            secret_store,
-            cancel_check=cancel_check,
-            column_sink=column_sink,
-            cursor_max_hold_seconds=cursor_max_hold_seconds,
-            statement_timeout_seconds=statement_timeout_seconds,
-            fetch_chunk_size=fetch_chunk_size,
-            connect_timeout_seconds=connect_timeout_seconds,
-        )
-    if conn_info.db_type is DbType.ORACLE:
-        return OracleAdapter(
-            conn_info,
-            secret_store,
-            cancel_check=cancel_check,
-            column_sink=column_sink,
-            cursor_max_hold_seconds=cursor_max_hold_seconds,
-            statement_timeout_seconds=statement_timeout_seconds,
-            fetch_chunk_size=fetch_chunk_size,
-            connect_timeout_seconds=connect_timeout_seconds,
-        )
-    if conn_info.db_type is DbType.DB2:
-        return Db2Adapter(
-            conn_info,
-            secret_store,
-            cancel_check=cancel_check,
-            column_sink=column_sink,
-            cursor_max_hold_seconds=cursor_max_hold_seconds,
-            statement_timeout_seconds=statement_timeout_seconds,
-            fetch_chunk_size=fetch_chunk_size,
-            connect_timeout_seconds=connect_timeout_seconds,
-        )
-    raise UnsupportedDbTypeError(f"Unsupported datasource db_type: {conn_info.db_type.value}")
+    adapter_class = _ADAPTER_CLASSES.get(conn_info.db_type)
+    if adapter_class is None:
+        raise UnsupportedDbTypeError(f"Unsupported datasource db_type: {conn_info.db_type.value}")
+    return adapter_class(
+        conn_info,
+        secret_store,
+        cancel_check=cancel_check,
+        column_sink=column_sink,
+        cursor_max_hold_seconds=cursor_max_hold_seconds,
+        statement_timeout_seconds=statement_timeout_seconds,
+        fetch_chunk_size=fetch_chunk_size,
+        connect_timeout_seconds=connect_timeout_seconds,
+    )
