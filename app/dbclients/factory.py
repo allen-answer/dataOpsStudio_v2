@@ -5,6 +5,7 @@ from collections.abc import Callable
 from app.dbclients.db2_adapter import Db2Adapter
 from app.dbclients.dm_adapter import DMAdapter
 from app.dbclients.mysql_adapter import MySQLAdapter
+from app.dbclients.oceanbase_oracle_adapter import OceanBaseOracleAdapter
 from app.dbclients.oracle_adapter import OracleAdapter
 from app.dbclients.postgresql_adapter import PostgresqlAdapter
 from app.dbclients.protocol import DatabaseAdapter
@@ -25,6 +26,7 @@ _ADAPTER_CLASSES: dict[DbType, Callable[..., DatabaseAdapter]] = {
     DbType.POSTGRESQL: PostgresqlAdapter,
     DbType.ORACLE: OracleAdapter,
     DbType.DB2: Db2Adapter,
+    DbType.OCEANBASE_ORACLE: OceanBaseOracleAdapter,
 }
 
 
