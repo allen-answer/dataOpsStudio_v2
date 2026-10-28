@@ -294,7 +294,7 @@ class DMAdapter(DatabaseAdapter):
         if self._shared_conn is not None:
             yield
             return
-        conn = self._connect()
+        conn = self._connect_or_raise()
         self._shared_conn = conn
         try:
             yield
@@ -503,7 +503,7 @@ class DMAdapter(DatabaseAdapter):
         conn = None
         cursor = None
         try:
-            conn = shared if shared is not None else self._connect()
+            conn = shared if shared is not None else self._connect_or_raise()
             cursor = conn.cursor()
             cursor.execute(sql, params)
             rows = cursor.fetchall()
@@ -527,7 +527,7 @@ class DMAdapter(DatabaseAdapter):
         conn = None
         cursor = None
         try:
-            conn = shared if shared is not None else self._connect()
+            conn = shared if shared is not None else self._connect_or_raise()
             cursor = conn.cursor()
             cursor.execute(sql, params)
             return [
@@ -565,6 +565,18 @@ class DMAdapter(DatabaseAdapter):
             (schema, table),
         )
         return {str(row["name"]) for row in rows}
+
+    def _connect_or_raise(self) -> Any:
+        """一次性小查询(元数据 / explain / DDL)的建连:连不上统一抛 AdapterConnectionError。
+
+        与 _stream_select 同口径,API 据此回 503 metadata_probe_failed、worker 记
+        connection_failed;此前裸抛驱动异常,元数据接口落成 500。
+        """
+        try:
+            return self._connect()
+        except Exception as exc:
+            # 保留 cause:排障看原始驱动异常,日志链路有 R5 脱敏兜底
+            raise AdapterConnectionError("adapter connection failed") from exc
 
     def _connect(self) -> Any:
         dm = self._load_dm()
