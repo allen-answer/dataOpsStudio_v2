@@ -356,10 +356,14 @@ class ActiveConsoleResultSetsLike(Protocol):
     def active_result_set_ids(self) -> frozenset[str]: ...
 
 
-class DatabaseAdapterLike(Protocol):
-    def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]: ...
+class WriteCapableAdapterLike(Protocol):
+    """capabilities.execute_write 为真的适配器(写语句链路专用,不进 DatabaseAdapterLike)。"""
 
     def execute_write(self, sql: str, params: dict[str, Any]) -> WriteResult: ...
+
+
+class DatabaseAdapterLike(Protocol):
+    def execute_select(self, sql: str, params: dict[str, object]) -> Iterable[Row]: ...
 
     # metadata_sync 用:遍历库结构。适配器本就实现了这三个方法(元数据接口在用),
     # 这里补进 Protocol 让 worker 侧也能类型安全地调用。
@@ -982,7 +986,7 @@ class WorkerRunner:
         if not getattr(getattr(adapter, "capabilities", None), "execute_write", False):
             raise OperationPolicyDeniedError("datasource adapter does not support write statements")
         self._check_cancel(job.id)
-        outcome = adapter.execute_write(classified.sql, params)
+        outcome = cast(WriteCapableAdapterLike, adapter).execute_write(classified.sql, params)
         affected_rows = outcome.affected_rows if classified.kind is SqlStatementKind.DML else None
         logger.info(
             "sql write statement executed",

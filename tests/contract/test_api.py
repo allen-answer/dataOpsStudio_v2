@@ -508,9 +508,10 @@ def test_sql_execute_enqueues_write_statement_when_allow_dml_is_on() -> None:
     # 写语句不做限行 / 分页分析
     assert "pagination_mode" not in payload
     audit = next(audit for audit in services.audits if audit["action"] == "sql_write")
-    assert audit["detail"]["statement_kind"] == "dml"
-    assert audit["detail"]["environment"] == "sandbox"
-    assert "UPDATE" not in str(audit["detail"])
+    detail = cast(dict[str, object], audit["detail"])
+    assert detail["statement_kind"] == "dml"
+    assert detail["environment"] == "sandbox"
+    assert "UPDATE" not in str(detail)
 
 
 def test_sql_execute_enqueues_ddl_statement() -> None:
@@ -562,8 +563,9 @@ def test_sql_execute_accepts_confirmed_prod_write() -> None:
 
     assert response.status_code == 202
     audit = next(audit for audit in services.audits if audit["action"] == "sql_write")
-    assert audit["detail"]["confirmed"] is True
-    assert audit["detail"]["environment"] == "prod"
+    detail = cast(dict[str, object], audit["detail"])
+    assert detail["confirmed"] is True
+    assert detail["environment"] == "prod"
 
 
 def test_sql_execute_prod_select_needs_no_confirmation() -> None:
