@@ -392,6 +392,8 @@ class PostgresJobBackend(JobBackend):
                   AND kind <> 'workflow_run'
                   AND last_heartbeat < now() - (:timeout_seconds * interval '1 second')
                   AND retry_count < :max_retries
+                  -- 写语句 job(DML / DDL)可能已在业务库提交,重排会重复执行:只判失败。
+                  AND COALESCE(payload->>'sql_write', 'false') <> 'true'
                 ORDER BY last_heartbeat ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT :limit

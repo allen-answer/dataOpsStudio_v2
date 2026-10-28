@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from enum import StrEnum
 
 
 class SqlGuardError(ValueError):
@@ -54,6 +56,109 @@ def validate_readonly_sql(sql: str) -> str:
         raise SqlGuardError("SQL contains forbidden write/control tokens")
 
     return stripped
+
+
+class SqlStatementKind(StrEnum):
+    """SQL 工作台可执行语句的分类。QUERY 走只读查询链路,DML/DDL 走写执行链路。"""
+
+    QUERY = "query"
+    DML = "dml"
+    DDL = "ddl"
+
+
+# 写语句白名单:按首关键字判定。GRANT/REVOKE/CALL/EXECUTE/LOCK/事务控制等仍拒绝。
+_DML_VERBS = frozenset({"insert", "update", "delete", "merge"})
+_DDL_VERBS = frozenset({"create", "alter", "drop", "truncate"})
+_WHERE_RE = re.compile(r"\bwhere\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ClassifiedSql:
+    """`classify_executable_sql` 的结果。
+
+    sql:        单条语句,已去掉首部注释与末尾分号(Oracle 驱动遇末尾分号报 ORA-00911)。
+    verb:       首关键字小写(select / with / insert / update / ... / truncate)。
+    missing_where: UPDATE / DELETE 不带 WHERE(整表改 / 删),供前端标红、审计留痕。
+    """
+
+    sql: str
+    kind: SqlStatementKind
+    verb: str
+    missing_where: bool = False
+
+    @property
+    def is_write(self) -> bool:
+        return self.kind is not SqlStatementKind.QUERY
+
+
+def classify_executable_sql(sql: str) -> ClassifiedSql:
+    """SQL 工作台执行入口的校验:SELECT/WITH 走只读 guard,DML/DDL 单语句放行。
+
+    写语句是否真能执行由调用方再按数据源 operation_policy.allow_dml 判定;
+    这里只做语句形态校验。错误信息同样不得包含 SQL 原文。
+    """
+
+    stripped = _strip_leading_comments(sql).strip()
+    if not stripped:
+        raise SqlGuardError("SQL is empty")
+    first = _FIRST_TOKEN_RE.match(stripped)
+    verb = first.group(0).lower() if first is not None else ""
+    if verb in {"select", "with"}:
+        return ClassifiedSql(sql=validate_readonly_sql(sql), kind=SqlStatementKind.QUERY, verb=verb)
+    if verb in _DML_VERBS:
+        kind = SqlStatementKind.DML
+    elif verb in _DDL_VERBS:
+        kind = SqlStatementKind.DDL
+    else:
+        raise SqlGuardError(
+            "Only SELECT/WITH/INSERT/UPDATE/DELETE/MERGE/CREATE/ALTER/DROP/TRUNCATE "
+            "statements are allowed"
+        )
+    statements = _split_semicolon_statements(stripped)
+    if len(statements) != 1:
+        raise SqlGuardError("Multiple SQL statements are not allowed")
+    statement = statements[0]
+    missing_where = verb in {"update", "delete"} and not _WHERE_RE.search(
+        _blank_literals_and_comments(statement)
+    )
+    return ClassifiedSql(sql=statement, kind=kind, verb=verb, missing_where=missing_where)
+
+
+def _blank_literals_and_comments(sql: str) -> str:
+    """把字符串字面量、引号标识符与注释替换成空格,只留语句骨架供关键字判定。"""
+
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(sql):
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < len(sql) else ""
+        if quote is not None:
+            if ch == quote and not (quote != "`" and _is_escaped(sql, i)):
+                quote = None
+            out.append(" ")
+            i += 1
+            continue
+        if ch == "-" and nxt == "-":
+            newline = sql.find("\n", i)
+            end = len(sql) if newline < 0 else newline
+            out.append(" " * (end - i))
+            i = end
+            continue
+        if ch == "/" and nxt == "*":
+            close = sql.find("*/", i + 2)
+            end = len(sql) if close < 0 else close + 2
+            out.append(" " * (end - i))
+            i = end
+            continue
+        if ch in {"'", '"', "`"}:
+            quote = ch
+            out.append(" ")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _strip_leading_comments(sql: str) -> str:

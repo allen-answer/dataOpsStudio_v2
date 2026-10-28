@@ -50,6 +50,10 @@ export interface JobExecutionMetrics {
   effective_sql_hash: string | null
   db_type: string | null
   worker_id: string | null
+  /** 写语句才有:dml / ddl;affected_rows 仅 DML 且驱动报告时有值。 */
+  statement_kind?: 'dml' | 'ddl' | null
+  statement_verb?: string | null
+  affected_rows?: number | null
 }
 
 export interface JobProgressResponse {

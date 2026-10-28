@@ -45,7 +45,13 @@ from app.dbclients.query_limit import apply_database_page, apply_database_row_li
 from app.dbclients.sql_build import limit_clause as _limit_clause
 from app.dbclients.sql_build import quote_alias as _quote_alias
 from app.dbclients.sql_build import quote_identifier as _quote_identifier
-from app.dbclients.sql_guard import validate_readonly_sql
+from app.dbclients.sql_guard import (
+    ClassifiedSql,
+    SqlStatementKind,
+    classify_executable_sql,
+    validate_readonly_sql,
+)
+from app.dbclients.sql_write import WriteResult
 from app.domain.compare import (
     CompareColumn,
     CompareDiffBucket,
@@ -348,6 +354,12 @@ class ActiveConsoleResultSetsLike(Protocol):
     """
 
     def active_result_set_ids(self) -> frozenset[str]: ...
+
+
+class WriteCapableAdapterLike(Protocol):
+    """capabilities.execute_write 为真的适配器(写语句链路专用,不进 DatabaseAdapterLike)。"""
+
+    def execute_write(self, sql: str, params: dict[str, Any]) -> WriteResult: ...
 
 
 class DatabaseAdapterLike(Protocol):
@@ -759,6 +771,18 @@ class WorkerRunner:
         result_set_id = str(payload.get("result_set_id") or job.id)
         console_id = _payload_optional_str(payload, "console_id")
         datasource = self._datasource_loader(datasource_id)
+        # worker 自己重新分类,不信 payload:写语句走单独链路(不限行、不分页、一条一事务)。
+        classified = classify_executable_sql(sql)
+        if classified.is_write:
+            return self._execute_sql_write(
+                job,
+                datasource,
+                classified,
+                params,
+                result_set_id=result_set_id,
+                console_id=console_id,
+                query_started_at=query_started_at,
+            )
         _require_operation_allowed(datasource.operation_policy, "select")
         pagination_mode = _payload_optional_str(payload, "pagination_mode")
         page_offset = _payload_non_negative_int(payload, "page_offset")
@@ -932,6 +956,87 @@ class WorkerRunner:
         self._heartbeat(job.id)
         result_ref = query_result_ref()
         self._write_result_set_catalog(job, result_set_id, result_ref, columns or [], console_id)
+        manifest = self._result_store.get_spool_manifest(result_set_id)
+        return _ExecutionOutcome(
+            result_ref=result_ref,
+            loaded_rows=_manifest_int(manifest, "loaded_rows"),
+        )
+
+    def _execute_sql_write(
+        self,
+        job: Job,
+        datasource: DatasourceConnInfo,
+        classified: ClassifiedSql,
+        params: dict[str, Any],
+        *,
+        result_set_id: str,
+        console_id: str | None,
+        query_started_at: float,
+    ) -> _ExecutionOutcome:
+        """单条 DML / DDL:一条语句一个事务,结果集为一行「语句类型 + 影响行数」。"""
+
+        _require_operation_allowed(datasource.operation_policy, "write")
+        self._write_result_set_streaming(job, result_set_id, [], 0, console_id)
+        adapter = self._adapter_factory(
+            datasource,
+            lambda: self._backend.is_cancel_requested(job.id),
+            lambda columns: None,
+            self._config.sql_spool_batch_size,
+        )
+        if not getattr(getattr(adapter, "capabilities", None), "execute_write", False):
+            raise OperationPolicyDeniedError("datasource adapter does not support write statements")
+        self._check_cancel(job.id)
+        outcome = cast(WriteCapableAdapterLike, adapter).execute_write(classified.sql, params)
+        affected_rows = outcome.affected_rows if classified.kind is SqlStatementKind.DML else None
+        logger.info(
+            "sql write statement executed",
+            job_id=job.id,
+            datasource_id=_payload_datasource_id(job),
+            db_type=datasource.db_type.value,
+            statement_kind=classified.kind.value,
+            statement_verb=classified.verb,
+            missing_where=classified.missing_where,
+            affected_rows=affected_rows,
+        )
+        columns = [
+            Column(name="statement", type=ColumnType.STRING),
+            Column(name="affected_rows", type=ColumnType.INTEGER),
+        ]
+        self._result_store.set_spool_columns(result_set_id, columns)
+        self._flush_batch(
+            job.id,
+            result_set_id,
+            [Row(values=[classified.verb.upper(), affected_rows])],
+        )
+        self._write_result_set_streaming(
+            job,
+            result_set_id,
+            columns,
+            _spool_loaded_rows(self._result_store, result_set_id),
+            console_id,
+        )
+        self._heartbeat(job.id)
+        base_ref = self._result_store.spool_ref(result_set_id)
+        result_ref = base_ref.model_copy(
+            update={
+                "metadata": {
+                    "timings": {
+                        **_adapter_query_timings(adapter),
+                        "worker_total_ms": _elapsed_ms(query_started_at),
+                    },
+                    "execution": {
+                        **_adapter_query_execution(adapter),
+                        "rows_returned": 1,
+                        "statement_kind": classified.kind.value,
+                        "statement_verb": classified.verb,
+                        "affected_rows": affected_rows,
+                        "db_type": datasource.db_type.value,
+                        "worker_id": self._config.worker_id,
+                    },
+                }
+            }
+        )
+        self._write_result_set_catalog(job, result_set_id, result_ref, columns, console_id)
         manifest = self._result_store.get_spool_manifest(result_set_id)
         return _ExecutionOutcome(
             result_ref=result_ref,
@@ -3582,6 +3687,8 @@ def _require_operation_allowed(policy: OperationPolicy, operation: str) -> None:
         raise OperationPolicyDeniedError("select denied by datasource operation_policy")
     if operation == "explain" and not policy.allow_explain:
         raise OperationPolicyDeniedError("explain denied by datasource operation_policy")
+    if operation == "write" and not policy.allow_dml:
+        raise OperationPolicyDeniedError("write denied by datasource operation_policy")
 
 
 class _DatabaseCompareReader:

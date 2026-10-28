@@ -212,7 +212,11 @@ from app.db.models import (
     users,
     workflows,
 )
-from app.dbclients.factory import UnsupportedDbTypeError, build_database_adapter
+from app.dbclients.factory import (
+    UnsupportedDbTypeError,
+    adapter_class_for,
+    build_database_adapter,
+)
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.query_limit import (
     QueryLimitError,
@@ -220,7 +224,12 @@ from app.dbclients.query_limit import (
     supports_ordered_pagination,
 )
 from app.dbclients.sql_build import limit_clause, quote_identifier, sql_literal
-from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
+from app.dbclients.sql_guard import (
+    ClassifiedSql,
+    SqlGuardError,
+    classify_executable_sql,
+    validate_readonly_sql,
+)
 from app.domain.ai import AiContext, AiOptions, ContextItem, EgressLevel, ReasoningMode
 from app.domain.ai_compare_map import (
     MAX_SAMPLE_ROWS,
@@ -1088,14 +1097,22 @@ def execute_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse
     if console_id is not None:
         _console_for_current_user(request, console_id)
     try:
-        sql = validate_readonly_sql(body.sql)
+        classified = classify_executable_sql(body.sql)
     except SqlGuardError as exc:
         logger.info(
             "sql guard rejected statement",
             request_id=request_id_from(request),
             reason=str(exc),
         )
-        raise ApiError(400, "invalid_sql", "Only read-only SELECT/WITH SQL is allowed") from exc
+        raise ApiError(
+            400,
+            "invalid_sql",
+            "Only a single SELECT/WITH, INSERT/UPDATE/DELETE/MERGE or "
+            "CREATE/ALTER/DROP/TRUNCATE statement is allowed",
+        ) from exc
+    if classified.is_write:
+        return _enqueue_sql_write(request, body, row, classified)
+    sql = classified.sql
 
     job_id = new_id()
     result_set_id = new_id()
@@ -1162,6 +1179,110 @@ def execute_sql(body: SqlExecuteRequest, request: Request) -> SqlExecuteResponse
         resource_id=job_id,
         result="accepted",
         detail={"datasource_id": body.datasource_id},
+    )
+    return SqlExecuteResponse(job_id=job_id, result_set_id=result_set_id)
+
+
+def _enqueue_sql_write(
+    request: Request,
+    body: SqlExecuteRequest,
+    row: RowMapping,
+    classified: ClassifiedSql,
+) -> SqlExecuteResponse:
+    """单条 DML / DDL 入队。闸门:适配器支持 + allow_dml 已开 + prod 已二次确认。
+
+    worker 侧会重新分类并再查 allow_dml(权威);这里先挡,避免无谓入队。
+    """
+    services = services_from(request)
+    user = current_user_from(request)
+    db_type = DbType(str(row["db_type"]))
+    adapter_class = adapter_class_for(db_type)
+    capabilities = getattr(adapter_class, "capabilities", None)
+    if capabilities is None or not capabilities.execute_write:
+        raise ApiError(
+            400,
+            "sql_write_unsupported",
+            "This datasource type does not support write statements",
+        )
+    policy = OperationPolicy.model_validate(row["operation_policy"] or {})
+    if not policy.allow_dml:
+        raise ApiError(
+            403,
+            "sql_write_not_allowed",
+            "Datasource operation policy denies INSERT/UPDATE/DELETE and DDL",
+        )
+    environment = str(row["environment"] or "")
+    if environment == "prod" and not body.confirm_write:
+        raise ApiError(
+            409,
+            "sql_write_confirmation_required",
+            "Write statements on a prod datasource need explicit confirmation",
+            extra={
+                "statement_kind": classified.kind.value,
+                "statement_verb": classified.verb,
+                "missing_where": classified.missing_where,
+            },
+        )
+
+    console_id = body.console_id
+    job_id = new_id()
+    result_set_id = new_id()
+    sql_hash = _sql_hash(classified.sql)
+    job = Job(
+        id=job_id,
+        kind=JobKind.SQL_QUERY,
+        status=JobStatus.PENDING,
+        owner_user_id=user.id,
+        project_id=str(row["project_id"]),
+        datasource_ids=[body.datasource_id],
+        priority=0,
+        timeout_seconds=300,
+        resource_profile=ResourceProfile(),
+        audit_id=new_id(),
+        payload={
+            "datasource_id": body.datasource_id,
+            "sql": classified.sql,
+            "sql_hash": sql_hash,
+            "params": body.params,
+            "result_set_id": result_set_id,
+            "console_id": console_id,
+            "page_size": body.page_size,
+            "max_result_rows": body.effective_max_result_rows,
+            "max_rows": body.effective_max_result_rows,
+            "db_type": str(row["db_type"]),
+            # 卡死回收不重排(jobbackend 按此键跳过 requeue):写语句可能已提交。
+            "sql_write": True,
+            "statement_kind": classified.kind.value,
+            "statement_verb": classified.verb,
+        },
+    )
+    _create_result_set_placeholder(
+        services,
+        result_set_id=result_set_id,
+        job_id=job_id,
+        console_id=console_id,
+    )
+    if console_id is not None:
+        _evict_console_resultsets(services, console_id)
+    services.job_backend.enqueue(job)
+    _audit_business(
+        services,
+        request,
+        user_id=user.id,
+        project_id=str(row["project_id"]),
+        action="sql_write",
+        resource_type="job",
+        resource_id=job_id,
+        result="accepted",
+        detail={
+            "datasource_id": body.datasource_id,
+            "environment": environment,
+            "statement_kind": classified.kind.value,
+            "statement_verb": classified.verb,
+            "missing_where": classified.missing_where,
+            "confirmed": body.confirm_write,
+            "sql_hash": sql_hash,
+        },
     )
     return SqlExecuteResponse(job_id=job_id, result_set_id=result_set_id)
 
@@ -10787,6 +10908,9 @@ def _job_execution_metrics(
         effective_sql_hash=_dict_str(execution, "effective_sql_hash"),
         db_type=_dict_str_or_payload(execution, payload, "db_type"),
         worker_id=_row_optional_str(row, "worker_id"),
+        statement_kind=_dict_str_or_payload(execution, payload, "statement_kind"),
+        statement_verb=_dict_str_or_payload(execution, payload, "statement_verb"),
+        affected_rows=_dict_int(execution, "affected_rows"),
     )
 
 

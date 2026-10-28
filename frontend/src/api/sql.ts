@@ -10,6 +10,8 @@ export interface SqlExecuteRequest {
   max_result_rows?: number
   /** @deprecated Compatibility with servers/jobs predating max_result_rows. */
   max_rows?: number
+  /** 写语句打到 prod 数据源时,用户已二次确认(否则后端 409 sql_write_confirmation_required)。 */
+  confirm_write?: boolean
 }
 
 export interface SqlConsole {
@@ -118,6 +120,7 @@ export function executeSql(req: SqlExecuteRequest): Promise<SqlExecuteResponse> 
     page_size: req.page_size,
     max_result_rows: req.max_result_rows,
     max_rows: req.max_rows,
+    confirm_write: req.confirm_write ?? false,
   })
 }
 

@@ -40,8 +40,8 @@ export interface DatasourceCapabilities {
 
 /**
  * Datasource operation policy(8 个 allow_* 开关)。
- * 源:app/domain/datasource.py OperationPolicy。默认仅 allow_select=true,其余 false。
- * 2.0.0 仅 allow_select / allow_explain 真生效,其余先落库供 2.1+ 复用。
+ * 源:app/domain/datasource.py OperationPolicy。默认 allow_select / allow_explain 开,其余 false。
+ * 已生效:allow_select / allow_explain / allow_dml,其余先落库供 2.1+ 复用。
  */
 export interface OperationPolicy {
   allow_select: boolean
@@ -52,6 +52,8 @@ export interface OperationPolicy {
   allow_schema_save: boolean
   allow_scenario_write: boolean
   allow_record_task: boolean
+  /** SQL 工作台执行 DML(INSERT/UPDATE/DELETE/MERGE)与 DDL(CREATE/ALTER/DROP/TRUNCATE)。 */
+  allow_dml: boolean
 }
 
 /** 后端默认值(app/domain/datasource.py):allow_select + allow_explain 开。 */
@@ -64,6 +66,7 @@ export const DEFAULT_OPERATION_POLICY: OperationPolicy = {
   allow_schema_save: false,
   allow_scenario_write: false,
   allow_record_task: false,
+  allow_dml: false,
 }
 
 export interface DatasourceListItem {

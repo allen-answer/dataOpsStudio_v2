@@ -20,6 +20,7 @@ from structlog.testing import capture_logs
 from app.dbclients.factory import UnsupportedDbTypeError
 from app.dbclients.mysql_adapter import MySQLAdapter, QueryCancelledError, QueryTimeoutError
 from app.dbclients.protocol import AdapterConnectionError
+from app.dbclients.sql_write import WriteResult
 from app.domain.compare import (
     CompareColumn,
     CompareHashExecutionMode,
@@ -461,6 +462,113 @@ def test_worker_runs_sql_explain_to_spool_and_completes() -> None:
     assert backend.completed == [("job-1", ResultRef(backend="local_fs", uri="spool/rs-1"))]
     assert catalog.completed[-1]["loaded_rows"] == 1
     assert catalog.completed[-1]["console_id"] == "console-1"
+
+
+def test_worker_executes_dml_once_and_reports_affected_rows() -> None:
+    job = _make_job(
+        payload={
+            "sql": "UPDATE users SET active = 0 WHERE id = 1;",
+            "result_set_id": "rs-write",
+            "console_id": "console-1",
+            "sql_write": True,
+        }
+    )
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    catalog = _FakeResultSetCatalog()
+    adapter = _FakeAdapter([])
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(
+            datasource_id, operation_policy=OperationPolicy(allow_dml=True)
+        ),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=10),
+        catalog,
+    )
+
+    assert runner.run_once() is True
+
+    # 写语句不套限行、不分页,末尾分号已去掉,只执行一次。
+    assert adapter.write_calls == [("UPDATE users SET active = 0 WHERE id = 1", {})]
+    assert adapter.execute_select_calls == 0
+    assert result_store.columns_by_result_set["rs-write"] == [
+        Column(name="statement", type=ColumnType.STRING),
+        Column(name="affected_rows", type=ColumnType.INTEGER),
+    ]
+    assert result_store.rows_by_result_set["rs-write"] == [Row(values=["UPDATE", 3])]
+    assert backend.failed == []
+    execution = backend.completed[0][1].metadata["execution"]
+    assert execution["statement_kind"] == "dml"
+    assert execution["statement_verb"] == "update"
+    assert execution["affected_rows"] == 3
+    assert catalog.completed[-1]["console_id"] == "console-1"
+
+
+def test_worker_ddl_result_has_no_affected_rows() -> None:
+    job = _make_job(payload={"sql": "CREATE TABLE t_new (id INT)", "result_set_id": "rs-ddl"})
+    backend = _FakeBackend([job])
+    result_store = _FakeResultStore()
+    adapter = _FakeAdapter([])
+    adapter.write_affected_rows = 0
+    runner = WorkerRunner(
+        backend,
+        result_store,
+        lambda datasource_id: _conn_info(
+            datasource_id, operation_policy=OperationPolicy(allow_dml=True)
+        ),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=10),
+    )
+
+    assert runner.run_once() is True
+
+    assert result_store.rows_by_result_set["rs-ddl"] == [Row(values=["CREATE", None])]
+    execution = backend.completed[0][1].metadata["execution"]
+    assert execution["statement_kind"] == "ddl"
+    assert execution["affected_rows"] is None
+
+
+def test_worker_rejects_write_when_allow_dml_is_off() -> None:
+    # API 闸门被绕过(或策略在入队后被关)时,worker 仍按当前策略拒绝,不碰业务库。
+    job = _make_job(payload={"sql": "DELETE FROM users", "result_set_id": "rs-denied"})
+    backend = _FakeBackend([job])
+    adapter = _FakeAdapter([])
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(datasource_id),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=10),
+    )
+
+    assert runner.run_once() is True
+
+    assert adapter.write_calls == []
+    assert backend.completed == []
+    assert len(backend.failed) == 1
+
+
+def test_worker_rejects_statements_outside_the_write_allowlist() -> None:
+    job = _make_job(payload={"sql": "GRANT SELECT ON users TO someone", "result_set_id": "rs-x"})
+    backend = _FakeBackend([job])
+    adapter = _FakeAdapter([])
+    runner = WorkerRunner(
+        backend,
+        _FakeResultStore(),
+        lambda datasource_id: _conn_info(
+            datasource_id, operation_policy=OperationPolicy(allow_dml=True)
+        ),
+        _adapter_factory(adapter),
+        WorkerRunnerConfig(worker_id="worker-1", sql_spool_batch_size=10),
+    )
+
+    assert runner.run_once() is True
+
+    assert adapter.write_calls == []
+    assert adapter.execute_select_calls == 0
+    assert len(backend.failed) == 1
 
 
 def test_workflow_sql_query_completion_persists_safe_output_metadata() -> None:
@@ -2337,6 +2445,8 @@ class _FakeAdapter:
         self.test_connection_calls = 0
         self.execute_select_calls = 0
         self.explain_calls = 0
+        self.write_calls: list[tuple[str, dict[str, Any]]] = []
+        self.write_affected_rows: int | None = 3
         self.last_server_version = "MySQL 8.0.test"
 
     def with_column_sink(self, column_sink: Callable[[list[Column]], None]) -> _FakeAdapter:
@@ -2354,6 +2464,10 @@ class _FakeAdapter:
                 self._column_sink(self._columns)
         rows = _filter_fake_compare_rows(sql, self._rows)
         yield from rows
+
+    def execute_write(self, sql: str, params: dict[str, Any]) -> WriteResult:
+        self.write_calls.append((sql, params))
+        return WriteResult(affected_rows=self.write_affected_rows)
 
     def explain(self, sql: str) -> PlanNode:
         self.explain_calls += 1

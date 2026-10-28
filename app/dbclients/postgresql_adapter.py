@@ -15,6 +15,7 @@ from app.dbclients.postgresql_types import (
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.query_timing import QueryTimingRecorder
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
+from app.dbclients.sql_write import WriteResult, disable_autocommit, run_write_statement
 from app.domain.capabilities import AdapterCapabilities
 from app.domain.compare import CompareHashPlan, CompareHashRequest
 from app.domain.datasource import DatasourceConnInfo, DbType
@@ -56,6 +57,7 @@ class PostgresqlAdapter(DatabaseAdapter):
 
     capabilities = AdapterCapabilities(
         execute_select=True,
+        execute_write=True,
         explain=True,
         stream_rows=True,
         # psycopg3 Connection.cancel_safe() 真取消在飞查询(execute() 阻塞窗口),
@@ -126,6 +128,39 @@ class PostgresqlAdapter(DatabaseAdapter):
 
     def stream_rows(self, sql: str) -> Iterator[Row]:
         return self.execute_select(sql, {})
+
+    def execute_write(self, sql: str, params: dict[str, Any]) -> WriteResult:
+        """单条 DML / DDL,一条语句一个事务。
+
+        调用方(worker)已过 `classify_executable_sql` 并按 operation_policy.allow_dml 放行;
+        这里不再做只读校验。
+        """
+        self._query_timing.reset()
+        self._query_timing.mark_connect_started()
+        connect_started = time.monotonic()
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            raise AdapterConnectionError("adapter connection failed") from exc
+        self._query_timing.record_connect(_elapsed_ms(connect_started))
+        try:
+            self._apply_statement_timeout(conn)
+            disable_autocommit(conn)
+            self._query_timing.mark_execute_started()
+            execute_started = time.monotonic()
+            result = run_write_statement(
+                conn,
+                sql,
+                params,
+                check_cancel=self._check_cancel,
+                execute=lambda cursor, stmt, bound: self._execute_with_cancel(
+                    conn, cursor, stmt, bound or {}
+                ),
+            )
+            self._query_timing.record_execute(_elapsed_ms(execute_started))
+            return result
+        finally:
+            _safe_close(conn)
 
     def explain(self, sql: str) -> PlanNode:
         guarded_sql = validate_readonly_sql(sql)

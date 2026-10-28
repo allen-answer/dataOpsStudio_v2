@@ -163,6 +163,9 @@ class SqlExecuteRequest(BaseModel):
     max_result_rows: int | None = Field(default=None, ge=1, le=SQL_WORKSPACE_MAX_ROWS)
     # Deprecated compatibility field for clients/jobs created before PR #187 follow-up.
     max_rows: int | None = Field(default=None, ge=1, le=SQL_WORKSPACE_MAX_ROWS)
+    # 写语句(DML / DDL)打到 environment=prod 的数据源时,用户已在前端二次确认。
+    # 缺省 False:prod 写语句返回 409 sql_write_confirmation_required,不入队。
+    confirm_write: bool = False
 
     @model_validator(mode="after")
     def validate_row_limits(self) -> SqlExecuteRequest:
@@ -1209,6 +1212,10 @@ class JobExecutionMetrics(BaseModel):
     effective_sql_hash: str | None = None
     db_type: str | None = None
     worker_id: str | None = None
+    # 写语句(DML / DDL)才有:statement_kind = dml / ddl,affected_rows 仅 DML 且驱动报告时有值。
+    statement_kind: str | None = None
+    statement_verb: str | None = None
+    affected_rows: int | None = None
 
 
 class JobProgressResponse(BaseModel):

@@ -7,9 +7,16 @@ from app.dbclients.mysql_adapter import (
     QueryTimeoutError,
 )
 from app.dbclients.protocol import DatabaseAdapter
-from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
+from app.dbclients.sql_guard import (
+    ClassifiedSql,
+    SqlGuardError,
+    SqlStatementKind,
+    classify_executable_sql,
+    validate_readonly_sql,
+)
 
 __all__ = [
+    "ClassifiedSql",
     "DMAdapter",
     "DMAdapterError",
     "DatabaseAdapter",
@@ -19,5 +26,7 @@ __all__ = [
     "QueryCancelledError",
     "QueryTimeoutError",
     "SqlGuardError",
+    "SqlStatementKind",
+    "classify_executable_sql",
     "validate_readonly_sql",
 ]
