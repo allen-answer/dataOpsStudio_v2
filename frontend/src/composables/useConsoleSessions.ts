@@ -25,9 +25,8 @@ import {
   type StatementSessionBlock,
 } from '../api/sessions'
 import { ApiError } from '../api/types'
+import { sessionConsoleFallback } from '../utils/datasourceCapabilities'
 
-/** 与后端 `app/broker/wiring.py:SESSION_CAPABLE_DB_TYPES` 同口径。 */
-export const SESSION_CAPABLE_DB_TYPES: ReadonlySet<string> = new Set(['mysql', 'dm'])
 
 export interface ConsoleSessionState {
   sessionId: string | null
@@ -75,7 +74,11 @@ export interface UseConsoleSessions {
   isTakenOver: (consoleId: string | null) => boolean
   /** 会话已不可续用:session_lost / connect_failed / closed。 */
   isLost: (consoleId: string | null) => boolean
-  ensureSession: (consoleId: string, dbType: string | null) => Promise<ConsoleSessionState | null>
+  ensureSession: (
+    consoleId: string,
+    dbType: string | null,
+    sessionCapable?: boolean,
+  ) => Promise<ConsoleSessionState | null>
   reattach: (consoleId: string, dbType: string | null) => Promise<ConsoleSessionState | null>
   observe: (consoleId: string) => Promise<void>
   applySessionBlock: (consoleId: string, block: StatementSessionBlock) => void
@@ -172,9 +175,12 @@ export function useConsoleSessions(): UseConsoleSessions {
   async function ensureSession(
     consoleId: string,
     dbType: string | null,
+    sessionCapable?: boolean,
   ): Promise<ConsoleSessionState | null> {
     if (routing.value === 'disabled') return null
-    if (dbType && !SESSION_CAPABLE_DB_TYPES.has(dbType)) {
+    // 以后端下发的 capabilities.session_console 为准;老后端不给时按 db_type 回落
+    const capable = sessionCapable ?? (dbType ? sessionConsoleFallback(dbType) : true)
+    if (!capable) {
       slot(consoleId).unsupported = true
       return null
     }

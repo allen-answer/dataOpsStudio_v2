@@ -217,7 +217,16 @@ interface FormState {
   password: string
   environment: string
   operation_policy: OperationPolicy
+  // OceanBase 连接参数(落 extra,后端 app/domain/datasource_extra.py 校验)
+  ob_tenant: string
+  ob_cluster: string
+  ob_access_mode: ObAccessMode
 }
+
+type ObAccessMode = 'proxy' | 'direct'
+const OB_ACCESS_MODES: ObAccessMode[] = ['proxy', 'direct']
+// OBProxy 缺省 2883,直连 observer 缺省 2881
+const OB_DIRECT_PORT = 2881
 
 const initialForm: FormState = {
   name: '',
@@ -229,6 +238,22 @@ const initialForm: FormState = {
   password: '',
   environment: 'sandbox',
   operation_policy: { ...DEFAULT_OPERATION_POLICY },
+  ob_tenant: '',
+  ob_cluster: '',
+  ob_access_mode: 'proxy',
+}
+
+const isOceanBase = computed(() => form.db_type === 'oceanbase_oracle')
+// 用户名已写成 user@tenant#cluster 时,租户 / 集群不再必填(后端同口径)
+const obLoginPrebuilt = computed(() => form.username.includes('@'))
+
+function obExtra(): Record<string, string> {
+  const extra: Record<string, string> = { access_mode: form.ob_access_mode }
+  if (form.ob_tenant.trim()) extra.tenant = form.ob_tenant.trim()
+  if (form.ob_access_mode === 'proxy' && form.ob_cluster.trim()) {
+    extra.cluster = form.ob_cluster.trim()
+  }
+  return extra
 }
 
 const form = reactive<FormState>({
@@ -241,24 +266,46 @@ const policyOpen = ref(false) // 权限折叠面板默认收起
 // ─── inline 必填校验 ───────────────────────────────────────
 // 提交时静默无反应是 UX 走查 nit:点提交后缺失字段要逐项红框 + 行内提示。
 // 校验在提交时跑一次(submitAttempted 置位);此后用户修字段实时清错。
-type RequiredField = 'name' | 'host' | 'username' | 'password'
+type RequiredField = 'name' | 'host' | 'username' | 'password' | 'ob_tenant' | 'ob_cluster'
 const fieldErrors = reactive<Record<RequiredField, boolean>>({
   name: false,
   host: false,
   username: false,
   password: false,
+  ob_tenant: false,
+  ob_cluster: false,
 })
 const submitAttempted = ref(false)
 
 function isFieldMissing(f: RequiredField): boolean {
   // 编辑态密码可留空(= 不改);新建态密码必填。
   if (f === 'password') return !isEditing.value && !form.password
+  // OceanBase:租户必填,经 OBProxy 时集群必填;用户名已是完整登录名时都可省
+  if (f === 'ob_tenant') {
+    return isOceanBase.value && !obLoginPrebuilt.value && !form.ob_tenant.trim()
+  }
+  if (f === 'ob_cluster') {
+    return (
+      isOceanBase.value &&
+      !obLoginPrebuilt.value &&
+      form.ob_access_mode === 'proxy' &&
+      !form.ob_cluster.trim()
+    )
+  }
   return !String(form[f]).trim()
 }
 
 function validateRequired(): boolean {
   let ok = true
-  for (const f of ['name', 'host', 'username', 'password'] as RequiredField[]) {
+  const fields: RequiredField[] = [
+    'name',
+    'host',
+    'username',
+    'password',
+    'ob_tenant',
+    'ob_cluster',
+  ]
+  for (const f of fields) {
     const missing = isFieldMissing(f)
     fieldErrors[f] = missing
     if (missing) ok = false
@@ -273,7 +320,17 @@ function clearFieldErrors(): void {
 
 // 提交尝试后,用户改动字段时实时清掉对应字段的红框。
 watch(
-  () => [form.name, form.host, form.username, form.database, form.password],
+  () => [
+    form.name,
+    form.host,
+    form.username,
+    form.database,
+    form.password,
+    form.db_type,
+    form.ob_tenant,
+    form.ob_cluster,
+    form.ob_access_mode,
+  ],
   () => {
     if (submitAttempted.value) validateRequired()
   },
@@ -319,14 +376,26 @@ const DB_PORT_DEFAULTS: Record<DbType, number> = {
   oracle: 1521,
   dm: 5236,
   db2: 50000,
+  oceanbase_oracle: 2883, // 经 OBProxy;直连 observer 见 OB_DIRECT_PORT
 }
-const KNOWN_DEFAULT_PORTS = new Set(Object.values(DB_PORT_DEFAULTS))
+const KNOWN_DEFAULT_PORTS = new Set([...Object.values(DB_PORT_DEFAULTS), OB_DIRECT_PORT])
 watch(
   () => form.db_type,
   (next) => {
     if (KNOWN_DEFAULT_PORTS.has(Number(form.port))) {
-      form.port = DB_PORT_DEFAULTS[next]
+      form.port =
+        next === 'oceanbase_oracle' && form.ob_access_mode === 'direct'
+          ? OB_DIRECT_PORT
+          : DB_PORT_DEFAULTS[next]
     }
+  },
+)
+// OceanBase 切换访问方式时,端口仍是缺省值才跟着切(不覆盖手填端口)
+watch(
+  () => form.ob_access_mode,
+  (mode) => {
+    if (!isOceanBase.value || !KNOWN_DEFAULT_PORTS.has(Number(form.port))) return
+    form.port = mode === 'direct' ? OB_DIRECT_PORT : DB_PORT_DEFAULTS.oceanbase_oracle
   },
 )
 
@@ -365,6 +434,10 @@ async function openEditModal(ds: DatasourceListItem): Promise<void> {
     form.environment = detail.environment || 'unknown'
     form.password = '' // 留空 = 不改密码
     form.operation_policy = { ...DEFAULT_OPERATION_POLICY, ...detail.operation_policy }
+    const extra = detail.extra ?? {}
+    form.ob_tenant = typeof extra.tenant === 'string' ? extra.tenant : ''
+    form.ob_cluster = typeof extra.cluster === 'string' ? extra.cluster : ''
+    form.ob_access_mode = extra.access_mode === 'direct' ? 'direct' : 'proxy'
   } catch (e) {
     formError.value = errorMessage(e)
   } finally {
@@ -389,7 +462,7 @@ const createMutation = useMutation({
       database: form.database.trim() || null,
       password: form.password,
       environment: form.environment || 'sandbox',
-      extra: {},
+      extra: isOceanBase.value ? obExtra() : {},
       operation_policy: { ...form.operation_policy },
     }),
   onSuccess: async () => {
@@ -413,6 +486,8 @@ const updateMutation = useMutation({
       ...(form.password ? { password: form.password } : {}),
       environment: form.environment || 'unknown',
       operation_policy: { ...form.operation_policy },
+      // 只有 OceanBase 的连接参数由本表单维护;其余类型不下发 extra(保留存量键不动)
+      ...(isOceanBase.value ? { extra: obExtra() } : {}),
     })
   },
   onSuccess: async () => {
@@ -533,6 +608,8 @@ const DB_TYPE_STYLE: Record<DbType, string> = {
     'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300 border border-amber-200/60 dark:border-amber-500/30',
   db2:
     'bg-teal-50 text-teal-700 dark:bg-teal-500/15 dark:text-teal-300 border border-teal-200/60 dark:border-teal-500/30',
+  oceanbase_oracle:
+    'bg-violet-50 text-violet-700 dark:bg-violet-500/15 dark:text-violet-300 border border-violet-200/60 dark:border-violet-500/30',
 }
 const DB_TYPE_LABEL: Record<DbType, string> = {
   mysql: 'MySQL',
@@ -540,6 +617,7 @@ const DB_TYPE_LABEL: Record<DbType, string> = {
   oracle: 'Oracle',
   dm: 'DM',
   db2: 'DB2',
+  oceanbase_oracle: 'OceanBase (Oracle)',
 }
 
 // ─── EnvBadge ──────────────────────────────────────────────
@@ -561,7 +639,7 @@ function envBadgeClass(env: string | undefined): string {
   return 'bg-slate-50 text-slate-600 dark:bg-slate-500/15 dark:text-slate-300 border border-slate-200/60 dark:border-slate-500/30'
 }
 
-const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
+const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'oceanbase_oracle', 'dm', 'db2']
 </script>
 
 <template>
@@ -916,16 +994,74 @@ const DB_TYPES: DbType[] = ['mysql', 'postgresql', 'oracle', 'dm', 'db2']
           <p v-if="fieldErrors.username" class="field-error-text">
             {{ t('datasources.field_required') }}
           </p>
+          <p v-else-if="isOceanBase" class="text-xs chrome-text-muted" data-testid="ob-username-hint">
+            {{ t('datasources.field_ob_username_hint') }}
+          </p>
         </div>
 
-        <!-- 数据库名 -->
+        <!-- OceanBase:访问方式 + 租户 + 集群(落 extra) -->
+        <template v-if="isOceanBase">
+          <div class="space-y-1.5">
+            <label class="form-label">{{ t('datasources.field_ob_access_mode') }}</label>
+            <select
+              v-model="form.ob_access_mode"
+              class="chrome-input w-full"
+              data-testid="ob-access-mode"
+              :disabled="submitting"
+            >
+              <option v-for="mode in OB_ACCESS_MODES" :key="mode" :value="mode">
+                {{ t(`datasources.ob_access_mode_${mode}`) }}
+              </option>
+            </select>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div class="space-y-1.5">
+              <label class="form-label">{{ t('datasources.field_ob_tenant') }}</label>
+              <input
+                v-model="form.ob_tenant"
+                type="text"
+                class="chrome-input w-full"
+                data-testid="ob-tenant"
+                :class="{ 'field-invalid': fieldErrors.ob_tenant }"
+                :placeholder="t('datasources.field_ob_tenant_placeholder')"
+                :disabled="submitting"
+                autocomplete="off"
+              />
+              <p v-if="fieldErrors.ob_tenant" class="field-error-text">
+                {{ t('datasources.field_required') }}
+              </p>
+            </div>
+            <div v-if="form.ob_access_mode === 'proxy'" class="space-y-1.5">
+              <label class="form-label">{{ t('datasources.field_ob_cluster') }}</label>
+              <input
+                v-model="form.ob_cluster"
+                type="text"
+                class="chrome-input w-full"
+                data-testid="ob-cluster"
+                :class="{ 'field-invalid': fieldErrors.ob_cluster }"
+                :placeholder="t('datasources.field_ob_cluster_placeholder')"
+                :disabled="submitting"
+                autocomplete="off"
+              />
+              <p v-if="fieldErrors.ob_cluster" class="field-error-text">
+                {{ t('datasources.field_required') }}
+              </p>
+            </div>
+          </div>
+        </template>
+
+        <!-- 数据库名(OceanBase Oracle 模式下即登录后切换的 schema) -->
         <div class="space-y-1.5">
           <label class="form-label">{{ t('datasources.field_database') }}</label>
           <input
             v-model="form.database"
             type="text"
             class="chrome-input w-full"
-            :placeholder="t('datasources.field_database_placeholder')"
+            :placeholder="
+              isOceanBase
+                ? t('datasources.field_ob_schema_placeholder')
+                : t('datasources.field_database_placeholder')
+            "
             :disabled="submitting"
             autocomplete="off"
           />

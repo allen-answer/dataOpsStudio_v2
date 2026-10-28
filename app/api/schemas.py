@@ -74,6 +74,22 @@ class DatasourceUpdateRequest(BaseModel):
     operation_policy: OperationPolicy | None = None
 
 
+class DatasourceCapabilities(BaseModel):
+    """后端按适配器能力、会话缝、operation_policy、成熟度算好的只读能力(不连库)。
+
+    前端据此决定执行 / 工具 / 补全 / 会话控制台是否可用,不再硬编码 db_type 白名单。
+    """
+
+    execute: bool
+    explain: bool
+    ddl: bool
+    metadata: bool
+    sql_tools: bool
+    session_console: bool
+    compare_db_hash: bool
+    maturity: Literal["certified", "preview"]
+
+
 class DatasourceResponse(BaseModel):
     id: str
     project_id: str
@@ -86,6 +102,7 @@ class DatasourceResponse(BaseModel):
     environment: str
     extra: dict[str, Any] = Field(default_factory=dict)
     operation_policy: OperationPolicy = Field(default_factory=OperationPolicy)
+    capabilities: DatasourceCapabilities | None = None
 
 
 class DatasourceListItem(BaseModel):
@@ -99,6 +116,7 @@ class DatasourceListItem(BaseModel):
     database: str | None = None
     operation_policy: OperationPolicy = Field(default_factory=OperationPolicy)
     created_at: datetime
+    capabilities: DatasourceCapabilities | None = None
 
 
 class DatasourceReferenceItem(BaseModel):

@@ -38,6 +38,7 @@ from sqlglot import exp
 from sqlglot.errors import ParseError
 from starlette.background import BackgroundTask
 
+from app.api.datasource_capabilities import datasource_capabilities
 from app.api.dependencies import current_user_from, request_id_from, services_from
 from app.api.errors import ApiError
 from app.api.routes.account import consume_recovery_code, verify_user_totp
@@ -285,6 +286,7 @@ from app.domain.compare_upstream_sql import (
 )
 from app.domain.console_session import ConsoleStatementState
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
+from app.domain.datasource_extra import DatasourceExtraError, validate_datasource_extra
 from app.domain.dialect import traits_for_name
 from app.domain.job import Job, JobErrorCode, JobKind, JobStatus
 from app.domain.lineage import (
@@ -807,6 +809,7 @@ def create_datasource(body: DatasourceCreateRequest, request: Request) -> Dataso
     services = services_from(request)
     user = current_user_from(request)
     database_name = _optional_stripped(body.database)
+    _require_valid_extra(body.db_type, body.username, body.extra)
     with services.engine.begin() as conn:
         _require_project_access(conn, body.project_id, user.id)
         secret_ref = services.secret_store.store_secret(
@@ -854,6 +857,7 @@ def create_datasource(body: DatasourceCreateRequest, request: Request) -> Dataso
         environment=body.environment,
         extra=body.extra,
         operation_policy=body.operation_policy,
+        capabilities=datasource_capabilities(body.db_type, body.operation_policy),
     )
 
 
@@ -923,6 +927,12 @@ def update_datasource(
             _require_project_access(conn, body.project_id, user.id)
             audit_project_id = body.project_id
 
+        # extra 按合并后的 db_type / username 校验(只改其中一项也要满足 OB 的租户 / 集群要求)
+        _require_valid_extra(
+            body.db_type or DbType(str(row["db_type"])),
+            body.username if body.username is not None else str(row["username"]),
+            body.extra if body.extra is not None else dict(row["capability_profile"] or {}),
+        )
         values: dict[str, object] = {}
         if body.project_id is not None:
             values["project_id"] = body.project_id
@@ -10621,34 +10631,47 @@ def _wait_for_job_terminal(services: ApiServices, job_id: str) -> Job | None:
 
 
 def _datasource_response(row: RowMapping) -> DatasourceResponse:
+    db_type = DbType(str(row["db_type"]))
+    policy = OperationPolicy.model_validate(row["operation_policy"] or {})
     return DatasourceResponse(
         id=str(row["id"]),
         project_id=str(row["project_id"]),
         name=str(row["name"]),
-        db_type=DbType(str(row["db_type"])),
+        db_type=db_type,
         host=str(row["host"]),
         port=int(row["port"]),
         username=str(row["username"]),
         database=_optional_str(row["database_name"]),
         environment=str(row["environment"]),
         extra=dict(row["capability_profile"] or {}),
-        operation_policy=OperationPolicy.model_validate(row["operation_policy"] or {}),
+        operation_policy=policy,
+        capabilities=datasource_capabilities(db_type, policy),
     )
 
 
 def _datasource_list_item(row: RowMapping) -> DatasourceListItem:
+    db_type = DbType(str(row["db_type"]))
+    policy = OperationPolicy.model_validate(row["operation_policy"] or {})
     return DatasourceListItem(
         id=str(row["id"]),
         name=str(row["name"]),
-        db_type=DbType(str(row["db_type"])),
+        db_type=db_type,
         host=str(row["host"]),
         port=int(row["port"]),
         environment=str(row["environment"]),
         environment_verified=bool(row["environment_verified"]),
         database=row["database_name"] if row["database_name"] is not None else None,
-        operation_policy=OperationPolicy.model_validate(row["operation_policy"] or {}),
+        operation_policy=policy,
         created_at=row["created_at"],
+        capabilities=datasource_capabilities(db_type, policy),
     )
+
+
+def _require_valid_extra(db_type: DbType, username: str, extra: dict[str, Any]) -> None:
+    try:
+        validate_datasource_extra(db_type, username, extra)
+    except DatasourceExtraError as exc:
+        raise ApiError(422, "invalid_datasource_extra", str(exc)) from exc
 
 
 def _datasource_test_error_code(job: Job | None) -> DatasourceTestErrorCode:
