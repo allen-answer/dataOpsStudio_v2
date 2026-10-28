@@ -299,10 +299,9 @@ class MySQLAdapter(DatabaseAdapter):
         sql: str,
         params: Sequence[Any] | dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
-        conn = None
+        conn = self._connect_or_raise()
         cursor = None
         try:
-            conn = self._connect()
             cursor = conn.cursor()
             cursor.execute(sql, params)
             rows = cursor.fetchall()
@@ -313,10 +312,9 @@ class MySQLAdapter(DatabaseAdapter):
             _safe_close(conn)
 
     def _query_tuples(self, sql: str) -> list[Sequence[Any]]:
-        conn = None
+        conn = self._connect_or_raise()
         cursor = None
         try:
-            conn = self._connect()
             cursor = conn.cursor()
             cursor.execute(sql)
             return [
@@ -326,6 +324,18 @@ class MySQLAdapter(DatabaseAdapter):
         finally:
             _safe_close(cursor)
             _safe_close(conn)
+
+    def _connect_or_raise(self) -> Any:
+        """一次性小查询(元数据 / explain / DDL)的建连:连不上统一抛 AdapterConnectionError。
+
+        与 _stream_select 同口径,API 据此回 503 metadata_probe_failed、worker 记
+        connection_failed;此前裸抛 PyMySQL OperationalError,元数据接口落成 500。
+        """
+        try:
+            return self._connect()
+        except Exception as exc:
+            # 保留 cause:排障看原始驱动异常,日志链路有 R5 脱敏兜底
+            raise AdapterConnectionError("adapter connection failed") from exc
 
     def _connect(self) -> Any:
         pymysql = self._load_pymysql()
