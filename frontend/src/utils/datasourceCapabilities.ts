@@ -5,7 +5,8 @@ import type { DatasourceCapabilities } from '../api/types'
  * 不再在各页面硬编码 db_type 白名单。
  *
  * 老后端(响应里没有 capabilities)时回落到收敛前的白名单;灰度期保留一版后删除。
- * 回落值必须与后端规则对同一类型给出相同结果,改动任一侧都要同步。
+ * 回落值对应的是“还没有 capabilities 字段的老后端”的行为,所以保持当时的白名单不变;
+ * 之后放开新类型(如 PR-6 的 Oracle / OB-Oracle)只改后端,不改这里。
  */
 const FALLBACK_EXECUTION = new Set(['mysql', 'dm', 'postgresql', 'db2'])
 const FALLBACK_SQL_TOOLS = new Set(['mysql', 'dm', 'postgresql'])

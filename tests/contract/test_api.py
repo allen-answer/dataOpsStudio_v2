@@ -981,9 +981,9 @@ def test_create_oceanbase_oracle_datasource_returns_capabilities() -> None:
     assert response.status_code == 201
     payload = response.json()
     assert payload["extra"] == {"tenant": "t1", "cluster": "c1"}
-    # Preview,执行待 PR-6 拍板;DDL 能力随适配器下发
+    # PR-6:Preview 档放开执行;DDL 能力随适配器下发
     assert payload["capabilities"]["maturity"] == "preview"
-    assert payload["capabilities"]["execute"] is False
+    assert payload["capabilities"]["execute"] is True
     assert payload["capabilities"]["ddl"] is True
 
 
