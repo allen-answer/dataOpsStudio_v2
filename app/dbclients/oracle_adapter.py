@@ -65,6 +65,7 @@ from app.dbclients.oracle_types import (
 from app.dbclients.protocol import AdapterConnectionError, DatabaseAdapter
 from app.dbclients.query_timing import QueryTimingRecorder
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
+from app.dbclients.sql_write import WriteResult, run_write_statement
 from app.domain.capabilities import AdapterCapabilities
 from app.domain.compare import CompareHashPlan, CompareHashRequest
 from app.domain.datasource import DatasourceConnInfo, DbType
@@ -208,6 +209,7 @@ class OracleAdapter(DatabaseAdapter):
 
     capabilities = AdapterCapabilities(
         execute_select=True,
+        execute_write=True,
         # EXPLAIN PLAN 写会话临时表 PLAN_TABLE;另受数据源 allow_oracle_plan_table 闸门
         explain=True,
         stream_rows=True,
@@ -275,6 +277,45 @@ class OracleAdapter(DatabaseAdapter):
 
     def stream_rows(self, sql: str) -> Iterator[Row]:
         return self.execute_select(sql, {})
+
+    def execute_write(self, sql: str, params: dict[str, Any]) -> WriteResult:
+        """单条 DML / DDL,一条语句一个事务。
+
+        调用方(worker)已过 `classify_executable_sql` 并按 operation_policy.allow_dml 放行;
+        这里不再做只读校验。
+        """
+        self._query_timing.reset()
+        self._query_timing.mark_connect_started()
+        connect_started = time.monotonic()
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            raise AdapterConnectionError("adapter connection failed") from exc
+        self._query_timing.record_connect(_elapsed_ms(connect_started))
+        try:
+            self._apply_statement_timeout(conn)
+            self._query_timing.mark_execute_started()
+            execute_started = time.monotonic()
+            result = run_write_statement(
+                conn,
+                sql,
+                params,
+                check_cancel=self._check_cancel,
+                execute=self._execute_write_cursor,
+            )
+            self._query_timing.record_execute(_elapsed_ms(execute_started))
+            return result
+        finally:
+            _safe_close(conn)
+
+    def _execute_write_cursor(self, cursor: Any, sql: str, params: dict[str, Any] | None) -> None:
+        try:
+            if params is None:
+                cursor.execute(sql)
+            else:
+                cursor.execute(sql, params)
+        except Exception as exc:
+            raise self._driver_error("Oracle execute failed", exc) from exc
 
     def explain(self, sql: str) -> PlanNode:
         # EXPLAIN PLAN 会往会话级临时表 PLAN_TABLE 写行;数据源策略显式放开才做。

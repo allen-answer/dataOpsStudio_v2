@@ -254,10 +254,10 @@ export default {
     create_success: 'Created',
     error_missing_field: 'Please fill in all required fields',
     field_required: 'Required',
-    // Permission panel (8 allow_* flags; only SELECT / EXPLAIN are effective in 2.0.0)
+    // Permission panel (allow_* flags; SELECT / EXPLAIN / writes and DDL are effective)
     policy_title: 'Operation permissions',
     policy_hint:
-      'Controls which operations this datasource allows. Only SELECT / EXPLAIN are effective in 2.0.0; the rest are persisted now and wired up in 2.1+.',
+      'Controls which operations this datasource allows. SELECT / EXPLAIN / writes and DDL are effective; the rest are persisted now and wired up in 2.1+.',
     policy_allow_select: 'Allow SELECT queries',
     policy_allow_explain: 'Allow EXPLAIN',
     policy_allow_oracle_plan_table: 'Allow Oracle PLAN_TABLE',
@@ -266,6 +266,8 @@ export default {
     policy_allow_schema_save: 'Allow schema write (create tables)',
     policy_allow_scenario_write: 'Allow scenario data writes',
     policy_allow_record_task: 'Allow auto-creating compare tasks',
+    policy_allow_dml:
+      'Allow writes and DDL (INSERT / UPDATE / DELETE / MERGE, CREATE / ALTER / DROP / TRUNCATE)',
     // Delete
     delete_title: 'Delete datasource',
     delete_confirm: 'Delete datasource "{name}"? This cannot be undone.',
@@ -479,6 +481,21 @@ export default {
     session_cancel_degraded_hint:
       'Server-side cancel is unavailable for this datasource, so cancelling disconnects the session.',
     session_statement_skipped: 'Skipped — an earlier statement in this batch did not start.',
+    // ── Write statements (DML / DDL) ──
+    write_not_allowed:
+      'Writes and DDL are not enabled for this datasource; only queries can run. Turn it on in the datasource operation permissions.',
+    write_batch_stopped: 'Skipped — an earlier statement in this batch did not succeed.',
+    write_confirm_title: 'Confirm running on a production datasource',
+    write_confirm_subtitle:
+      'Datasource "{name}" is marked prod. These statements change data or schema directly; they run one by one and each is committed.',
+    write_confirm_ddl_note: 'On most databases DDL commits implicitly and cannot be rolled back.',
+    write_confirm_missing_where: 'No WHERE clause: affects the whole table',
+    write_confirm_submit: 'Run',
+    write_success_dml: 'Done · {seconds}s · {verb} affected {rows} rows',
+    write_success_dml_unknown: 'Done · {seconds}s · {verb} executed (driver did not report affected rows)',
+    write_success_ddl: 'Done · {seconds}s · {verb} executed',
+    stats_statement: 'Statement',
+    stats_affected_rows: 'Affected rows',
     session_partial_rows: 'Partial result kept: {rows} rows loaded before the interruption.',
     error_code_label: 'Error code: {code}',
     session_page_beyond_loaded:

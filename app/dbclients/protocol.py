@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any, Protocol
 
+from app.dbclients.sql_write import WriteResult
 from app.domain.capabilities import AdapterCapabilities
 from app.domain.compare import CompareHashPlan, CompareHashRequest
 from app.domain.plan import PlanNode
@@ -34,6 +35,10 @@ class DatabaseAdapter(Protocol):
 
     def execute_select(self, sql: str, params: dict[str, Any]) -> Iterator[Row]:
         """流式 SELECT 执行。worker 用 fetchmany 拉,写 spool。"""
+        raise NotImplementedError
+
+    def execute_write(self, sql: str, params: dict[str, Any]) -> WriteResult:
+        """单条 DML / DDL,一条语句一个事务(capabilities.execute_write 为真时可用)。"""
         raise NotImplementedError
 
     def explain(self, sql: str) -> PlanNode:

@@ -336,8 +336,8 @@ watch(
   },
 )
 
-// ─── 8 个 allow_* 开关(顺序 + 文案 + 生效标 按 PRD §3 权限面板)──
-// 2.0.0 仅 SELECT / EXPLAIN 真生效;其余开关旁标 "2.1+"。
+// ─── allow_* 开关(顺序 + 文案 + 生效标 按 PRD §3 权限面板)──
+// SELECT / EXPLAIN / 增删改与 DDL 真生效;其余开关旁标 "2.1+"。
 interface PolicyToggle {
   key: keyof OperationPolicy
   effective: boolean // true = 2.0.0 已生效;false = 标 2.1+
@@ -345,6 +345,7 @@ interface PolicyToggle {
 const POLICY_TOGGLES: PolicyToggle[] = [
   { key: 'allow_select', effective: true },
   { key: 'allow_explain', effective: true },
+  { key: 'allow_dml', effective: true },
   { key: 'allow_oracle_plan_table', effective: false },
   { key: 'allow_dm_explain', effective: false },
   { key: 'allow_schema_import', effective: false },

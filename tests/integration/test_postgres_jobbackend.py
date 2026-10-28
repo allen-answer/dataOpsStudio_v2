@@ -278,6 +278,38 @@ def test_reaper_marks_stale_job_failed_when_retry_budget_exhausted() -> None:
     assert updated.status == JobStatus.FAILED
 
 
+def test_reaper_never_requeues_stale_sql_write_job() -> None:
+    # 写语句 job 可能已在业务库提交:即便还有重试预算也只判失败,不重复执行。
+    engine = _pg_engine_or_skip()
+    owner_id, project_id = _prepare_db(engine)
+    backend = PostgresJobBackend(engine, job_default_max_retries=1)
+    job = _make_job(str(uuid4()), owner_id, project_id).model_copy(
+        update={"payload": {"sql": "DELETE FROM t WHERE id = 1", "sql_write": True}}
+    )
+    backend.enqueue(job)
+    assert backend.claim_next("dead-worker") is not None
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE jobs
+                SET last_heartbeat = now() - interval '10 minutes'
+                WHERE id = :job_id
+                """
+            ),
+            {"job_id": job.id},
+        )
+
+    report = backend.reap_stale_running_jobs(heartbeat_timeout_seconds=1)
+
+    assert report.requeued == 0
+    assert report.failed == 1
+    updated = backend.get_job(job.id)
+    assert updated is not None
+    assert updated.status == JobStatus.FAILED
+    assert updated.retry_count == 0
+
+
 def test_late_complete_after_requeue_is_ignored_by_worker_id_condition() -> None:
     engine = _pg_engine_or_skip()
     owner_id, project_id = _prepare_db(engine)

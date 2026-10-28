@@ -479,6 +479,118 @@ def test_sql_execute_rejects_conflicting_new_and_legacy_safety_limits() -> None:
     assert response.status_code == 422
 
 
+def _write_datasource_row(
+    *, environment: str = "sandbox", allow_dml: bool = True
+) -> dict[str, object]:
+    row = _datasource_row(operation_policy=_policy(allow_dml=allow_dml))
+    row["environment"] = environment
+    return row
+
+
+def _post_sql(services: _Services, body: dict[str, object]) -> Any:
+    app = create_app(services=cast(ApiServices, services))
+    return AsgiClient(app).post("/api/sql/execute", headers=_auth_headers(), json_body=body)
+
+
+def test_sql_execute_enqueues_write_statement_when_allow_dml_is_on() -> None:
+    services = _Services(_FakeEngine([_write_datasource_row(), {"id": "project-1"}]))
+
+    response = _post_sql(
+        services, {"sql": "UPDATE users SET active = 0 WHERE id = 1;", "datasource_id": "ds-1"}
+    )
+
+    assert response.status_code == 202
+    payload = services.job_backend.enqueued[0].payload
+    assert payload["sql"] == "UPDATE users SET active = 0 WHERE id = 1"
+    assert payload["sql_write"] is True
+    assert payload["statement_kind"] == "dml"
+    assert payload["statement_verb"] == "update"
+    # 写语句不做限行 / 分页分析
+    assert "pagination_mode" not in payload
+    audit = next(audit for audit in services.audits if audit["action"] == "sql_write")
+    assert audit["detail"]["statement_kind"] == "dml"
+    assert audit["detail"]["environment"] == "sandbox"
+    assert "UPDATE" not in str(audit["detail"])
+
+
+def test_sql_execute_enqueues_ddl_statement() -> None:
+    services = _Services(_FakeEngine([_write_datasource_row(), {"id": "project-1"}]))
+
+    response = _post_sql(services, {"sql": "DROP TABLE tmp_users", "datasource_id": "ds-1"})
+
+    assert response.status_code == 202
+    assert services.job_backend.enqueued[0].payload["statement_kind"] == "ddl"
+
+
+def test_sql_execute_rejects_write_when_allow_dml_is_off() -> None:
+    services = _Services(_FakeEngine([_write_datasource_row(allow_dml=False), {"id": "project-1"}]))
+
+    response = _post_sql(
+        services, {"sql": "DELETE FROM users WHERE id = 1", "datasource_id": "ds-1"}
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "sql_write_not_allowed"
+    assert services.job_backend.enqueued == []
+
+
+def test_sql_execute_requires_confirmation_for_prod_write() -> None:
+    services = _Services(
+        _FakeEngine([_write_datasource_row(environment="prod"), {"id": "project-1"}])
+    )
+
+    response = _post_sql(services, {"sql": "DELETE FROM users", "datasource_id": "ds-1"})
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"] == "sql_write_confirmation_required"
+    assert body["statement_kind"] == "dml"
+    assert body["statement_verb"] == "delete"
+    assert body["missing_where"] is True
+    assert services.job_backend.enqueued == []
+
+
+def test_sql_execute_accepts_confirmed_prod_write() -> None:
+    services = _Services(
+        _FakeEngine([_write_datasource_row(environment="prod"), {"id": "project-1"}])
+    )
+
+    response = _post_sql(
+        services,
+        {"sql": "TRUNCATE TABLE tmp_users", "datasource_id": "ds-1", "confirm_write": True},
+    )
+
+    assert response.status_code == 202
+    audit = next(audit for audit in services.audits if audit["action"] == "sql_write")
+    assert audit["detail"]["confirmed"] is True
+    assert audit["detail"]["environment"] == "prod"
+
+
+def test_sql_execute_prod_select_needs_no_confirmation() -> None:
+    services = _Services(
+        _FakeEngine([_write_datasource_row(environment="prod"), {"id": "project-1"}])
+    )
+
+    response = _post_sql(services, {"sql": "SELECT * FROM users", "datasource_id": "ds-1"})
+
+    assert response.status_code == 202
+    assert "sql_write" not in services.job_backend.enqueued[0].payload
+
+
+@pytest.mark.parametrize(
+    "sql",
+    ["GRANT SELECT ON users TO someone", "INSERT INTO t VALUES (1); DELETE FROM t", "CALL p()"],
+)
+def test_sql_execute_rejects_statements_outside_the_allowlist(sql: str) -> None:
+    services = _Services(_FakeEngine([_write_datasource_row(), {"id": "project-1"}]))
+
+    response = _post_sql(services, {"sql": sql, "datasource_id": "ds-1"})
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_sql"
+    assert services.job_backend.enqueued == []
+
+
 def test_request_job_page_enqueues_ordered_stateless_continuation() -> None:
     root_row = _pagination_root_row(pagination_mode="ordered_offset")
     backend = _JobBackend()
@@ -8372,6 +8484,7 @@ def _policy(**overrides: bool) -> dict[str, bool]:
         "allow_schema_save": False,
         "allow_scenario_write": False,
         "allow_record_task": False,
+        "allow_dml": False,
     }
     values.update(overrides)
     return values

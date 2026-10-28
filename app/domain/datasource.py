@@ -48,7 +48,7 @@ class DbType(StrEnum):
 class OperationPolicy(BaseModel):
     """Datasource operation policy(设计稿 §4.5 / PRD §3 权限面板).
 
-    2.0.0 仅执行 allow_select / allow_explain;其余开关先作为显式策略落库,
+    已生效:allow_select / allow_explain / allow_dml;其余开关先作为显式策略落库,
     供 2.1+ 能力接入时复用同一校验入口。
     """
 
@@ -61,6 +61,9 @@ class OperationPolicy(BaseModel):
     allow_schema_save: bool = False
     allow_scenario_write: bool = False
     allow_record_task: bool = False
+    # SQL 工作台执行 INSERT/UPDATE/DELETE/MERGE 与 CREATE/ALTER/DROP/TRUNCATE。
+    # 默认关:已有数据源行为不变,需在权限面板按库打开;prod 库每次执行另需二次确认。
+    allow_dml: bool = False
 
 
 class DatasourceConnInfo(BaseModel):

@@ -24,3 +24,5 @@ class AdapterCapabilities(BaseModel):
     list_indexes: bool
     get_table_ddl: bool
     compare_db_hash: bool = False
+    # 单条 DML / DDL 写执行(execute_write);是否放行还看数据源 operation_policy.allow_dml。
+    execute_write: bool = False

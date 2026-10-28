@@ -8,7 +8,7 @@
  * - SQL 模板浏览 / 变量渲染 / admin CRUD
  * - running 状态轮询 ResultSet,展示已 spool 行
  */
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, shallowRef, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useQuery } from '@tanstack/vue-query'
@@ -127,6 +127,11 @@ import { clearSqlMetadataCache } from '../utils/sqlIntelligence'
 import { splitSqlStatements, statementAtOffset } from '../utils/sqlStatements'
 import { createUserErrorMessage } from '../utils/userErrorMessage'
 import {
+  classifyStatement,
+  isWriteStatement,
+  type ClassifiedStatement,
+} from '../utils/sqlStatementKind'
+import {
   consumeWorkspaceHandoff,
   createWorkspaceHandoff,
 } from '../utils/workspaceHandoff'
@@ -199,6 +204,18 @@ interface ConsoleRuntime {
 interface ResultReadOutcome {
   applied: boolean
   generation: number
+}
+
+interface WriteConfirmItem extends ClassifiedStatement {
+  sql: string
+}
+
+/** prod 数据源写语句的二次确认:弹窗挂着时 onExecute 在 resolve 上等。 */
+interface PendingWriteConfirmation {
+  datasourceName: string
+  statements: WriteConfirmItem[]
+  hasDdl: boolean
+  resolve: (confirmed: boolean) => void
 }
 
 // 元数据树节点态:数据源 -> schema -> 表 -> 列
@@ -465,6 +482,16 @@ const statusSummary = computed(() => {
     })
   }
   if (rt.status === 'success') {
+    const execution = rt.progress?.execution
+    if (execution?.statement_kind) {
+      const verb = (execution.statement_verb ?? '').toUpperCase()
+      const seconds = elapsedSeconds(rt)
+      if (execution.statement_kind === 'ddl') return t('sql.write_success_ddl', { verb, seconds })
+      if (execution.affected_rows == null) {
+        return t('sql.write_success_dml_unknown', { verb, seconds })
+      }
+      return t('sql.write_success_dml', { verb, seconds, rows: execution.affected_rows })
+    }
     const rows = rt.result?.total_rows ?? rt.result?.loaded_rows ?? loaded
     return t('sql.status_success_summary', {
       rows: rt.result?.has_more ? `${rows}+` : rows,
@@ -577,6 +604,16 @@ const statRows = computed<StatRow[]>(() => {
     value: res?.truncated ? t('sql.stats_yes') : t('sql.stats_no'),
   })
   const execution = rt.progress?.execution
+  if (execution?.statement_kind) {
+    rows.push({
+      label: t('sql.stats_statement'),
+      value: (execution.statement_verb ?? execution.statement_kind).toUpperCase(),
+    })
+    rows.push({
+      label: t('sql.stats_affected_rows'),
+      value: execution.affected_rows != null ? String(execution.affected_rows) : '-',
+    })
+  }
   rows.push({
     label: t('sql.stats_rows_read'),
     value: execution?.rows_read != null ? String(execution.rows_read) : '-',
@@ -1071,6 +1108,25 @@ async function onExecute(): Promise<void> {
     return
   }
 
+  // 含写语句(DML / DDL):先过 allow_dml 与 prod 二次确认,再按序逐条执行。
+  const classified = statements.map((statement) => classifyStatement(statement.sql))
+  const hasWrite = classified.some(isWriteStatement)
+  let confirmWrite = false
+  if (hasWrite) {
+    const ds = selectedDs.value
+    if (!ds?.operation_policy?.allow_dml) {
+      execError.value = t('sql.write_not_allowed')
+      return
+    }
+    if (ds.environment === 'prod') {
+      const writeItems = statements
+        .map((statement, index) => ({ ...classified[index], sql: statement.sql }))
+        .filter(isWriteStatement)
+      if (!(await requestWriteConfirmation(ds.name, writeItems))) return
+      confirmWrite = true
+    }
+  }
+
   await cancelConsoleQueries(consoleRow.id)
   stopConsolePoll(consoleRow.id)
   const nextRuntimes = statements.map((statement, index) => {
@@ -1083,6 +1139,18 @@ async function onExecute(): Promise<void> {
   // 从 reactive 容器重新取 proxy；后续异步轮询必须修改 proxy，才能即时刷新结果区。
   const batchRuntimes = runtimesFor(consoleRow.id)
   scrollResultIntoView()
+
+  if (hasWrite) {
+    // 写语句不走会话路径(会话链路只读),也不并行:后一条可能依赖前一条(先建表再插入)。
+    await submitSequentialBatch(
+      consoleRow.id,
+      selectedDsId.value,
+      batchRuntimes,
+      requestedMaxRows,
+      confirmWrite,
+    )
+    return
+  }
 
   // 懒 attach:走到这里才建会话。返回 null = 该部署/方言没有会话,回落 job 路径。
   let session: ConsoleSessionState | null = null
@@ -1137,12 +1205,108 @@ function failBatch(batchRuntimes: ConsoleRuntime[], message: string): void {
 }
 
 /** 未提交出去的语句标成 cancelled + 「已跳过」——不留一排假的 pending。 */
-function skipRemaining(batchRuntimes: ConsoleRuntime[], fromIndex: number): void {
+function skipRemaining(
+  batchRuntimes: ConsoleRuntime[],
+  fromIndex: number,
+  message = t('sql.session_statement_skipped'),
+): void {
   for (const runtime of batchRuntimes.slice(fromIndex)) {
     runtime.status = 'cancelled'
-    runtime.message = t('sql.session_statement_skipped')
+    runtime.message = message
     runtime.finishedAt = Date.now()
   }
+}
+
+const writeConfirmation = shallowRef<PendingWriteConfirmation | null>(null)
+
+function requestWriteConfirmation(
+  datasourceName: string,
+  statements: WriteConfirmItem[],
+): Promise<boolean> {
+  writeConfirmation.value?.resolve(false)
+  return new Promise((resolve) => {
+    writeConfirmation.value = {
+      datasourceName,
+      statements,
+      hasDdl: statements.some((statement) => statement.kind === 'ddl'),
+      resolve,
+    }
+  })
+}
+
+function settleWriteConfirmation(confirmed: boolean): void {
+  const pending = writeConfirmation.value
+  writeConfirmation.value = null
+  pending?.resolve(confirmed)
+}
+
+function writeErrorOverride(error: ApiError): string | undefined {
+  if (error.code === 'sql_write_not_allowed') return t('sql.write_not_allowed')
+  return undefined
+}
+
+/**
+ * 含写语句的批次:逐条提交 job,上一条成功到终态才提交下一条;任何一条失败 /
+ * 取消 / 被新一次执行顶掉,后面的都标「已跳过」,不再改库。
+ */
+async function submitSequentialBatch(
+  consoleId: string,
+  datasourceId: string,
+  batchRuntimes: ConsoleRuntime[],
+  requestedMaxRows: number,
+  confirmWrite: boolean,
+): Promise<void> {
+  for (const [index, runtime] of batchRuntimes.entries()) {
+    try {
+      const response = await executeSql({
+        datasource_id: datasourceId,
+        console_id: index === batchRuntimes.length - 1 ? consoleId : null,
+        sql: runtime.statement,
+        page_size: runtime.pageSize,
+        max_result_rows: requestedMaxRows,
+        confirm_write: confirmWrite,
+      })
+      runtime.jobId = response.job_id
+      runtime.rootJobId = response.job_id
+      runtime.resultSetId = response.result_set_id
+      startConsolePoll(consoleId, runtime)
+    } catch (e) {
+      runtime.status = null
+      runtime.error = errorMessage(e, writeErrorOverride)
+      runtime.finishedAt = Date.now()
+      skipRemaining(batchRuntimes, index + 1, t('sql.write_batch_stopped'))
+      return
+    }
+    if ((await waitForTerminal(consoleId, runtime)) !== 'success') {
+      skipRemaining(batchRuntimes, index + 1, t('sql.write_batch_stopped'))
+      return
+    }
+  }
+}
+
+/** 等一条 runtime 到终态;控制台切走或被新一次执行替换时返回 null(批次就此停下)。 */
+function waitForTerminal(consoleId: string, runtime: ConsoleRuntime): Promise<JobStatus | null> {
+  const outcome = (): JobStatus | null | undefined => {
+    if (runtime.status && TERMINAL.has(runtime.status)) return runtime.status
+    if (!runtimes[consoleId]?.includes(runtime) || activeConsoleId.value !== consoleId) return null
+    return undefined
+  }
+  return new Promise((resolve) => {
+    const immediate = outcome()
+    if (immediate !== undefined) {
+      resolve(immediate)
+      return
+    }
+    const stop = watch(
+      () => [runtime.status, runtimes[consoleId]?.includes(runtime), activeConsoleId.value],
+      () => {
+        const settled = outcome()
+        if (settled === undefined) return
+        stop()
+        resolve(settled)
+      },
+    )
+  })
 }
 
 /**
@@ -3499,6 +3663,61 @@ function parseVariables(value: string): string[] {
           </button>
         </div>
       </form>
+    </Modal>
+
+    <Modal
+      :open="writeConfirmation !== null"
+      :title="t('sql.write_confirm_title')"
+      :subtitle="
+        writeConfirmation
+          ? t('sql.write_confirm_subtitle', { name: writeConfirmation.datasourceName })
+          : ''
+      "
+      @close="settleWriteConfirmation(false)"
+    >
+      <div v-if="writeConfirmation" class="space-y-3" data-testid="write-confirm">
+        <ul class="space-y-2 max-h-64 overflow-y-auto">
+          <li
+            v-for="(item, index) in writeConfirmation.statements"
+            :key="index"
+            class="rounded border px-2 py-1.5"
+            :class="item.missingWhere ? 'border-red-500/60 bg-red-500/5' : 'chrome-border'"
+          >
+            <div class="flex items-center gap-2 text-xs">
+              <span class="font-mono font-semibold chrome-text-heading">
+                {{ item.verb.toUpperCase() }}
+              </span>
+              <span
+                v-if="item.missingWhere"
+                class="text-red-500 dark:text-red-400 font-medium"
+                data-testid="write-confirm-missing-where"
+              >
+                {{ t('sql.write_confirm_missing_where') }}
+              </span>
+            </div>
+            <pre
+              class="mt-1 text-[11px] font-mono chrome-text-muted whitespace-pre-wrap break-all max-h-16 overflow-hidden"
+            >{{ item.sql }}</pre>
+          </li>
+        </ul>
+        <p v-if="writeConfirmation.hasDdl" class="text-xs text-amber-600 dark:text-amber-400">
+          {{ t('sql.write_confirm_ddl_note') }}
+        </p>
+        <div class="flex justify-end gap-2 pt-2">
+          <button type="button" class="chrome-btn-secondary" @click="settleWriteConfirmation(false)">
+            <X class="w-3.5 h-3.5" />
+            {{ t('common.cancel') }}
+          </button>
+          <button
+            type="button"
+            class="chrome-btn-primary chrome-btn-danger"
+            data-testid="write-confirm-submit"
+            @click="settleWriteConfirmation(true)"
+          >
+            {{ t('sql.write_confirm_submit') }}
+          </button>
+        </div>
+      </div>
     </Modal>
 
   </div>
