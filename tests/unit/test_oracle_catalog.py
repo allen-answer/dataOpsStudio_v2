@@ -42,8 +42,14 @@ def test_every_declared_param_is_rendered_and_nothing_else(catalog_sql: CatalogS
         assert named == pyformat
 
 
-def test_table_ddl_binds_table_before_owner() -> None:
-    # GET_DDL 的参数顺序是 (类型, 名称, schema),与列表查询相反,防止写反
-    assert oracle_catalog.TABLE_DDL.render("named") == (
-        "SELECT DBMS_METADATA.GET_DDL('TABLE', UPPER(:tbl), UPPER(:owner)) FROM dual"
-    )
+def test_table_ddl_takes_object_type_from_all_objects() -> None:
+    # 视图也在 LIST_TABLES 里;类型写死 'TABLE' 时视图恒报 ORA-31603
+    sql = " ".join(oracle_catalog.TABLE_DDL.render("named").split())
+
+    assert "DBMS_METADATA.GET_DDL(o.OBJECT_TYPE, o.OBJECT_NAME, o.OWNER)" in sql
+    assert "'TABLE'," not in sql.split("FROM (")[0]
+    assert "OWNER = UPPER(:owner) AND OBJECT_NAME = UPPER(:tbl)" in sql
+    assert "OBJECT_TYPE IN ('TABLE', 'VIEW')" in sql
+    # 同名时优先 TABLE,且只取一行
+    assert "ORDER BY DECODE(OBJECT_TYPE, 'TABLE', 0, 1)" in sql
+    assert sql.endswith("WHERE ROWNUM = 1")
