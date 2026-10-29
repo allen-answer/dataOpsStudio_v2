@@ -128,5 +128,6 @@ def test_traits_for_name_unknown_returns_none() -> None:
     assert traits(DbType.MYSQL).identifier_style is IdentifierStyle.BACKTICK
 
 
-def test_session_capable_types_unchanged() -> None:
-    assert SESSION_CAPABLE_DB_TYPES == frozenset({DbType.MYSQL, DbType.DM})
+def test_session_capable_types() -> None:
+    # PR-5 起 Oracle 有会话缝(进程内硬取消);其余方言仍回退 job 路径
+    assert SESSION_CAPABLE_DB_TYPES == frozenset({DbType.MYSQL, DbType.DM, DbType.ORACLE})

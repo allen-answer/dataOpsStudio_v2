@@ -1196,11 +1196,12 @@ class _ControlLane:
                 self._channel.close()
                 return
             if command.kind == "cancel":
-                error = (
-                    self._run_control(self._channel.cancel, command.runtime)
-                    if self._support is ServerCancelSupport.AVAILABLE
-                    else CancelChannelError("server cancel is degraded")
-                )
+                if _local_cancel(command.runtime):
+                    error = None
+                elif self._support is ServerCancelSupport.AVAILABLE:
+                    error = self._run_control(self._channel.cancel, command.runtime)
+                else:
+                    error = CancelChannelError("server cancel is degraded")
                 self._on_cancel_done(command.runtime, error)
             elif command.kind == "destroy":
                 error = self._run_control(self._channel.destroy, command.runtime)
@@ -1219,6 +1220,21 @@ class _ControlLane:
         except CancelChannelError as exc:
             return exc
         return None
+
+
+def _local_cancel(runtime: _SessionRuntime) -> bool:
+    """硬取消先试进程内一级(Oracle `Connection.cancel()`,设计稿 §5)。
+
+    `local_cancel` 是会话连接的可选方法;没有、返回 False 或抛错都回到控制通道。
+    在 control 线程上调用 —— 跨线程打断正是它的用途。
+    """
+    local_cancel = getattr(runtime.connection, "local_cancel", None)
+    if local_cancel is None:
+        return False
+    try:
+        return bool(local_cancel())
+    except Exception:
+        return False
 
 
 _TERMINAL_STATEMENT_STATES = frozenset(

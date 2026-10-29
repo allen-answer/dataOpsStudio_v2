@@ -11,7 +11,9 @@
 - dmPython 建连失败:抛的是 `builtins.SystemError`("returned a result with an
   exception set"),真正的 `DatabaseError` 挂在 `__context__` 上 —— 必须回溯;
 - PyMySQL:`OperationalError(errno, message)`,码是第一个 int 参数,部分异常
-  另有 `.errno`。
+  另有 `.errno`;
+- python-oracledb:`args[0]` 是 `_Error`,结构化码在 `.full_code`(`ORA-01013` /
+  `DPY-4024`),`.code` 对 DPY 码恒为 0 —— Oracle 按 full_code 分类。
 
 `DmError` 对象在 dmPython 里被复用(多次异常拿到同一地址),所以分类必须
 **当场取值**,绝不持有该对象。
@@ -34,6 +36,7 @@ _PASSWORD_ASSIGNMENT_RE = re.compile(
 )
 _URL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s'\")]+")
 _NUMERIC_RE = re.compile(r"^-?\d+$")
+_FULL_CODE_RE = re.compile(r"^[A-Z]{3}-\d{1,5}$")
 _MAX_ERROR_SUMMARY_LENGTH = 240
 _MAX_CAUSE_DEPTH = 5
 
@@ -66,6 +69,35 @@ MYSQL_ERROR_CODES: Mapping[int, ErrorCategory] = {
     1146: ErrorCategory.STATEMENT_ERROR,  # ER_NO_SUCH_TABLE
     2006: ErrorCategory.CONNECTION_DEAD,  # CR_SERVER_GONE_ERROR
     2013: ErrorCategory.CONNECTION_DEAD,  # CR_SERVER_LOST
+}
+
+# Oracle 以 python-oracledb 的结构化码 `full_code`(`ORA-xxxxx` / `DPY-xxxx`)为键:
+# DPY 码的 `.code` 恒为 0,只看整数会把 DPY-4024 与真正的码 0 混为一谈,且 ORA/DPY
+# 两套编号会撞号。full_code 是驱动给的结构化字段,不是消息文本。
+# 标「实测」的出自 11.2.0.4 + Instant Client 19.29(thick);其余为常识码。
+ORACLE_ERROR_CODES: Mapping[str, ErrorCategory] = {
+    "ORA-01017": ErrorCategory.AUTH_FAILED,  # 用户名/口令无效(实测)
+    "ORA-28000": ErrorCategory.AUTH_FAILED,  # 账号已锁
+    "ORA-12541": ErrorCategory.HOST_UNREACHABLE,  # 无监听(实测:端口不通)
+    "ORA-12514": ErrorCategory.HOST_UNREACHABLE,  # 监听不认识该服务名(实测)
+    "ORA-12505": ErrorCategory.HOST_UNREACHABLE,  # 监听不认识该 SID
+    "ORA-12170": ErrorCategory.HOST_UNREACHABLE,  # 连接超时
+    "DPY-6005": ErrorCategory.HOST_UNREACHABLE,  # thin:无法连接
+    "ORA-01013": ErrorCategory.CANCELLED,  # 用户请求取消(实测:Connection.cancel())
+    "DPY-4024": ErrorCategory.TIMEOUT,  # call_timeout 超时(实测,连接仍可用)
+    "ORA-00900": ErrorCategory.STATEMENT_ERROR,  # 无效 SQL 语句
+    "ORA-00904": ErrorCategory.STATEMENT_ERROR,  # 无效标识符(列名)
+    "ORA-00933": ErrorCategory.STATEMENT_ERROR,  # SQL 命令未正确结束
+    "ORA-00942": ErrorCategory.STATEMENT_ERROR,  # 表或视图不存在(实测)
+    "ORA-01476": ErrorCategory.STATEMENT_ERROR,  # 除数为零
+    "ORA-01722": ErrorCategory.STATEMENT_ERROR,  # 无效数字
+    "ORA-03113": ErrorCategory.CONNECTION_DEAD,  # 通信通道文件结束
+    "ORA-03114": ErrorCategory.CONNECTION_DEAD,  # 未连接到 ORACLE
+    "ORA-03135": ErrorCategory.CONNECTION_DEAD,  # 连接失去联系
+    "ORA-00028": ErrorCategory.CONNECTION_DEAD,  # 会话已被终止(KILL SESSION)
+    "ORA-01012": ErrorCategory.CONNECTION_DEAD,  # 未登录
+    "DPY-4011": ErrorCategory.CONNECTION_DEAD,  # thin:连接已关闭
+    "DPY-1001": ErrorCategory.CONNECTION_DEAD,  # 未连接
 }
 
 # server_confirmed 只对"服务器确认的取消/超时"成立(设计 §4.1)。
@@ -115,6 +147,40 @@ class MySQLErrorClassifier(_CodeTableClassifier):
 
     def __init__(self) -> None:
         super().__init__(DbType.MYSQL, MYSQL_ERROR_CODES)
+
+
+class OracleErrorClassifier:
+    """Oracle 错误分类器(码表 `ORACLE_ERROR_CODES`,按 full_code 查)。无状态。"""
+
+    __slots__ = ()
+    db_type = DbType.ORACLE
+
+    def classify(self, exc: BaseException) -> ClassifiedError:
+        full_code = oracle_full_code(exc)
+        code = _numeric_part(full_code) if full_code else driver_error_code(exc)
+        category = ORACLE_ERROR_CODES.get(full_code) if full_code else None
+        if category is None:
+            category = _category_from_type(exc)
+        return ClassifiedError(
+            category=category,
+            driver_code=code,
+            summary=error_summary(exc, code),
+            server_confirmed=category in _SERVER_CONFIRMED_CATEGORIES,
+        )
+
+
+def oracle_full_code(exc: BaseException) -> str | None:
+    """python-oracledb 异常的 `args[0].full_code`(`ORA-01013` / `DPY-4024`);沿 cause 链找。"""
+    for candidate in _cause_chain(exc):
+        for arg in getattr(candidate, "args", ()):
+            full_code = getattr(arg, "full_code", None)
+            if isinstance(full_code, str) and _FULL_CODE_RE.fullmatch(full_code):
+                return full_code
+    return None
+
+
+def _numeric_part(full_code: str) -> int:
+    return int(full_code.split("-", 1)[1])
 
 
 def _category_from_type(exc: BaseException) -> ErrorCategory:
@@ -232,9 +298,12 @@ def _message_of(exc: BaseException) -> str:
 __all__ = [
     "DM_ERROR_CODES",
     "MYSQL_ERROR_CODES",
+    "ORACLE_ERROR_CODES",
     "DMErrorClassifier",
     "MySQLErrorClassifier",
+    "OracleErrorClassifier",
     "driver_error_code",
     "error_summary",
+    "oracle_full_code",
     "sanitize_error_text",
 ]

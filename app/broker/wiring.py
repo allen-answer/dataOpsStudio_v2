@@ -27,6 +27,8 @@ from app.dbclients.interactive import (
     InvalidDatasourceError,
     MySQLCancelChannel,
     MySQLInteractiveConnection,
+    OracleCancelChannel,
+    OracleInteractiveConnection,
 )
 from app.domain.console_session import ConsoleSession
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
@@ -40,6 +42,7 @@ _CancelChannelClass = Callable[[DatasourceConnInfo, SecretStore], CancelChannel]
 _SESSION_SEAMS: dict[DbType, tuple[_ConnectionClass, _CancelChannelClass]] = {
     DbType.MYSQL: (MySQLInteractiveConnection, MySQLCancelChannel),
     DbType.DM: (DMInteractiveConnection, DMCancelChannel),
+    DbType.ORACLE: (OracleInteractiveConnection, OracleCancelChannel),
 }
 
 # 会话纵切的方言范围线(设计 §6):其余方言整体回退 job 路径,不在此造会话。
