@@ -506,7 +506,7 @@ arguments: (-\d+)`,取出数值再查码表:`-4012` 超时、`-5065` 取消、`-
 | MySQL | `CONCAT_WS` | `MD5()` | `CONV` | 现有 `mysql_compare` |
 | OB-MySQL | 同 MySQL | 同 | 同 | 复用,V11 验证 |
 | DM | `\|\|` | `DBMS_CRYPTO.HASH` | `TO_NUMBER(...,'XXXXXXXX')` / 展开式 | 现有 `dm_compare` |
-| Oracle | `\|\|` | `STANDARD_HASH(x,'MD5')`(12.1+,无需授权);**11g 用 `DBMS_OBFUSCATION_TOOLKIT.MD5(input=>UTL_RAW.CAST_TO_RAW(CONVERT(x,'AL32UTF8')))`**(见下) | 复用 DM 的 `hex_to_uint64_expression` | 新 `oracle_compare` |
+| Oracle | 十六进制串 `\|\|`(见 §6.1.5) | 探测 `STANDARD_HASH`(12.1+)→ `DBMS_CRYPTO.HASH` → **11g `DBMS_OBFUSCATION_TOOLKIT.MD5(input => HEXTORAW(载荷))`** | 复用 DM 的 `hex_to_uint64_expression`(拆半 `TO_NUMBER`) | `oracle_compare`(PR-4 已实现) |
 
 **11g 哈希实测**(11.2.0.4,最小权限账号):`STANDARD_HASH` 不存在(904);`DBMS_CRYPTO` 未授权
 (904);**`DBMS_OBFUSCATION_TOOLKIT` 对 PUBLIC 可执行**,`MD5` 结果与 Python 逐字节一致,
@@ -534,9 +534,48 @@ arguments: (-\d+)`,取出数值再查码表:`-4012` 超时、`-5065` 取消、`-
    设计改为:OB-Oracle 缺省 `CLIENT_ROW_HASH`,库内下推做成能力但默认关闭,待有真实大表时
    对比两条路径(含网络)再决定缺省值。这一项列入 §14 待决。
 
-`oracle_compare.py` 从 `dm_compare.py` 抽公共部分(载荷拼接、数值 `TO_CHAR` 格式模型、时间
-格式化、hex→uint64),DM 与 Oracle 各自只保留 MD5 函数与降级原因。抽取后 DM 的输出 SQL
-逐字节不变(现有 `test_dm_compare_hash.py` 保护)。
+`oracle_compare.py` 只复用 `dm_compare.hex_to_uint64_expression`,载荷构造独立实现:Oracle 的
+字符集与 `''` 即 NULL 两点让 DM 那套拼接没法直接用(§6.1.5),DM 的输出 SQL 不动。
+
+#### 6.1.5 PR-4 实测与定稿(11.2.0.4,ZHS16GBK / AL16UTF16)
+
+上面 11g 行里的 `CONVERT(x,'AL32UTF8')` 写法**在 GBK 库上不成立**,实测推翻:
+
+- 缺省哨兵 U+2400、分隔符 U+241F 不在 GBK 里,写成 VARCHAR2 字面量即变 `?`;
+- `UTL_I18N.STRING_TO_RAW(nvarchar2, 'AL32UTF8')` 在 SQL 里先经库字符集,U+2400 得到
+  `EFBC9F`(全角问号),GBK 外字符一律丢失。
+
+定稿写法:**载荷按 UTF-8 十六进制串拼接**,SQL 全程只有 ASCII。
+
+- 固定字面量(NULL 位、哨兵、分隔符、哨兵长度)在 Python 侧算好 UTF-8 十六进制;
+- 文本值 `TO_NCHAR` 后取国家字符集字节,`UTL_RAW.CONVERT(UTL_RAW.CAST_TO_RAW(v),
+  'AMERICAN_AMERICA.AL32UTF8', 'AMERICAN_AMERICA.<NLS_NCHAR_CHARACTERSET>')` 转 UTF-8,
+  不经库字符集(GBK 外 BMP 字符、增补平面字符均与 Python 逐字节一致);`CONVERT(NULL)` 报
+  ORA-06502,值为 NULL 时先短路;
+- 数值、日期只含 ASCII,`UTL_RAW.CAST_TO_RAW` 原样取字节;
+- 最后 `HEXTORAW` 一次喂给 MD5。
+
+与客户端口径对齐的几处:
+
+| 差异 | 处理 |
+|---|---|
+| TRIM 全空格得 NULL,客户端得 `''` | NULL 位不开 `empty_as_null` 时只看原列;值为 NULL 按空串拼、长度记 0 |
+| `LENGTH` 对 NVARCHAR2 数 UTF-16 码元(😀=2) | 用 `LENGTHC`(码点) |
+| `CAST(ts AS TIMESTAMP(p))` 四舍五入,客户端截断 | `TO_CHAR(CAST(x AS TIMESTAMP(9)), '...FF9')` 后 `SUBSTR` |
+| BINARY_DOUBLE 转 NUMBER 得二进制精确值(2.675 → 2.67499…),客户端按最短往返 `2.675` 舍入 | 依次试 15/16/17 位有效数字,取第一个能转回原值的;需 `driver_type` 区分 BINARY_* 与 NUMBER 型 FLOAT,缺失即降级 |
+
+降级(返回 `CLIENT_ROW_HASH` 并写原因):无可用 MD5、国家字符集不是 AL16UTF16/UTF8、BYTES /
+BOOLEAN / UNKNOWN 列、`driver_type` 为 CLOB/NCLOB/LONG/XMLTYPE、FLOAT 无 `driver_type`、规范化字符集
+非 UTF-8。载荷上限 2000 字节(十六进制串受 VARCHAR2 4000 限制),超长行执行时报 ORA-01489,
+worker 退回客户端哈希并记日志。数据源 `extra.compare_md5_function` 可限定为某个函数或 `client`。
+
+真库对照(只读,内联视图 + `SYS.ALL_OBJECTS`):六组规则 × 边界数据逐行一致,`ALL_OBJECTS`
+3000 行一致;10 万行单段聚合库内 11.3 秒,客户端取数加哈希 24.8 秒(经 VPN)。11g 的
+`DBMS_OBFUSCATION_TOOLKIT` 约 9 千行/秒,大表下推是否划算仍要在现场网络上比。
+
+OB-Oracle 没有 `UTL_RAW.CONVERT`(实测 `-5055 FUNCTION UTL_RAW.CONVERT does not exist`),
+`DBMS_CRYPTO.HASH(UTL_I18N.STRING_TO_RAW(...))` 遇 GBK 外字符报 `-4258 Incorrect string value`,
+这套写法不能照搬,留给 PR-9。
 
 #### 6.1.2 Oracle 特有降级原因
 
