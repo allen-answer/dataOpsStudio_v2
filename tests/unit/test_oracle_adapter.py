@@ -136,8 +136,34 @@ def test_get_table_ddl_uses_dbms_metadata_with_bound_names() -> None:
     cursor = fake.connections[0].cursors[0]
     transform_sql, ddl_sql = cursor.executed_history
     assert "SET_TRANSFORM_PARAM" in transform_sql and "'STORAGE', FALSE" in transform_sql
-    assert "GET_DDL('TABLE', UPPER(:tbl), UPPER(:owner))" in ddl_sql
+    assert "GET_DDL(o.OBJECT_TYPE, o.OBJECT_NAME, o.OWNER)" in ddl_sql
+    assert "FROM ALL_OBJECTS" in ddl_sql
     assert cursor.params_history[1] == {"tbl": "orders", "owner": "app"}
+    assert fake.connections[0].closed is True
+
+
+def test_get_table_ddl_returns_view_ddl() -> None:
+    fake = _FakeOracleDb(
+        query_map=[
+            _Route(
+                "dbms_metadata.get_ddl",
+                (("DDL",),),
+                [('CREATE OR REPLACE FORCE VIEW "APP"."V_ORDERS" AS SELECT 1 FROM dual',)],
+            )
+        ]
+    )
+
+    ddl = _adapter(fake).get_table_ddl("APP", "V_ORDERS")
+
+    assert ddl.startswith('CREATE OR REPLACE FORCE VIEW "APP"."V_ORDERS"')
+
+
+def test_get_table_ddl_missing_object_is_unavailable() -> None:
+    # ALL_OBJECTS 无行(不存在或看不见)按取不到 DDL 处理,而不是笼统的 adapter 错误
+    fake = _FakeOracleDb(query_map=[_Route("dbms_metadata.get_ddl", (("DDL",),), [])])
+
+    with pytest.raises(OracleDdlUnavailableError):
+        _adapter(fake).get_table_ddl("APP", "NO_SUCH")
     assert fake.connections[0].closed is True
 
 

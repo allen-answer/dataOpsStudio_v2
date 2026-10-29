@@ -364,6 +364,29 @@ def test_get_table_ddl_permission_error_is_structured(monkeypatch: pytest.Monkey
         _adapter().get_table_ddl("APP", "T")
 
 
+def test_get_table_ddl_returns_view_ddl(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 真库实测:写死 'TABLE' 时视图报 OBE-31603;类型改从 ALL_OBJECTS 取
+    fake = _install_fake_driver(
+        monkeypatch,
+        description=(("DDL",),),
+        rows=[('CREATE OR REPLACE FORCE VIEW "V_ORDERS" AS SELECT 1 FROM DUAL',)],
+    )
+
+    ddl = _adapter().get_table_ddl("app", "v_orders")
+
+    assert ddl.startswith('CREATE OR REPLACE FORCE VIEW "V_ORDERS"')
+    cursor = fake.connections[0].cursors[1]
+    assert "GET_DDL(o.OBJECT_TYPE, o.OBJECT_NAME, o.OWNER)" in cursor.executed[0]
+    assert cursor.params[0] == {"tbl": "v_orders", "owner": "app"}
+
+
+def test_get_table_ddl_missing_object_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_driver(monkeypatch, description=(("DDL",),), rows=[])
+
+    with pytest.raises(ObOracleDdlUnavailableError):
+        _adapter().get_table_ddl("APP", "NO_SUCH")
+
+
 def test_internal_code_of_600_errors_is_surfaced(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_driver(
         monkeypatch,

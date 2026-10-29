@@ -143,11 +143,11 @@ _THIN_UNSUPPORTED_HINT = (
 # FETCH FIRST / OFFSET 自 12c 起支持;更早的库(11g)执行前改写为 ROWNUM。
 _FETCH_FIRST_MIN_MAJOR = 12
 
-# DBMS_METADATA:表不存在与无权读他人 schema(缺 SELECT_CATALOG_ROLE)同报 ORA-31603。
+# DBMS_METADATA:对象不存在与无权读他人 schema(缺 SELECT_CATALOG_ROLE)同报 ORA-31603。
 _DDL_UNAVAILABLE_CODE = "ORA-31603"
 _DDL_UNAVAILABLE_MESSAGE = (
-    "Oracle DDL unavailable (ORA-31603): the table does not exist, or reading DDL of "
-    "another schema requires SELECT_CATALOG_ROLE for this account"
+    "Oracle DDL unavailable (ORA-31603): the table or view does not exist, or reading DDL "
+    "of another schema requires SELECT_CATALOG_ROLE for this account"
 )
 # 只关物理存储 / 段属性与语句终止符,保留约束;设置失败不影响取 DDL。
 _DDL_TRANSFORM_SQL = """
@@ -465,6 +465,9 @@ class OracleAdapter(DatabaseAdapter):
                 if _oracle_error_code(exc) == _DDL_UNAVAILABLE_CODE:
                     raise OracleDdlUnavailableError(_DDL_UNAVAILABLE_MESSAGE) from exc
                 raise self._driver_error("Oracle DDL query failed", exc) from exc
+            if row is None:
+                # ALL_OBJECTS 里没有这张表或视图:不存在或当前账号看不见,与 ORA-31603 同类
+                raise OracleDdlUnavailableError(_DDL_UNAVAILABLE_MESSAGE)
             ddl = _lob_text(_first_cell(row))
             if not ddl:
                 raise OracleAdapterError("DBMS_METADATA.GET_DDL returned no DDL")

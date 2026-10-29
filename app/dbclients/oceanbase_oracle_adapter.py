@@ -66,6 +66,10 @@ _SYSTEM_SCHEMAS = frozenset({"SYS", "LBACSYS", "ORAAUDITOR", "PUBLIC"})
 # 服务端 net_write_timeout 缺省 60 秒;流式连接至少调到这个值以上。
 _MIN_NET_WRITE_TIMEOUT_SECONDS = 60
 _DDL_UNAVAILABLE_CODE = 31603
+_DDL_UNAVAILABLE_MESSAGE = (
+    "OceanBase DDL unavailable (ORA-31603): the table or view does not exist, "
+    "or this account cannot read DDL of that schema"
+)
 
 
 class ObOracleAdapterError(RuntimeError):
@@ -321,12 +325,12 @@ class OceanBaseOracleAdapter(DatabaseAdapter):
             )
         except ObOracleAdapterError as exc:
             if _first_int_arg(exc.__cause__) == _DDL_UNAVAILABLE_CODE:
-                raise ObOracleDdlUnavailableError(
-                    "OceanBase DDL unavailable (ORA-31603): the table does not exist, "
-                    "or this account cannot read DDL of that schema"
-                ) from exc.__cause__
+                raise ObOracleDdlUnavailableError(_DDL_UNAVAILABLE_MESSAGE) from exc.__cause__
             raise
-        ddl = next(iter(rows[0].values()), None) if rows else None
+        if not rows:
+            # ALL_OBJECTS 里没有这张表或视图:不存在或当前账号看不见,与 ORA-31603 同类
+            raise ObOracleDdlUnavailableError(_DDL_UNAVAILABLE_MESSAGE)
+        ddl = next(iter(rows[0].values()), None)
         if not ddl:
             raise ObOracleAdapterError("DBMS_METADATA.GET_DDL returned no DDL")
         return str(ddl).strip()

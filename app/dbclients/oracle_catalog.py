@@ -110,9 +110,21 @@ PRIMARY_KEY_INDEX_NAMES = CatalogSql(
     ("owner", "tbl"),
 )
 
-# 他人 schema 需 SELECT_CATALOG_ROLE,否则 ORA-31603(与表不存在同码)。
+# 对象类型从 ALL_OBJECTS 取:LIST_TABLES 连视图一起列,写死 'TABLE' 时视图恒报 ORA-31603。
+# 同名优先 TABLE(物化视图的容器表与之同名)。看不见的对象不返回行,由调用方归为取不到 DDL;
+# 他人 schema 需 SELECT_CATALOG_ROLE,否则 ORA-31603(与对象不存在同码)。
 TABLE_DDL = CatalogSql(
-    "SELECT DBMS_METADATA.GET_DDL('TABLE', UPPER({tbl}), UPPER({owner})) FROM dual",
+    """
+            SELECT DBMS_METADATA.GET_DDL(o.OBJECT_TYPE, o.OBJECT_NAME, o.OWNER) AS ddl
+            FROM (
+                SELECT OBJECT_TYPE, OBJECT_NAME, OWNER
+                FROM ALL_OBJECTS
+                WHERE OWNER = UPPER({owner}) AND OBJECT_NAME = UPPER({tbl})
+                  AND OBJECT_TYPE IN ('TABLE', 'VIEW')
+                ORDER BY DECODE(OBJECT_TYPE, 'TABLE', 0, 1)
+            ) o
+            WHERE ROWNUM = 1
+            """,
     ("tbl", "owner"),
 )
 
