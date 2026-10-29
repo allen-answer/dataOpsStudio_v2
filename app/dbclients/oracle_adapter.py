@@ -31,7 +31,8 @@ Preview 范围:execute_select / stream_rows / introspection(schemas/tables/colum
 indexes,目录视图 SQL 在 oracle_catalog,与 OB-Oracle 共用)开;get_table_ddl 走
 DBMS_METADATA(他人 schema 缺 SELECT_CATALOG_ROLE 报结构化错误);explain 走
 EXPLAIN PLAN + DBMS_XPLAN,会写会话临时表 PLAN_TABLE,另受数据源
-`allow_oracle_plan_table` 闸门(缺省关),结束即回滚;compare 仍关,调用方按 capabilities 降级。
+`allow_oracle_plan_table` 闸门(缺省关),结束即回滚;compare 库内哈希下推见 oracle_compare,
+MD5 函数按实例探测一次,探测不到返回客户端哈希计划。
 
 R1:oracledb 只允许在 app/dbclients/ import(banned-api 拦别处)。
 R2:密码只从 SecretStore 解出后进 password kwarg;DSN / 连接参数不落日志,
@@ -52,6 +53,13 @@ from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 from app.dbclients import oracle_catalog
+from app.dbclients.oracle_compare import (
+    DEFAULT_NCHAR_CHARSET,
+    ORACLE_MD5_FUNCTIONS,
+    build_oracle_compare_hash_plan,
+    md5_probe_expected,
+    md5_probe_sql,
+)
 from app.dbclients.oracle_legacy_paging import (
     LegacyPagingRewrite,
     rewrite_for_pre12c,
@@ -67,7 +75,7 @@ from app.dbclients.query_timing import QueryTimingRecorder
 from app.dbclients.sql_guard import SqlGuardError, validate_readonly_sql
 from app.dbclients.sql_write import WriteResult, run_write_statement
 from app.domain.capabilities import AdapterCapabilities
-from app.domain.compare import CompareHashPlan, CompareHashRequest
+from app.domain.compare import CompareHashExecutionMode, CompareHashPlan, CompareHashRequest
 from app.domain.datasource import DatasourceConnInfo, DbType
 from app.domain.plan import PlanNode
 from app.domain.schema import Column, Index, Row, Schema, Table
@@ -142,6 +150,13 @@ _THIN_UNSUPPORTED_HINT = (
 
 # FETCH FIRST / OFFSET 自 12c 起支持;更早的库(11g)执行前改写为 ROWNUM。
 _FETCH_FIRST_MIN_MAJOR = 12
+
+# extra.compare_md5_function=client:该数据源不做库内哈希下推。
+_COMPARE_CLIENT_ONLY = "client"
+# 载荷按国家字符集字节转 UTF-8(oracle_compare),需知道国家字符集;读不到按 AL16UTF16。
+_NCHAR_CHARSET_SQL = (
+    "SELECT VALUE AS value FROM NLS_DATABASE_PARAMETERS WHERE PARAMETER = 'NLS_NCHAR_CHARACTERSET'"
+)
 
 # DBMS_METADATA:对象不存在与无权读他人 schema(缺 SELECT_CATALOG_ROLE)同报 ORA-31603。
 _DDL_UNAVAILABLE_CODE = "ORA-31603"
@@ -219,7 +234,7 @@ class OracleAdapter(DatabaseAdapter):
         list_columns=True,
         list_indexes=True,
         get_table_ddl=True,  # DBMS_METADATA.GET_DDL;他人 schema 缺权限报 OracleDdlUnavailableError
-        compare_db_hash=False,
+        compare_db_hash=True,  # 无可用 MD5 时 build_compare_hash_query 返回客户端哈希计划
     )
 
     def __init__(
@@ -254,6 +269,21 @@ class OracleAdapter(DatabaseAdapter):
         self._last_server_version: str | None = None
         self._last_connection_error: str | None = None
         self._query_timing = QueryTimingRecorder()
+        # datasource.extra.compare_md5_function 可强制选型(auto / 某个函数 / client),
+        # 与 DM 的 compare_hex_mode 同走 extra 这条按数据源覆盖通道。
+        configured = str(conn_info.extra.get("compare_md5_function", "auto") or "auto").lower()
+        self._compare_client_only = configured == _COMPARE_CLIENT_ONLY
+        self._configured_md5: str | None = (
+            configured if configured in ORACLE_MD5_FUNCTIONS else None
+        )
+        self._md5_resolved = False
+        self._resolved_md5: str | None = None
+        self._nchar_charset: str | None = None
+
+    @property
+    def compare_md5_function(self) -> str | None:
+        """本次会话选用的 MD5 函数;未探测或无可用函数为 None。"""
+        return self._resolved_md5
 
     @property
     def last_server_version(self) -> str | None:
@@ -477,7 +507,55 @@ class OracleAdapter(DatabaseAdapter):
             _safe_close(conn)
 
     def build_compare_hash_query(self, request: CompareHashRequest) -> CompareHashPlan:
-        raise self._unsupported("build_compare_hash_query")
+        if self._compare_client_only:
+            return CompareHashPlan(
+                execution_mode=CompareHashExecutionMode.CLIENT_ROW_HASH,
+                degrade_reasons=["datasource compare_md5_function is client"],
+            )
+        md5_function = self._resolve_md5_function()
+        return build_oracle_compare_hash_plan(
+            request,
+            md5_function=md5_function,
+            nchar_charset=self._nchar_charset or DEFAULT_NCHAR_CHARSET,
+        )
+
+    def _resolve_md5_function(self) -> str | None:
+        """选定 MD5 函数;每个 adapter 实例(即每个 job)最多探测一次。"""
+        if not self._md5_resolved:
+            self._nchar_charset = self._probe_nchar_charset()
+            candidates = (
+                (self._configured_md5,)
+                if self._configured_md5 is not None
+                else ORACLE_MD5_FUNCTIONS
+            )
+            self._resolved_md5 = next(
+                (name for name in candidates if self._probe_md5_function(name)), None
+            )
+            self._md5_resolved = True
+        return self._resolved_md5
+
+    def _probe_nchar_charset(self) -> str:
+        try:
+            rows = self._query_dicts(_NCHAR_CHARSET_SQL, None)
+        except Exception:
+            return DEFAULT_NCHAR_CHARSET
+        value = rows[0].get("value") if rows else None
+        return str(value).upper() if value else DEFAULT_NCHAR_CHARSET
+
+    def _probe_md5_function(self, name: str) -> bool:
+        # 探测走完整链路并与 Python 侧比值;不存在 / 未授权 / 结果不一致都算不可用,
+        # 不让选型问题升级成比对失败。
+        sql = md5_probe_sql(name, self._nchar_charset or DEFAULT_NCHAR_CHARSET)
+        try:
+            rows = self._query_dicts(sql, None)
+        except Exception:
+            return False
+        if not rows:
+            return False
+        try:
+            return int(next(iter(rows[0].values()))) == md5_probe_expected()
+        except (TypeError, ValueError):
+            return False
 
     def kill_query(self, connection_id: str) -> bool:
         # thin Connection.cancel() 需另线程打断,当前软取消模型不接;恒 False。

@@ -18,6 +18,7 @@ from app.dbclients.db2_adapter import Db2Adapter
 from app.dbclients.dm_adapter import DMAdapter
 from app.dbclients.mysql_adapter import MySQLAdapter
 from app.dbclients.oracle_adapter import OracleAdapter
+from app.dbclients.oracle_compare import md5_probe_expected
 from app.dbclients.protocol import DatabaseAdapter
 from app.domain.compare import CompareColumn, CompareHashRequest, CompareTableRef
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
@@ -390,6 +391,13 @@ class _FakeOracleCursor:
         elif "all_constraints" in normalized:
             self.description = (("name",),)
             self._rows = [("ID",)]
+        elif "nls_database_parameters" in normalized:
+            self.description = (("value",),)
+            self._rows = [("AL16UTF16",)]
+        elif "dbms_obfuscation_toolkit" in normalized:
+            # 11g 最小权限账号的常态:只有它能算 MD5,其余候选按默认行返回错值即判不可用
+            self.description = (("v",),)
+            self._rows = [(md5_probe_expected(),)]
         else:
             self.description = (("ok",),)
             self._rows = [(1,)]

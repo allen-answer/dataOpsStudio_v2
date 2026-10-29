@@ -24,6 +24,13 @@ from app.dbclients.oracle_adapter import (
     OracleUnsupportedOperationError,
     QueryCancelledError,
 )
+from app.dbclients.oracle_compare import (
+    ORACLE_MD5_DBMS_CRYPTO,
+    ORACLE_MD5_FUNCTIONS,
+    ORACLE_MD5_OBFUSCATION_TOOLKIT,
+    ORACLE_MD5_STANDARD_HASH,
+    md5_probe_expected,
+)
 from app.dbclients.oracle_types import (
     data_type_string_to_column_type,
     description_item_to_column_type,
@@ -31,6 +38,7 @@ from app.dbclients.oracle_types import (
 )
 from app.dbclients.protocol import AdapterConnectionError
 from app.dbclients.sql_guard import SqlGuardError
+from app.domain.compare import CompareColumn, CompareHashRequest, CompareTableRef
 from app.domain.datasource import DatasourceConnInfo, DbType, OperationPolicy
 from app.domain.schema import Column, ColumnType, Index, Row, Schema, Table
 from app.domain.secret import HashedRef, RotationReport, SecretKind, SecretRef
@@ -56,10 +64,10 @@ def test_capabilities_declare_preview_scope() -> None:
     assert caps.list_tables is True
     assert caps.list_columns is True
     assert caps.list_indexes is True
-    # explain(另受 allow_oracle_plan_table 闸门)/ DDL(DBMS_METADATA)开;compare 仍关
+    # explain(另受 allow_oracle_plan_table 闸门)/ DDL(DBMS_METADATA)/ 比对哈希下推开
     assert caps.explain is True
     assert caps.get_table_ddl is True
-    assert caps.compare_db_hash is False
+    assert caps.compare_db_hash is True
 
 
 def test_kill_query_is_soft_cancel_false() -> None:
@@ -190,6 +198,110 @@ def test_get_table_ddl_validates_identifiers_before_connecting() -> None:
     fake = _FakeOracleDb()
     with pytest.raises(ValueError):
         _adapter(fake).get_table_ddl("APP", "T; DROP TABLE X")
+    assert fake.connections == []
+
+
+_MD5_NEEDLES = {
+    ORACLE_MD5_STANDARD_HASH: "standard_hash(",
+    ORACLE_MD5_DBMS_CRYPTO: "dbms_crypto.hash(",
+    ORACLE_MD5_OBFUSCATION_TOOLKIT: "dbms_obfuscation_toolkit.md5(",
+}
+
+
+def _hash_probe_db(*, working: str | None, nchar: str = "AL16UTF16") -> _FakeOracleDb:
+    """探测用 fake:国家字符集查询有固定答案;只有 working 对应的 MD5 探测返回正确值。
+
+    其余候选落默认行 (1,),数值不等即判不可用(与真库上「函数存在但结果不对」同一路径)。
+    """
+    routes = [_Route("nls_database_parameters", (("VALUE",),), [(nchar,)])]
+    if working is not None:
+        routes.append(_Route(_MD5_NEEDLES[working], (("V",),), [(md5_probe_expected(),)]))
+    return _FakeOracleDb(query_map=routes)
+
+
+def _hash_request() -> CompareHashRequest:
+    return CompareHashRequest(
+        table=CompareTableRef(schema_name="APP", name="ORDERS"),
+        columns=[CompareColumn(name="AMT", type=ColumnType.DECIMAL)],
+        key_columns=[CompareColumn(name="ID", type=ColumnType.INTEGER)],
+    )
+
+
+@pytest.mark.parametrize("working", ORACLE_MD5_FUNCTIONS)
+def test_compare_hash_probe_picks_first_working_md5_function(working: str) -> None:
+    adapter = _adapter(_hash_probe_db(working=working))
+
+    plan = adapter.build_compare_hash_query(_hash_request())
+
+    assert plan.uses_database_hash is True
+    assert adapter.compare_md5_function == working
+    assert plan.sql is not None and _MD5_NEEDLES[working].upper() in plan.sql.upper()
+
+
+def test_compare_hash_probe_runs_once_per_adapter() -> None:
+    fake = _hash_probe_db(working=ORACLE_MD5_OBFUSCATION_TOOLKIT)
+    adapter = _adapter(fake)
+
+    adapter.build_compare_hash_query(_hash_request())
+    connections_after_first = len(fake.connections)
+    adapter.build_compare_hash_query(_hash_request())
+
+    # 国家字符集 1 次 + 三个候选各 1 次;第二次构造计划不再连库
+    assert connections_after_first == 4
+    assert len(fake.connections) == connections_after_first
+
+
+def test_compare_hash_without_usable_md5_returns_client_plan() -> None:
+    err = _make_db_error("ORA-00904", "invalid identifier", 904)
+    fake = _FakeOracleDb(
+        query_map=[_Route("nls_database_parameters", (("VALUE",),), [("AL16UTF16",)])],
+        execute_exc_needle=("standard_hash(", err),
+    )
+    adapter = _adapter(fake)
+
+    plan = adapter.build_compare_hash_query(_hash_request())
+
+    assert plan.uses_database_hash is False
+    assert plan.sql is None
+    assert adapter.compare_md5_function is None
+    assert any("no usable MD5" in reason for reason in plan.degrade_reasons)
+
+
+def test_compare_hash_unsupported_national_charset_degrades() -> None:
+    adapter = _adapter(_hash_probe_db(working=ORACLE_MD5_DBMS_CRYPTO, nchar="WE8ISO8859P1"))
+
+    plan = adapter.build_compare_hash_query(_hash_request())
+
+    assert plan.uses_database_hash is False
+    assert any("national charset WE8ISO8859P1" in reason for reason in plan.degrade_reasons)
+
+
+def test_compare_hash_extra_limits_probe_to_configured_function() -> None:
+    fake = _hash_probe_db(working=ORACLE_MD5_DBMS_CRYPTO)
+    conn_info = _conn_info().model_copy(update={"extra": {"compare_md5_function": "dbms_crypto"}})
+    adapter = OracleAdapter(conn_info, cast(SecretStore, _SecretStore("pwd")), oracledb_module=fake)
+
+    plan = adapter.build_compare_hash_query(_hash_request())
+
+    assert plan.uses_database_hash is True
+    probed = [
+        sql.lower()
+        for conn in fake.connections
+        for cur in conn.cursors
+        for sql in cur.executed_history
+    ]
+    assert not any("standard_hash(" in sql for sql in probed)
+
+
+def test_compare_hash_extra_client_skips_pushdown_without_connecting() -> None:
+    fake = _hash_probe_db(working=ORACLE_MD5_STANDARD_HASH)
+    conn_info = _conn_info().model_copy(update={"extra": {"compare_md5_function": "client"}})
+    adapter = OracleAdapter(conn_info, cast(SecretStore, _SecretStore("pwd")), oracledb_module=fake)
+
+    plan = adapter.build_compare_hash_query(_hash_request())
+
+    assert plan.uses_database_hash is False
+    assert plan.degrade_reasons == ["datasource compare_md5_function is client"]
     assert fake.connections == []
 
 
