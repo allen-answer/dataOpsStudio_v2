@@ -667,3 +667,74 @@ def test_cancel_channel_failure_is_not_reported_as_confirmed() -> None:
     finally:
         harness.execute_release.set()
         broker.shutdown()
+
+
+class _LocalCancelConnection(FakeInteractiveConnection):
+    """带进程内硬取消的会话连接(Oracle 形态):local_cancel 打断执行,服务端确认取消。"""
+
+    local_cancel_result: bool | Exception = True
+
+    def local_cancel(self) -> bool:
+        self.harness.calls.append(("local_cancel", self._marker))
+        result = self.local_cancel_result
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def _local_cancel_harness(result: bool | Exception) -> DriverHarness:
+    harness = DriverHarness(block_execute=True)
+
+    def factory(_session: ConsoleSession) -> InteractiveConnection:
+        connection = _LocalCancelConnection(harness, marker=str(100 + len(harness.connections)))
+        connection.local_cancel_result = result
+        harness.connections.append(connection)
+        return connection
+
+    harness.connection_factory = factory  # type: ignore[method-assign]
+    return harness
+
+
+def test_local_cancel_is_tried_before_the_control_channel() -> None:
+    harness = _local_cancel_harness(True)
+    broker, store, _ = _broker(harness)
+    try:
+        session = broker.attach(_request())
+        _wait(lambda: broker.observe(session.id).state is ConsoleSessionState.IDLE)
+        receipt = broker.submit(session.id, session.epoch, "SELECT slow", "request-1")
+        assert harness.execute_started.wait(1)
+        broker.cancel(receipt.statement.id, session.epoch)
+        _wait(
+            lambda: any(
+                event.event_type == "cancel_dispatched"
+                for event in store.events
+                if event.statement_id == receipt.statement.id
+            )
+        )
+
+        assert ("local_cancel", "100") in harness.calls
+        assert not any(kind == "cancel" for kind, _marker in harness.calls)
+    finally:
+        harness.execute_release.set()
+        broker.shutdown()
+
+
+@pytest.mark.parametrize("result", [False, RuntimeError("driver refused")])
+def test_control_channel_cancel_is_used_when_local_cancel_does_not_take(
+    result: bool | Exception,
+) -> None:
+    harness = _local_cancel_harness(result)
+    broker, _store, _ = _broker(harness)
+    try:
+        session = broker.attach(_request())
+        _wait(lambda: broker.observe(session.id).state is ConsoleSessionState.IDLE)
+        receipt = broker.submit(session.id, session.epoch, "SELECT slow", "request-1")
+        assert harness.execute_started.wait(1)
+        broker.cancel(receipt.statement.id, session.epoch)
+        assert harness.cancel_started.wait(1)
+
+        kinds = [kind for kind, _marker in harness.calls]
+        assert kinds.index("local_cancel") < kinds.index("cancel")
+    finally:
+        harness.execute_release.set()
+        broker.shutdown()

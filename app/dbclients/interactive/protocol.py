@@ -178,6 +178,11 @@ class InteractiveConnection(Protocol):
 
     **线程约束**:除 `request_soft_cancel()` / `clear_soft_cancel()`(供 timer /
     control 线程置位的原子 flag)外,所有方法只允许在持有它的 lane 线程上调用。
+
+    **可选方法** `local_cancel() -> bool`(不列入协议成员,broker 用 getattr 取):
+    进程内硬取消,由 control 线程调用,打断本连接正在执行的调用。Oracle 用它
+    (`Connection.cancel()` 本就设计成跨线程调用、无需权限,设计稿 §5);返回 False
+    或没有该方法时,broker 走 `CancelChannel.cancel(marker)`。
     """
 
     capabilities: InteractiveCapabilities
@@ -190,7 +195,8 @@ class InteractiveConnection(Protocol):
 
     @property
     def session_marker(self) -> str | None:
-        """DM sid(`SELECT SESSID()`)/ MySQL `CONNECTION_ID()` —— 数值标识,非敏感。
+        """DM sid(`SELECT SESSID()`)/ MySQL `CONNECTION_ID()` / Oracle "sid,serial#"
+        —— 数值标识,非敏感。
 
         取消通道靠它定位服务端会话:open 失败即无 marker,即无法硬取消。
         """
