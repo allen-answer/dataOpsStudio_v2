@@ -28,8 +28,10 @@ from app.dbclients.interactive.dm import (
 from app.dbclients.interactive.errors import (
     DM_ERROR_CODES,
     MYSQL_ERROR_CODES,
+    ORACLE_ERROR_CODES,
     DMErrorClassifier,
     MySQLErrorClassifier,
+    OracleErrorClassifier,
 )
 from app.dbclients.interactive.mysql import (
     MYSQL_CANCEL_SQL,
@@ -40,6 +42,13 @@ from app.dbclients.interactive.mysql import (
     MYSQL_SESSION_MARKER_SQL,
     MySQLCancelChannel,
     MySQLInteractiveConnection,
+)
+from app.dbclients.interactive.oracle import (
+    ORACLE_DEFAULT_LOGIN_TIMEOUT_MS,
+    ORACLE_INTERACTIVE_CAPABILITIES,
+    ORACLE_SESSION_MARKER_SQL,
+    OracleCancelChannel,
+    OracleInteractiveConnection,
 )
 from app.dbclients.interactive.protocol import (
     CancelChannel,
@@ -72,6 +81,10 @@ __all__ = [
     "MYSQL_INTERACTIVE_CAPABILITIES",
     "MYSQL_SAFETY_BELT_MARGIN_SECONDS",
     "MYSQL_SESSION_MARKER_SQL",
+    "ORACLE_DEFAULT_LOGIN_TIMEOUT_MS",
+    "ORACLE_ERROR_CODES",
+    "ORACLE_INTERACTIVE_CAPABILITIES",
+    "ORACLE_SESSION_MARKER_SQL",
     "BaseCancelChannel",
     "BaseInteractiveConnection",
     "CancelChannel",
@@ -91,6 +104,9 @@ __all__ = [
     "MySQLCancelChannel",
     "MySQLErrorClassifier",
     "MySQLInteractiveConnection",
+    "OracleCancelChannel",
+    "OracleErrorClassifier",
+    "OracleInteractiveConnection",
     "ServerCancelSupport",
     "SessionNotOpenError",
     "SoftCancelledError",

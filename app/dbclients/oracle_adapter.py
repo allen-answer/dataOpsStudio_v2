@@ -42,17 +42,14 @@ R5:连接失败日志不得含密码 / DSN 敏感段(错误摘要经脱敏 helpe
 
 from __future__ import annotations
 
-import decimal
 import importlib
-import os
 import re
 import secrets
-import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
-from app.dbclients import oracle_catalog
+from app.dbclients import oracle_catalog, oracle_connect
 from app.dbclients.oracle_compare import (
     DEFAULT_NCHAR_CHARSET,
     ORACLE_MD5_FUNCTIONS,
@@ -138,8 +135,8 @@ _DRIVER_INSTALL_HINT = (
     "python-oracledb runs in thin mode by default, so no Oracle Instant Client is required."
 )
 
-# thick mode 开关:指向 Oracle Instant Client 目录(11g 需要;19c 是支持 11.2 的最高客户端)。
-_CLIENT_DIR_ENV = "DATAOPS_ORACLE_CLIENT_DIR"
+# thick mode 开关(进程级初始化状态在 oracle_connect,会话控制台共用)。
+_CLIENT_DIR_ENV = oracle_connect.CLIENT_DIR_ENV
 # thin mode 握手阶段即报(认证之前):服务端低于 12.1。
 _THIN_UNSUPPORTED_CODE = "DPY-3010"
 _THIN_UNSUPPORTED_HINT = (
@@ -180,11 +177,6 @@ _PLAN_TABLE_DISABLED_MESSAGE = (
     "Oracle explain writes the session PLAN_TABLE; enable "
     "operation_policy.allow_oracle_plan_table for this datasource to use it"
 )
-
-# init_oracle_client 每进程只能成功调一次;结果(含失败)缓存,失败时每次连接都如实报错。
-_client_init_lock = threading.Lock()
-_client_init_done = False
-_client_init_error: str | None = None
 
 
 class OracleAdapterError(RuntimeError):
@@ -661,34 +653,12 @@ class OracleAdapter(DatabaseAdapter):
     def _connect(self) -> Any:
         oracledb = self._load_oracledb()
         password = self._secret_store.reveal_secret(self._conn_info.password_ref)
-        dsn = self._build_dsn()
-        kwargs: dict[str, Any] = {
-            "user": self._conn_info.username,
-            "password": password,
-            "dsn": dsn,
-        }
-        connect_timeout = int(
-            self._conn_info.extra.get("connect_timeout", self._connect_timeout_seconds)
+        return oracle_connect.connect(
+            oracledb,
+            self._conn_info,
+            password,
+            connect_timeout_seconds=self._connect_timeout_seconds,
         )
-        if connect_timeout > 0:
-            # python-oracledb thin:tcp_connect_timeout 单位秒。
-            kwargs["tcp_connect_timeout"] = connect_timeout
-        # DSN / kwargs 含主机与 service,但不含密码(密码单独 kwarg);仍不入日志。
-        conn = oracledb.connect(**kwargs)
-        handler = _build_output_type_handler(oracledb)
-        if handler is not None:
-            conn.outputtypehandler = handler
-        return conn
-
-    def _build_dsn(self) -> str:
-        # extra["dsn"] 整串覆盖(Easy Connect 或 TNS descriptor;不含密码,R2 无虞);
-        # 否则 Easy Connect host:port/service_name,service_name 缺省取 database。
-        extra = self._conn_info.extra
-        override = extra.get("dsn")
-        if isinstance(override, str) and override.strip():
-            return override.strip()
-        service_name = extra.get("service_name") or self._conn_info.database
-        return f"{self._conn_info.host}:{self._conn_info.port}/{service_name}"
 
     def _load_oracledb(self) -> Any:
         if self._oracledb is None:
@@ -795,68 +765,21 @@ class OracleAdapter(DatabaseAdapter):
 
 
 def _ensure_client_mode(oracledb: Any) -> None:
-    """设了 DATAOPS_ORACLE_CLIENT_DIR 时,本进程首次加载驱动调一次 init_oracle_client。
-
-    oracledb 的 thin/thick 是进程级且只能定一次,必须在本进程第一个 Oracle 连接之前;
-    所有 Oracle 连接都经 _load_oracledb,故放在这里。失败结果缓存,之后每次连接都报同样
-    的结构化错误,不静默回落 thin(回落会让 11g 报更难懂的 DPY-3010)。
-    """
-    global _client_init_done, _client_init_error
-    lib_dir = os.environ.get(_CLIENT_DIR_ENV, "").strip()
-    if not lib_dir:
-        return
-    with _client_init_lock:
-        if not _client_init_done:
-            _client_init_done = True
-            try:
-                oracledb.init_oracle_client(lib_dir=lib_dir)
-            except Exception as exc:
-                parts = [type(exc).__name__]
-                code = _oracle_error_code(exc)
-                if code:
-                    parts.append(f"code={code}")
-                message = _sanitize_error_text(str(exc))
-                if message:
-                    parts.append(f"message={message}")
-                _client_init_error = " ".join(parts)
-        if _client_init_error is not None:
-            raise OracleClientInitError(
-                f"Oracle thick mode initialization failed ({_CLIENT_DIR_ENV}): {_client_init_error}"
-            )
-
-
-def _build_output_type_handler(oracledb: Any) -> Callable[[Any, Any], Any] | None:
-    """连接级 outputtypehandler:有小数位 / 无约束的 NUMBER → Decimal;LOB → str / bytes。
-
-    `NUMBER(p,0)`(precision>0、scale==0)缺省就取精确 int,不接管。驱动模块缺这些
-    DbType 常量时(单测 fake)返回 None,不挂 handler。
-    """
-    number_type = getattr(oracledb, "DB_TYPE_NUMBER", None)
-    lob_targets: dict[Any, Any] = {}
-    for source_name, target_name in (
-        ("DB_TYPE_CLOB", "DB_TYPE_LONG"),
-        ("DB_TYPE_NCLOB", "DB_TYPE_LONG_NVARCHAR"),
-        ("DB_TYPE_BLOB", "DB_TYPE_LONG_RAW"),
-    ):
-        source = getattr(oracledb, source_name, None)
-        target = getattr(oracledb, target_name, None)
-        if source is not None and target is not None:
-            lob_targets[source] = target
-    if number_type is None and not lob_targets:
-        return None
-
-    def handler(cursor: Any, metadata: Any) -> Any:
-        type_code = metadata.type_code
-        if number_type is not None and type_code is number_type:
-            if metadata.scale == 0 and (metadata.precision or 0) > 0:
-                return None
-            return cursor.var(decimal.Decimal, arraysize=cursor.arraysize)
-        target = lob_targets.get(type_code)
-        if target is not None:
-            return cursor.var(target, arraysize=cursor.arraysize)
-        return None
-
-    return handler
+    """thick 初始化(进程级,见 oracle_connect);失败转成带摘要的 OracleClientInitError。"""
+    try:
+        oracle_connect.ensure_client_mode(oracledb)
+    except oracle_connect.OracleClientInitFailure as failure:
+        exc = failure.cause
+        parts = [type(exc).__name__]
+        code = _oracle_error_code(exc) if isinstance(exc, Exception) else None
+        if code:
+            parts.append(f"code={code}")
+        message = _sanitize_error_text(str(exc))
+        if message:
+            parts.append(f"message={message}")
+        raise OracleClientInitError(
+            f"Oracle thick mode initialization failed ({_CLIENT_DIR_ENV}): {' '.join(parts)}"
+        ) from None
 
 
 def _legacy_paging_for(conn: Any, sql: str) -> LegacyPagingRewrite:

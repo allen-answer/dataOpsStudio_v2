@@ -2,7 +2,8 @@
 
 期望值:mysql / dm / postgresql / db2 照抄收敛前前端的硬编码白名单(SqlWorkspaceView /
 sqlIntelligence / useConsoleSessions),证明改读后端能力后这几类可用范围不变;
-oracle / oceanbase_oracle 是 PR-6 以 Preview 档新放开的执行与 SQL 工具。
+oracle / oceanbase_oracle 是 PR-6 以 Preview 档新放开的执行与 SQL 工具;oracle 的会话
+控制台由 PR-5 放开。
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from app.domain.datasource_extra import DatasourceExtraError, validate_datasourc
 
 _EXECUTION = {"mysql", "dm", "postgresql", "db2", "oracle", "oceanbase_oracle"}
 _TOOLS = {"mysql", "dm", "postgresql", "oracle", "oceanbase_oracle"}
-_SESSION = {"mysql", "dm"}
+_SESSION = {"mysql", "dm", "oracle"}
 # 缺省策略下 explain 按钮:Oracle 另需 allow_oracle_plan_table(缺省关)
 _EXPLAIN_BY_DEFAULT = {"mysql", "dm", "postgresql", "oceanbase_oracle"}
 

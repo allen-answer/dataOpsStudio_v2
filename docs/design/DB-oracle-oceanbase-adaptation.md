@@ -458,7 +458,7 @@ POC(V2)在 `charset=utf8mb4` 与 `gbk` 两种连接字符集下逐类型抓了 `
 |---|---|---|---|---|---|
 | OB-MySQL | `SELECT CONNECTION_ID()` | `KILL QUERY <id>` | `KILL <id>` | `ob_query_timeout`(微秒) | 1317 取消;OB 超时码(4012 族)〔待验证 V3〕 |
 | OB-Oracle | `SELECT SYS_CONTEXT('USERENV','SID') FROM DUAL`(实测与 PyMySQL `thread_id()`、`GV$OB_PROCESSLIST.ID` 是同一个数;`CONNECTION_ID()` 不存在) | `KILL QUERY <id>`(实测可用,经 OBProxy,约 1 秒内打断,被打断连接**仍可继续用**) | `KILL <id>`(实测普通账号可用,目标连接收到 2013);`ALTER SYSTEM KILL SESSION` 报 1031 无权限,不用 | `ob_query_timeout` | 取消 `600`/内部码 `-5065`;超时 `600`/`-4012` |
-| Oracle | `SYS_CONTEXT('USERENV','SID')` + `SERIAL#` | **进程内** `Connection.cancel()`(见下) | `ALTER SYSTEM KILL SESSION 'sid,serial#'`,需权限,探测不通即 `DEGRADED` | 无语句级服务端超时;`call_timeout` 作保险带 | ORA-01013 取消;DPY-4024 超时 |
+| Oracle | `DBMS_DEBUG_JDWP.CURRENT_SESSION_ID/_SERIAL` 拼 `sid,serial#`(`V$SESSION` 最小权限不可读;JDWP 被收回时退回只有 sid) | **进程内** `Connection.cancel()`(见下) | `ALTER SYSTEM KILL SESSION 'sid,serial#' IMMEDIATE`,需权限,无权时执行即失败 | 无语句级服务端超时;`call_timeout` 作保险带 | ORA-01013 取消;DPY-4024 超时(按 `full_code` 分类) |
 
 **Oracle 的取消走进程内,不走控制连接 SQL**:
 
@@ -468,8 +468,16 @@ POC(V2)在 `charset=utf8mb4` 与 `gbk` 两种连接字符集下逐类型抓了 `
 - 协议改动:`InteractiveConnection` 增加可选方法 `local_cancel() -> bool`,Oracle 实现调
   `conn.cancel()`,其他方言返回 False。broker 的取消阶梯在“硬取消”一级先试
   `local_cancel()`,不行再走 `CancelChannel.cancel(marker)`。MySQL/DM 行为不变。
-- `OracleCancelChannel` 只负责破坏性兜底(`KILL SESSION`)与权限探测;探测不通时如实上报
-  `DEGRADED`,但由于 `local_cancel` 可用,前端提示文案区分“可取消,但兜底断开需 DBA 权限”。
+- `OracleCancelChannel` 只负责破坏性兜底(`KILL SESSION`)。**PR-5 定稿**:控制通道恒报
+  `AVAILABLE` —— 硬取消不经控制连接、不需权限,报 `DEGRADED` 会让前端误提示“取消将断开会话”;
+  兜底无权限时在执行时失败,broker 记 `destroy_failed`(前端文案区分留作后续)。
+
+**PR-5 实测**(11.2.0.4,仅 CONNECT 角色,thick):`Connection.cancel()` 约 2 秒打断笛卡尔积
+长查询,报 ORA-01013,连接照常续用;真 `SessionBroker`(内存 store)上取消到语句
+`cancelled:1013` 约 0.2 秒,下一条语句成功。`call_timeout` 超时报 DPY-4024,其 `.code` 为 0,
+分类器按 `full_code` 查表。另:broker 的安全限行按 Oracle 方言渲染 `FETCH FIRST`,11g 不认,
+会话缝连到 12c 以前的库时与 job 路径一样改写为 ROWNUM(带 OFFSET 时去掉行号列)。
+thick 初始化是进程级的,job 路径与会话缝共用 `oracle_connect` 里同一份初始化状态。
 
 OB 经 OBProxy 时,会话号是代理侧会话号,`KILL QUERY` 由代理路由到后端 observer。OB-Oracle
 在 proxy 模式下已实测可用;OB-MySQL 尚无实例,按同一机制预期可用,待验证。

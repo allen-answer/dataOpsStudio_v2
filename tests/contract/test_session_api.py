@@ -448,7 +448,7 @@ def test_observe_always_carries_current_epoch() -> None:
 def test_attach_refuses_non_session_dialects_so_frontend_falls_back_to_jobs() -> None:
     harness = _DriverHarness()
     broker = _broker(harness)
-    client, _ = _client(_FakeEngine(_attach_rows(db_type="oracle")), broker)
+    client, _ = _client(_FakeEngine(_attach_rows(db_type="postgresql")), broker)
     try:
         response = client.post(
             "/api/sql/sessions/attach",

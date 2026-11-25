@@ -13,7 +13,7 @@ from typing import Any, cast
 
 import pytest
 
-from app.dbclients import oracle_adapter as oracle_adapter_module
+from app.dbclients import oracle_connect
 from app.dbclients.oracle_adapter import (
     InvalidDatasourceError,
     OracleAdapter,
@@ -1132,8 +1132,8 @@ def _installed_handler(fake: _FakeTypedOracleDb) -> Any:
 
 def _reset_client_init(monkeypatch: pytest.MonkeyPatch, *, lib_dir: str | None) -> None:
     """thick 初始化是进程级缓存;每个用例从“未初始化”开始。"""
-    monkeypatch.setattr(oracle_adapter_module, "_client_init_done", False)
-    monkeypatch.setattr(oracle_adapter_module, "_client_init_error", None)
+    monkeypatch.setattr(oracle_connect, "_client_init_done", False)
+    monkeypatch.setattr(oracle_connect, "_client_init_error", None)
     if lib_dir is None:
         monkeypatch.delenv("DATAOPS_ORACLE_CLIENT_DIR", raising=False)
     else:

@@ -1,4 +1,4 @@
-"""MySQL / DM 会话缝实现的共享骨架。
+"""MySQL / DM / Oracle 会话缝实现的共享骨架。
 
 方言差异全部落在子类钩子上(建连 kwargs、marker SQL、cursor 类、保险带、
 控制命令);会话不变量(软取消 flag、批间检查、cursor 只活在栈上、连接判死)
@@ -61,6 +61,8 @@ class BaseInteractiveConnection:
     _ping_sql: str
     # session_marker 采集 SQL(§4.1 表)。
     _session_marker_sql: str
+    # marker 格式(DM sid / MySQL connection id 是纯数字;Oracle 是 "sid,serial#")。
+    _session_marker_re: re.Pattern[str] = _SESSION_MARKER_RE
 
     def __init__(
         self,
@@ -107,6 +109,13 @@ class BaseInteractiveConnection:
 
     def clear_soft_cancel(self) -> None:
         self._cancel_flag.clear()
+
+    def local_cancel(self) -> bool:
+        """进程内硬取消(设计稿 §5):由控制线程打断本连接正在执行的调用。
+
+        MySQL / DM 没有这条路,返回 False,broker 改走 `CancelChannel.cancel`。
+        """
+        return False
 
     # ── 生命周期 ────────────────────────────────────────────────────────────
 
@@ -258,7 +267,7 @@ class BaseInteractiveConnection:
                 "session marker query returned no value",
                 ClassifiedError(category=ErrorCategory.UNKNOWN, summary="empty session marker"),
             )
-        return validate_session_marker(str(marker))
+        return validate_session_marker(str(marker), self._session_marker_re)
 
     def _emit_columns(self, request: StatementRequest, cursor: Any) -> None:
         if request.column_sink is None:
@@ -290,6 +299,8 @@ class BaseCancelChannel:
     _driver_name: str
     _ping_sql: str
     _session_marker_sql: str
+    # 目标会话 marker 的格式(与该方言的会话连接一致)。
+    _session_marker_re: re.Pattern[str] = _SESSION_MARKER_RE
 
     def __init__(
         self,
@@ -334,10 +345,12 @@ class BaseCancelChannel:
         return self._support
 
     def cancel(self, session_marker: str) -> None:
-        self._control(self._cancel_command(validate_session_marker(session_marker)))
+        marker = validate_session_marker(session_marker, self._session_marker_re)
+        self._control(self._cancel_command(marker))
 
     def destroy(self, session_marker: str) -> None:
-        self._control(self._destroy_command(validate_session_marker(session_marker)))
+        marker = validate_session_marker(session_marker, self._session_marker_re)
+        self._control(self._destroy_command(marker))
 
     def ping(self) -> bool:
         conn = self._conn
@@ -419,7 +432,11 @@ class BaseCancelChannel:
         finally:
             _safe_close(cursor)
         self._conn = conn
-        self._own_marker = validate_session_marker(str(marker)) if marker is not None else None
+        self._own_marker = (
+            validate_session_marker(str(marker), self._session_marker_re)
+            if marker is not None
+            else None
+        )
 
     def _execute_control(self, command: tuple[str, Any]) -> None:
         conn = self._conn
@@ -453,13 +470,15 @@ class BaseCancelChannel:
         return self._secret_store.reveal_secret(self._conn_info.password_ref)
 
 
-def validate_session_marker(session_marker: str) -> str:
-    """marker 必须是纯数字(DM sid / MySQL connection id 都是数值)。
+def validate_session_marker(
+    session_marker: str, pattern: re.Pattern[str] = _SESSION_MARKER_RE
+) -> str:
+    """marker 必须匹配方言格式(缺省纯数字:DM sid / MySQL connection id)。
 
     控制命令要把它拼进 SQL 语义里,这里守死格式,不给任何非数值值可乘之机。
     """
     candidate = session_marker.strip()
-    if _SESSION_MARKER_RE.fullmatch(candidate) is None:
+    if pattern.fullmatch(candidate) is None:
         raise CancelChannelError("invalid session marker")
     return candidate
 
